@@ -1100,7 +1100,7 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
 {
    if (TU_DEBUG(SYSMEM)) {
       cmd->state.rp.gmem_disable_reason = "TU_DEBUG(SYSMEM)";
-      return true;
+      return false;
    }
 
    /* can't fit attachments into gmem */
@@ -1146,7 +1146,7 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       return true;
    }
 
-   if (TU_DEBUG(GMEM))
+   
       return false;
 
    bool use_sysmem = tu_autotune_use_bypass(&cmd->device->autotune,
