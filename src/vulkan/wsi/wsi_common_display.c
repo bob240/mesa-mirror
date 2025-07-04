@@ -1395,9 +1395,22 @@ wsi_display_start_wait_thread(struct wsi_display *wsi)
 static void
 wsi_display_stop_wait_thread(struct wsi_display *wsi)
 {
+   #ifdef __ANDROID__
+   struct sigaction actions;
+   memset (&actions, 0, sizeof (actions));
+   sigemptyset (&actions.sa_mask);
+   actions.sa_flags = 0;
+   actions.sa_handler = thread_signal_handler;
+   sigaction (SIGUSR2, &actions, NULL);
+   #endif
+
    mtx_lock(&wsi->wait_mutex);
    if (wsi->wait_thread) {
+      #ifndef __ANDROID__
       pthread_cancel(wsi->wait_thread);
+      #else
+      pthread_kill(wsi->wait_thread, SIGUSR2);
+      #endif
       pthread_join(wsi->wait_thread, NULL);
       wsi->wait_thread = 0;
    }
