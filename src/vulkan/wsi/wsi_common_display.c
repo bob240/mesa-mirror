@@ -2276,8 +2276,10 @@ udev_event_listener_thread(void *data)
 
    int udev_fd = udev_monitor_get_fd(mon);
 
+   #ifndef __ANDROID__
    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-
+   #endif
+   
    for (;;) {
       nfds_t nfds = 1;
       struct pollfd fds[1] =  {
@@ -2400,6 +2402,14 @@ wsi_display_finish_wsi(struct wsi_device *wsi_device,
 {
    struct wsi_display *wsi =
       (struct wsi_display *) wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY];
+   #ifdef __ANDROID__
+   struct sigaction actions;
+   memset (&actions, 0, sizeof (actions));
+   sigemptyset (&actions.sa_mask);
+   actions.sa_flags = 0;
+   actions.sa_handler = thread_signal_handler;
+   sigaction (SIGUSR2, &actions, NULL);
+  #endif
 
    if (wsi) {
       wsi_for_each_connector(connector, wsi) {
@@ -2412,7 +2422,11 @@ wsi_display_finish_wsi(struct wsi_device *wsi_device,
       wsi_display_stop_wait_thread(wsi);
 
       if (wsi->hotplug_thread) {
+         #ifndef __ANDROID__
          pthread_cancel(wsi->hotplug_thread);
+         #else
+         pthread_kill(wsi->hotplug_thread, SIGUSR2);
+         #endif
          pthread_join(wsi->hotplug_thread, NULL);
       }
 
