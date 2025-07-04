@@ -176,6 +176,12 @@ struct wsi_display_sync {
 
 static uint64_t fence_sequence;
 
+#ifdef __ANDROID__
+static void thread_signal_handler (int signum) {
+   pthread_exit (0);
+}
+#endif
+
 ICD_DEFINE_NONDISP_HANDLE_CASTS(wsi_display_mode, VkDisplayModeKHR)
 ICD_DEFINE_NONDISP_HANDLE_CASTS(wsi_display_connector, VkDisplayKHR)
 
