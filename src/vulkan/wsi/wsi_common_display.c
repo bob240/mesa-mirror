@@ -1365,7 +1365,9 @@ wsi_display_wait_thread(void *data)
       .events = POLLIN
    };
 
+   #ifndef __ANDROID__
    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+   #endif
    for (;;) {
       int ret = poll(&pollfd, 1, -1);
       if (ret > 0) {
