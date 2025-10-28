@@ -33,6 +33,8 @@
 #include "vk_common_entrypoints.h"
 #include "vk_enum_to_str.h"
 
+#include <ac_shader_debug_info.h>
+
 #define COLOR_RESET  "\033[0m"
 #define COLOR_RED    "\033[31m"
 #define COLOR_GREEN  "\033[1;32m"
@@ -129,7 +131,7 @@ radv_address_binding_callback(VkDebugUtilsMessageSeverityFlagBitsEXT message_sev
          .object_type = callback_data->pObjects[i].objectType,
       };
 
-      util_dynarray_append(&tracker->reports, struct radv_address_binding_report, report);
+      util_dynarray_append(&tracker->reports, report);
    }
 
    simple_mtx_unlock(&tracker->mtx);
@@ -222,7 +224,7 @@ radv_finish_trace(struct radv_device *device)
 }
 
 static void
-radv_dump_trace(const struct radv_device *device, struct radeon_cmdbuf *cs, FILE *f)
+radv_dump_trace(const struct radv_device *device, struct ac_cmdbuf *cs, FILE *f)
 {
    fprintf(f, "Trace ID: %x\n", device->trace_data->primary_id);
    device->ws->cs_dump(cs, f, (const int *)&device->trace_data->primary_id, 2, RADV_CS_DUMP_TYPE_IBS);
@@ -474,9 +476,46 @@ radv_dump_annotated_shader(const struct radv_shader *shader, mesa_shader_stage s
 
    fprintf(f, COLOR_YELLOW "%s - annotated disassembly:" COLOR_RESET "\n", radv_get_shader_name(&shader->info, stage));
 
+   /* Maps a given offset inside the shader binary to a given debug_info index */
+   struct ac_shader_debug_info **debug_info_mapping = NULL;
+   if (shader->debug_info_count > 0) {
+      debug_info_mapping = calloc(shader->code_size, sizeof(struct ac_shader_debug_info *));
+      for (uint32_t debug_index = 0; debug_index < shader->debug_info_count; debug_index++) {
+         struct ac_shader_debug_info *debug_info = &shader->debug_info[debug_index];
+         if (debug_info->type != ac_shader_debug_info_src_loc)
+            continue;
+
+         /* Such a debug_info marks the end of a range of instructions with location info */
+         if (!debug_info->src_loc.file)
+            continue;
+
+         uint32_t range_start = debug_info->offset;
+         uint32_t range_end = shader->code_size; /* Last debug_info spans until the end of the shader */
+
+         if (debug_index + 1 <
+             shader->debug_info_count) { /* Only if there is another debug_info after the current one */
+            struct ac_shader_debug_info *next_debug_info = &shader->debug_info[debug_index + 1];
+            range_end = next_debug_info->offset;
+         }
+
+         for (uint32_t offset = range_start; offset < range_end; offset++)
+            debug_info_mapping[offset] = debug_info;
+      }
+   }
+
    /* Print instructions with annotations. */
    for (i = 0; i < num_inst; i++) {
       struct radv_shader_inst *inst = &instructions[i];
+
+      /* Print source location, if we have it */
+      if (debug_info_mapping) {
+         struct ac_shader_debug_info *debug_info = debug_info_mapping[inst->offset];
+         if (debug_info) {
+            /* Found the source location, print it */
+            fprintf(f, "// 0x%x %s:%u:%u\n", debug_info->offset, debug_info->src_loc.file, debug_info->src_loc.line,
+                    debug_info->src_loc.column);
+         }
+      }
 
       fprintf(f, "%s\n", inst->text);
 
@@ -500,6 +539,7 @@ radv_dump_annotated_shader(const struct radv_shader *shader, mesa_shader_stage s
    }
 
    fprintf(f, "\n\n");
+   free(debug_info_mapping);
    free(instructions);
 }
 

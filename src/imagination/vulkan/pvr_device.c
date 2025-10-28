@@ -83,6 +83,7 @@
 #include "util/os_misc.h"
 #include "util/u_math.h"
 #include "vk_alloc.h"
+#include "vk_device_memory.h"
 #include "vk_extensions.h"
 #include "vk_log.h"
 #include "vk_object.h"
@@ -107,18 +108,6 @@
  * been rounded up since the percentage is treated as an integer.
  */
 #define PVR_GLOBAL_FREE_LIST_GROW_THRESHOLD 13U
-
-#if defined(VK_USE_PLATFORM_DISPLAY_KHR)
-#   define PVR_USE_WSI_PLATFORM_DISPLAY true
-#else
-#   define PVR_USE_WSI_PLATFORM_DISPLAY false
-#endif
-
-#if PVR_USE_WSI_PLATFORM_DISPLAY
-#   define PVR_USE_WSI_PLATFORM true
-#else
-#   define PVR_USE_WSI_PLATFORM false
-#endif
 
 /* Amount of padding required for VkBuffers to ensure we don't read beyond
  * a page boundary.
@@ -163,6 +152,7 @@ static const struct pvr_drm_device_config pvr_drm_configs[] = {
 #undef DEF_CONFIG
 
 static const struct vk_instance_extension_table pvr_instance_extensions = {
+   .KHR_device_group_creation = true,
    .KHR_display = PVR_USE_WSI_PLATFORM_DISPLAY,
    .KHR_external_fence_capabilities = true,
    .KHR_external_memory_capabilities = true,
@@ -171,11 +161,14 @@ static const struct vk_instance_extension_table pvr_instance_extensions = {
    .KHR_get_physical_device_properties2 = true,
    .KHR_get_surface_capabilities2 = PVR_USE_WSI_PLATFORM,
    .KHR_surface = PVR_USE_WSI_PLATFORM,
-#ifndef VK_USE_PLATFORM_WIN32_KHR
-   .EXT_headless_surface = PVR_USE_WSI_PLATFORM && false,
+#ifdef VK_USE_PLATFORM_WAYLAND_KHR
+   .KHR_wayland_surface = true,
 #endif
    .EXT_debug_report = true,
    .EXT_debug_utils = true,
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+   .EXT_headless_surface = PVR_USE_WSI_PLATFORM && false,
+#endif
 };
 
 static void pvr_physical_device_get_supported_extensions(
@@ -183,19 +176,21 @@ static void pvr_physical_device_get_supported_extensions(
 {
    *extensions = (struct vk_device_extension_table){
       .KHR_bind_memory2 = true,
+      .KHR_buffer_device_address = true,
       .KHR_copy_commands2 = true,
       .KHR_create_renderpass2 = true,
       .KHR_dedicated_allocation = true,
       .KHR_depth_stencil_resolve = true,
       .KHR_descriptor_update_template = true,
+      .KHR_device_group = true,
       .KHR_driver_properties = true,
       .KHR_external_fence = true,
       .KHR_external_fence_fd = true,
       .KHR_external_memory = true,
       .KHR_external_memory_fd = true,
-      .KHR_format_feature_flags2 = false,
       .KHR_external_semaphore = PVR_USE_WSI_PLATFORM,
       .KHR_external_semaphore_fd = PVR_USE_WSI_PLATFORM,
+      .KHR_format_feature_flags2 = false,
       .KHR_get_memory_requirements2 = true,
       .KHR_image_format_list = true,
       .KHR_imageless_framebuffer = true,
@@ -204,17 +199,23 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_maintenance1 = true,
       .KHR_maintenance2 = true,
       .KHR_maintenance3 = true,
+      .KHR_map_memory2 = true,
       .KHR_multiview = true,
       .KHR_present_id2 = PVR_USE_WSI_PLATFORM,
       .KHR_present_wait2 = PVR_USE_WSI_PLATFORM,
+      .KHR_relaxed_block_layout = true,
       .KHR_robustness2 = true,
+      .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_draw_parameters = true,
       .KHR_shader_expect_assume = false,
       .KHR_shader_float_controls = true,
+      .KHR_shader_non_semantic_info = true,
+      .KHR_shader_relaxed_extended_instruction = true,
       .KHR_shader_subgroup_extended_types = true,
-      .KHR_spirv_1_4 = true,
       .KHR_shader_terminate_invocation = true,
+      .KHR_spirv_1_4 = true,
+      .KHR_storage_buffer_storage_class = true,
       .KHR_swapchain = PVR_USE_WSI_PLATFORM,
       .KHR_swapchain_mutable_format = PVR_USE_WSI_PLATFORM,
       .KHR_timeline_semaphore = true,
@@ -234,17 +235,20 @@ static void pvr_physical_device_get_supported_extensions(
       .EXT_image_2d_view_of_3d = true,
       .EXT_index_type_uint8 = false,
       .EXT_line_rasterization = true,
+      .EXT_map_memory_placed = true,
       .EXT_physical_device_drm = true,
       .EXT_private_data = true,
       .EXT_provoking_vertex = true,
-      .EXT_robustness2 = true,
       .EXT_queue_family_foreign = true,
-      .EXT_separate_stencil_usage = true,
+      .EXT_robustness2 = true,
       .EXT_scalar_block_layout = true,
+      .EXT_separate_stencil_usage = true,
       .EXT_shader_demote_to_helper_invocation = true,
+      .EXT_shader_replicated_composites = true,
       .EXT_texel_buffer_alignment = false,
       .EXT_tooling_info = true,
       .EXT_vertex_attribute_divisor = true,
+      .EXT_zero_initialize_device_memory = true,
    };
 }
 
@@ -351,9 +355,6 @@ static void pvr_physical_device_get_supported_features(
       .descriptorBindingVariableDescriptorCount = false,
       .runtimeDescriptorArray = false,
       .samplerFilterMinmax = false,
-      .bufferDeviceAddress = false,
-      .bufferDeviceAddressCaptureReplay = false,
-      .bufferDeviceAddressMultiDevice = false,
       .vulkanMemoryModel = false,
       .vulkanMemoryModelDeviceScope = false,
       .vulkanMemoryModelAvailabilityVisibilityChains = false,
@@ -383,6 +384,9 @@ static void pvr_physical_device_get_supported_features(
 
       /* Vulkan 1.2 / VK_KHR_separate_depth_stencil_layouts */
       .separateDepthStencilLayouts = true,
+
+      /* VK_KHR_shader_relaxed_extended_instruction */
+      .shaderRelaxedExtendedInstruction = true,
 
       /* Vulkan 1.2 / VK_KHR_shader_subgroup_extended_types */
       .shaderSubgroupExtendedTypes = true,
@@ -446,6 +450,11 @@ static void pvr_physical_device_get_supported_features(
       .image2DViewOf3D = true,
       .sampler2DViewOf3D = true,
 
+      /* VK_EXT_map_memory_placed */
+      .memoryMapPlaced = true,
+      .memoryMapRangePlaced = false,
+      .memoryUnmapReserve = true,
+
       /* Vulkan 1.3 / VK_EXT_private_data */
       .privateData = true,
 
@@ -459,11 +468,19 @@ static void pvr_physical_device_get_supported_features(
       /* Vulkan 1.3 / VK_EXT_texel_buffer_alignment */
       .texelBufferAlignment = true,
 
+      /* Vulkan 1.2 / VK_KHR_buffer_device_address */
+      .bufferDeviceAddress = true,
+      .bufferDeviceAddressCaptureReplay = false,
+      .bufferDeviceAddressMultiDevice = false,
+
       /* VK_KHR_shader_expect_assume */
       .shaderExpectAssume = false,
 
       /* VK_EXT_shader_demote_to_helper_invocation */
       .shaderDemoteToHelperInvocation = true,
+
+      /* VK_EXT_shader_replicated_composites */
+      .shaderReplicatedComposites = true,
 
       /* VK_KHR_shader_terminate_invocation */
       .shaderTerminateInvocation = true,
@@ -494,6 +511,9 @@ static void pvr_physical_device_get_supported_features(
 
       /* VK_KHR_line_rasterization */
       .bresenhamLines = true,
+
+      /* VK_EXT_zero_initialize_device_memory */
+      .zeroInitializeDeviceMemory = true,
    };
 }
 
@@ -782,6 +802,9 @@ static bool pvr_physical_device_get_properties(
       /* VK_EXT_extended_dynamic_state3 */
       .dynamicPrimitiveTopologyUnrestricted = false,
 
+      /* VK_EXT_map_memory_placed */
+      .minPlacedMemoryMapAlignment = pdevice->ws->page_size,
+
       /* VK_EXT_provoking_vertex */
       .provokingVertexModePerPipeline = true,
       .transformFeedbackPreservesTriangleFanProvokingVertex = false,
@@ -926,8 +949,7 @@ static void pvr_physical_device_destroy(struct vk_physical_device *vk_pdevice)
     * before freeing or that the freeing functions accept NULL pointers.
     */
 
-   if (pdevice->pco_ctx)
-      ralloc_free(pdevice->pco_ctx);
+   ralloc_free(pdevice->pco_ctx);
 
    pvr_wsi_finish(pdevice);
 
@@ -1040,6 +1062,20 @@ pvr_physical_device_setup_uuids(struct pvr_physical_device *const pdevice)
           sizeof(pdevice->vk.properties.shaderBinaryUUID));
 }
 
+static bool pvr_device_is_conformant(const struct pvr_device_info *info)
+{
+   const uint64_t bvnc = pvr_get_packed_bvnc(info);
+   switch (bvnc) {
+   case PVR_BVNC_PACK(36, 53, 104, 796):
+      return true;
+
+   default:
+      break;
+   }
+
+   return false;
+}
+
 static VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                                          struct pvr_instance *instance,
                                          drmDevicePtr drm_render_device,
@@ -1100,16 +1136,6 @@ static VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    if (result != VK_SUCCESS)
       goto err_vk_free_display_path;
 
-   if (!getenv("PVR_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
-      result = vk_errorf(instance,
-                         VK_ERROR_INCOMPATIBLE_DRIVER,
-                         "WARNING: powervr is not a conformant Vulkan "
-                         "implementation. Pass "
-                         "PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 if you know "
-                         "what you're doing.");
-      goto err_pvr_winsys_destroy;
-   }
-
    pdevice->instance = instance;
    pdevice->render_path = render_path;
    pdevice->display_path = display_path;
@@ -1120,6 +1146,21 @@ static VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                                       &pdevice->dev_runtime_info);
    if (result != VK_SUCCESS)
       goto err_pvr_winsys_destroy;
+
+   if (!pvr_device_is_conformant(&pdevice->dev_info)) {
+      if (!getenv("PVR_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
+         result = vk_errorf(instance,
+                            VK_ERROR_INCOMPATIBLE_DRIVER,
+                            "WARNING: powervr is not a conformant Vulkan "
+                            "implementation for %s. Pass "
+                            "PVR_I_WANT_A_BROKEN_VULKAN_DRIVER=1 if you know "
+                            "what you're doing.",
+                            pdevice->dev_info.ident.public_name);
+         goto err_pvr_winsys_destroy;
+      }
+
+      vk_warn_non_conformant_implementation("powervr");
+   }
 
    /* Setup available memory heaps and types */
    pdevice->memory.memoryHeapCount = 1;
@@ -2557,10 +2598,10 @@ VkResult pvr_AllocateMemory(VkDevice _device,
    if (aligned_alloc_size > mem_heap->size)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   mem = vk_object_alloc(&device->vk,
-                         pAllocator,
-                         sizeof(*mem),
-                         VK_OBJECT_TYPE_DEVICE_MEMORY);
+   mem = vk_device_memory_create(&device->vk,
+                                 pAllocateInfo,
+                                 pAllocator,
+                                 sizeof(*mem));
    if (!mem)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -2580,6 +2621,9 @@ VkResult pvr_AllocateMemory(VkDevice _device,
           * allocations that won't be suballocated to multiple resources.
           */
          break;
+      case VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO:
+         /* We're not yet using any of the flags provided. */
+         break;
       default:
          vk_debug_ignored_stype(ext->sType);
          break;
@@ -2595,7 +2639,7 @@ VkResult pvr_AllocateMemory(VkDevice _device,
                                                       fd_info->fd,
                                                       &mem->bo);
       if (result != VK_SUCCESS)
-         goto err_vk_object_free_mem;
+         goto err_vk_device_memory_destroy;
 
       /* For security purposes, we reject importing the bo if it's smaller
        * than the requested allocation size. This prevents a malicious client
@@ -2613,7 +2657,7 @@ VkResult pvr_AllocateMemory(VkDevice _device,
                             pAllocateInfo->allocationSize,
                             mem->bo->size);
          device->ws->ops->buffer_destroy(mem->bo);
-         goto err_vk_object_free_mem;
+         goto err_vk_device_memory_destroy;
       }
 
       /* From the Vulkan spec:
@@ -2647,15 +2691,15 @@ VkResult pvr_AllocateMemory(VkDevice _device,
                                               PVR_WINSYS_BO_FLAG_CPU_ACCESS,
                                               &mem->bo);
       if (result != VK_SUCCESS)
-         goto err_vk_object_free_mem;
+         goto err_vk_device_memory_destroy;
    }
 
    *pMem = pvr_device_memory_to_handle(mem);
 
    return VK_SUCCESS;
 
-err_vk_object_free_mem:
-   vk_object_free(&device->vk, pAllocator, mem);
+err_vk_device_memory_destroy:
+   vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 
    return result;
 }
@@ -2716,22 +2760,21 @@ void pvr_FreeMemory(VkDevice _device,
     *   unmapped.
     */
    if (mem->bo->map)
-      device->ws->ops->buffer_unmap(mem->bo);
+      device->ws->ops->buffer_unmap(mem->bo, false);
 
    device->ws->ops->buffer_destroy(mem->bo);
 
-   vk_object_free(&device->vk, pAllocator, mem);
+   vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 }
 
-VkResult pvr_MapMemory(VkDevice _device,
-                       VkDeviceMemory _memory,
-                       VkDeviceSize offset,
-                       VkDeviceSize size,
-                       VkMemoryMapFlags flags,
-                       void **ppData)
+VkResult pvr_MapMemory2(VkDevice _device,
+                        const VkMemoryMapInfo *pMemoryMapInfo,
+                        void **ppData)
 {
    VK_FROM_HANDLE(pvr_device, device, _device);
-   VK_FROM_HANDLE(pvr_device_memory, mem, _memory);
+   VK_FROM_HANDLE(pvr_device_memory, mem, pMemoryMapInfo->memory);
+   VkDeviceSize offset;
+   VkDeviceSize size;
    VkResult result;
 
    if (!mem) {
@@ -2739,8 +2782,16 @@ VkResult pvr_MapMemory(VkDevice _device,
       return VK_SUCCESS;
    }
 
-   if (size == VK_WHOLE_SIZE)
-      size = mem->bo->size - offset;
+   offset = pMemoryMapInfo->offset;
+   size = vk_device_memory_range(&mem->vk, offset, pMemoryMapInfo->size);
+
+   void *addr = NULL;
+   if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
+      const VkMemoryMapPlacedInfoEXT *placed_info =
+         vk_find_struct_const(pMemoryMapInfo->pNext,
+                              MEMORY_MAP_PLACED_INFO_EXT);
+      addr = placed_info->pPlacedAddress;
+   }
 
    /* From the Vulkan spec version 1.0.32 docs for MapMemory:
     *
@@ -2753,14 +2804,22 @@ VkResult pvr_MapMemory(VkDevice _device,
    assert(size > 0);
    assert(offset + size <= mem->bo->size);
 
-   /* Check if already mapped */
-   if (mem->bo->map) {
-      *ppData = (uint8_t *)mem->bo->map + offset;
-      return VK_SUCCESS;
+   /* From the Vulkan 1.2.194 spec:
+    *
+    *    "memory must not be currently host mapped"
+    */
+   if (mem->bo->map != NULL) {
+      return vk_errorf(device,
+                       VK_ERROR_MEMORY_MAP_FAILED,
+                       "Memory object already mapped.");
+   }
+
+   vk_foreach_struct_const (ext, pMemoryMapInfo->pNext) {
+      vk_debug_ignored_stype(ext->sType);
    }
 
    /* Map it all at once */
-   result = device->ws->ops->buffer_map(mem->bo);
+   result = device->ws->ops->buffer_map(mem->bo, addr);
    if (result != VK_SUCCESS)
       return result;
 
@@ -2769,15 +2828,19 @@ VkResult pvr_MapMemory(VkDevice _device,
    return VK_SUCCESS;
 }
 
-void pvr_UnmapMemory(VkDevice _device, VkDeviceMemory _memory)
+VkResult pvr_UnmapMemory2(VkDevice _device,
+                          const VkMemoryUnmapInfo *pMemoryUnmapInfo)
 {
    VK_FROM_HANDLE(pvr_device, device, _device);
-   VK_FROM_HANDLE(pvr_device_memory, mem, _memory);
+   VK_FROM_HANDLE(pvr_device_memory, mem, pMemoryUnmapInfo->memory);
 
-   if (!mem || !mem->bo->map)
-      return;
+   if (mem && mem->bo->map) {
+      bool reserve =
+         !!(pMemoryUnmapInfo->flags & VK_MEMORY_UNMAP_RESERVE_BIT_EXT);
+      return device->ws->ops->buffer_unmap(mem->bo, reserve);
+   }
 
-   device->ws->ops->buffer_unmap(mem->bo);
+   return VK_SUCCESS;
 }
 
 VkResult pvr_FlushMappedMemoryRanges(VkDevice _device,
@@ -3048,6 +3111,31 @@ VkResult pvr_CreateBuffer(VkDevice _device,
    *pBuffer = pvr_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
+}
+
+VkDeviceAddress
+pvr_GetBufferDeviceAddress(UNUSED VkDevice device,
+                           const VkBufferDeviceAddressInfo *pInfo)
+{
+   VK_FROM_HANDLE(pvr_buffer, buffer, pInfo->buffer);
+
+   return buffer->dev_addr.addr;
+}
+
+uint64_t
+pvr_GetBufferOpaqueCaptureAddress(UNUSED VkDevice device,
+                                  UNUSED const VkBufferDeviceAddressInfo *pInfo)
+{
+   pvr_finishme("Missing support for bufferDeviceAddressCaptureReplay");
+   return 0;
+}
+
+uint64_t pvr_GetDeviceMemoryOpaqueCaptureAddress(
+   UNUSED VkDevice device,
+   UNUSED const VkDeviceMemoryOpaqueCaptureAddressInfo *pInfo)
+{
+   pvr_finishme("Missing support for bufferDeviceAddressCaptureReplay");
+   return 0;
 }
 
 void pvr_DestroyBuffer(VkDevice _device,

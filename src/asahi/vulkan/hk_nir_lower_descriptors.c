@@ -46,9 +46,9 @@ static nir_def *
 load_speculatable(nir_builder *b, unsigned num_components, unsigned bit_size,
                   nir_def *addr, unsigned align)
 {
-   return nir_build_load_global_constant(b, num_components, bit_size, addr,
-                                         .align_mul = align,
-                                         .access = ACCESS_CAN_SPECULATE);
+   return nir_load_global_constant(b, num_components, bit_size, addr,
+                                   .align_mul = align,
+                                   .access = ACCESS_CAN_SPECULATE);
 }
 
 static nir_def *
@@ -478,7 +478,7 @@ lower_uvs_index(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
       return true;
    }
 
-   case nir_intrinsic_load_stat_query_address_agx: {
+   case nir_intrinsic_load_stat_query_address_poly: {
       b->cursor = nir_instr_remove(&intrin->instr);
 
       unsigned off1 = hk_root_descriptor_offset(draw.pipeline_stats);

@@ -281,7 +281,7 @@ setup_uniform_remap_tables(const struct gl_constants *consts,
     * that we can keep track of unused uniforms with explicit locations.
     */
    assert(!prog->data->spirv ||
-          (prog->data->spirv && list_is_empty(prog->UniformRemapTable)));
+          (prog->data->spirv && list_is_empty(&prog->UniformRemapTable->r_list)));
 
    union gl_constant_value *data =
       rzalloc_array(prog->data,
@@ -378,6 +378,8 @@ setup_uniform_remap_tables(const struct gl_constants *consts,
                               uniform->remap_location + entries - 1,
                               prog->UniformRemapTable, uniform);
    }
+
+   util_range_switch_to_sorted_array(prog->UniformRemapTable);
 
    /* Verify that total amount of entries for explicit and implicit locations
     * is less than MAX_UNIFORM_LOCATIONS.
@@ -586,7 +588,7 @@ add_var_use_deref(nir_deref_instr *deref, struct hash_table *live,
       mark_array_elements_referenced(*derefs, num_derefs, array_depth,
                                      ainfo->indices);
 
-      util_dynarray_append(ainfo->deref_list, nir_deref_instr *, deref);
+      util_dynarray_append(ainfo->deref_list, deref);
    }
 
    assert(deref->modes == deref->var->data.mode);

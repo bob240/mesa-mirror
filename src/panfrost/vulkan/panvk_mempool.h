@@ -209,14 +209,10 @@ panvk_pool_upload_aligned(struct panvk_pool *pool, const void *data, size_t sz,
    };
 
    struct panvk_priv_mem mem = panvk_pool_alloc_mem(pool, info);
-   memcpy(panvk_priv_mem_host_addr(mem), data, sz);
+   void *host_addr = panvk_priv_mem_host_addr(mem);
+   if (likely(host_addr != NULL))
+      memcpy(host_addr, data, sz);
    return mem;
-}
-
-static inline struct panvk_priv_mem
-panvk_pool_upload(struct panvk_pool *pool, const void *data, size_t sz)
-{
-   return panvk_pool_upload_aligned(pool, data, sz, sz);
 }
 
 #define panvk_pool_alloc_desc(pool, name)                                      \

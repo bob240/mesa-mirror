@@ -5,10 +5,10 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "pipe/p_defines.h"
+#include "poly/nir/poly_nir_lower_gs.h"
 #include "util/bitset.h"
 #include "util/u_dynarray.h"
 #include "agx_abi.h"
-#include "agx_nir_lower_gs.h"
 #include "agx_state.h"
 #include "nir.h"
 #include "nir_builder_opcodes.h"
@@ -88,7 +88,7 @@ load_sysval_indirect(nir_builder *b, unsigned dim, unsigned bitsize,
       /* Index into the table and load */
       nir_def *address = nir_iadd(
          b, array_base, nir_u2u64(b, nir_imul_imm(b, offset_el, stride)));
-      return nir_load_global_constant(b, address, bitsize / 8, dim, bitsize);
+      return nir_load_global_constant(b, dim, bitsize, address);
    }
 }
 
@@ -96,7 +96,7 @@ static unsigned
 stage_table(nir_builder *b)
 {
    mesa_shader_stage stage = b->shader->info.stage;
-   if (stage == MESA_SHADER_VERTEX && b->shader->info.vs.tes_agx)
+   if (stage == MESA_SHADER_VERTEX && b->shader->info.vs.tes_poly)
       stage = MESA_SHADER_TESS_EVAL;
 
    assert(stage < MESA_SHADER_STAGES);
@@ -111,8 +111,9 @@ load_ubo(nir_builder *b, nir_intrinsic_instr *intr, void *bases)
 
    nir_def *address = nir_iadd(b, base, nir_u2u64(b, intr->src[1].ssa));
 
-   return nir_load_global_constant(b, address, nir_intrinsic_align(intr),
-                                   intr->num_components, intr->def.bit_size);
+   return nir_load_global_constant(b, intr->num_components, intr->def.bit_size,
+                                   address,
+                                   .align_mul = nir_intrinsic_align(intr));
 }
 
 static nir_def *
@@ -166,7 +167,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       return load_sysval_root(b, 1, 16, &u->sample_mask);
    case nir_intrinsic_load_sample_positions_agx:
       return load_sysval_root(b, 1, 32, &u->ppp_multisamplectl);
-   case nir_intrinsic_load_stat_query_address_agx:
+   case nir_intrinsic_load_stat_query_address_poly:
       return load_sysval_root(
          b, 1, 64, &u->pipeline_statistics[nir_intrinsic_base(intr)]);
    case nir_intrinsic_load_ssbo_address:
@@ -185,7 +186,7 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       return load_sysval_root(b, 1, 64, &u->geometry_params);
    case nir_intrinsic_load_vs_output_buffer_poly:
       return nir_load_global_constant(
-         b, load_sysval_root(b, 1, 64, &u->vertex_output_buffer_ptr), 8, 1, 64);
+         b, 1, 64, load_sysval_root(b, 1, 64, &u->vertex_output_buffer_ptr));
    case nir_intrinsic_load_vs_outputs_poly:
       return load_sysval_root(b, 1, 64, &u->vertex_outputs);
    case nir_intrinsic_load_tess_param_buffer_poly:
@@ -304,7 +305,7 @@ record_loads(nir_builder *b, nir_intrinsic_instr *intr, void *data)
          table->element_size[(offset / 2) + i] = element_size;
    }
 
-   util_dynarray_append(&state->loads, nir_intrinsic_instr *, intr);
+   util_dynarray_append(&state->loads, intr);
    return false;
 }
 

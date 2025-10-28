@@ -1817,6 +1817,8 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
    /* In case of AHardwareBuffer import, we don't know the layout yet */
    if (image->vk.external_handle_types &
        VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID) {
+      /* AHB images with more than one layer are not supported */
+      assert(image->vk.array_layers == 1);
       image->from_ahb = true;
       return VK_SUCCESS;
    }
@@ -1946,6 +1948,10 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
       anv_get_format_plane(device->physical, image->vk.format, 0,
                            image->vk.tiling).isl_format;
    add_image_view_format(image, image_format);
+
+   if (isl_format_is_srgb(image_format) &&
+       device->vk.enabled_features.maintenance10)
+      add_image_view_format(image, isl_format_srgb_to_linear(image_format));
 
    if (image->vk.usage & (VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) {
@@ -3463,7 +3469,7 @@ anv_layout_to_aux_state(const struct intel_device_info * const devinfo,
     */
    case VK_IMAGE_LAYOUT_UNDEFINED:
    case VK_IMAGE_LAYOUT_PREINITIALIZED:
-      return ISL_AUX_STATE_AUX_INVALID;
+      return isl_aux_get_initial_state(devinfo, aux_usage, false);
 
    case VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: {
       assert(image->vk.aspects == VK_IMAGE_ASPECT_COLOR_BIT);

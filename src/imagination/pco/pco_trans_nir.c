@@ -31,6 +31,7 @@ typedef struct _trans_ctx {
    pco_builder b; /** Builder. */
    mesa_shader_stage stage; /** Shader stage. */
    enum pco_cf_node_flag flag; /** Implementation-defined control-flow flag. */
+   bool ftz32b;
    bool olchk;
 
    BITSET_WORD *float_types; /** NIR SSA float vars. */
@@ -1171,6 +1172,58 @@ static pco_instr *trans_load_buffer(trans_ctx *tctx,
                  addr);
 }
 
+static pco_instr *trans_load_global(trans_ctx *tctx,
+                                    nir_intrinsic_instr *intr,
+                                    pco_ref dest,
+                                    pco_ref addr)
+{
+   unsigned chans = pco_ref_get_chans(dest);
+   ASSERTED unsigned bits = pco_ref_get_bits(dest);
+   assert(bits == 32);
+
+   return pco_ld(&tctx->b,
+                 dest,
+                 pco_ref_drc(PCO_DRC_0),
+                 pco_ref_imm8(chans),
+                 addr);
+}
+
+static pco_instr *
+trans_store_global(trans_ctx *tctx, pco_ref data_src, pco_ref addr_src)
+{
+   unsigned chans = pco_ref_get_chans(data_src);
+   unsigned bits = pco_ref_get_bits(data_src);
+
+   pco_ref addr_data_comps[3] = {
+      [2] = data_src,
+   };
+
+   pco_ref_new_ssa_addr_comps(tctx->func, addr_data_comps);
+   pco_comp(&tctx->b, addr_data_comps[0], addr_src, pco_ref_val16(0));
+   pco_comp(&tctx->b, addr_data_comps[1], addr_src, pco_ref_val16(1));
+
+   pco_ref addr_data = pco_ref_new_ssa_addr_data(tctx->func, chans);
+   pco_vec(&tctx->b, addr_data, ARRAY_SIZE(addr_data_comps), addr_data_comps);
+
+   pco_ref data_comp = pco_ref_new_ssa(tctx->func, bits, chans);
+   pco_comp(&tctx->b, data_comp, addr_data, pco_ref_val16(2));
+
+   switch (bits) {
+   case 32:
+      return pco_st32(&tctx->b,
+                      data_comp,
+                      pco_ref_drc(PCO_DRC_0),
+                      pco_ref_imm8(chans),
+                      addr_data,
+                      pco_ref_null());
+
+   default:
+      break;
+   }
+
+   UNREACHABLE("");
+}
+
 static pco_instr *
 trans_get_buffer_size(trans_ctx *tctx, nir_intrinsic_instr *intr, pco_ref dest)
 {
@@ -2002,6 +2055,14 @@ static pco_instr *trans_intr(trans_ctx *tctx, nir_intrinsic_instr *intr)
    case nir_intrinsic_load_ubo:
    case nir_intrinsic_load_ssbo:
       instr = trans_load_buffer(tctx, intr, dest, src[1]);
+      break;
+
+   case nir_intrinsic_load_global_2x32:
+      instr = trans_load_global(tctx, intr, dest, src[0]);
+      break;
+
+   case nir_intrinsic_store_global_2x32:
+      instr = trans_store_global(tctx, src[0], src[1]);
       break;
 
    case nir_intrinsic_get_ubo_size:
@@ -2948,6 +3009,88 @@ trans_trig(trans_ctx *tctx, nir_op op, pco_ref dest, pco_ref src)
                         fred_dest_b);
 }
 
+static pco_instr *
+trans_conv(trans_ctx *tctx, nir_op op, pco_ref dest, pco_ref src)
+{
+   bool roundzero;
+   enum pco_pck_fmt pck_fmt;
+   bool unpck;
+
+   switch (op) {
+   /* b2* ops are just sels. */
+   case nir_op_b2f32:
+   case nir_op_b2i32:
+      return pco_bcsel(&tctx->b,
+                       dest,
+                       src,
+                       op == nir_op_b2f32 ? pco_fone : pco_one,
+                       pco_zero);
+
+   case nir_op_f2f16:
+   case nir_op_f2f16_rtne:
+   case nir_op_f2f16_rtz:
+      assert(pco_ref_get_bits(src) == 32);
+
+      roundzero = (op != nir_op_f2f16_rtne);
+      pck_fmt = PCO_PCK_FMT_F16F16;
+      unpck = false;
+
+      /* TODO: support non-32 bit vars. */
+      dest = pco_ref_bits(dest, 32);
+      break;
+
+   case nir_op_f2f32:
+      assert(pco_ref_get_bits(src) == 16);
+
+      roundzero = false;
+      pck_fmt = PCO_PCK_FMT_F16F16;
+      unpck = true;
+
+      /* TODO: support non-32 bit vars. */
+      src = pco_ref_bits(src, 32);
+      break;
+
+   case nir_op_f2i32:
+   case nir_op_f2i32_rtne:
+   case nir_op_f2u32:
+      roundzero = (op != nir_op_f2i32_rtne);
+      pck_fmt = (op == nir_op_f2u32) ? PCO_PCK_FMT_U32 : PCO_PCK_FMT_S32;
+      unpck = false;
+      break;
+
+   /* Just consume/treat as 32-bit for now. */
+   /* TODO: support non-32 bit vars. */
+   case nir_op_i2i16:
+   case nir_op_i2i32:
+   case nir_op_u2u16:
+   case nir_op_u2u32:
+      dest = pco_ref_bits(dest, 32);
+      src = pco_ref_bits(src, 32);
+      return pco_mov(&tctx->b, dest, src);
+
+   case nir_op_i2f32:
+   case nir_op_u2f32:
+      roundzero = tctx->ftz32b;
+      pck_fmt = (op == nir_op_u2f32) ? PCO_PCK_FMT_U32 : PCO_PCK_FMT_S32;
+      unpck = true;
+      break;
+
+   default:
+      UNREACHABLE("Unsupported conversion op.");
+   }
+
+   return unpck ? pco_unpck(&tctx->b,
+                            dest,
+                            pco_ref_elem(src, 0),
+                            .pck_fmt = pck_fmt,
+                            .roundzero = roundzero)
+                : pco_pck(&tctx->b,
+                          dest,
+                          src,
+                          .pck_fmt = pck_fmt,
+                          .roundzero = roundzero);
+}
+
 /**
  * \brief Translates a NIR alu instruction into PCO.
  *
@@ -3129,7 +3272,7 @@ static pco_instr *trans_alu(trans_ctx *tctx, nir_alu_instr *alu)
                           pco_ref_null());
       break;
 
-   case nir_op_umul_low:
+   case nir_op_umul_16x16:
       instr = pco_imadd64(&tctx->b,
                           dest,
                           pco_ref_null(),
@@ -3188,14 +3331,6 @@ static pco_instr *trans_alu(trans_ctx *tctx, nir_alu_instr *alu)
       instr = trans_csel(tctx, alu->op, dest, src[0], src[1], src[2]);
       break;
 
-   case nir_op_b2f32:
-      instr = pco_bcsel(&tctx->b, dest, src[0], pco_fone, pco_zero);
-      break;
-
-   case nir_op_b2i32:
-      instr = pco_bcsel(&tctx->b, dest, src[0], pco_one, pco_zero);
-      break;
-
    case nir_op_iand:
    case nir_op_ior:
    case nir_op_ixor:
@@ -3246,67 +3381,22 @@ static pco_instr *trans_alu(trans_ctx *tctx, nir_alu_instr *alu)
       instr = pco_shuffle(&tctx->b, dest, src[0], src[1]);
       break;
 
-   case nir_op_f2i32:
-      instr = pco_pck(&tctx->b,
-                      dest,
-                      src[0],
-                      .pck_fmt = PCO_PCK_FMT_S32,
-                      .roundzero = true);
-      break;
-
+   case nir_op_b2f32:
+   case nir_op_b2i32:
+   case nir_op_f2f16:
    case nir_op_f2f16_rtne:
-      assert(pco_ref_get_bits(src[0]) == 32);
-
-      instr = pco_pck(&tctx->b,
-                      pco_ref_bits(dest, 32),
-                      src[0],
-                      .rpt = 1,
-                      .pck_fmt = PCO_PCK_FMT_F16F16);
-      break;
-
+   case nir_op_f2f16_rtz:
    case nir_op_f2f32:
-      assert(pco_ref_get_bits(src[0]) == 16);
-
-      instr = pco_unpck(&tctx->b,
-                        dest,
-                        pco_ref_elem(pco_ref_bits(src[0], 32), 0),
-                        .rpt = 1,
-                        .pck_fmt = PCO_PCK_FMT_F16F16);
-      break;
-
-   /* Just consume/treat as 32-bit for now. */
-   case nir_op_i2i16:
-      instr = pco_mov(&tctx->b, pco_ref_bits(dest, 32), src[0]);
-      break;
-
-   case nir_op_u2u32:
-      instr = pco_mov(&tctx->b, dest, pco_ref_bits(src[0], 32));
-      break;
-
+   case nir_op_f2i32:
    case nir_op_f2i32_rtne:
-      instr = pco_pck(&tctx->b, dest, src[0], .pck_fmt = PCO_PCK_FMT_S32);
-      break;
-
    case nir_op_f2u32:
-      instr = pco_pck(&tctx->b,
-                      dest,
-                      src[0],
-                      .pck_fmt = PCO_PCK_FMT_U32,
-                      .roundzero = true);
-      break;
-
    case nir_op_i2f32:
-      instr = pco_unpck(&tctx->b,
-                        dest,
-                        pco_ref_elem(src[0], 0),
-                        .pck_fmt = PCO_PCK_FMT_S32);
-      break;
-
+   case nir_op_i2i16:
+   case nir_op_i2i32:
    case nir_op_u2f32:
-      instr = pco_unpck(&tctx->b,
-                        dest,
-                        pco_ref_elem(src[0], 0),
-                        .pck_fmt = PCO_PCK_FMT_U32);
+   case nir_op_u2u16:
+   case nir_op_u2u32:
+      instr = trans_conv(tctx, alu->op, dest, src[0]);
       break;
 
    case nir_op_fmin:
@@ -3794,6 +3884,8 @@ pco_trans_nir(pco_ctx *ctx, nir_shader *nir, pco_data *data, void *mem_ctx)
       .pco_ctx = ctx,
       .shader = shader,
       .stage = shader->stage,
+      .ftz32b =
+         nir_is_rounding_mode_rtz(nir->info.float_controls_execution_mode, 32),
    };
 
    if (shader->stage == MESA_SHADER_FRAGMENT)

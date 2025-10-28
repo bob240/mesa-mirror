@@ -229,7 +229,7 @@ add_src_instr(nir_src *src, void *state)
    if (data->buf->size >= data->buf->capacity)
       return false;
 
-   util_dynarray_append(data->buf, nir_instr *, src->ssa->parent_instr);
+   util_dynarray_append(data->buf, src->ssa->parent_instr);
    return true;
 }
 
@@ -250,7 +250,7 @@ can_remat_chain_ssa_def(nir_def *def, struct sized_bitset *remat, struct util_dy
    void *mem_ctx = ralloc_context(NULL);
 
    /* Add all the instructions involved in build this ssa_def */
-   util_dynarray_append(buf, nir_instr *, def->parent_instr);
+   util_dynarray_append(buf, def->parent_instr);
 
    unsigned idx = 0;
    struct add_instr_data data = {
@@ -1228,8 +1228,16 @@ wrap_instr(nir_builder *b, nir_instr *instr, void *data)
 static bool
 wrap_instrs(nir_shader *shader, wrap_instr_callback callback)
 {
-   return nir_shader_instructions_pass(shader, wrap_instr,
-                                       nir_metadata_none, callback);
+   bool progress = nir_shader_instructions_pass(shader, wrap_instr,
+                                                nir_metadata_none, callback);
+   /* Wrapping jump instructions that are located inside ifs can break SSA
+    * invariants because the else block no longer dominates the merge block.
+    * Repair the SSA to make the validator happy again.
+    */
+   if (progress)
+      nir_repair_ssa(shader);
+
+   return progress;
 }
 
 static bool
@@ -1347,12 +1355,12 @@ lower_stack_instr_to_scratch(struct nir_builder *b, nir_instr *instr, void *data
          nir_def *addr = nir_iadd_imm(b,
                                       nir_load_scratch_base_ptr(b, 1, 64, 1),
                                       nir_intrinsic_base(stack));
-         data = nir_build_load_global(b,
-                                      stack->def.num_components,
-                                      stack->def.bit_size,
-                                      addr,
-                                      .align_mul = nir_intrinsic_align_mul(stack),
-                                      .align_offset = nir_intrinsic_align_offset(stack));
+         data = nir_load_global(b,
+                                stack->def.num_components,
+                                stack->def.bit_size,
+                                addr,
+                                .align_mul = nir_intrinsic_align_mul(stack),
+                                .align_offset = nir_intrinsic_align_offset(stack));
       } else {
          assert(state->address_format == nir_address_format_32bit_offset);
          data = nir_load_scratch(b,
@@ -1374,10 +1382,8 @@ lower_stack_instr_to_scratch(struct nir_builder *b, nir_instr *instr, void *data
          nir_def *addr = nir_iadd_imm(b,
                                       nir_load_scratch_base_ptr(b, 1, 64, 1),
                                       nir_intrinsic_base(stack));
-         nir_store_global(b, addr,
-                          nir_intrinsic_align_mul(stack),
-                          data,
-                          nir_component_mask(data->num_components));
+         nir_store_global(b, data, addr,
+                          .align_mul = nir_intrinsic_align_mul(stack));
       } else {
          assert(state->address_format == nir_address_format_32bit_offset);
          nir_store_scratch(b, data,
@@ -1657,7 +1663,7 @@ nir_opt_sort_and_pack_stack(nir_shader *shader,
                .value = value_id,
             };
 
-            util_dynarray_append(&ops, struct scratch_item, item);
+            util_dynarray_append(&ops, item);
             _mesa_hash_table_u64_insert(value_id_to_item, value_id, (void *)(uintptr_t) true);
          }
       }
@@ -1994,6 +2000,11 @@ nir_lower_shader_calls(nir_shader *shader,
    {
       bool progress = false;
       NIR_PASS(progress, shader, wrap_instrs, instr_is_shader_call);
+
+      /* NIR_PASS might recreate the function_impl when NIR_DEBUG=serialize or
+       * NIR_DEBUG=clone is used.
+       */
+      impl = nir_shader_get_entrypoint(shader);
 
       nir_rematerialize_derefs_in_use_blocks_impl(impl);
 

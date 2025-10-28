@@ -76,6 +76,7 @@
 #include "vk_log.h"
 #include "vk_object.h"
 #include "vk_pipeline_layout.h"
+#include "vk_synchronization.h"
 #include "vk_util.h"
 
 /* Structure used to pass data into pvr_compute_generate_control_stream()
@@ -5427,9 +5428,7 @@ pvr_setup_isp_depth_bias_scissor_state(struct pvr_cmd_buffer *const cmd_buffer)
          util_dynarray_num_elements(&cmd_buffer->depth_bias_array,
                                     __typeof__(depth_bias));
 
-      util_dynarray_append(&cmd_buffer->depth_bias_array,
-                           __typeof__(depth_bias),
-                           depth_bias);
+      util_dynarray_append(&cmd_buffer->depth_bias_array, depth_bias);
 
       header->pres_ispctl_dbsc = true;
    }
@@ -5518,7 +5517,6 @@ pvr_setup_isp_depth_bias_scissor_state(struct pvr_cmd_buffer *const cmd_buffer)
                                     struct pvr_scissor_words);
 
       util_dynarray_append(&cmd_buffer->scissor_array,
-                           struct pvr_scissor_words,
                            cmd_buffer->scissor_words);
 
       header->pres_ispctl_dbsc = true;
@@ -6239,9 +6237,7 @@ static VkResult pvr_emit_ppp_state(struct pvr_cmd_buffer *const cmd_buffer,
          };
       }
 
-      util_dynarray_append(&cmd_buffer->deferred_csb_commands,
-                           struct pvr_deferred_cs_command,
-                           cmd);
+      util_dynarray_append(&cmd_buffer->deferred_csb_commands, cmd);
    }
 
    state->emit_header = (struct ROGUE_TA_STATE_HEADER){ 0 };
@@ -8341,7 +8337,6 @@ void pvr_CmdSetEvent2(VkCommandBuffer commandBuffer,
 {
    VK_FROM_HANDLE(pvr_cmd_buffer, cmd_buffer, commandBuffer);
    VK_FROM_HANDLE(pvr_event, event, _event);
-   VkPipelineStageFlags2 stage_mask = 0;
    VkResult result;
 
    PVR_CHECK_COMMAND_BUFFER_BUILDING_STATE(cmd_buffer);
@@ -8350,14 +8345,8 @@ void pvr_CmdSetEvent2(VkCommandBuffer commandBuffer,
    if (result != VK_SUCCESS)
       return;
 
-   for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++)
-      stage_mask |= pDependencyInfo->pMemoryBarriers[i].srcStageMask;
-
-   for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++)
-      stage_mask |= pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask;
-
-   for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++)
-      stage_mask |= pDependencyInfo->pImageMemoryBarriers[i].srcStageMask;
+   VkPipelineStageFlags2 stage_mask =
+      vk_collect_dependency_info_src_stages(pDependencyInfo);
 
    cmd_buffer->state.current_sub_cmd->event = (struct pvr_sub_cmd_event){
       .type = PVR_EVENT_TYPE_SET,

@@ -18,7 +18,7 @@ enum radv_ud_index {
    AC_UD_SCRATCH_RING_OFFSETS = 0,
    AC_UD_PUSH_CONSTANTS = 1,
    AC_UD_INLINE_PUSH_CONSTANTS = 2,
-   AC_UD_INDIRECT_DESCRIPTOR_SETS = 3,
+   AC_UD_INDIRECT_DESCRIPTORS = 3,
    AC_UD_VIEW_INDEX = 4,
    AC_UD_STREAMOUT_BUFFERS = 5,
    AC_UD_STREAMOUT_STATE = 6,
@@ -33,7 +33,8 @@ enum radv_ud_index {
    AC_UD_TASK_RING_ENTRY = 15,
    AC_UD_NEXT_STAGE_PC = 16,
    AC_UD_EPILOG_PC = 17,
-   AC_UD_SHADER_START = 18,
+   AC_UD_DYNAMIC_DESCRIPTORS = 18,
+   AC_UD_SHADER_START = 19,
    AC_UD_VS_VERTEX_BUFFERS = AC_UD_SHADER_START,
    AC_UD_VS_BASE_VERTEX_START_INSTANCE,
    AC_UD_VS_PROLOG_INPUTS,
@@ -73,7 +74,7 @@ struct radv_userdata_locations {
 struct radv_shader_args {
    struct ac_shader_args ac;
 
-   struct ac_arg descriptor_sets[MAX_SETS];
+   struct ac_arg descriptors[MAX_SETS];
 
    /* Streamout */
    struct ac_arg streamout_buffers;

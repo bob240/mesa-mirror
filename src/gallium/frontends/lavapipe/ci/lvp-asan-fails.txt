@@ -28,4 +28,3 @@ dEQP-VK.dynamic_state.monolithic.compute_transfer.single.compute.vertex_input_bi
 
 # New fails in 1.4.1.1
 dEQP-VK.pipeline.pipeline_library.bind_buffers_2.maintenance5.robustness2.triangle_list.buffers9.stride_offset_rnd654.true_size.beyond_size,Fail
-

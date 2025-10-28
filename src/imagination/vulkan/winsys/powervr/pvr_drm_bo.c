@@ -299,7 +299,7 @@ VkResult pvr_drm_winsys_buffer_get_fd(struct pvr_winsys_bo *bo,
    return VK_SUCCESS;
 }
 
-VkResult pvr_drm_winsys_buffer_map(struct pvr_winsys_bo *bo)
+VkResult pvr_drm_winsys_buffer_map(struct pvr_winsys_bo *bo, void *addr)
 {
    struct pvr_drm_winsys_bo *drm_bo = to_pvr_drm_winsys_bo(bo);
    struct pvr_drm_winsys *drm_ws = to_pvr_drm_winsys(bo->ws);
@@ -313,7 +313,8 @@ VkResult pvr_drm_winsys_buffer_map(struct pvr_winsys_bo *bo)
    if (result != VK_SUCCESS)
       goto err_out;
 
-   result = pvr_mmap(bo->size,
+   result = pvr_mmap(addr,
+                     bo->size,
                      PROT_READ | PROT_WRITE,
                      MAP_SHARED,
                      drm_ws->base.render_fd,
@@ -333,19 +334,22 @@ err_out:
    return result;
 }
 
-void pvr_drm_winsys_buffer_unmap(struct pvr_winsys_bo *bo)
+VkResult pvr_drm_winsys_buffer_unmap(struct pvr_winsys_bo *bo, bool reserve)
 {
    struct pvr_drm_winsys_bo *drm_bo = to_pvr_drm_winsys_bo(bo);
+   VkResult result;
 
    assert(bo->map);
 
-   pvr_munmap(bo->map, bo->size);
+   result = pvr_munmap(bo->map, bo->size, reserve);
 
    VG(VALGRIND_FREELIKE_BLOCK(bo->map, 0));
 
    bo->map = NULL;
 
    pvr_drm_buffer_release(drm_bo);
+
+   return result;
 }
 
 /* This function must be used to allocate from a heap carveout and must only be

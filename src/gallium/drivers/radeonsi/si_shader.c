@@ -6,6 +6,7 @@
 
 #include "ac_nir.h"
 #include "ac_rtld.h"
+#include "ac_shader_util.h"
 #include "nir_builder.h"
 #include "nir_serialize.h"
 #include "nir_tcs_info.h"
@@ -116,6 +117,7 @@ unsigned si_shader_io_get_unique_index(unsigned semantic)
 
 unsigned si_get_max_workgroup_size(const struct si_shader *shader)
 {
+   struct si_screen *sscreen = shader->selector->screen;
    mesa_shader_stage stage = shader->is_gs_copy_shader ?
       MESA_SHADER_VERTEX : shader->selector->stage;
 
@@ -129,18 +131,20 @@ unsigned si_get_max_workgroup_size(const struct si_shader *shader)
          return shader->info.num_streamout_vec4s ? 256 : 128;
 
       /* As part of merged shader. */
-      return shader->selector->screen->info.gfx_level >= GFX9 &&
+      return sscreen->info.gfx_level >= GFX9 &&
          (shader->key.ge.as_ls || shader->key.ge.as_es) ? 128 : shader->wave_size;
 
    case MESA_SHADER_TESS_CTRL:
       /* Return this so that LLVM doesn't remove s_barrier
        * instructions on chips where we use s_barrier. */
-      return shader->selector->screen->info.gfx_level >= GFX7 ? 128 : shader->wave_size;
+      return sscreen->info.gfx_level >= GFX7 ? 128 : shader->wave_size;
 
    case MESA_SHADER_GEOMETRY:
       /* GS can always generate up to 256 vertices. */
-      return shader->selector->screen->info.gfx_level >= GFX9 ? 256 : shader->wave_size;
+      return sscreen->info.gfx_level >= GFX9 ? 256 : shader->wave_size;
 
+   case MESA_SHADER_TASK:
+   case MESA_SHADER_MESH:
    case MESA_SHADER_COMPUTE:
       break; /* see below */
 
@@ -156,14 +160,18 @@ unsigned si_get_max_workgroup_size(const struct si_shader *shader)
    unsigned max_work_group_size = (uint32_t)local_size[0] *
                                   (uint32_t)local_size[1] *
                                   (uint32_t)local_size[2];
+
+   /* Without multi-row export, we need at least number of output vertex/primitive
+    * threads in workgroup for export (one vertex/primitive per thread).
+    */
+   if (stage == MESA_SHADER_MESH && !sscreen->info.mesh_fast_launch_2) {
+      max_work_group_size = MAX3(max_work_group_size,
+                                 shader->selector->info.base.mesh.max_vertices_out,
+                                 shader->selector->info.base.mesh.max_primitives_out);
+   }
+
    assert(max_work_group_size);
    return max_work_group_size;
-}
-
-static unsigned get_lds_granularity(struct si_screen *screen, mesa_shader_stage stage)
-{
-   return screen->info.gfx_level >= GFX11 && stage == MESA_SHADER_FRAGMENT ? 1024 :
-          screen->info.gfx_level >= GFX7 ? 512 : 256;
 }
 
 static bool si_shader_binary_open(struct si_screen *screen, struct si_shader *shader,
@@ -421,12 +429,13 @@ static int upload_binary_elf(struct si_screen *sscreen, struct si_shader *shader
    return size;
 }
 
-static void calculate_needed_lds_size(struct si_screen *sscreen, struct si_shader *shader)
+unsigned si_calculate_needed_lds_size(enum amd_gfx_level gfx_level, struct si_shader *shader)
 {
    mesa_shader_stage stage =
       shader->is_gs_copy_shader ? MESA_SHADER_VERTEX : shader->selector->stage;
+   unsigned lds_size = 0;
 
-   if (sscreen->info.gfx_level >= GFX9 && stage <= MESA_SHADER_GEOMETRY &&
+   if (gfx_level >= GFX9 && stage <= MESA_SHADER_GEOMETRY &&
        (stage == MESA_SHADER_GEOMETRY || shader->key.ge.as_ngg)) {
       unsigned size_in_dw = shader->key.ge.as_ngg ? shader->ngg.info.esgs_lds_size
                                                   : shader->gs_info.esgs_lds_size;
@@ -434,18 +443,16 @@ static void calculate_needed_lds_size(struct si_screen *sscreen, struct si_shade
       if (stage == MESA_SHADER_GEOMETRY && shader->key.ge.as_ngg)
          size_in_dw += shader->ngg.info.ngg_out_lds_size;
 
-      shader->config.lds_size =
-         DIV_ROUND_UP(size_in_dw * 4, get_lds_granularity(sscreen, stage));
+      lds_size = size_in_dw * 4;
    }
 
    if (stage == MESA_SHADER_COMPUTE) {
-      shader->config.lds_size = DIV_ROUND_UP(shader->selector->info.base.shared_size,
-                                             sscreen->info.lds_encode_granularity);
+      lds_size = shader->selector->info.base.shared_size;
    }
 
    /* Check that the LDS size is within hw limits. */
-   assert(shader->config.lds_size * get_lds_granularity(sscreen, stage) <=
-          (sscreen->info.gfx_level == GFX6 ? 32 : 64) * 1024);
+   assert(lds_size <= shader->selector->screen->info.lds_size_per_workgroup);
+   return lds_size;
 }
 
 static int upload_binary_raw(struct si_screen *sscreen, struct si_shader *shader,
@@ -518,7 +525,8 @@ int si_shader_binary_upload_at(struct si_screen *sscreen, struct si_shader *shad
       r = upload_binary_raw(sscreen, shader, scratch_va, dma_upload, bo_offset);
    }
 
-   calculate_needed_lds_size(sscreen, shader);
+   shader->config.lds_size = si_calculate_needed_lds_size(sscreen->info.gfx_level, shader);
+
    return r;
 }
 
@@ -604,7 +612,7 @@ static void si_calculate_max_simd_waves(struct si_shader *shader)
 {
    struct si_screen *sscreen = shader->selector->screen;
    struct ac_shader_config *conf = &shader->config;
-   unsigned lds_increment = get_lds_granularity(sscreen, shader->selector->stage);
+   unsigned lds_increment = ac_shader_get_lds_alloc_granularity(sscreen->info.gfx_level);
    unsigned lds_per_wave = 0;
    unsigned max_simd_waves;
 
@@ -623,13 +631,12 @@ static void si_calculate_max_simd_waves(struct si_shader *shader)
        * Other stages don't know the size at compile time or don't
        * allocate LDS per wave, but instead they do it per thread group.
        */
-      lds_per_wave = conf->lds_size * lds_increment +
+      lds_per_wave = align(conf->lds_size, lds_increment) +
                      align(shader->info.num_ps_inputs * 48, lds_increment);
       break;
    case MESA_SHADER_COMPUTE: {
          unsigned max_workgroup_size = si_get_max_workgroup_size(shader);
-         lds_per_wave = (conf->lds_size * lds_increment) /
-                        DIV_ROUND_UP(max_workgroup_size, shader->wave_size);
+         lds_per_wave = align(conf->lds_size, lds_increment) / DIV_ROUND_UP(max_workgroup_size, shader->wave_size);
       }
       break;
    default:;
@@ -662,7 +669,7 @@ static void si_calculate_max_simd_waves(struct si_shader *shader)
       max_simd_waves = MIN2(max_simd_waves, max_vgprs / num_vgprs);
    }
 
-   unsigned max_lds_per_simd = sscreen->info.lds_size_per_workgroup / 4;
+   unsigned max_lds_per_simd = sscreen->info.lds_size_per_workgroup / sscreen->info.num_simd_per_compute_unit;
    if (lds_per_wave)
       max_simd_waves = MIN2(max_simd_waves, max_lds_per_simd / lds_per_wave);
 
@@ -719,7 +726,8 @@ void si_shader_dump_stats_for_shader_db(struct si_screen *screen, struct si_shad
                       "HSPatchOuts: %u ESOutputs: %u GSOutputs: %u VSOutputs: %u PSOutputs: %u "
                       "InlineUniforms: %u DivergentLoop: %u (%s, W%u)",
                       conf->num_sgprs, conf->num_vgprs, si_get_shader_binary_size(screen, shader),
-                      conf->lds_size, conf->scratch_bytes_per_wave, shader->info.max_simd_waves,
+                      ALIGN(conf->lds_size, ac_shader_get_lds_alloc_granularity(screen->info.gfx_level)),
+                      conf->scratch_bytes_per_wave, shader->info.max_simd_waves,
                       conf->spilled_sgprs, conf->spilled_vgprs, shader->info.private_mem_vgprs,
                       num_ls_outputs, num_hs_outputs,
                       shader->selector->info.tess_io_info.highest_remapped_vram_patch_output,
@@ -742,7 +750,7 @@ bool si_can_dump_shader(struct si_screen *sscreen, mesa_shader_stage stage,
       [SI_DUMP_ACO_IR] = DBG(ACO),
       [SI_DUMP_ASM] = DBG(ASM),
       [SI_DUMP_STATS] = DBG(STATS),
-      [SI_DUMP_ALWAYS] = DBG(VS) | DBG(TCS) | DBG(TES) | DBG(GS) | DBG(PS) | DBG(CS),
+      [SI_DUMP_ALWAYS] = DBG(VS) | DBG(TCS) | DBG(TES) | DBG(GS) | DBG(PS) | DBG(CS) | DBG(TS) | DBG(MS),
    };
    assert(dump_type < ARRAY_SIZE(filter));
 
@@ -777,8 +785,7 @@ static void si_shader_dump_stats(struct si_screen *sscreen, struct si_shader *sh
            "********************\n\n\n",
            conf->num_sgprs, conf->num_vgprs, conf->spilled_sgprs, conf->spilled_vgprs,
            shader->info.private_mem_vgprs, si_get_shader_binary_size(sscreen, shader),
-           conf->lds_size * get_lds_granularity(sscreen, shader->selector->stage),
-           conf->scratch_bytes_per_wave, shader->info.max_simd_waves);
+           conf->lds_size, conf->scratch_bytes_per_wave, shader->info.max_simd_waves);
 }
 
 const char *si_get_shader_name(const struct si_shader *shader)
@@ -811,6 +818,10 @@ const char *si_get_shader_name(const struct si_shader *shader)
       return "Pixel Shader";
    case MESA_SHADER_COMPUTE:
       return "Compute Shader";
+   case MESA_SHADER_TASK:
+      return "Task Shader";
+   case MESA_SHADER_MESH:
+      return "Mesh Shader";
    default:
       return "Unknown Shader";
    }
@@ -970,12 +981,16 @@ static void si_dump_shader_key(const struct si_shader *shader, FILE *f)
       fprintf(f, "  mono.fbfetch_layered = %u\n", key->ps.mono.fbfetch_layered);
       break;
 
+   case MESA_SHADER_TASK:
+   case MESA_SHADER_MESH:
+      break;
+
    default:
       assert(0);
    }
 
    if ((stage == MESA_SHADER_GEOMETRY || stage == MESA_SHADER_TESS_EVAL ||
-        stage == MESA_SHADER_VERTEX) &&
+        stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_MESH) &&
        !key->ge.as_es && !key->ge.as_ls) {
       fprintf(f, "  mono.remove_streamout = 0x%x\n", key->ge.mono.remove_streamout);
       fprintf(f, "  mono.write_pos_to_clipvertex = %u\n", key->ge.mono.write_pos_to_clipvertex);
@@ -989,12 +1004,12 @@ static void si_dump_shader_key(const struct si_shader *shader, FILE *f)
               key->ge.opt.ngg_vs_streamout_num_verts_per_prim);
    }
 
-   if (stage <= MESA_SHADER_GEOMETRY)
+   if (stage <= MESA_SHADER_GEOMETRY || stage == MESA_SHADER_MESH)
       fprintf(f, "  opt.prefer_mono = %u\n", key->ge.opt.prefer_mono);
    else
       fprintf(f, "  opt.prefer_mono = %u\n", key->ps.opt.prefer_mono);
 
-   if (stage <= MESA_SHADER_GEOMETRY) {
+   if (stage <= MESA_SHADER_GEOMETRY || stage == MESA_SHADER_MESH) {
       if (key->ge.opt.inline_uniforms) {
          fprintf(f, "  opt.inline_uniforms = %u (0x%x, 0x%x, 0x%x, 0x%x)\n",
                  key->ge.opt.inline_uniforms,
@@ -1116,9 +1131,27 @@ static void si_lower_ngg(struct si_shader *shader, nir_shader *nir,
    const union si_shader_key *key = &shader->key;
    assert(key->ge.as_ngg);
 
+   unsigned max_workgroup_size = si_get_max_workgroup_size(shader);
+
+   if (nir->info.stage == MESA_SHADER_MESH) {
+      bool out_needs_scratch_ring;
+      NIR_PASS(_, nir, ac_nir_lower_ngg_mesh,
+               &sel->screen->info,
+               shader->info.clipdist_mask | shader->info.culldist_mask,
+               temp_info->vs_output_param_offset,
+               shader->info.nr_param_exports || shader->info.nr_prim_param_exports,
+               &out_needs_scratch_ring,
+               shader->wave_size,
+               ALIGN(max_workgroup_size, shader->wave_size),
+               false,
+               false);
+      shader->info.uses_mesh_scratch_ring = out_needs_scratch_ring;
+      return;
+   }
+
    ac_nir_lower_ngg_options options = {
       .hw_info = &sel->screen->info,
-      .max_workgroup_size = si_get_max_workgroup_size(shader),
+      .max_workgroup_size = max_workgroup_size,
       .wave_size = shader->wave_size,
       .can_cull = si_shader_culling_enabled(shader),
       .disable_streamout = !shader->info.num_streamout_vec4s,
@@ -1209,6 +1242,7 @@ static void si_nir_assign_param_offsets(nir_shader *nir, struct si_shader *shade
 
    uint64_t outputs_written = 0;
    uint32_t outputs_written_16bit = 0;
+   uint64_t per_primitive_outputs = 0;
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    assert(impl);
@@ -1219,7 +1253,9 @@ static void si_nir_assign_param_offsets(nir_shader *nir, struct si_shader *shade
             continue;
 
          nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-         if (intr->intrinsic != nir_intrinsic_store_output)
+         if (intr->intrinsic != nir_intrinsic_store_output &&
+             intr->intrinsic != nir_intrinsic_store_per_vertex_output &&
+             intr->intrinsic != nir_intrinsic_store_per_primitive_output)
             continue;
 
          /* No indirect indexing allowed. */
@@ -1234,6 +1270,9 @@ static void si_nir_assign_param_offsets(nir_shader *nir, struct si_shader *shade
          else
             outputs_written |= BITFIELD64_BIT(sem.location);
 
+         if (intr->intrinsic == nir_intrinsic_store_per_primitive_output)
+            per_primitive_outputs |= BITFIELD64_BIT(sem.location);
+
          /* Assign the param index if it's unassigned. */
          if (nir_slot_is_varying(sem.location, MESA_SHADER_FRAGMENT) && !sem.no_varying &&
              (sem.gs_streams & 0x3) == 0 &&
@@ -1243,7 +1282,10 @@ static void si_nir_assign_param_offsets(nir_shader *nir, struct si_shader *shade
             /* It must not be remapped (duplicated). */
             assert(slot_remap[sem.location] == -1);
 
-            temp_info->vs_output_param_offset[sem.location] = info->nr_param_exports++;
+            temp_info->vs_output_param_offset[sem.location] =
+               intr->intrinsic == nir_intrinsic_store_per_primitive_output ?
+               info->nr_prim_param_exports++ :
+               info->nr_param_exports++;
          }
       }
    }
@@ -1258,9 +1300,19 @@ static void si_nir_assign_param_offsets(nir_shader *nir, struct si_shader *shade
       temp_info->vs_output_param_offset[VARYING_SLOT_PRIMITIVE_ID] = info->nr_param_exports++;
    }
 
+   /* per primitive outputs come after per vertex outputs */
+   unsigned per_primitive_outputs_offset = info->nr_param_exports;
+   if (sel->screen->info.gfx_level >= GFX11)
+      per_primitive_outputs_offset = MAX2(per_primitive_outputs_offset, 1);
+   u_foreach_bit64 (i, per_primitive_outputs) {
+      if (temp_info->vs_output_param_offset[i] != AC_EXP_PARAM_DEFAULT_VAL_0000)
+         temp_info->vs_output_param_offset[i] += per_primitive_outputs_offset;
+   }
+
    /* Update outputs written info, we may remove some outputs before. */
    nir->info.outputs_written = outputs_written;
    nir->info.outputs_written_16bit = outputs_written_16bit;
+   nir->info.per_primitive_outputs = per_primitive_outputs;
 }
 
 static void si_assign_param_offsets(nir_shader *nir, struct si_shader *shader,
@@ -1268,6 +1320,7 @@ static void si_assign_param_offsets(nir_shader *nir, struct si_shader *shader,
 {
    /* Initialize this first. */
    shader->info.nr_param_exports = 0;
+   shader->info.nr_prim_param_exports = 0;
 
    STATIC_ASSERT(sizeof(temp_info->vs_output_param_offset[0]) == 1);
    memset(temp_info->vs_output_param_offset, AC_EXP_PARAM_UNDEFINED,
@@ -1280,7 +1333,7 @@ static void si_assign_param_offsets(nir_shader *nir, struct si_shader *shader,
    memset(slot_remap, -1, NUM_TOTAL_VARYING_SLOTS);
 
    /* This sets DEFAULT_VAL for constant outputs in vs_output_param_offset. */
-   /* TODO: This doesn't affect GS. */
+   /* TODO: This doesn't affect GS and MS. */
    NIR_PASS(_, nir, ac_nir_optimize_outputs, false, slot_remap,
             temp_info->vs_output_param_offset);
 
@@ -1314,7 +1367,7 @@ static void run_pre_link_optimization_passes(struct si_nir_shader_ctx *ctx)
    bool progress = false;
 
    /* Kill outputs according to the shader key. */
-   if (nir->info.stage <= MESA_SHADER_GEOMETRY)
+   if (nir->info.stage <= MESA_SHADER_GEOMETRY || nir->info.stage == MESA_SHADER_MESH)
       NIR_PASS(progress, nir, si_nir_kill_outputs, key);
 
    bool inline_uniforms = false;
@@ -1519,10 +1572,11 @@ static void run_late_optimization_and_lowering_passes(struct si_nir_shader_ctx *
 
    /* Legacy GS is not the last VGT stage because there is also the GS copy shader. */
    bool is_last_vgt_stage =
-      (nir->info.stage == MESA_SHADER_VERTEX ||
-       nir->info.stage == MESA_SHADER_TESS_EVAL ||
-       (nir->info.stage == MESA_SHADER_GEOMETRY && shader->key.ge.as_ngg)) &&
-      !shader->key.ge.as_ls && !shader->key.ge.as_es;
+      nir->info.stage == MESA_SHADER_MESH ||
+      ((nir->info.stage == MESA_SHADER_VERTEX ||
+        nir->info.stage == MESA_SHADER_TESS_EVAL ||
+        (nir->info.stage == MESA_SHADER_GEOMETRY && shader->key.ge.as_ngg)) &&
+       !shader->key.ge.as_ls && !shader->key.ge.as_es);
 
    if (nir->info.stage == MESA_SHADER_VERTEX)
       NIR_PASS(progress, nir, si_nir_lower_vs_inputs, shader, &ctx->args);
@@ -1624,10 +1678,9 @@ static void run_late_optimization_and_lowering_passes(struct si_nir_shader_ctx *
       NIR_PASS(_, nir, nir_clear_shared_memory, shared_size, chunk_size);
    }
 
-   nir_divergence_analysis(nir); /* required by ac_nir_flag_smem_for_loads */
    /* This is required by ac_nir_scalarize_overfetching_loads_callback. */
    NIR_PASS(progress, nir, ac_nir_flag_smem_for_loads, sel->screen->info.gfx_level,
-            !sel->info.base.use_aco_amd, false);
+            !sel->info.base.use_aco_amd);
    /* Scalarize overfetching loads, so that we don't load more components than necessary.
     * Adjacent loads will be re-vectorized with a conservative overfetching limit.
     */
@@ -1668,9 +1721,6 @@ static void run_late_optimization_and_lowering_passes(struct si_nir_shader_ctx *
    NIR_PASS(progress, nir, ac_nir_lower_mem_access_bit_sizes,
             sel->screen->info.gfx_level, !nir->info.use_aco_amd);
 
-   if (nir->info.stage == MESA_SHADER_KERNEL)
-      NIR_PASS(progress, nir, ac_nir_lower_global_access);
-
    if (ac_nir_might_lower_bit_size(nir)) {
       if (sel->screen->info.gfx_level >= GFX8)
          nir_divergence_analysis(nir);
@@ -1685,8 +1735,11 @@ static void run_late_optimization_and_lowering_passes(struct si_nir_shader_ctx *
    if (nir->info.use_aco_amd)
       progress |= ac_nir_optimize_uniform_atomics(nir);
 
-   NIR_PASS(progress, nir, nir_lower_int64);
    NIR_PASS(progress, nir, si_nir_lower_abi, shader, &ctx->args);
+   /* Global access lowering must be called after lowering ABI which emits regular load_global intrinsics. */
+   NIR_PASS(progress, nir, ac_nir_lower_global_access);
+   NIR_PASS(progress, nir, nir_lower_int64);
+
    NIR_PASS(progress, nir, ac_nir_lower_intrinsics_to_args, sel->screen->info.gfx_level,
             sel->screen->info.has_ls_vgpr_init_bug,
             si_select_hw_stage(nir->info.stage, key, sel->screen->info.gfx_level),
@@ -1863,6 +1916,9 @@ si_nir_generate_gs_copy_shader(struct si_screen *sscreen,
             sscreen->info.has_ls_vgpr_init_bug, AC_HW_VERTEX_SHADER, 64, 64,
             &linked.consumer.args.ac);
 
+   NIR_PASS(_, nir, ac_nir_lower_global_access);
+   NIR_PASS(_, nir, nir_lower_int64);
+
    si_nir_opts(gs_selector->screen, nir, false);
 
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
@@ -1992,7 +2048,8 @@ bool si_compile_shader(struct si_screen *sscreen, struct ac_llvm_compiler *compi
    /* Compute vs_output_ps_input_cntl. */
    if ((nir->info.stage == MESA_SHADER_VERTEX ||
         nir->info.stage == MESA_SHADER_TESS_EVAL ||
-        nir->info.stage == MESA_SHADER_GEOMETRY) &&
+        nir->info.stage == MESA_SHADER_GEOMETRY ||
+        nir->info.stage == MESA_SHADER_MESH) &&
        !shader->key.ge.as_ls && !shader->key.ge.as_es) {
       uint8_t *vs_output_param_offset = linked.consumer.temp_info.vs_output_param_offset;
 
@@ -2019,6 +2076,10 @@ bool si_compile_shader(struct si_screen *sscreen, struct ac_llvm_compiler *compi
             ps_input_cntl = S_028644_OFFSET(0x20) |
                             S_028644_DEFAULT_VAL(offset);
          }
+
+         if (sscreen->info.gfx_level >= GFX11 &&
+             (nir->info.per_primitive_outputs & BITFIELD64_BIT(semantic)))
+            ps_input_cntl |= S_028644_PRIM_ATTR(1);
 
          shader->info.vs_output_ps_input_cntl[semantic] = ps_input_cntl;
       }
@@ -2403,7 +2464,7 @@ void si_multiwave_lds_size_workaround(struct si_screen *sscreen, unsigned *lds_s
     *   It applies to workgroup sizes of more than one wavefront.
     */
    if (sscreen->info.family == CHIP_BONAIRE || sscreen->info.family == CHIP_KABINI)
-      *lds_size = MAX2(*lds_size, 8);
+      *lds_size = MAX2(*lds_size, 8 * ac_shader_get_lds_alloc_granularity(sscreen->info.gfx_level));
 }
 
 static void si_fix_resource_usage(struct si_screen *sscreen, struct si_shader *shader)

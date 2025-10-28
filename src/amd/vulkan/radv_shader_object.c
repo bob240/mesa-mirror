@@ -88,13 +88,6 @@ radv_shader_stage_init(const VkShaderCreateInfoEXT *sinfo, struct radv_shader_st
       out_stage->layout.use_dynamic_descriptors = true;
    }
 
-   for (unsigned i = 0; i < sinfo->pushConstantRangeCount; ++i) {
-      const VkPushConstantRange *range = sinfo->pPushConstantRanges + i;
-      out_stage->layout.push_constant_size = MAX2(out_stage->layout.push_constant_size, range->offset + range->size);
-   }
-
-   out_stage->layout.push_constant_size = align(out_stage->layout.push_constant_size, 16);
-
    const VkShaderRequiredSubgroupSizeCreateInfoEXT *const subgroup_size =
       vk_find_struct_const(sinfo->pNext, SHADER_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT);
 
@@ -167,8 +160,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
       binary = binaries[stage];
 
       ralloc_free(stages[stage].nir);
-      if (stages[MESA_SHADER_GEOMETRY].gs_copy_shader)
-         ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
+      ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
 
       shader_obj->shader = shader;
       shader_obj->binary = binary;
@@ -196,8 +188,7 @@ radv_shader_object_init_graphics(struct radv_shader_object *shader_obj, struct r
          binary = binaries[stage];
 
          ralloc_free(stages[stage].nir);
-         if (stages[MESA_SHADER_GEOMETRY].gs_copy_shader)
-            ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
+         ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
 
          if (stage == MESA_SHADER_VERTEX) {
             if (next_stage == MESA_SHADER_TESS_CTRL) {
@@ -274,15 +265,6 @@ radv_get_shader_layout(const VkShaderCreateInfoEXT *pCreateInfo, struct radv_sha
    if (layout->dynamic_offset_count && (dynamic_shader_stages & pCreateInfo->stage)) {
       layout->use_dynamic_descriptors = true;
    }
-
-   layout->push_constant_size = 0;
-
-   for (unsigned i = 0; i < pCreateInfo->pushConstantRangeCount; ++i) {
-      const VkPushConstantRange *range = pCreateInfo->pPushConstantRanges + i;
-      layout->push_constant_size = MAX2(layout->push_constant_size, range->offset + range->size);
-   }
-
-   layout->push_constant_size = align(layout->push_constant_size, 16);
 }
 
 static VkResult
@@ -316,7 +298,6 @@ radv_shader_object_init(struct radv_shader_object *shader_obj, struct radv_devic
 
    shader_obj->stage = vk_to_mesa_shader_stage(pCreateInfo->stage);
    shader_obj->code_type = pCreateInfo->codeType;
-   shader_obj->push_constant_size = layout.push_constant_size;
    shader_obj->dynamic_offset_count = layout.dynamic_offset_count;
 
    if (pCreateInfo->codeType == VK_SHADER_CODE_TYPE_BINARY_EXT) {
@@ -512,7 +493,6 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
 
       shader_obj->stage = s;
       shader_obj->code_type = pCreateInfo->codeType;
-      shader_obj->push_constant_size = stages[s].layout.push_constant_size;
       shader_obj->dynamic_offset_count = stages[s].layout.dynamic_offset_count;
 
       if (s == MESA_SHADER_VERTEX) {
@@ -549,8 +529,7 @@ radv_shader_object_create_linked(VkDevice _device, uint32_t createInfoCount, con
       pShaders[i] = radv_shader_object_to_handle(shader_obj);
    }
 
-   if (stages[MESA_SHADER_GEOMETRY].gs_copy_shader)
-      ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
+   ralloc_free(stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
 
    return VK_SUCCESS;
 }

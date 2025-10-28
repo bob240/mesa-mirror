@@ -111,9 +111,9 @@ GENX(pan_select_crc_rt)(const struct pan_fb_info *fb, unsigned tile_size)
          continue;
 
       bool valid = *(fb->rts[i].crc_valid);
-      bool full = !fb->extent.minx && !fb->extent.miny &&
-                  fb->extent.maxx == (fb->width - 1) &&
-                  fb->extent.maxy == (fb->height - 1);
+      bool full = !fb->draw_extent.minx && !fb->draw_extent.miny &&
+                  fb->draw_extent.maxx == (fb->width - 1) &&
+                  fb->draw_extent.maxy == (fb->height - 1);
       if (!full && !valid)
          continue;
 
@@ -1089,9 +1089,10 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
 #endif
       cfg.width = fb->width;
       cfg.height = fb->height;
-      cfg.bound_max_x = fb->width - 1;
-      cfg.bound_max_y = fb->height - 1;
-
+      cfg.bound_min_x = fb->frame_bounding_box.minx;
+      cfg.bound_min_y = fb->frame_bounding_box.miny;
+      cfg.bound_max_x = fb->frame_bounding_box.maxx;
+      cfg.bound_max_y = fb->frame_bounding_box.maxy;
       cfg.effective_tile_size = fb->tile_size;
       /* Ensure we cover the samples on the edge for 16x MSAA */
       cfg.tie_break_rule = fb->nr_samples == 16 ?
@@ -1135,9 +1136,9 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
 
       if (crc_rt >= 0) {
          bool *valid = fb->rts[crc_rt].crc_valid;
-         bool full = !fb->extent.minx && !fb->extent.miny &&
-                     fb->extent.maxx == (fb->width - 1) &&
-                     fb->extent.maxy == (fb->height - 1);
+         bool full = !fb->draw_extent.minx && !fb->draw_extent.miny &&
+                     fb->draw_extent.maxx == (fb->width - 1) &&
+                     fb->draw_extent.maxy == (fb->height - 1);
          bool clean_tile_write = fb->rts[crc_rt].clear;
 
 #if PAN_ARCH >= 6
@@ -1386,10 +1387,10 @@ GENX(pan_emit_fragment_job_payload)(const struct pan_fb_info *fb, uint64_t fbd,
                                     void *out)
 {
    pan_section_pack(out, FRAGMENT_JOB, PAYLOAD, payload) {
-      payload.bound_min_x = fb->extent.minx >> MALI_TILE_SHIFT;
-      payload.bound_min_y = fb->extent.miny >> MALI_TILE_SHIFT;
-      payload.bound_max_x = fb->extent.maxx >> MALI_TILE_SHIFT;
-      payload.bound_max_y = fb->extent.maxy >> MALI_TILE_SHIFT;
+      payload.bound_min_x = fb->draw_extent.minx >> MALI_TILE_SHIFT;
+      payload.bound_min_y = fb->draw_extent.miny >> MALI_TILE_SHIFT;
+      payload.bound_max_x = fb->draw_extent.maxx >> MALI_TILE_SHIFT;
+      payload.bound_max_y = fb->draw_extent.maxy >> MALI_TILE_SHIFT;
       payload.framebuffer = fbd;
 
 #if PAN_ARCH >= 5

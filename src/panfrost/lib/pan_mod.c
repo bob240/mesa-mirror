@@ -247,8 +247,8 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
    if (iprops->extent_px.width <= 16 && iprops->extent_px.height <= 16)
       return PAN_MOD_NOT_OPTIMAL;
 
-   /* Reserve 32x8 tiles for scanout buffers. */
-   if (iusage && !iusage->scanout &&
+   /* Reserve 32x8 tiles for WSI images. */
+   if (iusage && !iusage->wsi &&
        pan_afbc_superblock_width(iprops->modifier) != 16)
       return PAN_MOD_NOT_OPTIMAL;
 
@@ -265,13 +265,6 @@ pan_mod_afbc_test_props(const struct pan_kmod_dev_props *dprops,
 
    if (is_tiled && !can_tile)
       return PAN_MOD_NOT_SUPPORTED;
-
-   /* Prefer tiled headers when the image is big enough. */
-   bool should_tile =
-      iprops->extent_px.width >= 128 && iprops->extent_px.height >= 128;
-
-   if (is_tiled != should_tile)
-      return PAN_MOD_NOT_OPTIMAL;
 
    /* Packing/unpacking AFBC payload requires a COMPUTE job which we'd rather
     * avoid.

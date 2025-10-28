@@ -1727,6 +1727,7 @@ translate_atomic_op_str(nir_atomic_op op)
 {
    switch (op) {
    case nir_atomic_op_iadd:     return "add";
+   case nir_atomic_op_isub:     return "sub";
    case nir_atomic_op_imin:     return "smin";
    case nir_atomic_op_umin:     return "umin";
    case nir_atomic_op_imax:     return "smax";
@@ -1751,6 +1752,7 @@ translate_atomic_op(nir_atomic_op op)
 {
    switch (op) {
    case nir_atomic_op_iadd: return LLVMAtomicRMWBinOpAdd;
+   case nir_atomic_op_isub: return LLVMAtomicRMWBinOpSub;
    case nir_atomic_op_xchg: return LLVMAtomicRMWBinOpXchg;
    case nir_atomic_op_iand: return LLVMAtomicRMWBinOpAnd;
    case nir_atomic_op_ior:  return LLVMAtomicRMWBinOpOr;
@@ -3228,26 +3230,6 @@ static bool visit_intrinsic(struct ac_nir_context *ctx, nir_intrinsic_instr *ins
       result = ac_to_integer(&ctx->ac, ac_get_arg(&ctx->ac, arg));
       if (ac_get_elem_bits(&ctx->ac, LLVMTypeOf(result)) != 32)
          result = LLVMBuildBitCast(ctx->ac.builder, result, get_def_type(ctx, &instr->def), "");
-      break;
-   }
-   case nir_intrinsic_load_smem_amd: {
-      LLVMValueRef base = get_src(ctx, instr->src[0]);
-      LLVMValueRef offset = get_src(ctx, instr->src[1]);
-
-      bool is_addr_32bit = nir_src_bit_size(instr->src[0]) == 32;
-      int addr_space = is_addr_32bit ? AC_ADDR_SPACE_CONST_32BIT : AC_ADDR_SPACE_CONST;
-
-      LLVMTypeRef result_type = get_def_type(ctx, &instr->def);
-      LLVMValueRef addr = LLVMBuildIntToPtr(ctx->ac.builder, base,
-                                            LLVMPointerTypeInContext(ctx->ac.context, addr_space), "");
-      /* see ac_build_load_custom() for 32bit/64bit addr GEP difference */
-      addr = is_addr_32bit ?
-         LLVMBuildInBoundsGEP2(ctx->ac.builder, ctx->ac.i8, addr, &offset, 1, "") :
-         LLVMBuildGEP2(ctx->ac.builder, ctx->ac.i8, addr, &offset, 1, "");
-
-      LLVMSetMetadata(addr, ctx->ac.uniform_md_kind, ctx->ac.empty_md);
-      result = LLVMBuildLoad2(ctx->ac.builder, result_type, addr, "");
-      LLVMSetMetadata(result, ctx->ac.invariant_load_md_kind, ctx->ac.empty_md);
       break;
    }
    case nir_intrinsic_ordered_xfb_counter_add_gfx11_amd: {

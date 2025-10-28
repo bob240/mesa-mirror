@@ -19,7 +19,6 @@ project(
 
 if host_machine.system() == 'darwin'
   add_languages('objc', native : false)
-  add_project_arguments('-fobjc-arc', language : 'objc')
   libname_prefix = 'lib'
   libname_suffix = 'dylib'
 elif host_machine.system() == 'windows'
@@ -187,7 +186,7 @@ elif gallium_drivers.contains('all')
    gallium_drivers = [
      'r300', 'r600', 'radeonsi', 'crocus', 'v3d', 'vc4', 'freedreno', 'etnaviv', 'i915',
      'nouveau', 'svga', 'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
-     'zink', 'd3d12', 'asahi', 'rocket'
+     'zink', 'd3d12', 'asahi', 'rocket', 'ethosu'
    ]
 endif
 
@@ -215,6 +214,7 @@ with_gallium_zink = gallium_drivers.contains('zink')
 with_gallium_d3d12 = gallium_drivers.contains('d3d12')
 with_gallium_asahi = gallium_drivers.contains('asahi')
 with_gallium_rocket = gallium_drivers.contains('rocket')
+with_gallium_ethosu = gallium_drivers.contains('ethosu')
 foreach gallium_driver : gallium_drivers
   pre_args += '-DHAVE_@0@'.format(gallium_driver.to_upper())
 endforeach
@@ -270,8 +270,8 @@ elif _vulkan_drivers.contains('all')
    # Build every vulkan driver regardless of architecture.
    _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'swrast',
                       'freedreno', 'panfrost', 'virtio', 'broadcom',
-                      'imagination-experimental', 'microsoft-experimental',
-                      'nouveau', 'asahi', 'gfxstream']
+                      'imagination', 'microsoft-experimental',
+                      'nouveau', 'asahi', 'gfxstream', 'kosmickrisp']
 endif
 
 with_intel_vk = _vulkan_drivers.contains('intel')
@@ -282,12 +282,13 @@ with_panfrost_vk = _vulkan_drivers.contains('panfrost')
 with_swrast_vk = _vulkan_drivers.contains('swrast')
 with_virtio_vk = _vulkan_drivers.contains('virtio')
 with_broadcom_vk = _vulkan_drivers.contains('broadcom')
-with_imagination_vk = _vulkan_drivers.contains('imagination-experimental')
+with_imagination_vk = _vulkan_drivers.contains('imagination')
 with_imagination_srv = get_option('imagination-srv')
 with_microsoft_vk = _vulkan_drivers.contains('microsoft-experimental')
 with_nouveau_vk = _vulkan_drivers.contains('nouveau')
 with_asahi_vk = _vulkan_drivers.contains('asahi')
 with_gfxstream_vk = _vulkan_drivers.contains('gfxstream')
+with_kosmickrisp_vk = _vulkan_drivers.contains('kosmickrisp')
 with_any_vk = _vulkan_drivers.length() != 0
 
 with_llvm = with_llvm \
@@ -829,6 +830,7 @@ with_driver_using_cl = [
   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
   with_gallium_panfrost, with_panfrost_vk,
   with_nouveau_vk, with_imagination_vk,
+  with_kosmickrisp_vk,
 ].contains(true)
 
 if get_option('mesa-clc') == 'system'
@@ -844,6 +846,10 @@ endif
 
 with_llvm = with_llvm \
   .enable_if(with_clc, error_message : 'CLC requires LLVM')
+
+with_poly = [
+  with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
+].contains(true)
 
 dep_clc = null_dep
 if with_clc
@@ -1854,7 +1860,8 @@ with_spirv_tools = get_option('spirv-tools') \
 dep_spirv_tools = dependency(
   'SPIRV-Tools',
   required : with_spirv_tools,
-  version : '>= 2024.1'
+  version : '>= 2024.1',
+  static : host_machine.system() == 'darwin',
 )
 if dep_spirv_tools.found()
   pre_args += '-DHAVE_SPIRV_TOOLS'
@@ -2196,6 +2203,9 @@ endif
 
 add_project_arguments(pre_args, language : ['c', 'cpp'])
 add_project_arguments(c_cpp_args, language : ['c', 'cpp'])
+if host_machine.system() == 'darwin'
+  add_project_arguments(pre_args, language : ['objc'])
+endif
 
 add_project_arguments(c_args,   language : ['c'])
 add_project_arguments(cpp_args, language : ['cpp'])

@@ -1625,9 +1625,12 @@ BEGIN_TEST(optimize.vop3p_constants)
          //;                     0x42420000, 0x42424242, 0x4242c242, 0x4242ffff, 0x7ffefffe,
          //;                     0x80300030, 0xbeefdead, 0xc2424242, 0xdeadbeef, 0xfffe0000,
          //;                     0xfffe7ffe, 0xffff0030, 0xffff3c00, 0xffff4242, 0xc242c242,
-         //;                     0x80308030, 0xdeaddead, 0xbeefbeef, 0x7ffe7ffe]
+         //;                     0x80308030, 0xdeaddead, 0xbeefbeef, 0x7ffe7ffe, 0x0000c242,
+         //;                     0x0000beef, 0x0000dead, ]
          //; if opcode == 'v_pk_add_u16':
-         //;    allowed_literals.extend([0x00003c00, 0x3c000000, 0x3c003c00, 0x3c00bc00, 0xbc003c00, 0xbc00bc00])
+         //;    allowed_literals.extend([0x00003c00, 0x3c000000, 0x3c003c00, 0x3c00bc00,
+         //;                             0xbc003c00, 0xbc00bc00, 0x0000bc00, 0x00008030,
+         //;                             0x00007ffe])
          //; else:
          //;    allowed_literals.extend([0x00003f80, 0x3f800000, 0x3f803f80])
          //;
@@ -1698,14 +1701,14 @@ BEGIN_TEST(optimize.fmamix_two_literals)
 
       /* v_fma_mix_f32 is a fused mul/add, so it can't be used for precise separate mul/add. */
       //~gfx10! v1: (precise)%res3 = v_madak_f32 %a, %c15, 0x40400000
-      //~gfx10_3! v1: (precise)%res3_tmp = v_mul_f32 %a, 0x3fc00000
-      //~gfx10_3! v1: %res3 = v_add_f32 %res3_tmp, 0x40400000
+      //~gfx10_3! v1: (precise)%res3_tmp = v_mul_f32 0x3fc00000, %a
+      //~gfx10_3! v1: %res3 = v_add_f32 0x40400000, %res3_tmp
       //! p_unit_test 3, %res3
       writeout(3, fadd(bld.precise().vop2(aco_opcode::v_mul_f32, bld.def(v1), a, c15), c30));
 
       //~gfx10! v1: (precise)%res4 = v_madak_f32 %1, %c16, 0x40400000
-      //~gfx10_3! v1: %res4_tmp = v_mul_f32 %a, 0x3fc00000
-      //~gfx10_3! v1: (precise)%res4 = v_add_f32 %res4_tmp, 0x40400000
+      //~gfx10_3! v1: %res4_tmp = v_mul_f32 0x3fc00000, %a
+      //~gfx10_3! v1: (precise)%res4 = v_add_f32 0x40400000, %res4_tmp
       //! p_unit_test 4, %res4
       writeout(4, bld.precise().vop2(aco_opcode::v_add_f32, bld.def(v1), fmul(a, c15), c30));
 
@@ -1740,9 +1743,9 @@ BEGIN_TEST(optimize.fmamix_two_literals)
       writeout(7, fma(c15, c30, c45));
 
       /* Modifiers must be preserved. */
-      //! v1: %res8 = v_fma_mix_f32 -%a, lo(0x44804200), hi(0x44804200)
+      //! v1: %res8 = v_fma_mix_f32 |%a|, lo(0x44804200), hi(0x44804200)
       //! p_unit_test 8, %res8
-      writeout(8, fma(fneg(a), c30, c45));
+      writeout(8, fma(fabs(a), c30, c45));
 
       //! v1: %res9 = v_fma_mix_f32 lo(0x44804200), |%a|, hi(0x44804200)
       //! p_unit_test 9, %res9
@@ -2023,7 +2026,7 @@ BEGIN_TEST(optimizer.trans_inline_constant)
    //! p_unit_test 5, %res5
    writeout(5, bld.vop1(aco_opcode::v_rcp_f32, bld.def(v1), bld.copy(bld.def(s1), Operand::c32(0x3c00))));
 
-   //! v2b: %res6 = v_rcp_f16 0x3f800000
+   //! v2b: %res6 = v_rcp_f16 0
    //! p_unit_test 6, %res6
    writeout(6, bld.vop1(aco_opcode::v_rcp_f16, bld.def(v2b), bld.copy(bld.def(s1), Operand::c32(0x3f800000))));
 

@@ -119,7 +119,6 @@ get_info(nir_intrinsic_op op)
       STORE(nir_var_uniform, const_ir3, -1, -1, -1, 0, 4)
       INFO(nir_var_mem_shared, shared_append_amd, true, -1, -1, -1, -1, 1)
       INFO(nir_var_mem_shared, shared_consume_amd, true, -1, -1, -1, -1, 1)
-      LOAD(nir_var_mem_global, smem_amd, 0, 1, -1, 1)
       LOAD(0, buffer_amd, 0, 1, -1, 1)
       STORE(0, buffer_amd, 1, 2, -1, 0, 1)
    default:
@@ -400,13 +399,16 @@ parse_offset(nir_scalar base, uint64_t *offset)
          add += add2 * mul;
       }
 
-      if (nir_scalar_is_alu(base) && (nir_scalar_alu_op(base) == nir_op_mov ||
-                                      nir_scalar_alu_op(base) == nir_op_u2u64)) {
-         if (nir_scalar_alu_op(base) == nir_op_u2u64) {
+      if (nir_scalar_is_alu(base)) {
+         if (nir_scalar_alu_op(base) == nir_op_mov) {
+            base = nir_scalar_chase_alu_src(base, 0);
+         } else if (nir_scalar_alu_op(base) == nir_op_u2u64) {
+            base = nir_scalar_chase_alu_src(base, 0);
             require_nuw = true;
             uub = u_uintN_max(base.def->bit_size);
+         } else {
+            continue;
          }
-         base = nir_scalar_chase_alu_src(base, 0);
          progress = true;
       }
    } while (progress);
@@ -1416,6 +1418,10 @@ can_vectorize(struct vectorize_ctx *ctx, struct entry *first, struct entry *seco
        (first->access & ACCESS_VOLATILE) || first->info->is_unvectorizable)
       return false;
 
+   /* We can't change the bit size of atomic load/store */
+   if ((first->access & ACCESS_ATOMIC) && get_bit_size(first) != get_bit_size(second))
+      return false;
+
    if (first->intrin->intrinsic == nir_intrinsic_load_buffer_amd ||
        first->intrin->intrinsic == nir_intrinsic_store_buffer_amd) {
       if (first->access & ACCESS_USES_FORMAT_AMD)
@@ -1467,7 +1473,7 @@ try_vectorize(nir_function_impl *impl, struct vectorize_ctx *ctx,
    } else if (low_bit_size != high_bit_size &&
               new_bitsize_acceptable(ctx, high_bit_size, low, high, new_size)) {
       new_bit_size = high_bit_size;
-   } else {
+   } else if (!(first->access & ACCESS_ATOMIC)) {
       new_bit_size = 64;
       for (; new_bit_size >= 8; new_bit_size /= 2) {
          /* don't repeat trying out bitsizes */
@@ -1478,6 +1484,8 @@ try_vectorize(nir_function_impl *impl, struct vectorize_ctx *ctx,
       }
       if (new_bit_size < 8)
          return false;
+   } else {
+      return false;
    }
    unsigned new_num_components = new_size / new_bit_size;
 
@@ -1536,15 +1544,16 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
    if (first != low)
       offset = nir_iadd_imm(&b, offset, -(int)diff);
 
+   uint32_t access = nir_intrinsic_access(first->intrin);
    if (first->is_store) {
       nir_def *low_val = low->intrin->src[low->info->value_src].ssa;
       nir_def *high_val = high->intrin->src[high->info->value_src].ssa;
       nir_def *val = nir_vec2(&b, nir_bitcast_vector(&b, low_val, low_size * 8u),
                               nir_bitcast_vector(&b, high_val, low_size * 8u));
-      nir_store_shared2_amd(&b, val, offset, .offset1 = diff / stride, .st64 = st64);
+      nir_store_shared2_amd(&b, val, offset, .offset1 = diff / stride, .st64 = st64, .access = access);
    } else {
       nir_def *new_def = nir_load_shared2_amd(&b, low_size * 8u, offset, .offset1 = diff / stride,
-                                              .st64 = st64);
+                                              .st64 = st64, .access = access);
       nir_def_rewrite_uses(&low->intrin->def,
                            nir_bitcast_vector(&b, nir_channel(&b, new_def, 0), low_bit_size));
       nir_def_rewrite_uses(&high->intrin->def,
@@ -1805,7 +1814,7 @@ process_block(nir_function_impl *impl, struct vectorize_ctx *ctx, nir_block *blo
          util_dynarray_init(arr, arr);
          _mesa_hash_table_insert_pre_hashed(adj_ht, key_hash, entry->key, arr);
       }
-      util_dynarray_append(arr, struct entry *, entry);
+      util_dynarray_append(arr, entry);
    }
 
    /* sort and combine entries */

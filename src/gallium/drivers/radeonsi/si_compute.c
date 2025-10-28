@@ -6,6 +6,7 @@
 
 #include "ac_rtld.h"
 #include "nir/tgsi_to_nir.h"
+#include "ac_shader_util.h"
 #include "si_build_pm4.h"
 #include "si_shader_internal.h"
 #include "util/u_async_debug.h"
@@ -53,38 +54,40 @@ static void si_create_compute_state_async(void *job, void *gdata, int thread_ind
                          (sel->info.uses_variable_block_size ? 1 : 0) +
                          sel->nir->info.cs.user_data_components_amd;
 
-   /* Fast path for compute shaders - some descriptors passed via user SGPRs. */
-   /* Shader buffers in user SGPRs. */
-   for (unsigned i = 0; i < MIN2(3, sel->nir->info.num_ssbos) && user_sgprs <= 12; i++) {
-      user_sgprs = align(user_sgprs, 4);
-      if (i == 0)
-         sel->cs_shaderbufs_sgpr_index = user_sgprs;
-      user_sgprs += 4;
-      sel->cs_num_shaderbufs_in_user_sgprs++;
+   if (sel->stage != MESA_SHADER_TASK) {
+      /* Fast path for compute shaders - some descriptors passed via user SGPRs. */
+      /* Shader buffers in user SGPRs. */
+      for (unsigned i = 0; i < MIN2(3, sel->nir->info.num_ssbos) && user_sgprs <= 12; i++) {
+         user_sgprs = align(user_sgprs, 4);
+         if (i == 0)
+            sel->cs_shaderbufs_sgpr_index = user_sgprs;
+         user_sgprs += 4;
+         sel->cs_num_shaderbufs_in_user_sgprs++;
+      }
+
+      /* Images in user SGPRs. */
+      unsigned non_fmask_images = BITFIELD_MASK(sel->nir->info.num_images);
+
+      /* Remove images with FMASK from the bitmask.  We only care about the first
+       * 3 anyway, so we can take msaa_images[0] and ignore the rest.
+       */
+      if (sscreen->info.gfx_level < GFX11)
+         non_fmask_images &= ~sel->nir->info.msaa_images[0];
+
+      for (unsigned i = 0; i < 3 && non_fmask_images & (1 << i); i++) {
+         unsigned num_sgprs = BITSET_TEST(sel->nir->info.image_buffers, i) ? 4 : 8;
+
+         if (align(user_sgprs, num_sgprs) + num_sgprs > 16)
+            break;
+
+         user_sgprs = align(user_sgprs, num_sgprs);
+         if (i == 0)
+            sel->cs_images_sgpr_index = user_sgprs;
+         user_sgprs += num_sgprs;
+         sel->cs_num_images_in_user_sgprs++;
+      }
+      sel->cs_images_num_sgprs = user_sgprs - sel->cs_images_sgpr_index;
    }
-
-   /* Images in user SGPRs. */
-   unsigned non_fmask_images = BITFIELD_MASK(sel->nir->info.num_images);
-
-   /* Remove images with FMASK from the bitmask.  We only care about the first
-    * 3 anyway, so we can take msaa_images[0] and ignore the rest.
-    */
-   if (sscreen->info.gfx_level < GFX11)
-      non_fmask_images &= ~sel->nir->info.msaa_images[0];
-
-   for (unsigned i = 0; i < 3 && non_fmask_images & (1 << i); i++) {
-      unsigned num_sgprs = BITSET_TEST(sel->nir->info.image_buffers, i) ? 4 : 8;
-
-      if (align(user_sgprs, num_sgprs) + num_sgprs > 16)
-         break;
-
-      user_sgprs = align(user_sgprs, num_sgprs);
-      if (i == 0)
-         sel->cs_images_sgpr_index = user_sgprs;
-      user_sgprs += num_sgprs;
-      sel->cs_num_images_in_user_sgprs++;
-   }
-   sel->cs_images_num_sgprs = user_sgprs - sel->cs_images_sgpr_index;
    assert(user_sgprs <= 16);
 
    unsigned char ir_sha1_cache_key[20];
@@ -111,6 +114,12 @@ static void si_create_compute_state_async(void *job, void *gdata, int thread_ind
          return;
       }
 
+      /* task ring entry and draw id
+       * note uses_draw_id is only available after shader variant creation
+       */
+      if (sel->stage == MESA_SHADER_TASK)
+         user_sgprs += shader->info.uses_draw_id ? 3 : 2;
+
       shader->config.rsrc1 = S_00B848_VGPRS((shader->config.num_vgprs - 1) /
                                             ((shader->wave_size == 32 ||
                                               sscreen->info.wave64_vgpr_alloc_granularity == 8) ? 8 : 4)) |
@@ -133,7 +142,7 @@ static void si_create_compute_state_async(void *job, void *gdata, int thread_ind
                              S_00B84C_TIDIG_COMP_CNT(sel->info.uses_thread_id[2]
                                                         ? 2
                                                         : sel->info.uses_thread_id[1] ? 1 : 0) |
-                             S_00B84C_LDS_SIZE(shader->config.lds_size);
+                             S_00B84C_LDS_SIZE(ac_shader_encode_lds_size(shader->config.lds_size, sscreen->info.gfx_level, MESA_SHADER_COMPUTE));
 
       /* COMPUTE_PGM_RSRC3 is only present on GFX10+ and GFX940+. */
       shader->config.rsrc3 = S_00B8A0_SHARED_VGPR_CNT(shader->config.num_shared_vgprs / 8);

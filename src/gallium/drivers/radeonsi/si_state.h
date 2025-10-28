@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define SI_NUM_GRAPHICS_SHADERS (MESA_SHADER_FRAGMENT + 1)
-#define SI_NUM_SHADERS          (MESA_SHADER_COMPUTE + 1)
+#define SI_NUM_SHADERS          (MESA_SHADER_MESH + 1)
 
 #define SI_NUM_VERTEX_BUFFERS SI_MAX_ATTRIBS
 #define SI_NUM_SAMPLERS       32 /* OpenGL textures units per shader */
@@ -429,6 +429,11 @@ enum si_tracked_reg
    SI_TRACKED_COMPUTE_DISPATCH_SCRATCH_BASE_LO, /* GFX11+ */
    SI_TRACKED_COMPUTE_DISPATCH_SCRATCH_BASE_HI, /* GFX11+ */
 
+   /* 3 consecutive registers. */
+   SI_TRACKED_SPI_SHADER_GS_MESHLET_DIM,       /* GFX11+ */
+   SI_TRACKED_SPI_SHADER_GS_MESHLET_EXP_ALLOC, /* GFX11+ */
+   SI_TRACKED_SPI_SHADER_GS_MESHLET_CTRL,      /* GFX12+ */
+
    SI_NUM_ALL_TRACKED_REGS,
 };
 
@@ -600,11 +605,13 @@ void si_set_ring_buffer(struct si_context *sctx, uint slot, struct pipe_resource
 void si_init_all_descriptors(struct si_context *sctx);
 void si_release_all_descriptors(struct si_context *sctx);
 void si_compute_resources_add_all_to_bo_list(struct si_context *sctx);
+void si_mesh_resources_add_all_to_bo_list(struct si_context *sctx);
 int si_gfx_resources_check_encrypted(struct si_context *sctx);
 bool si_compute_resources_check_encrypted(struct si_context *sctx);
 void si_shader_pointers_mark_dirty(struct si_context *sctx);
 void si_add_all_descriptors_to_bo_list(struct si_context *sctx);
 void si_update_all_texture_descriptors(struct si_context *sctx);
+void si_set_user_data_base(struct si_context *sctx, unsigned shader, uint32_t new_base);
 void si_shader_change_notify(struct si_context *sctx);
 void si_update_needs_color_decompress_masks(struct si_context *sctx);
 void si_emit_compute_shader_pointers(struct si_context *sctx);
@@ -688,6 +695,7 @@ void si_set_vertex_buffer_descriptor(struct si_screen *sscreen, struct si_vertex
                                      const struct pipe_vertex_buffer *vb, unsigned element_index,
                                      uint32_t *out);
 void si_emit_buffered_compute_sh_regs(struct si_context *sctx);
+void si_emit_buffered_gfx_sh_regs_for_mesh(struct si_context *sctx);
 void si_init_draw_functions_GFX6(struct si_context *sctx);
 void si_init_draw_functions_GFX7(struct si_context *sctx);
 void si_init_draw_functions_GFX8(struct si_context *sctx);

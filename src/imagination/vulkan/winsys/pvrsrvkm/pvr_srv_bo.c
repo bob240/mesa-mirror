@@ -297,7 +297,7 @@ VkResult pvr_srv_winsys_buffer_get_fd(struct pvr_winsys_bo *bo,
    return VK_SUCCESS;
 }
 
-VkResult pvr_srv_winsys_buffer_map(struct pvr_winsys_bo *bo)
+VkResult pvr_srv_winsys_buffer_map(struct pvr_winsys_bo *bo, void *addr)
 {
    struct pvr_srv_winsys_bo *srv_bo = to_pvr_srv_winsys_bo(bo);
    struct pvr_winsys *ws = bo->ws;
@@ -310,7 +310,8 @@ VkResult pvr_srv_winsys_buffer_map(struct pvr_winsys_bo *bo)
    assert(!bo->map);
 
    /* Map the full PMR to CPU space */
-   result = pvr_mmap(bo->size,
+   result = pvr_mmap(addr,
+                     bo->size,
                      prot,
                      MAP_SHARED,
                      ws->render_fd,
@@ -328,9 +329,10 @@ VkResult pvr_srv_winsys_buffer_map(struct pvr_winsys_bo *bo)
    return VK_SUCCESS;
 }
 
-void pvr_srv_winsys_buffer_unmap(struct pvr_winsys_bo *bo)
+VkResult pvr_srv_winsys_buffer_unmap(struct pvr_winsys_bo *bo, bool reserve)
 {
    struct pvr_srv_winsys_bo *srv_bo = to_pvr_srv_winsys_bo(bo);
+   VkResult result;
 
    /* output error if trying to unmap memory that is not previously mapped */
    assert(bo->map);
@@ -338,11 +340,13 @@ void pvr_srv_winsys_buffer_unmap(struct pvr_winsys_bo *bo)
    VG(VALGRIND_FREELIKE_BLOCK(bo->map, 0));
 
    /* Unmap the whole PMR from CPU space */
-   pvr_munmap(bo->map, bo->size);
+   result = pvr_munmap(bo->map, bo->size, reserve);
 
    bo->map = NULL;
 
    buffer_release(srv_bo);
+
+   return result;
 }
 
 /* This function must be used to allocate from a heap carveout and must only be

@@ -564,7 +564,9 @@ static void r600_bind_vertex_elements(struct pipe_context *ctx, void *state)
 
 	r600_set_cso_state(rctx, &rctx->vertex_fetch_shader, state);
 	if (!prev || (cso && cso->buffer_mask &&
-		      (prev->buffer_mask != cso->buffer_mask || memcmp(cso->strides, prev->strides, util_last_bit(cso->buffer_mask))))) {
+		      (prev->buffer_mask != cso->buffer_mask ||
+		       memcmp(cso->strides, prev->strides,
+			      util_last_bit(cso->buffer_mask) * sizeof(cso->strides[0]))))) {
 		rctx->vertex_buffer_state.dirty_mask |= cso ? cso->buffer_mask : 0;
 		r600_vertex_buffers_dirty(rctx);
 	}
@@ -1155,13 +1157,11 @@ void r600_delete_shader_selector(struct pipe_context *ctx,
 	if (sel->ir_type == PIPE_SHADER_IR_TGSI) {
 		free(sel->tokens);
 		/* We might have converted the TGSI shader to a NIR shader */
-		if (sel->nir)
-			ralloc_free(sel->nir);
+		ralloc_free(sel->nir);
 	}
 	else if (sel->ir_type == PIPE_SHADER_IR_NIR)
 		ralloc_free(sel->nir);
-	if (sel->nir_blob)
-		free(sel->nir_blob);
+	free(sel->nir_blob);
 	free(sel);
 }
 

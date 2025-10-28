@@ -94,8 +94,8 @@ create_kmod_dev(struct panvk_physical_device *device,
 
    drmFreeVersion(version);
 
-   if (instance->debug_flags & PANVK_DEBUG_STARTUP)
-      vk_logi(VK_LOG_NO_OBJS(instance), "Found compatible device '%s'.", path);
+   if (PANVK_DEBUG(STARTUP))
+      mesa_logi("Found compatible device '%s'.", path);
 
    device->kmod.dev = pan_kmod_dev_create(fd, PAN_KMOD_DEV_FLAG_OWNS_FD,
                                           &instance->kmod.allocator);
@@ -135,20 +135,55 @@ get_drm_device_ids(struct panvk_physical_device *device,
    return VK_SUCCESS;
 }
 
-static int
-get_cache_uuid(uint16_t family, void *uuid)
+static void
+get_cache_sha1(struct panvk_physical_device *device,
+               const struct panvk_instance *instance)
 {
-   uint32_t mesa_timestamp;
-   uint16_t f = family;
+   struct mesa_sha1 sha_ctx;
+   _mesa_sha1_init(&sha_ctx);
 
-   if (!disk_cache_get_function_timestamp(get_cache_uuid, &mesa_timestamp))
-      return -1;
+   _mesa_sha1_update(&sha_ctx, instance->driver_build_sha,
+                     sizeof(instance->driver_build_sha));
 
-   memset(uuid, 0, VK_UUID_SIZE);
-   memcpy(uuid, &mesa_timestamp, 4);
-   memcpy((char *)uuid + 4, &f, 2);
-   snprintf((char *)uuid + 6, VK_UUID_SIZE - 10, "pan");
-   return 0;
+   _mesa_sha1_update(&sha_ctx, &device->kmod.props.gpu_id,
+                     sizeof(device->kmod.props.gpu_id));
+
+   unsigned char sha[SHA1_DIGEST_LENGTH];
+   _mesa_sha1_final(&sha_ctx, sha);
+
+   STATIC_ASSERT(VK_UUID_SIZE <= SHA1_DIGEST_LENGTH);
+   memcpy(device->cache_uuid, sha, VK_UUID_SIZE);
+}
+
+static void
+init_disk_cache(struct panvk_physical_device *device,
+                const struct panvk_instance *instance)
+{
+#ifdef ENABLE_SHADER_CACHE
+   char renderer[17];
+   ASSERTED int len = snprintf(renderer, sizeof(renderer), "panvk_0x%08x",
+                               device->kmod.props.gpu_id);
+   assert(len == sizeof(renderer) - 1);
+
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
+   _mesa_sha1_format(timestamp, instance->driver_build_sha);
+
+   const uint64_t driver_flags = 0;
+   device->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+#endif
+}
+
+static void
+free_disk_cache(struct panvk_physical_device *device)
+{
+#ifdef ENABLE_SHADER_CACHE
+   if (device->vk.disk_cache) {
+      disk_cache_destroy(device->vk.disk_cache);
+      device->vk.disk_cache = NULL;
+   }
+#else
+   assert(device->vk.disk_cache == NULL);
+#endif
 }
 
 static VkResult
@@ -235,6 +270,8 @@ panvk_physical_device_finish(struct panvk_physical_device *device)
 {
    panvk_wsi_finish(device);
 
+   free_disk_cache(device);
+
    pan_kmod_dev_destroy(device->kmod.dev);
 
    vk_physical_device_finish(&device->vk);
@@ -299,11 +336,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    memset(device->name, 0, sizeof(device->name));
    sprintf(device->name, "%s", device->model->name);
 
-   if (get_cache_uuid(device->kmod.props.gpu_id, device->cache_uuid)) {
-      result = panvk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
-                            "cannot generate UUID");
-      goto fail;
-   }
+   get_cache_sha1(device, instance);
 
    result = get_core_masks(device, instance);
    if (result != VK_SUCCESS)
@@ -350,6 +383,8 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
    device->vk.supported_sync_types = device->sync_types;
 
+   init_disk_cache(device, instance);
+
    result = panvk_wsi_init(device);
    if (result != VK_SUCCESS)
       goto fail;
@@ -357,6 +392,8 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    return VK_SUCCESS;
 
 fail:
+   free_disk_cache(device);
+
    if (device->vk.instance)
       vk_physical_device_finish(&device->vk);
 
@@ -759,6 +796,7 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
                                          VkFormatProperties2 *pFormatProperties)
 {
    VK_FROM_HANDLE(panvk_physical_device, physical_device, physicalDevice);
+   const unsigned arch = pan_arch(physical_device->kmod.props.gpu_id);
 
    VkFormatFeatureFlags2 tex =
       get_image_format_features(physical_device, format);
@@ -785,6 +823,24 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
       VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
                              list->pDrmFormatModifierProperties,
                              &list->drmFormatModifierCount);
+      if (pFormatProperties->formatProperties.optimalTilingFeatures &&
+          PANVK_DEBUG(WSI_AFBC))
+      {
+         PAN_SUPPORTED_MODIFIERS(supported);
+         for (int mi = 0; mi < ARRAY_SIZE(supported); mi++) {
+            if (drm_is_afbc(supported[mi]) &&
+                pan_afbc_supports_format(arch, vk_format_to_pipe_format(format)))
+            {
+               vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, mod_props)
+               {
+                  mod_props->drmFormatModifier = supported[mi];
+                  mod_props->drmFormatModifierPlaneCount = 1;
+                  mod_props->drmFormatModifierTilingFeatures =
+                     pFormatProperties->formatProperties.optimalTilingFeatures;
+               }
+            }
+         }
+      }
 
       if (pFormatProperties->formatProperties.linearTilingFeatures) {
          vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
@@ -878,7 +934,16 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
       const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
          vk_find_struct_const(
             info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
-      if (mod_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR)
+
+      /* TODO: switch to using a more generic function for checking mod support here
+       * when adding new modifiers, so that this case doesn't become too big. */
+      const bool can_use_afbc = 
+         PANVK_DEBUG(WSI_AFBC) &&
+         panvk_image_can_use_afbc(physical_device, info->format, info->usage,
+                                  info->type, info->tiling, 0);
+      const bool supported = (drm_is_afbc(mod_info->drmFormatModifier) && can_use_afbc) ||
+         mod_info->drmFormatModifier == DRM_FORMAT_MOD_LINEAR;
+      if (!supported)
          goto unsupported;
 
       /* The only difference between optimal and linear is currently whether

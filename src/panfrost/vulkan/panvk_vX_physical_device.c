@@ -138,6 +138,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_descriptor_indexing = PAN_ARCH >= 9,
       .EXT_extended_dynamic_state = true,
       .EXT_extended_dynamic_state2 = true,
+      .EXT_external_memory_acquire_unmodified = true,
       .EXT_external_memory_dma_buf = true,
       .EXT_global_priority = true,
       .EXT_global_priority_query = true,
@@ -922,12 +923,11 @@ panvk_per_arch(get_physical_device_properties)(
          MAX_INLINE_UNIFORM_BLOCK_DESCRIPTORS,
       .maxInlineUniformTotalSize =
          MAX_INLINE_UNIFORM_BLOCK_DESCRIPTORS * MAX_INLINE_UNIFORM_BLOCK_SIZE,
-      .integerDotProduct8BitUnsignedAccelerated = true,
-      .integerDotProduct8BitSignedAccelerated = true,
+      .integerDotProduct8BitUnsignedAccelerated = false,
+      .integerDotProduct8BitSignedAccelerated = false,
       .integerDotProduct8BitMixedSignednessAccelerated = false,
-      .integerDotProduct4x8BitPackedUnsignedAccelerated = true,
-      .integerDotProduct4x8BitPackedSignedAccelerated = true,
-      .integerDotProduct4x8BitPackedSignedAccelerated = false,
+      .integerDotProduct4x8BitPackedUnsignedAccelerated = PAN_ARCH >= 9,
+      .integerDotProduct4x8BitPackedSignedAccelerated = PAN_ARCH >= 9,
       .integerDotProduct16BitUnsignedAccelerated = false,
       .integerDotProduct16BitSignedAccelerated = false,
       .integerDotProduct16BitMixedSignednessAccelerated = false,
@@ -940,8 +940,8 @@ panvk_per_arch(get_physical_device_properties)(
       .integerDotProductAccumulatingSaturating8BitUnsignedAccelerated = false,
       .integerDotProductAccumulatingSaturating8BitSignedAccelerated = false,
       .integerDotProductAccumulatingSaturating8BitMixedSignednessAccelerated = false,
-      .integerDotProductAccumulatingSaturating4x8BitPackedUnsignedAccelerated = false,
-      .integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated = false,
+      .integerDotProductAccumulatingSaturating4x8BitPackedUnsignedAccelerated = PAN_ARCH >= 9,
+      .integerDotProductAccumulatingSaturating4x8BitPackedSignedAccelerated = PAN_ARCH >= 9,
       .integerDotProductAccumulatingSaturating4x8BitPackedMixedSignednessAccelerated = false,
       .integerDotProductAccumulatingSaturating16BitUnsignedAccelerated = false,
       .integerDotProductAccumulatingSaturating16BitSignedAccelerated = false,
@@ -1123,4 +1123,9 @@ panvk_per_arch(get_physical_device_properties)(
    STATIC_ASSERT(sizeof(instance->driver_build_sha) >= VK_UUID_SIZE);
    memcpy(properties->optimalTilingLayoutUUID, instance->driver_build_sha,
           VK_UUID_SIZE);
+
+   if (PANVK_DEBUG(STARTUP)) {
+      mesa_logi("%s (%s) %s", properties->driverName, properties->deviceName,
+                properties->driverInfo);
+   }
 }

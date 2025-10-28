@@ -196,7 +196,7 @@ debian-build-x86_64:
       -D gallium-rusticl=false
       -D legacy-wayland=bind-wayland-display
     GALLIUM_DRIVERS: "i915,iris,nouveau,r300,r600,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,d3d12,asahi,crocus"
-    VULKAN_DRIVERS: "intel_hasvk,imagination-experimental,microsoft-experimental,nouveau,swrast"
+    VULKAN_DRIVERS: "intel_hasvk,imagination,microsoft-experimental,nouveau,swrast"
     BUILDTYPE: "debugoptimized"
     EXTRA_OPTION: >
       -D spirv-to-dxil=true
@@ -228,7 +228,7 @@ debian-release:
       -D gallium-rusticl=false
       -D llvm=enabled
     GALLIUM_DRIVERS: "i915,iris,nouveau,r300,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,d3d12,asahi,crocus"
-    VULKAN_DRIVERS: "swrast,intel_hasvk,imagination-experimental,microsoft-experimental"
+    VULKAN_DRIVERS: "swrast,intel_hasvk,imagination,microsoft-experimental"
     EXTRA_OPTION: >
       -D spirv-to-dxil=true
       -D tools=all
@@ -272,7 +272,7 @@ alpine-build-testing:
       -D microsoft-clc=disabled
       -D shared-llvm=enabled
     UNWIND: "disabled"
-    VULKAN_DRIVERS: "amd,broadcom,freedreno,intel,imagination-experimental"
+    VULKAN_DRIVERS: "amd,broadcom,freedreno,intel,imagination"
 
 fedora-release:
   extends:
@@ -320,7 +320,7 @@ fedora-release:
       -D microsoft-clc=disabled
       -D shared-llvm=enabled
     UNWIND: "disabled"
-    VULKAN_DRIVERS: "amd,asahi,broadcom,freedreno,imagination-experimental,intel,intel_hasvk"
+    VULKAN_DRIVERS: "amd,asahi,broadcom,freedreno,imagination,intel,intel_hasvk"
 
 debian-android:
   extends:
@@ -378,24 +378,22 @@ debian-android:
       -D precomp-compiler=enabled
       -D install-precomp-compiler=true
       -D tools=panfrost
-    S3_ARTIFACT_NAME: mesa-x86_64-android-${BUILDTYPE}
   script:
     # x86_64 build:
     - export CROSS=x86_64-linux-android
     - export GALLIUM_DRIVERS=iris,radeonsi,softpipe,virgl,zink
     - export VULKAN_DRIVERS=amd,intel,nouveau,swrast,virtio
     - .gitlab-ci/create-llvm-meson-wrap-file.sh
+    - export S3_ARTIFACT_NAME=mesa-x86_64-android-${BUILDTYPE}
     - !reference [.meson-build-for-tests, script]
     # remove all the files created by the previous build before the next build
     - git clean -dxf .
     # aarch64 build:
-    # build-only, to catch compilation regressions
-    # without calling .gitlab-ci/prepare-artifacts.sh so that the
-    # artifacts are not shipped in mesa-x86_64-android-${BUILDTYPE}
     - export CROSS=aarch64-linux-android
     - export GALLIUM_DRIVERS=etnaviv,freedreno,lima,panfrost,vc4,v3d
     - export VULKAN_DRIVERS=freedreno,broadcom,panfrost,virtio
-    - !reference [.meson-build-only, script]
+    - export S3_ARTIFACT_NAME=mesa-arm64-android-${BUILDTYPE}
+    - !reference [.meson-build-for-tests, script]
 
 .meson-cross:
   extends:
@@ -552,7 +550,7 @@ debian-arm64-build-test:
     - .ci-deqp-artifacts
     - .meson-build-only
   variables:
-    VULKAN_DRIVERS: "amd,asahi,imagination-experimental,nouveau"
+    VULKAN_DRIVERS: "amd,asahi,imagination,nouveau"
     DRI_LOADERS:
       -D glvnd=disabled
     EXTRA_OPTION: >
@@ -628,7 +626,7 @@ debian-clang:
       -D microsoft-clc=disabled
       -D shared-llvm=enabled
     GALLIUM_DRIVERS: "iris,nouveau,r300,r600,freedreno,llvmpipe,softpipe,svga,v3d,vc4,virgl,etnaviv,panfrost,lima,zink,radeonsi,tegra,d3d12,crocus,i915,asahi"
-    VULKAN_DRIVERS: intel,amd,freedreno,broadcom,virtio,swrast,panfrost,imagination-experimental,microsoft-experimental,nouveau
+    VULKAN_DRIVERS: intel,amd,freedreno,broadcom,virtio,swrast,panfrost,imagination,microsoft-experimental,nouveau
     EXTRA_OPTION:
       -D spirv-to-dxil=true
       -D imagination-srv=true
@@ -712,7 +710,7 @@ debian-vulkan:
       -D c_args=-fno-sanitize-recover=all
       -D cpp_args=-fno-sanitize-recover=all
     UBSAN_OPTIONS: "print_stacktrace=1"
-    VULKAN_DRIVERS: amd,asahi,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination-experimental,microsoft-experimental,nouveau
+    VULKAN_DRIVERS: amd,asahi,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination,microsoft-experimental,nouveau,kosmickrisp
     EXTRA_OPTION: >
       -D vulkan-layers=device-select,overlay
       -D build-radv-tests=true

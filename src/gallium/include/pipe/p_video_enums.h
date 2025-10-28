@@ -167,11 +167,6 @@ enum pipe_video_cap
     */
    PIPE_VIDEO_CAP_ENC_HEVC_RANGE_EXTENSION_FLAGS_SUPPORT = 52,
    /*
-    * Video Post Processing support HDR content
-    */
-   PIPE_VIDEO_CAP_VPP_SUPPORT_HDR_INPUT = 53,
-   PIPE_VIDEO_CAP_VPP_SUPPORT_HDR_OUTPUT = 54,
-   /*
     * Video encode max long term references supported
     */
    PIPE_VIDEO_CAP_ENC_MAX_LONG_TERM_REFERENCES_PER_FRAME = 55,
@@ -338,17 +333,6 @@ enum pipe_video_vpp_blend_mode
 {
    PIPE_VIDEO_VPP_BLEND_MODE_NONE = 0x0,
    PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA = 0x1,
-};
-
-/* To be used for VPP state*/
-enum pipe_video_vpp_color_standard_type
-{
-   PIPE_VIDEO_VPP_COLOR_STANDARD_TYPE_NONE = 0x0,
-   PIPE_VIDEO_VPP_COLOR_STANDARD_TYPE_BT601 = 0x1,
-   PIPE_VIDEO_VPP_COLOR_STANDARD_TYPE_BT709 = 0x2,
-   PIPE_VIDEO_VPP_COLOR_STANDARD_TYPE_BT2020 = 0xC,
-   PIPE_VIDEO_VPP_COLOR_STANDARD_TYPE_EXPLICIT = 0xD,
-   PIPE_VIDEO_VPP_COLOR_STANDARD_TYPE_COUNT,
 };
 
 /* To be used for VPP state*/

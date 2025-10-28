@@ -34,6 +34,8 @@
 #include "pipe/p_defines.h"
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
+#include "poly/geometry.h"
+#include "poly/nir/poly_nir_lower_gs.h"
 #include "util/bitscan.h"
 #include "util/bitset.h"
 #include "util/blend.h"
@@ -57,10 +59,8 @@
 #include "agx_disk_cache.h"
 #include "agx_linker.h"
 #include "agx_nir.h"
-#include "agx_nir_lower_gs.h"
 #include "agx_nir_lower_vbo.h"
 #include "agx_tilebuffer.h"
-#include "geometry.h"
 #include "libagx.h"
 #include "libagx_dgc.h"
 #include "libagx_shaders.h"
@@ -1544,7 +1544,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
    nir_shader *nir = nir_deserialize(NULL, &agx_nir_options, &reader);
 
    /* Auxiliary programs */
-   struct agx_gs_info gs_info = {0};
+   struct poly_gs_info gs_info = {0};
    uint64_t outputs = 0;
    struct agx_fs_epilog_link_info epilog_key = {false};
    nir_shader *gs_count = NULL;
@@ -1563,8 +1563,8 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       struct asahi_vs_shader_key *key = &key_->vs;
 
-      if (nir->info.vs.tes_agx) {
-         NIR_PASS(_, nir, agx_nir_lower_tes, key->hw);
+      if (nir->info.vs.tes_poly) {
+         NIR_PASS(_, nir, poly_nir_lower_tes, key->hw);
       } else {
          NIR_PASS(_, nir, agx_nir_gather_vs_inputs, attrib_components_read);
          NIR_PASS(_, nir, agx_nir_lower_vs_input_to_prolog);
@@ -1580,7 +1580,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          NIR_PASS(_, nir, agx_nir_lower_cull_distance_vs);
          NIR_PASS(_, nir, agx_nir_lower_uvs, &uvs);
       } else {
-         NIR_PASS(_, nir, agx_nir_lower_vs_before_gs);
+         NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
 
          /* Turn into a compute shader now that we're free of vertexisms */
          nir->info.stage = MESA_SHADER_COMPUTE;
@@ -1589,10 +1589,14 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          outputs = nir->info.outputs_written;
       }
    } else if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, agx_nir_lower_tcs);
+      NIR_PASS(_, nir, poly_nir_lower_tcs);
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
-      NIR_PASS(_, nir, agx_nir_lower_gs, &gs_count, &gs_copy, &pre_gs,
+      NIR_PASS(_, nir, poly_nir_lower_gs, &gs_count, &gs_copy, &pre_gs,
                &gs_info);
+
+      agx_preprocess_nir(gs_count);
+      agx_preprocess_nir(gs_copy);
+      agx_preprocess_nir(pre_gs);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       struct asahi_fs_shader_key *key = &key_->fs;
 
@@ -1865,7 +1869,7 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
 
    if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
       nir->info.stage = MESA_SHADER_VERTEX;
-      nir->info.vs.tes_agx = true;
+      nir->info.vs.tes_poly = true;
    }
 
    blob_init(&so->serialized_nir);
@@ -1928,11 +1932,11 @@ agx_create_shader_state(struct pipe_context *pctx,
       so->tess.spacing = nir->info.tess.spacing;
       so->tess.output_patch_size = nir->info.tess.tcs_vertices_out;
       so->tess.primitive = nir->info.tess._primitive_mode;
-      so->tess.per_vertex_outputs = agx_tcs_per_vertex_outputs(nir);
+      so->tess.per_vertex_outputs = poly_tcs_per_vertex_outputs(nir);
       so->tess.nr_patch_outputs =
          util_last_bit(nir->info.patch_outputs_written);
       if (nir->info.stage == MESA_SHADER_TESS_CTRL)
-         so->tess.output_stride = agx_tcs_output_stride(nir);
+         so->tess.output_stride = poly_tcs_output_stride(nir);
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       so->gs_mode = nir->info.gs.output_primitive;
    }
@@ -2072,7 +2076,7 @@ static bool
 lower_fs_prolog_abi(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *_)
 {
    if (intr->intrinsic != nir_intrinsic_load_polygon_stipple_agx &&
-       intr->intrinsic != nir_intrinsic_load_stat_query_address_agx)
+       intr->intrinsic != nir_intrinsic_load_stat_query_address_poly)
       return false;
 
    b->cursor = nir_before_instr(&intr->instr);
@@ -2082,16 +2086,18 @@ lower_fs_prolog_abi(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *_)
    if (intr->intrinsic == nir_intrinsic_load_polygon_stipple_agx) {
       off_t stipple_offs = offsetof(struct agx_draw_uniforms, polygon_stipple);
       nir_def *stipple_ptr_ptr = nir_iadd_imm(b, root, stipple_offs);
-      nir_def *base = nir_load_global_constant(b, stipple_ptr_ptr, 4, 1, 64);
+      nir_def *base =
+         nir_load_global_constant(b, 1, 64, stipple_ptr_ptr, .align_mul = 4);
 
       nir_def *row = intr->src[0].ssa;
       nir_def *addr = nir_iadd(b, base, nir_u2u64(b, nir_imul_imm(b, row, 4)));
 
-      repl = nir_load_global_constant(b, addr, 4, 1, 32);
+      repl = nir_load_global_constant(b, 1, 32, addr);
    } else {
       off_t offs = offsetof(struct agx_draw_uniforms,
                             pipeline_statistics[nir_intrinsic_base(intr)]);
-      repl = nir_load_global_constant(b, nir_iadd_imm(b, root, offs), 4, 1, 64);
+      repl = nir_load_global_constant(b, 1, 64, nir_iadd_imm(b, root, offs),
+                                      .align_mul = 4);
    }
 
    nir_def_replace(&intr->def, repl);
@@ -3899,7 +3905,7 @@ agx_batch_heap(struct agx_batch *batch)
                                         PIPE_USAGE_DEFAULT, size);
       }
 
-      struct agx_heap heap = {
+      struct poly_heap heap = {
          .base = agx_resource(ctx->heap)->bo->va->addr,
          .size = size,
       };
@@ -3920,7 +3926,7 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
                           const struct pipe_draw_start_count_bias *draw,
                           const struct pipe_draw_indirect_info *indirect)
 {
-   struct agx_ia_state ia = {
+   struct poly_ia_state ia = {
       .index_buffer = input_index_buffer,
       .index_buffer_range_el = index_buffer_size_B / info->index_size,
       .verts_per_instance = draw ? draw->count : 0,
@@ -3929,7 +3935,7 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
    batch->uniforms.input_assembly =
       agx_pool_upload_aligned(&batch->pool, &ia, sizeof(ia), 8);
 
-   struct agx_geometry_params params = {
+   struct poly_geometry_params params = {
       .indirect_desc = batch->geom_indirect,
       .flat_outputs =
          batch->ctx->stage[MESA_SHADER_FRAGMENT].shader->info.inputs_flat_shaded,
@@ -4013,8 +4019,8 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
 
       params.input_primitives = params.gs_grid[0] * info->instance_count;
 
-      unsigned vb_size = libagx_tcs_in_size(draw->count * info->instance_count,
-                                            batch->uniforms.vertex_outputs);
+      unsigned vb_size = poly_tcs_in_size(draw->count * info->instance_count,
+                                          batch->uniforms.vertex_outputs);
       unsigned size = params.input_primitives * params.count_buffer_stride;
 
       if (size && prefix_sum) {
@@ -4030,8 +4036,8 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
          params.input_buffer = addr;
       }
 
-      struct agx_gs_info *gsi = &batch->ctx->gs->gs;
-      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
+      struct poly_gs_info *gsi = &batch->ctx->gs->gs;
+      if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          unsigned idx_size = params.input_primitives * gsi->max_indices;
 
          params.output_index_buffer =
@@ -4121,10 +4127,10 @@ agx_launch_gs_prerast(struct agx_batch *batch,
       libagx_gs_setup_indirect_struct(batch, agx_1d(1), AGX_BARRIER_ALL, gsi);
 
       grid_vs = agx_grid_indirect_local(
-         gp + offsetof(struct agx_geometry_params, vs_grid));
+         gp + offsetof(struct poly_geometry_params, vs_grid));
 
       grid_gs = agx_grid_indirect_local(
-         gp + offsetof(struct agx_geometry_params, gs_grid));
+         gp + offsetof(struct poly_geometry_params, gs_grid));
    } else {
       grid_vs = agx_3d(draws->count, info->instance_count, 1);
 
@@ -4242,7 +4248,7 @@ agx_draw_without_restart(struct agx_batch *batch,
    /* Unroll the index buffer for each draw */
    libagx_unroll_restart_struct(batch, agx_1d(1024 * indirect->draw_count),
                                 AGX_BARRIER_ALL, unroll,
-                                libagx_compact_prim(info->mode));
+                                poly_compact_prim(info->mode));
 
    /* Now draw the results without restart */
    struct pipe_draw_info new_info = {
@@ -4534,8 +4540,8 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    bool point_mode = MAX2(tcs->tess.point_mode, tes->tess.point_mode);
    enum mesa_prim out_prim = agx_tess_output_prim(tcs, tes);
 
-   enum libagx_tess_partitioning partitioning =
-      (enum libagx_tess_partitioning)pspacing;
+   enum poly_tess_partitioning partitioning =
+      (enum poly_tess_partitioning)pspacing;
 
    struct agx_bo *draw_bo = NULL;
    size_t draw_stride = 5 * sizeof(uint32_t);
@@ -4553,7 +4559,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    if (info->index_size)
       ib = agx_index_buffer_ptr(batch, info, draws, &ib_extent);
 
-   struct agx_ia_state ia = {
+   struct poly_ia_state ia = {
       .index_buffer = ib,
       .index_buffer_range_el = ib_extent,
       .verts_per_instance = draws ? draws->count : 0,
@@ -4568,7 +4574,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    uint64_t heap = agx_batch_heap(batch);
    assert((tcs->tess.output_stride & 3) == 0 && "must be aligned");
 
-   struct libagx_tess_args args = {
+   struct poly_tess_args args = {
       .heap = heap,
       .tcs_stride_el = tcs->tess.output_stride / 4,
       .statistic = agx_get_query_address(
@@ -4640,8 +4646,8 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       args.out_draws = blob.gpu + draw_offs;
       args.counts = blob.gpu + count_offs;
 
-      unsigned vb_size = libagx_tcs_in_size(draws->count * info->instance_count,
-                                            batch->uniforms.vertex_outputs);
+      unsigned vb_size = poly_tcs_in_size(draws->count * info->instance_count,
+                                          batch->uniforms.vertex_outputs);
       uint64_t addr = agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
       batch->uniforms.vertex_output_buffer_ptr =
          agx_pool_upload(&batch->pool, &addr, 8);
@@ -4712,11 +4718,11 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
    /* Generate counts, then prefix sum them, then finally tessellate. */
    libagx_tessellate(batch, tess_grid, AGX_BARRIER_ALL, mode,
-                     LIBAGX_TESS_MODE_COUNT, state);
+                     POLY_TESS_MODE_COUNT, state);
    libagx_prefix_sum_tess(batch, agx_1d(1024), AGX_BARRIER_ALL, state, c_prims,
                           c_invs, c_prims || c_invs);
    libagx_tessellate(batch, tess_grid, AGX_BARRIER_ALL, mode,
-                     LIBAGX_TESS_MODE_WITH_COUNTS, state);
+                     POLY_TESS_MODE_WITH_COUNTS, state);
 
    /* Face culling state needs to be specialized for tess */
    ctx->dirty |= AGX_DIRTY_RS;
@@ -5137,12 +5143,12 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       agx_launch_gs_prerast(batch, info, draws, indirect);
 
       /* Setup to rasterize the GS results */
-      struct agx_gs_info *gsi = &ctx->gs->gs;
+      struct poly_gs_info *gsi = &ctx->gs->gs;
       info_gs = (struct pipe_draw_info){
          .mode = gsi->mode,
-         .index_size = agx_gs_index_size(gsi->shape),
-         .primitive_restart = agx_gs_indexed(gsi->shape),
-         .restart_index = agx_gs_index_size(gsi->shape) == 1 ? 0xFF : ~0,
+         .index_size = poly_gs_index_size(gsi->shape),
+         .primitive_restart = poly_gs_indexed(gsi->shape),
+         .restart_index = poly_gs_index_size(gsi->shape) == 1 ? 0xFF : ~0,
          .index.resource = &index_rsrc.base,
          .instance_count = 1,
       };
@@ -5163,11 +5169,11 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
             u_decomposed_prims_for_vertices(info->mode, draws->count);
 
          draw_gs = (struct pipe_draw_start_count_bias){
-            .count = agx_gs_rast_vertices(gsi->shape, gsi->max_indices, prims,
-                                          info->instance_count),
+            .count = poly_gs_rast_vertices(gsi->shape, gsi->max_indices, prims,
+                                           info->instance_count),
          };
 
-         info_gs.instance_count = agx_gs_rast_instances(
+         info_gs.instance_count = poly_gs_rast_instances(
             gsi->shape, gsi->max_indices, prims, info->instance_count);
 
          draws = &draw_gs;
@@ -5180,10 +5186,10 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       batch->reduced_prim = u_reduced_prim(info->mode);
       ctx->dirty |= AGX_DIRTY_PRIM;
 
-      if (gsi->shape == AGX_GS_SHAPE_DYNAMIC_INDEXED) {
+      if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          ib = batch->geom_index;
          ib_extent = index_rsrc.bo->size - (batch->geom_index - ib);
-      } else if (gsi->shape == AGX_GS_SHAPE_STATIC_INDEXED) {
+      } else if (gsi->shape == POLY_GS_SHAPE_STATIC_INDEXED) {
          ib = agx_pool_upload(&batch->pool, gsi->topology, gsi->max_indices);
          ib_extent = gsi->max_indices;
       }

@@ -202,8 +202,7 @@ apply_nuw_to_offsets(isel_context* ctx, nir_function_impl* impl)
                apply_nuw_to_ssa(ctx, intrin->src[2].ssa);
             break;
          case nir_intrinsic_load_scratch: apply_nuw_to_ssa(ctx, intrin->src[0].ssa); break;
-         case nir_intrinsic_store_scratch:
-         case nir_intrinsic_load_smem_amd: apply_nuw_to_ssa(ctx, intrin->src[1].ssa); break;
+         case nir_intrinsic_store_scratch: apply_nuw_to_ssa(ctx, intrin->src[1].ssa); break;
          case nir_intrinsic_load_global_amd:
             if (nir_intrinsic_access(intrin) & ACCESS_SMEM_AMD)
                apply_nuw_to_ssa(ctx, intrin->src[1].ssa);
@@ -228,23 +227,6 @@ setup_tcs_info(isel_context* ctx)
 {
    ctx->tcs_in_out_eq = ctx->program->info.vs.tcs_in_out_eq;
    ctx->any_tcs_inputs_via_lds = ctx->program->info.vs.any_tcs_inputs_via_lds;
-}
-
-void
-setup_lds_size(isel_context* ctx, nir_shader* nir)
-{
-   /* TCS and GFX9 GS are special cases, already in units of the allocation granule. */
-   if (ctx->stage.has(SWStage::TCS))
-      ctx->program->config->lds_size = ctx->program->info.tcs.num_lds_blocks;
-   else if (ctx->stage.hw == AC_HW_LEGACY_GEOMETRY_SHADER && ctx->options->gfx_level >= GFX9)
-      ctx->program->config->lds_size = ctx->program->info.gfx9_gs_ring_lds_size;
-   else
-      ctx->program->config->lds_size =
-         DIV_ROUND_UP(nir->info.shared_size, ctx->program->dev.lds_encoding_granule);
-
-   /* Make sure we fit the available LDS space. */
-   assert((ctx->program->config->lds_size * ctx->program->dev.lds_encoding_granule) <=
-          ctx->program->dev.lds_limit);
 }
 
 void
@@ -382,7 +364,6 @@ init_context(isel_context* ctx, nir_shader* shader)
    nir_divergence_analysis_impl(impl, (nir_divergence_options)options);
 
    apply_nuw_to_offsets(ctx, impl);
-   ac_nir_flag_smem_for_loads(shader, ctx->program->gfx_level, false, true);
 
    if (shader->info.stage == MESA_SHADER_FRAGMENT) {
       nir_opt_load_skip_helpers_options skip_helper_options = {};
@@ -566,7 +547,6 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_ballot_relaxed:
                case nir_intrinsic_bindless_image_samples:
                case nir_intrinsic_load_scalar_arg_amd:
-               case nir_intrinsic_load_smem_amd:
                case nir_intrinsic_unit_test_uniform_amd: type = RegType::sgpr; break;
                case nir_intrinsic_load_input:
                case nir_intrinsic_load_per_primitive_input:
@@ -781,16 +761,15 @@ setup_isel_context(Program* program, unsigned shader_count, struct nir_shader* c
    calc_min_waves(program);
 
    unsigned scratch_size = 0;
-   for (unsigned i = 0; i < shader_count; i++) {
-      nir_shader* nir = shaders[i];
-      setup_nir(&ctx, nir);
-      setup_lds_size(&ctx, nir);
-   }
+   for (unsigned i = 0; i < shader_count; i++)
+      setup_nir(&ctx, shaders[i]);
 
    for (unsigned i = 0; i < shader_count; i++)
       scratch_size = std::max(scratch_size, shaders[i]->scratch_size);
 
    ctx.program->config->scratch_bytes_per_wave = align(scratch_size, 4) * ctx.program->wave_size;
+   ctx.program->config->lds_size = program->info.lds_size;
+   assert(ctx.program->config->lds_size <= ctx.program->dev.lds_limit);
 
    unsigned nir_num_blocks = 0;
    for (unsigned i = 0; i < shader_count; i++)

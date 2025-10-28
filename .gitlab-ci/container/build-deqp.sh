@@ -23,8 +23,8 @@ set -x
 # - the GL release produces `glcts`, and
 # - the GLES release produces `deqp-gles*` and `deqp-egl`
 
-DEQP_MAIN_COMMIT=9dd9a72b28218f1ca12777d9b73c2a85c5c60231
-DEQP_VK_VERSION=1.4.1.1
+DEQP_MAIN_COMMIT=db48c34bebaf3359453e44ab151a2ff9f9c58eb2
+DEQP_VK_VERSION=1.4.3.3
 DEQP_GL_VERSION=4.6.6.0
 DEQP_GLES_VERSION=3.2.12.0
 
@@ -46,8 +46,6 @@ main_cts_patch_files=(
 
 # shellcheck disable=SC2034
 vk_cts_commits_to_backport=(
-  # Stop querying device address from unbound buffers
-  046343f46f7d39d53b47842d7fd8ed3279528046
 )
 
 # shellcheck disable=SC2034
@@ -80,6 +78,15 @@ gles_cts_patch_files=(
   build-deqp-gl_Revert-Fix-issues-with-GLX-reset-notification-strate.patch
   build-deqp-gl_Revert-Fix-spurious-failures-when-using-a-config-wit.patch
 )
+
+if [ "${DEQP_TARGET}" = 'android' ]; then
+  gles_cts_patch_files+=(
+    build-deqp-Print-to-logcat-in-Android-executable-builds.patch
+  )
+  vk_cts_patch_files+=(
+    build-deqp-Print-to-logcat-in-Android-executable-builds.patch
+  )
+fi
 
 
 ### Careful editing anything below this line

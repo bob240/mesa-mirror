@@ -222,6 +222,42 @@ parseline_nowhitespace(const char *line, const char *fmt, ...)
       } else
 
 /*
+ * Helpers to decode pipe-id, etc
+ */
+
+static uint32_t
+statetype_id(const char *name)
+{
+   if (!is_a7xx())
+      return 0;
+   return enumval("a7xx_statetype_id", name);
+}
+
+static uint32_t
+pipe_id(const char *name)
+{
+   if (!name)
+      return 0;
+   return enumval("adreno_pipe", name);
+}
+
+static uint32_t
+debugbus_id(const char *name)
+{
+   if (!is_a7xx())
+      return 0;
+   return enumval("a7xx_debugbus_id", name);
+}
+
+static uint32_t
+cluster_id(const char *name)
+{
+   if (!is_a7xx())
+      return 0;
+   return enumval("a7xx_cluster", name);
+}
+
+/*
  * Decode ringbuffer section:
  */
 
@@ -553,7 +589,9 @@ decode_bos(void)
             dump_hex_ascii(buf, size, 1);
 
          add_buffer(iova, size, buf);
-         snapshot_gpu_object(iova, size, buf);
+
+         if (size <= 0x40000)
+            snapshot_gpu_object(iova, size, buf);
 
          continue;
       }
@@ -650,7 +688,8 @@ decode_clusters(void)
       } else if (startswith_nowhitespace(line, "- location:")) {
          parseline_nowhitespace(line, "- location: %u", &location);
       } else if (startswith_nowhitespace(line, "- pipe:")) {
-         snapshot_cluster_regs(pipe_name, cluster_name, context, location);
+         snapshot_cluster_regs(pipe_id(pipe_name), cluster_id(cluster_name),
+                               context, location);
 
          free(pipe_name);
          parseline_nowhitespace(line, "- pipe: %ms", &pipe_name);
@@ -674,7 +713,10 @@ decode_clusters(void)
       printf("%s", line);
    }
 
-   snapshot_cluster_regs(pipe_name, cluster_name, context, location);
+   if (reg_buf.count) {
+      snapshot_cluster_regs(pipe_id(pipe_name), cluster_id(cluster_name),
+                            context, location);
+   }
 
    free(cluster_name);
    free(pipe_name);
@@ -935,7 +977,8 @@ decode_shader_blocks(void)
          if (dump)
             dump_hex_ascii(buf, 4 * sizedwords, 1);
 
-         snapshot_shader_block(type, pipe, sp, usptp, location, buf, sizedwords);
+         snapshot_shader_block(statetype_id(type), pipe_id(pipe),
+                               sp, usptp, location, buf, sizedwords);
 
          free(buf);
 
@@ -975,7 +1018,7 @@ decode_debugbus(void)
 
          if (dump)
             dump_hex_ascii(buf, 4 * sizedwords, 1);
-         snapshot_debugbus(block, buf, sizedwords);
+         snapshot_debugbus(debugbus_id(block), buf, sizedwords);
 
          free(buf);
 

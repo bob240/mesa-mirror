@@ -88,7 +88,7 @@ Interference::initialize(ComponentInterference& comp_interference,
       comp_interference.prepare_row(row);
       for (size_t col = 0; col < row; ++col) {
          auto& col_entry = clr[col];
-         if (row_entry.m_end >= col_entry.m_start && row_entry.m_start <= col_entry.m_end)
+         if (row_entry.m_end > col_entry.m_start && row_entry.m_start < col_entry.m_end)
             comp_interference.add(row, col);
       }
    }
@@ -393,7 +393,11 @@ register_allocation(LiveRangeMap& lrm)
       for (auto& entry : comp) {
          sfn_log << SfnLog::merge << "Set " << *entry.m_register << " to ";
          entry.m_register->set_sel(entry.m_color);
+         /* No need for any pinning past this point, keeping the flags just makes
+          * testing more difficult.
+          */
          entry.m_register->set_pin(pin_none);
+         entry.m_register->reset_flag(Register::pin_start);
          sfn_log << SfnLog::merge << *entry.m_register << "\n";
       }
    }

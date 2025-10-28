@@ -91,8 +91,13 @@ tu_lrz_disable_reason(struct tu_cmd_buffer *cmd, const char *reason) {
               cmd->state.rp.lrz_disabled_at_draw);
 }
 
-static inline void
-tu_lrz_write_disable_reason(struct tu_cmd_buffer *cmd, const char *reason) {
+void
+tu_lrz_disable_write_for_rp(struct tu_cmd_buffer *cmd, const char *reason)
+{
+   if (cmd->state.lrz.disable_write_for_rp)
+      return;
+
+   cmd->state.lrz.disable_write_for_rp = true;
    cmd->state.rp.lrz_write_disabled_at_draw = cmd->state.rp.drawcall_count;
    perf_debug(
       cmd->device,
@@ -232,6 +237,8 @@ tu_lrz_init_state(struct tu_cmd_buffer *cmd,
    cmd->state.lrz.valid = true;
    cmd->state.lrz.valid_at_start = true;
    cmd->state.lrz.disable_write_for_rp = false;
+   cmd->state.lrz.color_written_with_z_test = false;
+   cmd->state.lrz.has_lrz_write_with_skipped_color_writes = false;
    cmd->state.lrz.prev_direction = TU_LRZ_UNKNOWN;
    /* Be optimistic and unconditionally enable fast-clear in
     * secondary cmdbufs and when reusing previous LRZ state.
@@ -267,6 +274,8 @@ tu_lrz_init_secondary(struct tu_cmd_buffer *cmd,
    cmd->state.lrz.valid = true;
    cmd->state.lrz.valid_at_start = true;
    cmd->state.lrz.disable_write_for_rp = false;
+   cmd->state.lrz.color_written_with_z_test = false;
+   cmd->state.lrz.has_lrz_write_with_skipped_color_writes = false;
    cmd->state.lrz.prev_direction = TU_LRZ_UNKNOWN;
    cmd->state.lrz.gpu_dir_tracking = has_gpu_tracking;
 
@@ -370,6 +379,20 @@ tu_lrz_begin_renderpass(struct tu_cmd_buffer *cmd)
    if (!cmd->state.lrz.valid_at_start) {
       tu6_write_lrz_cntl<CHIP>(cmd, &cmd->cs, {});
       tu6_emit_lrz_buffer<CHIP>(&cmd->cs, NULL);
+   }
+
+   /* Multisample and single-sample LRZ layout are different, so when
+    * unresolving a depth image we have to disable LRZ for the entirety of the
+    * render pass.
+    */
+   for (unsigned i = 0; i < cmd->state.pass->subpass_count; i++) {
+      const struct tu_subpass *subpass = &cmd->state.pass->subpasses[i];
+      if (subpass->depth_stencil_attachment.attachment != VK_ATTACHMENT_UNUSED &&
+          subpass->unresolve_count > subpass->color_count &&
+          subpass->unresolve_attachments[subpass->color_count].attachment !=
+          VK_ATTACHMENT_UNUSED) {
+         tu_lrz_disable_during_renderpass<CHIP>(cmd, "multisampled_render_to_single_sample with LOAD_OP_LOAD");
+      }
    }
 }
 TU_GENX(tu_lrz_begin_renderpass);
@@ -718,7 +741,8 @@ tu_lrz_flush_valid_during_renderpass(struct tu_cmd_buffer *cmd,
    /* Even if state is valid, we cannot be sure that secondary
     * command buffer has the same sticky disable_write_for_rp.
     */
-   if (cmd->state.lrz.valid && !cmd->state.lrz.disable_write_for_rp)
+   if (cmd->state.lrz.valid && !cmd->state.lrz.disable_write_for_rp &&
+       !cmd->state.lrz.has_lrz_write_with_skipped_color_writes)
       return;
 
    tu6_write_lrz_reg(cmd, cs, A6XX_GRAS_LRZ_VIEW_INFO(
@@ -764,7 +788,7 @@ tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
    }
 
    /* See comment in tu_pipeline about disabling LRZ write for blending. */
-   bool reads_dest = cmd->state.blend_reads_dest;
+   enum tu_lrz_blend_status blend_status = cmd->state.lrz_blend_status;
 
    gras_lrz_cntl.enable = true;
    gras_lrz_cntl.lrz_write =
@@ -929,10 +953,8 @@ tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
       /* Stencil test happens after LRZ is written, so if stencil could kill
        * the fragment - we cannot write LRZ.
        */
-      if (!cmd->state.lrz.disable_write_for_rp &&
-          frag_may_be_killed_by_stencil) {
-         tu_lrz_write_disable_reason(cmd, "Stencil may kill fragments");
-         cmd->state.lrz.disable_write_for_rp = true;
+      if (frag_may_be_killed_by_stencil) {
+         tu_lrz_disable_write_for_rp(cmd, "Stencil may kill fragments");
       }
 
       /* Because the LRZ test runs first, failing the LRZ test may result in
@@ -966,11 +988,26 @@ tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
     * enable LRZ write.  But this would cause early-z/lrz to discard
     * fragments from draw A which should be visible due to draw B.
     */
-   if (reads_dest && z_write_enable && cmd->device->instance->conservative_lrz) {
-      if (!cmd->state.lrz.disable_write_for_rp) {
-         tu_lrz_write_disable_reason(cmd, "Depth write + blending");
-         cmd->state.lrz.disable_write_for_rp = true;
+   if (blend_status == TU_LRZ_BLEND_READS_DEST_OR_PARTIAL_WRITE &&
+       z_write_enable && cmd->device->instance->conservative_lrz) {
+      tu_lrz_disable_write_for_rp(cmd, "Depth write + blending");
+   }
+
+   /* This is a special case because we want to avoid disabling LRZ when a
+    * renderpass starts with depth-only draw calls, or consists entirely
+    * of them, but also has color attachments.
+    */
+   if (blend_status == TU_LRZ_BLEND_ALL_COLOR_WRITES_SKIPPED &&
+       z_write_enable && cmd->device->instance->conservative_lrz) {
+      if (cmd->state.lrz.color_written_with_z_test) {
+         tu_lrz_disable_write_for_rp(cmd, "Depth write + no color writes");
       }
+      cmd->state.lrz.has_lrz_write_with_skipped_color_writes = true;
+   }
+
+   if (z_test_enable &&
+       blend_status != TU_LRZ_BLEND_ALL_COLOR_WRITES_SKIPPED) {
+      cmd->state.lrz.color_written_with_z_test = true;
    }
 
    /* If the stencil test behavior depends on the result of the depth test, we
@@ -986,8 +1023,7 @@ tu6_calculate_lrz_state(struct tu_cmd_buffer *cmd,
     * test fails then we need to disable the LRZ test for the draw as well.
     */
    if (cmd->state.stencil_written_based_on_depth_test) {
-      tu_lrz_write_disable_reason(cmd, "stencil write based on depth test");
-      cmd->state.lrz.disable_write_for_rp = true;
+      tu_lrz_disable_write_for_rp(cmd, "stencil write based on depth test");
    }
 
    if (disable_lrz)

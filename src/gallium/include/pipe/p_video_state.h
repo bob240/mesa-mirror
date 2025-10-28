@@ -1931,6 +1931,7 @@ struct pipe_vp9_picture_desc
          uint32_t  segmentation_enabled:1;
          uint32_t  segmentation_temporal_update:1;
          uint32_t  segmentation_update_map:1;
+         uint32_t  segmentation_update_data:1;
          uint32_t  last_ref_frame:3;
          uint32_t  last_ref_frame_sign_bias:1;
          uint32_t  golden_ref_frame:3;
@@ -1938,6 +1939,7 @@ struct pipe_vp9_picture_desc
          uint32_t  alt_ref_frame:3;
          uint32_t  alt_ref_frame_sign_bias:1;
          uint32_t  lossless_flag:1;
+         uint32_t  use_prev_frame_mvs:1;
       } pic_fields;
 
       uint8_t filter_level;
@@ -1965,8 +1967,8 @@ struct pipe_vp9_picture_desc
       int8_t uv_ac_delta_q;
       int8_t uv_dc_delta_q;
       uint8_t abs_delta;
-      uint8_t ref_deltas[4];
-      uint8_t mode_deltas[2];
+      int8_t ref_deltas[4];
+      int8_t mode_deltas[2];
    } picture_parameter;
 
    struct {
@@ -2185,10 +2187,8 @@ struct pipe_vpp_desc
    struct pipe_video_buffer *dst;
 
    uint32_t background_color;
-   enum pipe_video_vpp_color_standard_type in_colors_standard;
    enum pipe_video_vpp_color_range in_color_range;
    enum pipe_video_vpp_chroma_siting in_chroma_siting;
-   enum pipe_video_vpp_color_standard_type out_colors_standard;
    enum pipe_video_vpp_color_range out_color_range;
    enum pipe_video_vpp_chroma_siting out_chroma_siting;
 

@@ -33,11 +33,12 @@ glsl_util_files = files(
     'mesa/program/dummy_errors.c',
 )
 
-sha1_h = vcs_tag(
-  input : 'git_sha1.h.in',
+sha1_h = custom_target(
+  'git_sha1.h',
   output : 'git_sha1.h',
-  command : ['git', 'show', '--no-patch', '--abbrev=10', '--format=" (git-%h)"'],
-  fallback : '""',
+  command : [prog_python, git_sha1_gen_py, '--output', '@OUTPUT@'],
+  build_by_default : true,
+  build_always_stale : true, # commit sha1 can change without having touched these files
 )
 
 if cc.get_argument_syntax() == 'msvc'
@@ -52,6 +53,9 @@ if with_gallium_or_lvp or with_gbm or with_platform_wayland
   subdir('loader')
 endif
 subdir('compiler')
+if with_poly
+  subdir('poly')
+endif
 if with_tools.contains('drm-shim')
   subdir('drm-shim')
 endif
@@ -109,6 +113,9 @@ if with_gfxstream_vk
 endif
 if with_gallium_asahi or with_asahi_vk or with_tools.contains('asahi')
   subdir('asahi')
+endif
+if with_kosmickrisp_vk
+  subdir('kosmickrisp')
 endif
 if with_gallium
   subdir('mesa')

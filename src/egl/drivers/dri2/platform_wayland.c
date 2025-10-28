@@ -339,8 +339,7 @@ dri2_wl_formats_init(struct dri2_wl_formats *formats)
     * represent all the formats of dri2_wl_visuals. We use BITSET_WORDS for
     * this task. */
    formats->num_formats = ARRAY_SIZE(dri2_wl_visuals);
-   formats->formats_bitmap = calloc(BITSET_WORDS(formats->num_formats),
-                                    sizeof(*formats->formats_bitmap));
+   formats->formats_bitmap = BITSET_CALLOC(formats->num_formats);
    if (!formats->formats_bitmap)
       goto err;
 
@@ -617,8 +616,7 @@ surface_dmabuf_feedback_tranche_done(
    struct dmabuf_feedback *feedback = &dri2_surf->pending_dmabuf_feedback;
 
    /* Add tranche to array of tranches. */
-   util_dynarray_append(&feedback->tranches, struct dmabuf_feedback_tranche,
-                        feedback->pending_tranche);
+   util_dynarray_append(&feedback->tranches, feedback->pending_tranche);
 
    dmabuf_feedback_tranche_init(&feedback->pending_tranche);
 }

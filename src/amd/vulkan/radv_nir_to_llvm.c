@@ -57,7 +57,7 @@ create_llvm_function(struct ac_llvm_context *ctx, LLVMModuleRef module, LLVMBuil
    }
 
    ac_llvm_set_workgroup_size(main_function.value, max_workgroup_size);
-   ac_llvm_set_target_features(main_function.value, ctx, true);
+   ac_llvm_set_target_features(main_function.value, ctx, options->wgp_mode);
 
    return main_function;
 }
@@ -390,6 +390,7 @@ ac_compile_llvm_module(struct ac_llvm_compiler *ac_llvm, LLVMModuleRef llvm_modu
 
    rbin->base.type = RADV_BINARY_TYPE_RTLD;
    rbin->base.total_size = alloc_size;
+   rbin->base.config.wgp_mode = options->wgp_mode;
    rbin->elf_size = elf_size;
    rbin->llvm_ir_size = llvm_ir_size;
    *rbinary = &rbin->base;

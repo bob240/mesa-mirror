@@ -23,7 +23,7 @@
 
 #include "anv_nir.h"
 #include "nir/nir_builder.h"
-#include "compiler/brw_nir.h"
+#include "compiler/brw/brw_nir.h"
 #include "util/mesa-sha1.h"
 #include "util/set.h"
 
@@ -1897,7 +1897,6 @@ lower_load_constant(nir_builder *b, nir_intrinsic_instr *intrin,
 
    unsigned load_size = intrin->def.num_components *
                         intrin->def.bit_size / 8;
-   unsigned load_align = intrin->def.bit_size / 8;
 
    assert(load_size < b->shader->constant_data_size);
    unsigned max_offset = b->shader->constant_data_size - load_size;
@@ -1905,15 +1904,14 @@ lower_load_constant(nir_builder *b, nir_intrinsic_instr *intrin,
 
    nir_def *const_data_addr = nir_pack_64_2x32_split(b,
       nir_iadd(b,
-         nir_load_reloc_const_intel(b, BRW_SHADER_RELOC_CONST_DATA_ADDR_LOW),
+         nir_load_reloc_const_intel(b, INTEL_SHADER_RELOC_CONST_DATA_ADDR_LOW),
          offset),
-      nir_load_reloc_const_intel(b, BRW_SHADER_RELOC_CONST_DATA_ADDR_HIGH));
+      nir_load_reloc_const_intel(b, INTEL_SHADER_RELOC_CONST_DATA_ADDR_HIGH));
 
    nir_def *data =
-      nir_load_global_constant(b, const_data_addr,
-                               load_align,
-                               intrin->def.num_components,
-                               intrin->def.bit_size);
+      nir_load_global_constant(b, intrin->def.num_components,
+                               intrin->def.bit_size,
+                               const_data_addr);
 
    nir_def_rewrite_uses(&intrin->def, data);
 
@@ -2075,7 +2073,7 @@ lower_num_workgroups(nir_builder *b, nir_intrinsic_instr *intrin,
       nir_def *addr = nir_pack_64_2x32_split(b,
                                              nir_channel(b, num_workgroups, 1),
                                              nir_channel(b, num_workgroups, 2));
-      num_workgroups_indirect = nir_load_global_constant(b, addr, 4, 3, 32);
+      num_workgroups_indirect = nir_load_global_constant(b, 3, 32, addr);
    }
    nir_pop_if(b, NULL);
 

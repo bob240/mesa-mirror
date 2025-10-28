@@ -382,43 +382,16 @@ radv_emit_tess_factor_ring(struct radv_device *device, struct radv_cmd_stream *c
                            struct radeon_winsys_bo *tess_rings_bo)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   uint64_t tf_va;
-   uint32_t tf_ring_size;
+   uint64_t va;
+
    if (!tess_rings_bo)
       return;
 
-   tf_ring_size = pdev->info.tess_factor_ring_size / 4;
-   tf_va = radv_buffer_get_va(tess_rings_bo) + pdev->info.tess_offchip_ring_size;
+   va = radv_buffer_get_va(tess_rings_bo);
 
    radv_cs_add_buffer(device->ws, cs->b, tess_rings_bo);
 
-   radeon_begin(cs);
-
-   if (pdev->info.gfx_level >= GFX7) {
-      if (pdev->info.gfx_level >= GFX11) {
-         /* TF_RING_SIZE is per SE on GFX11. */
-         tf_ring_size /= pdev->info.max_se;
-      }
-
-      radeon_set_uconfig_reg(R_030938_VGT_TF_RING_SIZE, S_030938_SIZE(tf_ring_size));
-      radeon_set_uconfig_reg(R_030940_VGT_TF_MEMORY_BASE, tf_va >> 8);
-
-      if (pdev->info.gfx_level >= GFX12) {
-         radeon_set_uconfig_reg(R_03099C_VGT_TF_MEMORY_BASE_HI, S_03099C_BASE_HI(tf_va >> 40));
-      } else if (pdev->info.gfx_level >= GFX10) {
-         radeon_set_uconfig_reg(R_030984_VGT_TF_MEMORY_BASE_HI, S_030984_BASE_HI(tf_va >> 40));
-      } else if (pdev->info.gfx_level == GFX9) {
-         radeon_set_uconfig_reg(R_030944_VGT_TF_MEMORY_BASE_HI, S_030944_BASE_HI(tf_va >> 40));
-      }
-
-      radeon_set_uconfig_reg(R_03093C_VGT_HS_OFFCHIP_PARAM, pdev->info.hs_offchip_param);
-   } else {
-      radeon_set_config_reg(R_008988_VGT_TF_RING_SIZE, S_008988_SIZE(tf_ring_size));
-      radeon_set_config_reg(R_0089B8_VGT_TF_MEMORY_BASE, tf_va >> 8);
-      radeon_set_config_reg(R_0089B0_VGT_HS_OFFCHIP_PARAM, pdev->info.hs_offchip_param);
-   }
-
-   radeon_end();
+   ac_emit_cp_tess_rings(cs->b, &pdev->info, va);
 }
 
 static VkResult
@@ -487,24 +460,13 @@ radv_emit_graphics_scratch(struct radv_device *device, struct radv_cmd_stream *c
    if (!scratch_bo)
       return;
 
+   const uint64_t va = radv_buffer_get_va(scratch_bo);
+
    ac_get_scratch_tmpring_size(gpu_info, waves, size_per_wave, &tmpring_size);
 
    radv_cs_add_buffer(device->ws, cs->b, scratch_bo);
 
-   radeon_begin(cs);
-
-   if (gpu_info->gfx_level >= GFX11) {
-      uint64_t va = radv_buffer_get_va(scratch_bo);
-
-      radeon_set_context_reg_seq(R_0286E8_SPI_TMPRING_SIZE, 3);
-      radeon_emit(tmpring_size);
-      radeon_emit(va >> 8);  /* SPI_GFX_SCRATCH_BASE_LO */
-      radeon_emit(va >> 40); /* SPI_GFX_SCRATCH_BASE_HI */
-   } else {
-      radeon_set_context_reg(R_0286E8_SPI_TMPRING_SIZE, tmpring_size);
-   }
-
-   radeon_end();
+   ac_emit_cp_gfx_scratch(cs->b, pdev->info.gfx_level, va, tmpring_size);
 }
 
 static void
@@ -635,73 +597,19 @@ radv_emit_ge_rings(struct radv_device *device, struct radv_cmd_stream *cs, struc
    if (!ge_rings_bo)
       return;
 
-   assert(pdev->info.gfx_level >= GFX11);
-
    va = radv_buffer_get_va(ge_rings_bo);
-   assert((va >> 32) == pdev->info.address32_hi);
 
    radv_cs_add_buffer(device->ws, cs->b, ge_rings_bo);
-
-   radeon_begin(cs);
 
    /* We must wait for idle using an EOP event before changing the attribute ring registers. Use the
     * bottom-of-pipe EOP event, but increment the PWS counter instead of writing memory.
     */
-   radeon_emit(PKT3(PKT3_RELEASE_MEM, 6, 0));
-   radeon_emit(S_490_EVENT_TYPE(V_028A90_BOTTOM_OF_PIPE_TS) | S_490_EVENT_INDEX(5) | S_490_PWS_ENABLE(1));
-   radeon_emit(0); /* DST_SEL, INT_SEL, DATA_SEL */
-   radeon_emit(0); /* ADDRESS_LO */
-   radeon_emit(0); /* ADDRESS_HI */
-   radeon_emit(0); /* DATA_LO */
-   radeon_emit(0); /* DATA_HI */
-   radeon_emit(0); /* INT_CTXID */
+   ac_emit_cp_release_mem_pws(cs->b, pdev->info.gfx_level, AMD_IP_GFX, V_028A90_BOTTOM_OF_PIPE_TS, 0);
 
    /* Wait for the PWS counter. */
-   radeon_emit(PKT3(PKT3_ACQUIRE_MEM, 6, 0));
-   radeon_emit(S_580_PWS_STAGE_SEL(V_580_CP_ME) | S_580_PWS_COUNTER_SEL(V_580_TS_SELECT) | S_580_PWS_ENA2(1) |
-               S_580_PWS_COUNT(0));
-   radeon_emit(0xffffffff); /* GCR_SIZE */
-   radeon_emit(0x01ffffff); /* GCR_SIZE_HI */
-   radeon_emit(0);          /* GCR_BASE_LO */
-   radeon_emit(0);          /* GCR_BASE_HI */
-   radeon_emit(S_585_PWS_ENA(1));
-   radeon_emit(0); /* GCR_CNTL */
+   ac_emit_cp_acquire_mem_pws(cs->b, pdev->info.gfx_level, AMD_IP_GFX, V_028A90_BOTTOM_OF_PIPE_TS, V_580_CP_ME, 0, 0);
 
-   /* The PS will read inputs from this address. */
-   radeon_set_uconfig_reg_seq(R_031110_SPI_GS_THROTTLE_CNTL1, 4);
-   radeon_emit(0x12355123); /* SPI_GS_THROTTLE_CNTL1 */
-   radeon_emit(0x1544D);    /* SPI_GS_THROTTLE_CNTL2 */
-   radeon_emit(va >> 16);   /* SPI_ATTRIBUTE_RING_BASE */
-   radeon_emit(S_03111C_MEM_SIZE((pdev->info.attribute_ring_size_per_se >> 16) - 1) |
-               S_03111C_BIG_PAGE(pdev->info.discardable_allows_big_page) |
-               S_03111C_L1_POLICY(1)); /* SPI_ATTRIBUTE_RING_SIZE */
-
-   if (pdev->info.gfx_level >= GFX12) {
-      const uint64_t pos_address = va + pdev->info.pos_ring_offset;
-      const uint64_t prim_address = va + pdev->info.prim_ring_offset;
-
-      /* When one of these 4 registers is updated, all 4 must be updated. */
-      radeon_set_uconfig_reg_seq(R_0309A0_GE_POS_RING_BASE, 4);
-      radeon_emit(pos_address >> 16);                                       /* R_0309A0_GE_POS_RING_BASE */
-      radeon_emit(S_0309A4_MEM_SIZE(pdev->info.pos_ring_size_per_se >> 5)); /* R_0309A4_GE_POS_RING_SIZE */
-      radeon_emit(prim_address >> 16);                                      /* R_0309A8_GE_PRIM_RING_BASE */
-      radeon_emit(S_0309AC_MEM_SIZE(pdev->info.prim_ring_size_per_se >> 5) | S_0309AC_SCOPE(gfx12_scope_device) |
-                  S_0309AC_PAF_TEMPORAL(gfx12_store_high_temporal_stay_dirty) |
-                  S_0309AC_PAB_TEMPORAL(gfx12_load_last_use_discard) | S_0309AC_SPEC_DATA_READ(gfx12_spec_read_auto) |
-                  S_0309AC_FORCE_SE_SCOPE(1) | S_0309AC_PAB_NOFILL(1)); /* R_0309AC_GE_PRIM_RING_SIZE */
-
-      if (pdev->info.gfx_level == GFX12 && pdev->info.pfp_fw_version >= 2680) {
-         /* Mitigate the HiZ GPU hang by increasing a timeout when BOTTOM_OF_PIPE_TS is used as the
-          * workaround. This must be emitted when the gfx queue is idle.
-          */
-         const uint32_t timeout = pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_PARTIAL ? 0xfff : 0;
-
-         radeon_emit(PKT3(PKT3_UPDATE_DB_SUMMARIZER_TIMEOUT, 0, 0));
-         radeon_emit(S_EF1_SUMM_CNTL_EVICT_TIMEOUT(timeout));
-      }
-   }
-
-   radeon_end();
+   ac_emit_cp_gfx11_ge_rings(cs->b, &pdev->info, va, pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_PARTIAL);
 }
 
 static void
@@ -745,7 +653,7 @@ radv_emit_compute(struct radv_device *device, struct radv_cmd_stream *cs, bool i
                      S_00B8BC_INTERLEAVE_1D(preamble_state.gfx11.compute_dispatch_interleave));
 
    ac_pm4_finalize(pm4);
-   radv_emit_pm4_commands(cs, pm4);
+   ac_pm4_emit_commands(cs->b, pm4);
    ac_pm4_free_state(pm4);
 }
 
@@ -923,7 +831,7 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
    }
 
    ac_pm4_finalize(pm4);
-   radv_emit_pm4_commands(cs, pm4);
+   ac_pm4_emit_commands(cs->b, pm4);
    ac_pm4_free_state(pm4);
 
    radv_emit_compute(device, cs, false);
@@ -1121,11 +1029,13 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
       ws->buffer_unmap(ws, descriptor_bo, false);
    }
 
+   const enum amd_ip_type hw_ip = radv_queue_family_to_ring(pdev, queue->qf);
+
    for (int i = 0; i < 3; ++i) {
       enum rgp_flush_bits sqtt_flush_bits = 0;
       struct radv_cmd_stream *cs = NULL;
 
-      result = radv_create_cmd_stream(device, queue->qf, false, &cs);
+      result = radv_create_cmd_stream(device, hw_ip, false, &cs);
       if (result != VK_SUCCESS)
          goto fail;
 
@@ -1190,7 +1100,7 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
                flush_bits |= RADV_CMD_FLAG_PS_PARTIAL_FLUSH;
          }
 
-         radv_cs_emit_cache_flush(ws, cs, gfx_level, NULL, 0, queue->qf, flush_bits, &sqtt_flush_bits, 0);
+         radv_cs_emit_cache_flush(ws, cs, gfx_level, NULL, 0, flush_bits, &sqtt_flush_bits, 0);
       }
 
       result = radv_finalize_cmd_stream(device, cs);
@@ -1385,7 +1295,7 @@ radv_create_flush_postamble(struct radv_queue *queue)
    struct radv_cmd_stream *cs;
    VkResult result;
 
-   result = radv_create_cmd_stream(device, queue->state.qf, false, &cs);
+   result = radv_create_cmd_stream(device, ip, false, &cs);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1406,7 +1316,7 @@ radv_create_flush_postamble(struct radv_queue *queue)
    }
 
    enum rgp_flush_bits sqtt_flush_bits = 0;
-   radv_cs_emit_cache_flush(ws, cs, gfx_level, NULL, 0, queue->state.qf, flush_bits, &sqtt_flush_bits, 0);
+   radv_cs_emit_cache_flush(ws, cs, gfx_level, NULL, 0, flush_bits, &sqtt_flush_bits, 0);
 
    result = radv_finalize_cmd_stream(device, cs);
    if (result != VK_SUCCESS) {
@@ -1423,6 +1333,7 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
 {
    struct radv_device *device = radv_queue_device(queue);
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   const enum amd_ip_type ip = radv_queue_family_to_ring(pdev, queue->state.qf);
 
    if (queue->gang_sem_bo)
       return VK_SUCCESS;
@@ -1444,19 +1355,19 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
    struct radv_cmd_stream *leader_pre_cs = NULL, *leader_post_cs = NULL;
    struct radv_cmd_stream *ace_pre_cs = NULL, *ace_post_cs = NULL;
 
-   r = radv_create_cmd_stream(device, queue->state.qf, false, &leader_pre_cs);
+   r = radv_create_cmd_stream(device, ip, false, &leader_pre_cs);
    if (r != VK_SUCCESS)
       goto fail;
 
-   radv_create_cmd_stream(device, queue->state.qf, false, &leader_post_cs);
+   radv_create_cmd_stream(device, ip, false, &leader_post_cs);
    if (r != VK_SUCCESS)
       goto fail;
 
-   radv_create_cmd_stream(device, RADV_QUEUE_COMPUTE, false, &ace_pre_cs);
+   radv_create_cmd_stream(device, AMD_IP_COMPUTE, false, &ace_pre_cs);
    if (r != VK_SUCCESS)
       goto fail;
 
-   radv_create_cmd_stream(device, RADV_QUEUE_COMPUTE, false, &ace_post_cs);
+   radv_create_cmd_stream(device, AMD_IP_COMPUTE, false, &ace_post_cs);
    if (r != VK_SUCCESS)
       goto fail;
 
@@ -1481,19 +1392,19 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
     * in a multi-process environment, because task shader dispatches are not
     * meant to be executed on multiple compute engines at the same time.
     */
-   radv_cp_wait_mem(ace_pre_cs, RADV_QUEUE_COMPUTE, WAIT_REG_MEM_GREATER_OR_EQUAL, ace_wait_va, 1, 0xffffffff);
-   radv_cs_write_data(device, ace_pre_cs, RADV_QUEUE_COMPUTE, V_370_ME, ace_wait_va, 1, &zero, false);
-   radv_cs_write_data(device, leader_pre_cs, queue->state.qf, V_370_ME, ace_wait_va, 1, &one, false);
+   radv_cp_wait_mem(ace_pre_cs, WAIT_REG_MEM_GREATER_OR_EQUAL, ace_wait_va, 1, 0xffffffff);
+   radv_cs_write_data(device, ace_pre_cs, V_370_ME, ace_wait_va, 1, &zero, false);
+   radv_cs_write_data(device, leader_pre_cs, V_370_ME, ace_wait_va, 1, &one, false);
    /* Create postambles for gang submission.
     * This ensures that the gang leader waits for the whole gang,
     * which is necessary because the kernel signals the userspace fence
     * as soon as the gang leader is done, which may lead to bugs because the
     * same command buffers could be submitted again while still being executed.
     */
-   radv_cp_wait_mem(leader_post_cs, queue->state.qf, WAIT_REG_MEM_GREATER_OR_EQUAL, leader_wait_va, 1, 0xffffffff);
-   radv_cs_write_data(device, leader_post_cs, queue->state.qf, V_370_ME, leader_wait_va, 1, &zero, false);
-   radv_cs_emit_write_event_eop(ace_post_cs, pdev->info.gfx_level, RADV_QUEUE_COMPUTE, V_028A90_BOTTOM_OF_PIPE_TS, 0,
-                                EOP_DST_SEL_MEM, EOP_DATA_SEL_VALUE_32BIT, leader_wait_va, 1, 0);
+   radv_cp_wait_mem(leader_post_cs, WAIT_REG_MEM_GREATER_OR_EQUAL, leader_wait_va, 1, 0xffffffff);
+   radv_cs_write_data(device, leader_post_cs, V_370_ME, leader_wait_va, 1, &zero, false);
+   radv_cs_emit_write_event_eop(ace_post_cs, pdev->info.gfx_level, V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM,
+                                EOP_INT_SEL_SEND_DATA_AFTER_WR_CONFIRM, EOP_DATA_SEL_VALUE_32BIT, leader_wait_va, 1, 0);
 
    r = radv_finalize_cmd_stream(device, leader_pre_cs);
    if (r != VK_SUCCESS)
@@ -1592,7 +1503,7 @@ radv_create_perf_counter_lock_cs(struct radv_device *device, unsigned pass, bool
    if (*cs_ref)
       return *cs_ref;
 
-   result = radv_create_cmd_stream(device, RADV_QUEUE_GENERAL, false, &cs);
+   result = radv_create_cmd_stream(device, AMD_IP_GFX, false, &cs);
    if (result != VK_SUCCESS)
       return NULL;
 
@@ -1600,54 +1511,29 @@ radv_create_perf_counter_lock_cs(struct radv_device *device, unsigned pass, bool
 
    radv_cs_add_buffer(device->ws, cs->b, device->perf_counter_bo);
 
-   radeon_begin(cs);
-
    if (!unlock) {
       uint64_t mutex_va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_LOCK_OFFSET;
-      radeon_emit(PKT3(PKT3_ATOMIC_MEM, 7, 0));
-      radeon_emit(ATOMIC_OP(TC_OP_ATOMIC_CMPSWAP_32) | ATOMIC_COMMAND(ATOMIC_COMMAND_LOOP));
-      radeon_emit(mutex_va);       /* addr lo */
-      radeon_emit(mutex_va >> 32); /* addr hi */
-      radeon_emit(1);              /* data lo */
-      radeon_emit(0);              /* data hi */
-      radeon_emit(0);              /* compare data lo */
-      radeon_emit(0);              /* compare data hi */
-      radeon_emit(10);             /* loop interval */
+
+      ac_emit_cp_atomic_mem(cs->b, TC_OP_ATOMIC_CMPSWAP_32, ATOMIC_COMMAND_LOOP, mutex_va, 1, 0);
    }
 
    uint64_t va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_PASS_OFFSET;
    uint64_t unset_va = va + (unlock ? 8 * pass : 0);
    uint64_t set_va = va + (unlock ? 0 : 8 * pass);
 
-   radeon_emit(PKT3(PKT3_COPY_DATA, 4, 0));
-   radeon_emit(COPY_DATA_SRC_SEL(COPY_DATA_IMM) | COPY_DATA_DST_SEL(COPY_DATA_DST_MEM) | COPY_DATA_COUNT_SEL |
-               COPY_DATA_WR_CONFIRM);
-   radeon_emit(0); /* immediate */
-   radeon_emit(0);
-   radeon_emit(unset_va);
-   radeon_emit(unset_va >> 32);
+   ac_emit_cp_copy_data(cs->b, COPY_DATA_IMM, COPY_DATA_DST_MEM, 0, unset_va,
+                        AC_CP_COPY_DATA_COUNT_SEL | AC_CP_COPY_DATA_WR_CONFIRM, false);
 
-   radeon_emit(PKT3(PKT3_COPY_DATA, 4, 0));
-   radeon_emit(COPY_DATA_SRC_SEL(COPY_DATA_IMM) | COPY_DATA_DST_SEL(COPY_DATA_DST_MEM) | COPY_DATA_COUNT_SEL |
-               COPY_DATA_WR_CONFIRM);
-   radeon_emit(1); /* immediate */
-   radeon_emit(0);
-   radeon_emit(set_va);
-   radeon_emit(set_va >> 32);
+   ac_emit_cp_copy_data(cs->b, COPY_DATA_IMM, COPY_DATA_DST_MEM, 1, set_va,
+                        AC_CP_COPY_DATA_COUNT_SEL | AC_CP_COPY_DATA_WR_CONFIRM, false);
 
    if (unlock) {
       uint64_t mutex_va = radv_buffer_get_va(device->perf_counter_bo) + PERF_CTR_BO_LOCK_OFFSET;
 
-      radeon_emit(PKT3(PKT3_COPY_DATA, 4, 0));
-      radeon_emit(COPY_DATA_SRC_SEL(COPY_DATA_IMM) | COPY_DATA_DST_SEL(COPY_DATA_DST_MEM) | COPY_DATA_COUNT_SEL |
-                  COPY_DATA_WR_CONFIRM);
-      radeon_emit(0); /* immediate */
-      radeon_emit(0);
-      radeon_emit(mutex_va);
-      radeon_emit(mutex_va >> 32);
+      ac_emit_cp_copy_data(cs->b, COPY_DATA_IMM, COPY_DATA_DST_MEM, 0, mutex_va,
+                           AC_CP_COPY_DATA_COUNT_SEL | AC_CP_COPY_DATA_WR_CONFIRM, false);
    }
 
-   radeon_end();
    assert(cs->b->cdw <= cdw);
 
    result = radv_finalize_cmd_stream(device, cs);
@@ -1706,7 +1592,7 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
    const unsigned max_cs_submission = radv_device_fault_detection_enabled(device) ? 1 : cmd_buffer_count;
    const unsigned cs_array_size = (use_ace ? 2 : 1) * MIN2(max_cs_submission, cmd_buffer_count);
 
-   struct radeon_cmdbuf **cs_array = malloc(sizeof(struct radeon_cmdbuf *) * cs_array_size);
+   struct ac_cmdbuf **cs_array = malloc(sizeof(struct ac_cmdbuf *) * cs_array_size);
    if (!cs_array)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -1740,9 +1626,9 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
    unsigned num_initial_preambles = 0;
    unsigned num_continue_preambles = 0;
    unsigned num_postambles = 0;
-   struct radeon_cmdbuf *initial_preambles[5] = {0};
-   struct radeon_cmdbuf *continue_preambles[5] = {0};
-   struct radeon_cmdbuf *postambles[4] = {0};
+   struct ac_cmdbuf *initial_preambles[5] = {0};
+   struct ac_cmdbuf *continue_preambles[5] = {0};
+   struct ac_cmdbuf *postambles[4] = {0};
 
    if (queue->state.qf == RADV_QUEUE_GENERAL || queue->state.qf == RADV_QUEUE_COMPUTE) {
       initial_preambles[num_initial_preambles++] =
@@ -1816,8 +1702,8 @@ radv_queue_submit_normal(struct radv_queue *queue, struct vk_queue_submit *submi
       if (radv_device_fault_detection_enabled(device))
          device->trace_data->primary_id = 0;
 
-      struct radeon_cmdbuf *chainable = NULL;
-      struct radeon_cmdbuf *chainable_ace = NULL;
+      struct ac_cmdbuf *chainable = NULL;
+      struct ac_cmdbuf *chainable_ace = NULL;
 
       /* Add CS from submitted command buffers. */
       for (unsigned c = 0; c < advance; ++c) {
@@ -1979,7 +1865,7 @@ fail:
 }
 
 bool
-radv_queue_internal_submit(struct radv_queue *queue, struct radeon_cmdbuf *cs)
+radv_queue_internal_submit(struct radv_queue *queue, struct ac_cmdbuf *cs)
 {
    struct radv_device *device = radv_queue_device(queue);
    struct radeon_winsys_ctx *ctx = queue->hw_ctx;

@@ -15,6 +15,7 @@
 #include <poll.h>
 
 #include "git_sha1.h"
+#include "util/cache_ops.h"
 #include "util/u_debug.h"
 #include "util/disk_cache.h"
 #include "util/hex.h"
@@ -303,6 +304,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_map_memory_placed = true,
       .EXT_memory_budget = true,
       .EXT_multi_draw = true,
+      .EXT_multisampled_render_to_single_sampled = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_nested_command_buffer = true,
       .EXT_non_seamless_cube_map = true,
@@ -335,6 +337,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_transform_feedback = true,
       .EXT_vertex_attribute_divisor = true,
       .EXT_vertex_input_dynamic_state = true,
+      .EXT_zero_initialize_device_memory = true,
 
       /* For Graphics Flight Recorder (GFR) */
       .AMD_buffer_marker = true,
@@ -804,11 +807,17 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->unifiedImageLayouts = true;
    features->unifiedImageLayoutsVideo = false;
 
+   /* VK_EXT_zero_initialize_device_memory */
+   features->zeroInitializeDeviceMemory = true;
+
    /* VK_VALVE_fragment_density_map_layered */
    features->fragmentDensityMapLayered = true;
 
    /* VK_EXT_dynamic_rendering_unused_attachments */
    features->dynamicRenderingUnusedAttachments = true;
+
+   /* VK_EXT_multisampled_render_to_single_sampled */
+   features->multisampledRenderToSingleSampled = true;
 }
 
 static void
@@ -858,6 +867,8 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
 static const size_t max_descriptor_set_size = MAX_SET_SIZE / (4 * A6XX_TEX_CONST_DWORDS);
 static const VkSampleCountFlags sample_counts =
    VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+static const VkSampleCountFlags sample_location_counts =
+   VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
 
 static void
 tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
@@ -1232,7 +1243,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
 
    /* VK_EXT_sample_locations */
    props->sampleLocationSampleCounts =
-      pdevice->vk.supported_extensions.EXT_sample_locations ? sample_counts : 0;
+      pdevice->vk.supported_extensions.EXT_sample_locations ? sample_location_counts : 0;
    props->maxSampleLocationGridSize = (VkExtent2D) { 1 , 1 };
    props->sampleLocationCoordinateRange[0] = SAMPLE_LOCATION_MIN;
    props->sampleLocationCoordinateRange[1] = SAMPLE_LOCATION_MAX;
@@ -1489,6 +1500,15 @@ static const VkQueueFamilyProperties tu_gfx_queue_family_properties = {
    .minImageTransferGranularity = { 1, 1, 1 },
 };
 
+static const VkQueueFamilyProperties tu_gfx_sparse_queue_family_properties = {
+   .queueFlags =
+      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT |
+      VK_QUEUE_SPARSE_BINDING_BIT,
+   .queueCount = 1,
+   .timestampValidBits = 48,
+   .minImageTransferGranularity = { 1, 1, 1 },
+};
+
 static const VkQueueFamilyProperties tu_sparse_queue_family_properties = {
    .queueFlags = VK_QUEUE_SPARSE_BINDING_BIT,
    .queueCount = 1,
@@ -1594,7 +1614,7 @@ tu_physical_device_init(struct tu_physical_device *device,
       goto fail_free_name;
    }
 
-   device->level1_dcache_size = tu_get_l1_dcache_size();
+   device->level1_dcache_size = util_cache_granularity();
    device->has_cached_non_coherent_memory =
       device->level1_dcache_size > 0 && !DETECT_ARCH_ARM;
 
@@ -1667,7 +1687,9 @@ tu_physical_device_init(struct tu_physical_device *device,
    device->queue_families[device->num_queue_families++] =
       (struct tu_queue_family) {
          .type = TU_QUEUE_GFX,
-         .properties = &tu_gfx_queue_family_properties,
+         .properties = device->has_sparse ?
+            &tu_gfx_sparse_queue_family_properties :
+            &tu_gfx_queue_family_properties,
       };
 
    if (device->has_sparse) {
@@ -2232,12 +2254,16 @@ tu_create_copy_timestamp_cs(struct tu_u_trace_submission_data *submission_data,
    tu_device *device = cmd_buffers[0]->device;
    uint32_t cs_size = trace_chunks_to_copy * 6 * 2 + 3;
 
+   mtx_lock(&device->copy_timestamp_cs_pool_mutex);
    if (!list_is_empty(&device->copy_timestamp_cs_pool)) {
       submission_data->timestamp_copy_data =
          list_first_entry(&device->copy_timestamp_cs_pool,
                           struct tu_copy_timestamp_data, node);
       list_del(&submission_data->timestamp_copy_data->node);
-   } else {
+   }
+   mtx_unlock(&device->copy_timestamp_cs_pool_mutex);
+
+   if (!submission_data->timestamp_copy_data) {
       submission_data->timestamp_copy_data =
          (struct tu_copy_timestamp_data *) vk_zalloc(
             &device->vk.alloc, sizeof(struct tu_copy_timestamp_data), 8,
@@ -2361,8 +2387,11 @@ tu_u_trace_submission_data_finish(
       if (u_trace_enabled(&device->trace_context)) {
          tu_cs_reset(&submission_data->timestamp_copy_data->cs);
          u_trace_fini(&submission_data->timestamp_copy_data->trace);
+
+         mtx_lock(&device->copy_timestamp_cs_pool_mutex);
          list_addtail(&submission_data->timestamp_copy_data->node,
                       &device->copy_timestamp_cs_pool);
+         mtx_unlock(&device->copy_timestamp_cs_pool_mutex);
       } else {
          tu_free_copy_timestamp_data(device,
                                      submission_data->timestamp_copy_data);
@@ -2587,6 +2616,7 @@ tu_device_destroy_mutexes(struct tu_device *device)
    mtx_destroy(&device->fiber_pvtmem_bo.mtx);
    mtx_destroy(&device->wave_pvtmem_bo.mtx);
    mtx_destroy(&device->mutex);
+   mtx_destroy(&device->copy_timestamp_cs_pool_mutex);
 #ifdef HAVE_PERFETTO
    mtx_destroy(&device->perfetto.pending_clocks_sync_mtx);
 #endif
@@ -2696,6 +2726,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    mtx_init(&device->fiber_pvtmem_bo.mtx, mtx_plain);
    mtx_init(&device->wave_pvtmem_bo.mtx, mtx_plain);
    mtx_init(&device->mutex, mtx_plain);
+   mtx_init(&device->copy_timestamp_cs_pool_mutex, mtx_plain);
 #ifdef HAVE_PERFETTO
    mtx_init(&device->perfetto.pending_clocks_sync_mtx, mtx_plain);
 #endif
@@ -2961,7 +2992,7 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
       physical_device->info->a6xx.has_z24uint_s8uint &&
       (!border_color_without_format ||
        physical_device->instance->disable_d24s8_border_color_workaround);
-   device->use_lrz = !TU_DEBUG_ENV(NOLRZ);
+   device->use_lrz = !TU_DEBUG_START(NOLRZ);
 
    tu_gpu_tracepoint_config_variable();
 
@@ -3097,9 +3128,7 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    tu_cs_finish(&device->sub_cs);
 
-   if (device->perfcntrs_pass_cs_entries) {
-      free(device->perfcntrs_pass_cs_entries);
-   }
+   free(device->perfcntrs_pass_cs_entries);
 
    if (device->dbg_cmdbuf_stomp_cs) {
       tu_cs_finish(device->dbg_cmdbuf_stomp_cs);
@@ -3143,6 +3172,11 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       if (device->queue_count[i])
          vk_free(&device->vk.alloc, device->queues[i]);
    }
+
+   if (device->msrtss_color_temporary)
+      tu_destroy_memory(device, device->msrtss_color_temporary);
+   if (device->msrtss_depth_temporary)
+      tu_destroy_memory(device, device->msrtss_depth_temporary);
 
    tu_drm_device_finish(device);
 
@@ -3261,6 +3295,112 @@ tu_add_to_heap(struct tu_device *dev, struct tu_bo *bo)
    return VK_SUCCESS;
 }
 
+static VkResult
+_tu_init_memory(struct tu_device *device,
+                struct tu_device_memory *mem,
+                VkMemoryPropertyFlags mem_property,
+                enum tu_bo_alloc_flags alloc_flags,
+                VkDeviceSize size,
+                VkDeviceAddress client_address,
+                const char *name)
+{
+   VkResult result;
+
+   if (mem_property & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) {
+      mem->lazy = true;
+      mtx_init(&mem->lazy_mutex, mtx_plain);
+      enum tu_sparse_vma_flags sparse_flags =
+         (alloc_flags & TU_BO_ALLOC_REPLAYABLE) ?
+         TU_SPARSE_VMA_REPLAYABLE : TU_SPARSE_VMA_NONE;
+      result = tu_sparse_vma_init(device, &mem->vk.base,
+                                  &mem->lazy_vma, &mem->iova,
+                                  sparse_flags,
+                                  size,
+                                  client_address);
+   } else {
+      result = tu_bo_init_new_explicit_iova(
+         device, &mem->vk.base, &mem->bo, size,
+         client_address, mem_property, alloc_flags, NULL, name);
+   }
+
+   return result;
+}
+
+static VkResult
+tu_create_memory(struct tu_device *device,
+                 struct tu_device_memory **mem_out,
+                 VkMemoryPropertyFlags mem_property,
+                 enum tu_bo_alloc_flags alloc_flags,
+                 VkDeviceSize size,
+                 const char *name)
+{
+   struct tu_device_memory *mem =
+      (struct tu_device_memory *) vk_object_zalloc(
+         &device->vk, NULL, sizeof(*mem), VK_OBJECT_TYPE_DEVICE_MEMORY);
+
+   if (!mem)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   mem->vk.size = size;
+   mem->size = size;
+   mem->refcnt = 1;
+
+   VkResult result = _tu_init_memory(device, mem, mem_property, alloc_flags,
+                                     size, 0, name);
+
+   if (result != VK_SUCCESS) {
+      vk_object_free(&device->vk, NULL, mem);
+      return result;
+   }
+
+   if (!mem->lazy) {
+      result = tu_add_to_heap(device, mem->bo);
+      mem->iova = mem->bo->iova;
+
+      if (result != VK_SUCCESS) {
+         vk_object_free(&device->vk, NULL, mem);
+         return result;
+      }
+   }
+
+   *mem_out = mem;
+   return VK_SUCCESS;
+}
+
+static struct tu_device_memory *
+tu_memory_get_ref(struct tu_device_memory *mem)
+{
+   p_atomic_inc(&mem->refcnt);
+   return mem;
+}
+
+static void
+_tu_destroy_memory(struct tu_device *device,
+                  struct tu_device_memory *mem)
+{
+   if (mem->bo) {
+      p_atomic_add(&device->physical_device->heap.used, -mem->bo->size);
+      tu_bo_finish(device, mem->bo);
+   }
+
+   if (mem->lazy) {
+      tu_sparse_vma_finish(device, &mem->lazy_vma);
+      mtx_destroy(&mem->lazy_mutex);
+   }
+}
+
+void
+tu_destroy_memory(struct tu_device *device,
+                  struct tu_device_memory *mem)
+{
+   if (!p_atomic_dec_zero(&mem->refcnt))
+      return;
+
+   _tu_destroy_memory(device, mem);
+
+   vk_object_free(&device->vk, NULL, mem);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_AllocateMemory(VkDevice _device,
                   const VkMemoryAllocateInfo *pAllocateInfo,
@@ -3291,6 +3431,7 @@ tu_AllocateMemory(VkDevice _device,
    }
 
    mem->size = pAllocateInfo->allocationSize;
+   mem->refcnt = 1;
 
    const VkImportMemoryFdInfoKHR *fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
@@ -3360,22 +3501,9 @@ tu_AllocateMemory(VkDevice _device,
       VkMemoryPropertyFlags mem_property =
          device->physical_device->memory.types[pAllocateInfo->memoryTypeIndex];
 
-      if (mem_property & VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT) {
-         mem->lazy = true;
-         mtx_init(&mem->lazy_mutex, mtx_plain);
-         enum tu_sparse_vma_flags sparse_flags =
-            (alloc_flags & TU_BO_ALLOC_REPLAYABLE) ?
-            TU_SPARSE_VMA_REPLAYABLE : TU_SPARSE_VMA_NONE;
-         result = tu_sparse_vma_init(device, &mem->vk.base,
-                                     &mem->lazy_vma, &mem->iova,
-                                     sparse_flags,
-                                     pAllocateInfo->allocationSize,
-                                     client_address);
-      } else {
-         result = tu_bo_init_new_explicit_iova(
-            device, &mem->vk.base, &mem->bo, pAllocateInfo->allocationSize,
-            client_address, mem_property, alloc_flags, NULL, name);
-      }
+      result = _tu_init_memory(device, mem, mem_property, alloc_flags,
+                               pAllocateInfo->allocationSize, client_address,
+                               name);
    }
 
    if (result == VK_SUCCESS && !mem->lazy) {
@@ -3463,15 +3591,7 @@ tu_FreeMemory(VkDevice _device,
 
    TU_RMV(resource_destroy, device, mem);
 
-   if (mem->bo) {
-      p_atomic_add(&device->physical_device->heap.used, -mem->bo->size);
-      tu_bo_finish(device, mem->bo);
-   }
-
-   if (mem->lazy) {
-      tu_sparse_vma_finish(device, &mem->lazy_vma);
-      mtx_destroy(&mem->lazy_mutex);
-   }
+   _tu_destroy_memory(device, mem);
 
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 }
@@ -3564,6 +3684,193 @@ tu_GetDeviceMemoryCommitment(VkDevice device,
    *pCommittedMemoryInBytes = memory->lazy_initialized ? memory->size : 0;
 }
 
+static VkResult
+tu_get_msrtss_temporary(struct tu_device *dev,
+                        struct tu_device_memory **mem_out,
+                        uint64_t size, bool depth)
+{
+   struct tu_device_memory **msrtss_temporary =
+      depth ? &dev->msrtss_depth_temporary : &dev->msrtss_color_temporary;
+
+   mtx_lock(&dev->mutex);
+   if ((*msrtss_temporary) &&
+       (*msrtss_temporary)->size >= size) {
+      struct tu_device_memory *mem = tu_memory_get_ref(*msrtss_temporary);
+      mtx_unlock(&dev->mutex);
+      *mem_out = mem;
+      return VK_SUCCESS;
+   }
+
+   if (*msrtss_temporary)
+      tu_destroy_memory(dev, *msrtss_temporary);
+
+   struct tu_device_memory *mem;
+   VkResult result =
+      tu_create_memory(dev, &mem,
+                       depth ? (VkMemoryPropertyFlags)0 :
+                       VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT,
+                       TU_BO_ALLOC_INTERNAL_RESOURCE,
+                       size, depth ? "MSRTSS depth" : "MSRTSS color");
+   if (result != VK_SUCCESS) {
+      mtx_unlock(&dev->mutex);
+      return result;
+   }
+
+   *msrtss_temporary = tu_memory_get_ref(mem);
+   mtx_unlock(&dev->mutex);
+
+   *mem_out = mem;
+   return VK_SUCCESS;
+}
+
+/* Allocate lazy memory and setup images for transient attachments that are
+ * implicitly created by MSRTSS. The lifetime of these are tied to the
+ * framebuffer with render passes or the command buffer with dynamic
+ * rendering.
+ */
+VkResult
+tu_init_msrtss_attachments(struct tu_device *device,
+                           const struct tu_render_pass *pass,
+                           const struct tu_framebuffer *fb,
+                           const struct VkFramebufferAttachmentImageInfo *attachment_info,
+                           const struct tu_image_view **attachments,
+                           struct tu_image *images,
+                           struct tu_image_view *iviews,
+                           struct tu_device_memory **depth_mem_out,
+                           struct tu_device_memory **color_mem_out)
+{
+   uint64_t depth_size = 0, color_size = 0;
+
+   /* First, create images and calculate size requirement. */
+   for (unsigned i = 0; i < pass->attachment_count - pass->user_attachment_count; i++) {
+      const struct tu_render_pass_attachment *att =
+         &pass->attachments[pass->user_attachment_count + i];
+      uint32_t user_att_idx = att->user_att;
+      VkImageCreateFlags flags =
+         attachments ? attachments[user_att_idx]->image->vk.create_flags :
+         attachment_info[user_att_idx].flags;
+      bool is_ds = vk_format_is_depth_or_stencil(att->format);
+      VkImageCreateInfo image_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+         .flags = flags & VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT,
+         .imageType = VK_IMAGE_TYPE_2D,
+         .format = att->format,
+         .extent = {
+            fb->width, fb->height, 1
+         },
+         .mipLevels = 1,
+         .arrayLayers = MAX2(fb->layers, pass->num_views),
+         .samples = att->samples,
+         .tiling = VK_IMAGE_TILING_OPTIMAL,
+         .usage = is_ds ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
+            (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+             VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT),
+      };
+
+      /* In case we're using dynamic rendering, reset the image struct from
+       * the last use.
+       */
+      memset(&images[i], 0, sizeof(images[i]));
+
+      /* Note: we don't need a corresponding vk_image_finish() when destroying
+       * the framebuffer or finishing the render pass because the object is
+       * internal and we never attach private data or a name to it.
+       */
+      vk_image_init(&device->vk, &images[i].vk, &image_info);
+
+      tu_image_init(device, &images[i], &image_info);
+      TU_CALLX(device, tu_image_update_layout)(device, &images[i], DRM_FORMAT_MOD_INVALID, NULL);
+
+      if (is_ds) {
+         depth_size = align64(depth_size, images[i].layout[0].base_align);
+         depth_size += images[i].total_size;
+      } else {
+         color_size = align64(color_size, images[i].layout[0].base_align);
+         color_size += images[i].total_size;
+      }
+   }
+
+   /* Allocate memory.
+    *
+    * TODO: Once we support partially committing memory, we won't need to make
+    * separate allocations for depth and color. For now this at least avoids
+    * allocating memory for color attachments.
+    */
+   VkResult result = VK_SUCCESS;
+
+   struct tu_device_memory *depth_mem = NULL, *color_mem = NULL;
+   if (depth_size != 0) {
+      result =
+         tu_get_msrtss_temporary(device, &depth_mem, depth_size, true);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   if (color_size != 0) {
+      result =
+         tu_get_msrtss_temporary(device, &color_mem, color_size, false);
+      if (result != VK_SUCCESS) {
+         if (depth_size != 0)
+            tu_destroy_memory(device, depth_mem);
+         return result;
+      }
+   }
+
+   *depth_mem_out = depth_mem;
+   *color_mem_out = color_mem;
+
+   /* Bind images to memory and create image views. */
+   uint64_t depth_offset = 0, color_offset = 0;
+   for (unsigned i = 0; i < pass->attachment_count - pass->user_attachment_count; i++) {
+      const struct tu_render_pass_attachment *att =
+         &pass->attachments[pass->user_attachment_count + i];
+      struct tu_image *image = &images[i];
+      bool is_ds = vk_format_is_depth_or_stencil(att->format);
+
+      if (is_ds) {
+         depth_offset = align64(depth_offset, image->layout[0].base_align);
+         image->mem = depth_mem;
+         image->mem_offset = depth_offset;
+         image->iova = depth_mem->iova + depth_offset;
+         depth_offset += image->total_size;
+      } else {
+         color_offset = align64(color_offset, image->layout[0].base_align);
+         image->mem = color_mem;
+         image->mem_offset = color_offset;
+         image->iova = color_mem->iova + color_offset;
+         color_offset += image->total_size;
+      }
+
+      VkImageViewCreateInfo iview_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+         .image = tu_image_to_handle(&images[i]),
+         .viewType =
+            fb->layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D,
+         .format = att->format,
+         .components = {
+            VK_COMPONENT_SWIZZLE_R,
+            VK_COMPONENT_SWIZZLE_G,
+            VK_COMPONENT_SWIZZLE_B,
+            VK_COMPONENT_SWIZZLE_A,
+         },
+         .subresourceRange = {
+            .aspectMask = vk_format_aspects(att->format),
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = fb->layers,
+         }
+      };
+
+      tu_image_view_init(device, &iviews[i], &iview_info);
+   }
+
+   assert(color_offset == color_size);
+   assert(depth_offset == depth_size);
+
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateFramebuffer(VkDevice _device,
                      const VkFramebufferCreateInfo *pCreateInfo,
@@ -3583,15 +3890,27 @@ tu_CreateFramebuffer(VkDevice _device,
 
    bool imageless = pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT;
 
-   size_t size = sizeof(*framebuffer);
-   if (!imageless)
-      size += sizeof(struct tu_attachment_info) * pCreateInfo->attachmentCount;
-   framebuffer = (struct tu_framebuffer *) vk_object_alloc(
-      &device->vk, pAllocator, size, VK_OBJECT_TYPE_FRAMEBUFFER);
-   if (framebuffer == NULL)
+   uint32_t msrtss_attachment_count = pass->attachment_count -
+      pass->user_attachment_count;
+   struct tu_image_view **attachments;
+   struct tu_image *images;
+   struct tu_image_view *iviews;
+   VK_MULTIALLOC(ma);
+   vk_multialloc_add(&ma, &framebuffer, struct tu_framebuffer, 1);
+   vk_multialloc_add(&ma, &attachments, struct tu_image_view *,
+                     (imageless ? 0 : pCreateInfo->attachmentCount) +
+                     msrtss_attachment_count);
+   if (msrtss_attachment_count) {
+      vk_multialloc_add(&ma, &images, struct tu_image,
+                        msrtss_attachment_count);
+      vk_multialloc_add(&ma, &iviews, struct tu_image_view,
+                        msrtss_attachment_count);
+   }
+   if (!vk_object_multizalloc(
+      &device->vk, &ma, pAllocator, VK_OBJECT_TYPE_FRAMEBUFFER))
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   framebuffer->attachment_count = pCreateInfo->attachmentCount;
+   framebuffer->attachment_count = pass->attachment_count;
    framebuffer->width = pCreateInfo->width;
    framebuffer->height = pCreateInfo->height;
    framebuffer->layers = pCreateInfo->layers;
@@ -3600,11 +3919,40 @@ tu_CreateFramebuffer(VkDevice _device,
       for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
          VkImageView _iview = pCreateInfo->pAttachments[i];
          struct tu_image_view *iview = tu_image_view_from_handle(_iview);
-         framebuffer->attachments[i].attachment = iview;
+         framebuffer->attachments[i] = iview;
       }
    }
 
    tu_framebuffer_tiling_config(framebuffer, device, pass);
+
+   /* For MSRTSS, allocate extra images that are tied to the VkFramebuffer */
+   if (msrtss_attachment_count > 0) {
+      const VkFramebufferAttachmentsCreateInfo *fb_att_info =
+         vk_find_struct_const(pCreateInfo->pNext,
+                              FRAMEBUFFER_ATTACHMENTS_CREATE_INFO);
+      VkResult result =
+         tu_init_msrtss_attachments(device,
+                                    pass, framebuffer,
+                                    imageless ? fb_att_info->pAttachmentImageInfos : NULL,
+                                    imageless ? NULL :
+                                    framebuffer->attachments,
+                                    images, iviews,
+                                    &framebuffer->depth_mem,
+                                    &framebuffer->color_mem);
+      if (result != VK_SUCCESS) {
+         vk_object_free(&device->vk, pAllocator, framebuffer);
+         return vk_error(device, result);
+      }
+
+      /* With imageless attachments, the only attachments in the framebuffer
+       * are MSRTSS attachments. Without imageless attachments, they are after
+       * the user's attachments.
+       */
+      for (uint32_t i = 0; i < msrtss_attachment_count; i++) {
+         uint32_t fb_idx = i + (imageless ? 0 : pCreateInfo->attachmentCount);
+         framebuffer->attachments[fb_idx] = &iviews[i];
+      }
+   }
 
    *pFramebuffer = tu_framebuffer_to_handle(framebuffer);
    return VK_SUCCESS;
@@ -3628,6 +3976,46 @@ tu_setup_dynamic_framebuffer(struct tu_cmd_buffer *cmd_buffer,
    tu_framebuffer_tiling_config(framebuffer, cmd_buffer->device, pass);
 }
 
+VkResult
+tu_setup_dynamic_msrtss(struct tu_cmd_buffer *cmd_buffer)
+{
+   struct tu_render_pass *pass = &cmd_buffer->dynamic_pass;
+   struct tu_framebuffer *framebuffer = &cmd_buffer->dynamic_framebuffer;
+
+   if (pass->attachment_count > pass->user_attachment_count) {
+      struct tu_device_memory *depth_mem = NULL, *color_mem = NULL;
+
+      VkResult result =
+         tu_init_msrtss_attachments(cmd_buffer->device,
+                                    pass, framebuffer, NULL,
+                                    cmd_buffer->dynamic_attachments,
+                                    cmd_buffer->dynamic_msrtss_images,
+                                    cmd_buffer->dynamic_msrtss_iviews,
+                                    &depth_mem, &color_mem);
+
+      if (result != VK_SUCCESS) {
+         return vk_error(cmd_buffer, result);
+      }
+
+      for (unsigned i = 0; i < pass->attachment_count -
+           pass->user_attachment_count; i++) {
+         cmd_buffer->dynamic_attachments[i + pass->user_attachment_count] =
+            &cmd_buffer->dynamic_msrtss_iviews[i];
+      }
+
+      if (color_mem) {
+         util_dynarray_append(&cmd_buffer->msrtss_color_temporaries,
+                              color_mem);
+      }
+      if (depth_mem) {
+         util_dynarray_append(&cmd_buffer->msrtss_depth_temporaries,
+                              depth_mem);
+      }
+   }
+
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL
 tu_DestroyFramebuffer(VkDevice _device,
                       VkFramebuffer _fb,
@@ -3644,6 +4032,11 @@ tu_DestroyFramebuffer(VkDevice _device,
 
    if (!fb)
       return;
+
+   if (fb->depth_mem)
+      tu_destroy_memory(device, fb->depth_mem);
+   if (fb->color_mem)
+      tu_destroy_memory(device, fb->color_mem);
 
    vk_object_free(&device->vk, pAllocator, fb);
 }
@@ -3713,7 +4106,7 @@ tu_GetPhysicalDeviceMultisamplePropertiesEXT(
 {
    VK_FROM_HANDLE(tu_physical_device, pdevice, physicalDevice);
 
-   if (samples <= VK_SAMPLE_COUNT_4_BIT && pdevice->vk.supported_extensions.EXT_sample_locations)
+   if (pdevice->vk.supported_extensions.EXT_sample_locations && (samples & sample_location_counts))
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){ 1, 1 };
    else
       pMultisampleProperties->maxSampleLocationGridSize = (VkExtent2D){ 0, 0 };
@@ -3810,7 +4203,7 @@ tu_debug_bos_print_stats(struct tu_device *dev)
    {
       struct tu_debug_bos_entry *debug_bos =
          (struct tu_debug_bos_entry *) entry->data;
-      util_dynarray_append(&dyn, struct tu_debug_bos_entry *, debug_bos);
+      util_dynarray_append(&dyn, debug_bos);
       size += debug_bos->size / 1024;
       count += debug_bos->count;
    }
@@ -3845,7 +4238,7 @@ tu_dump_bo_init(struct tu_device *dev, struct tu_bo *bo)
    uint32_t idx =
       util_dynarray_num_elements(&dev->dump_bo_list, struct tu_bo *);
    bo->dump_bo_list_idx = idx;
-   util_dynarray_append(&dev->dump_bo_list, struct tu_bo *, bo);
+   util_dynarray_append(&dev->dump_bo_list, bo);
    mtx_unlock(&dev->bo_mutex);
 }
 

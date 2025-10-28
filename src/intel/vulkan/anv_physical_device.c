@@ -26,6 +26,8 @@
 #include <sys/sysmacros.h>
 #endif
 
+#include "vk_android.h"
+
 /* This is probably far to big but it reflects the max size used for messages
  * in OpenGLs KHR_debug.
  */
@@ -195,8 +197,9 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_maintenance5                      = true,
       .KHR_maintenance6                      = true,
       .KHR_maintenance7                      = true,
-      .KHR_maintenance8                      = false, /* Temporary, will reenable on Xe2+ */
+      .KHR_maintenance8                      = true,
       .KHR_maintenance9                      = true,
+      .KHR_maintenance10                     = true,
       .KHR_map_memory2                       = true,
       .KHR_multiview                         = true,
       .KHR_performance_query =
@@ -366,6 +369,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_shader_subgroup_ballot            = true,
       .EXT_shader_subgroup_vote              = true,
       .EXT_shader_viewport_index_layer       = true,
+      .EXT_shader_uniform_buffer_unsized_array = true,
       .EXT_subgroup_size_control             = true,
 #ifdef ANV_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1            = true,
@@ -379,10 +383,6 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_ycbcr_image_arrays                = true,
       .AMD_buffer_marker                     = true,
       .AMD_texture_gather_bias_lod           = device->info.ver >= 20,
-#if DETECT_OS_ANDROID
-      .ANDROID_external_memory_android_hardware_buffer = true,
-      .ANDROID_native_buffer                 = true,
-#endif
       .GOOGLE_decorate_string                = true,
       .GOOGLE_hlsl_functionality1            = true,
       .GOOGLE_user_type                      = true,
@@ -394,6 +394,12 @@ get_device_extensions(const struct anv_physical_device *device,
       .VALVE_mutable_descriptor_type         = true,
       .KHR_shader_bfloat16                   = device->info.has_bfloat16,
    };
+
+   if (vk_android_get_ugralloc() != NULL) {
+      ext->ANDROID_external_memory_android_hardware_buffer = true,
+      ext->ANDROID_native_buffer = true;
+      ext->ANDROID_external_format_resolve = true;
+   }
 }
 
 static void
@@ -984,6 +990,12 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_EXT_shader_object */
       .shaderObject = true,
+
+      /* VK_EXT_shader_uniform_buffer_unsized_array */
+      .shaderUniformBufferUnsizedArray = true,
+
+      /* VK_KHR_maintenance10 */
+      .maintenance10 = true,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -992,6 +1004,9 @@ get_features(const struct anv_physical_device *pdevice,
     */
    if (app_info->engine_name && strcmp(app_info->engine_name, "idTech") == 0)
       features->depthBounds = true;
+
+   if (vk_android_get_ugralloc() != NULL)
+      features->externalFormatResolve = true;
 }
 
 #define MAX_PER_STAGE_DESCRIPTOR_UNIFORM_BUFFERS   64
@@ -1501,8 +1516,8 @@ get_properties(const struct anv_physical_device *pdevice,
 
    /* VK_KHR_maintenance5 */
    {
-      props->earlyFragmentMultisampleCoverageAfterSampleCounting = false;
-      props->earlyFragmentSampleMaskTestBeforeSampleCounting = false;
+      props->earlyFragmentMultisampleCoverageAfterSampleCounting = devinfo->verx10 >= 200;
+      props->earlyFragmentSampleMaskTestBeforeSampleCounting = devinfo->verx10 >= 200;
       props->depthStencilSwizzleOneSupport = true;
       props->polygonModePointSize = true;
       props->nonStrictSinglePixelWideLinesUseParallelogram = false;
@@ -1534,6 +1549,13 @@ get_properties(const struct anv_physical_device *pdevice,
       props->image2DViewOf3DSparse = false;
       props->defaultVertexAttributeValue =
          VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ZERO_KHR;
+   }
+
+   /* VK_KHR_maintenance10 */
+   {
+      props->rgba4OpaqueBlackSwizzled = true;
+      props->resolveSrgbFormatAppliesTransferFunction = true;
+      props->resolveSrgbFormatSupportsTransferFunctionControl = true;
    }
 
    /* VK_KHR_performance_query */
@@ -2005,10 +2027,17 @@ get_properties(const struct anv_physical_device *pdevice,
       props->transformFeedbackDraw = true;
    }
 
-   /* VK_ANDROID_native_buffer */
 #if DETECT_OS_ANDROID
+   /* VK_ANDROID_native_buffer */
    {
       props->sharedImage = !!vk_android_get_front_buffer_usage();
+   }
+
+   /* VK_ANDROID_external_format_resolve */
+   {
+      props->nullColorAttachmentWithExternalFormatResolve = VK_FALSE;
+      props->externalFormatResolveChromaOffsetX = VK_CHROMA_LOCATION_MIDPOINT;
+      props->externalFormatResolveChromaOffsetY = VK_CHROMA_LOCATION_MIDPOINT;
    }
 #endif /* DETECT_OS_ANDROID */
 

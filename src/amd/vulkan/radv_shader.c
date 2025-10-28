@@ -20,6 +20,7 @@
 #include "util/mesa-sha1.h"
 #include "util/streaming-load-memcpy.h"
 #include "util/u_atomic.h"
+#include "ac_shader_util.h"
 #include "radv_cs.h"
 #include "radv_debug.h"
 #include "radv_debug_nir.h"
@@ -39,8 +40,10 @@
 #include "vk_debug_report.h"
 #include "vk_format.h"
 #include "vk_nir.h"
+#include "vk_nir_convert_ycbcr.h"
 #include "vk_semaphore.h"
 #include "vk_sync.h"
+#include "vk_ycbcr_conversion.h"
 
 #include "aco_shader_info.h"
 #include "radv_aco_shader_info.h"
@@ -232,7 +235,7 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
 }
 
 void
-radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad, enum amd_gfx_level gfx_level)
+radv_optimize_nir_algebraic_early(nir_shader *nir)
 {
    bool more_algebraic = true;
    while (more_algebraic) {
@@ -256,21 +259,11 @@ radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad, e
       NIR_PASS(_, nir, nir_opt_remove_phis);
       NIR_PASS(_, nir, nir_opt_dead_cf);
    }
+}
 
-   if (opt_offsets) {
-      const nir_opt_offsets_options offset_options = {
-         .uniform_max = 0,
-         .buffer_max = ~0,
-         .shared_max = UINT16_MAX,
-         .shared_atomic_max = UINT16_MAX,
-         .allow_offset_wrap_cb = ac_nir_allow_offset_wrap_cb,
-         .cb_data = &gfx_level,
-      };
-      NIR_PASS(_, nir, nir_opt_offsets, &offset_options);
-   }
-   if (opt_mqsad)
-      NIR_PASS(_, nir, nir_opt_mqsad);
-
+void
+radv_optimize_nir_algebraic_late(nir_shader *nir)
+{
    /* Do late algebraic optimization to turn add(a,
     * neg(b)) back into subs, then the mandatory cleanup
     * after algebraic.  Note that it may produce fnegs,
@@ -288,6 +281,28 @@ radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad, e
       NIR_LOOP_PASS(_, skip, nir, nir_opt_cse);
    }
    _mesa_set_destroy(skip, NULL);
+}
+
+void
+radv_optimize_nir_algebraic(nir_shader *nir, bool opt_offsets, bool opt_mqsad, enum amd_gfx_level gfx_level)
+{
+   radv_optimize_nir_algebraic_early(nir);
+
+   if (opt_offsets) {
+      const nir_opt_offsets_options offset_options = {
+         .uniform_max = 0,
+         .buffer_max = ~0,
+         .shared_max = UINT16_MAX,
+         .shared_atomic_max = UINT16_MAX,
+         .allow_offset_wrap_cb = ac_nir_allow_offset_wrap_cb,
+         .cb_data = &gfx_level,
+      };
+      NIR_PASS(_, nir, nir_opt_offsets, &offset_options);
+   }
+   if (opt_mqsad)
+      NIR_PASS(_, nir, nir_opt_mqsad);
+
+   radv_optimize_nir_algebraic_late(nir);
 }
 
 static void
@@ -419,6 +434,20 @@ radv_shader_choose_subgroup_size(struct radv_device *device, nir_shader *nir,
       nir->info.min_subgroup_size = wave_size;
 }
 
+static const struct vk_ycbcr_conversion_state *
+ycbcr_conversion_lookup(const void *data, uint32_t set, uint32_t binding, uint32_t array_index)
+{
+   const struct radv_shader_layout *layout = data;
+
+   const struct radv_descriptor_set_layout *set_layout = layout->set[set].layout;
+   const struct vk_ycbcr_conversion_state *ycbcr_samplers = radv_immutable_ycbcr_samplers(set_layout, binding);
+
+   if (!ycbcr_samplers)
+      return NULL;
+
+   return ycbcr_samplers + array_index;
+}
+
 nir_shader *
 radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_stage *stage,
                          const struct radv_spirv_to_nir_options *options, bool is_internal)
@@ -426,6 +455,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
    nir_shader *nir;
+   bool progress;
 
    if (stage->internal_nir) {
       /* Some things such as our meta clear/blit code will give us a NIR
@@ -506,7 +536,8 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
        */
       NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
       NIR_PASS(_, nir, nir_lower_returns);
-      bool progress = false;
+
+      progress = false;
       NIR_PASS(progress, nir, nir_inline_functions);
       if (progress) {
          NIR_PASS(_, nir, nir_opt_copy_prop_vars);
@@ -631,6 +662,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       .lower_lod_zero_width = true,
       .lower_invalid_implicit_lod = true,
       .lower_1d = pdev->info.gfx_level == GFX9,
+      .optimize_txd = true,
    };
 
    NIR_PASS(_, nir, nir_lower_tex, &tex_options);
@@ -702,7 +734,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
    unsigned lower_flrp = (nir->options->lower_flrp16 ? 16 : 0) | (nir->options->lower_flrp32 ? 32 : 0) |
                          (nir->options->lower_flrp64 ? 64 : 0);
    if (lower_flrp != 0) {
-      bool progress = false;
+      progress = false;
       NIR_PASS(progress, nir, nir_lower_flrp, lower_flrp, false /* always precise */);
       if (progress)
          NIR_PASS(_, nir, nir_opt_constant_folding);
@@ -759,6 +791,15 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       /* Optimize the lowered code before the linking optimizations. */
       radv_optimize_nir(nir, false);
    }
+
+   /* Lower immutable/embedded sampler derefs to vec4. */
+   NIR_PASS(_, nir, radv_nir_lower_immediate_samplers, device, stage);
+
+   progress = false;
+   NIR_PASS(progress, nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion_lookup, &stage->layout);
+   /* Gather info in the case that nir_vk_lower_ycbcr_tex might have emitted resinfo instructions. */
+   if (progress)
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    return nir;
 }
@@ -886,7 +927,7 @@ radv_lower_ngg(struct radv_device *device, struct radv_shader_stage *ngg_stage,
       assert(info->is_ngg);
 
       if (info->has_ngg_culling)
-         radv_optimize_nir_algebraic(nir, false, false, pdev->info.gfx_level);
+         radv_optimize_nir_algebraic_late(nir);
 
       options.num_vertices_per_primitive = num_vertices_per_prim;
       options.early_prim_export = info->has_ngg_early_prim_export;
@@ -1393,7 +1434,7 @@ radv_init_shader_upload_queue(struct radv_device *device)
    for (unsigned i = 0; i < RADV_SHADER_UPLOAD_CS_COUNT; i++) {
       struct radv_shader_dma_submission *submission = calloc(1, sizeof(struct radv_shader_dma_submission));
 
-      result = radv_create_cmd_stream(device, RADV_QUEUE_TRANSFER, false, &submission->cs);
+      result = radv_create_cmd_stream(device, AMD_IP_SDMA, false, &submission->cs);
       if (result != VK_SUCCESS) {
          free(submission);
          return result;
@@ -1454,18 +1495,25 @@ radv_should_use_wgp_mode(const struct radv_device *device, mesa_shader_stage sta
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    enum amd_gfx_level chip = pdev->info.gfx_level;
-   switch (stage) {
-   case MESA_SHADER_COMPUTE:
-   case MESA_SHADER_TESS_CTRL:
-      return chip >= GFX10;
-   case MESA_SHADER_GEOMETRY:
-      return chip == GFX10 || (chip >= GFX10_3 && !info->is_ngg);
-   case MESA_SHADER_VERTEX:
-   case MESA_SHADER_TESS_EVAL:
-      return chip == GFX10 && info->is_ngg;
-   default:
+   if (chip < GFX10)
       return false;
-   }
+
+   /* Disable the WGP mode on gfx10.3 because it can hang. (it
+    * happened on VanGogh) Let's disable it on all chips that
+    * disable exactly 1 CU per SA for GS.
+    */
+   if (chip > GFX10 && info->is_ngg)
+      return false;
+
+   if (stage == MESA_SHADER_FRAGMENT)
+      return false;
+
+   /* VS+TCS programs might have an unknown LDS size if the input patch size is dynamic. */
+   bool uses_lds = radv_calculate_lds_size(info, chip) > 0 ||
+                   (stage == MESA_SHADER_TESS_CTRL && !info->num_tess_patches);
+
+   /* LDS is faster with CU mode. */
+   return !uses_lds;
 }
 
 #if defined(USE_LIBELF)
@@ -2027,20 +2075,9 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
          return false;
       }
 
-      unsigned lds_size = 0;
+      /* Calculate LDS allocation requirements. */
+      config->lds_size = radv_calculate_lds_size(&binary->info, pdev->info.gfx_level);
 
-      if (binary->info.is_ngg)
-         lds_size = binary->info.ngg_info.lds_size;
-      else if (pdev->info.gfx_level >= GFX9 && binary->info.stage == MESA_SHADER_GEOMETRY)
-         lds_size = binary->info.gs_ring_info.lds_size;
-      else if (binary->info.stage == MESA_SHADER_TESS_CTRL)
-         lds_size = binary->info.tcs.num_lds_blocks * pdev->info.lds_encode_granularity; /* only used by stats */
-      else
-         lds_size = binary->info.nir_shared_size;
-
-      config->lds_size = DIV_ROUND_UP(lds_size, pdev->info.lds_encode_granularity);
-
-      assert(!binary->info.has_ngg_culling || config->lds_size);
       ac_rtld_close(&rtld_binary);
 #endif
    }
@@ -2132,7 +2169,8 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
       }
    }
 
-   bool wgp_mode = radv_should_use_wgp_mode(device, stage, info);
+   assert(config->lds_size <= pdev->info.lds_size_per_workgroup);
+   unsigned lds_alloc = ac_shader_encode_lds_size(config->lds_size, pdev->info.gfx_level, stage);
 
    switch (stage) {
    case MESA_SHADER_TESS_EVAL:
@@ -2173,7 +2211,7 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
       } else {
          config->rsrc2 |= S_00B12C_OC_LDS_EN(1) | S_00B12C_EXCP_EN(excp_en);
       }
-      config->rsrc1 |= S_00B428_MEM_ORDERED(radv_mem_ordered(pdev)) | S_00B428_WGP_MODE(wgp_mode);
+      config->rsrc1 |= S_00B428_MEM_ORDERED(radv_mem_ordered(pdev)) | S_00B428_WGP_MODE(config->wgp_mode);
       config->rsrc2 |= S_00B42C_SHARED_VGPR_CNT(num_shared_vgpr_blocks);
       break;
    case MESA_SHADER_VERTEX:
@@ -2233,13 +2271,13 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
    case MESA_SHADER_ANY_HIT:
    case MESA_SHADER_COMPUTE:
    case MESA_SHADER_TASK:
-      config->rsrc1 |= S_00B848_MEM_ORDERED(radv_mem_ordered(pdev)) | S_00B848_WGP_MODE(wgp_mode);
+      config->rsrc1 |= S_00B848_MEM_ORDERED(radv_mem_ordered(pdev)) | S_00B848_WGP_MODE(config->wgp_mode);
       config->rsrc2 |= S_00B84C_TGID_X_EN(info->cs.uses_block_id[0]) | S_00B84C_TGID_Y_EN(info->cs.uses_block_id[1]) |
                        S_00B84C_TGID_Z_EN(info->cs.uses_block_id[2]) |
                        S_00B84C_TIDIG_COMP_CNT(info->cs.uses_thread_id[2]   ? 2
                                                : info->cs.uses_thread_id[1] ? 1
                                                                             : 0) |
-                       S_00B84C_TG_SIZE_EN(info->cs.uses_local_invocation_idx) | S_00B84C_LDS_SIZE(config->lds_size) |
+                       S_00B84C_TG_SIZE_EN(info->cs.uses_local_invocation_idx) | S_00B84C_LDS_SIZE(lds_alloc) |
                        S_00B84C_EXCP_EN(excp_en) | S_00B84C_EXCP_EN_MSB(excp_en_msb);
       config->rsrc3 |= S_00B8A0_SHARED_VGPR_CNT(num_shared_vgpr_blocks);
 
@@ -2314,12 +2352,8 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
          }
       }
 
-      /* Disable the WGP mode on gfx10.3 because it can hang. (it
-       * happened on VanGogh) Let's disable it on all chips that
-       * disable exactly 1 CU per SA for GS.
-       */
-      config->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) | S_00B228_WGP_MODE(wgp_mode);
-      config->rsrc2 |= S_00B22C_ES_VGPR_COMP_CNT(es_vgpr_comp_cnt) | S_00B22C_LDS_SIZE(config->lds_size) |
+      config->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) | S_00B228_WGP_MODE(config->wgp_mode);
+      config->rsrc2 |= S_00B22C_ES_VGPR_COMP_CNT(es_vgpr_comp_cnt) | S_00B22C_LDS_SIZE(lds_alloc) |
                        S_00B22C_OC_LDS_EN(es_stage == MESA_SHADER_TESS_EVAL);
    } else if (pdev->info.gfx_level >= GFX9 && stage == MESA_SHADER_GEOMETRY) {
       unsigned gs_vgpr_comp_cnt, es_vgpr_comp_cnt;
@@ -2350,7 +2384,7 @@ radv_postprocess_binary_config(struct radv_device *device, struct radv_shader_bi
          gs_vgpr_comp_cnt = 0; /* VGPR0 contains offsets 0, 1 */
       }
 
-      config->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) | S_00B228_WGP_MODE(wgp_mode);
+      config->rsrc1 |= S_00B228_GS_VGPR_COMP_CNT(gs_vgpr_comp_cnt) | S_00B228_WGP_MODE(config->wgp_mode);
       config->rsrc2 |=
          S_00B22C_ES_VGPR_COMP_CNT(es_vgpr_comp_cnt) | S_00B22C_OC_LDS_EN(es_stage == MESA_SHADER_TESS_EVAL);
    } else if (pdev->info.gfx_level >= GFX9 && stage == MESA_SHADER_TESS_CTRL) {
@@ -2422,12 +2456,12 @@ radv_shader_combine_cfg_vs_gs(const struct radv_device *device, const struct rad
       rsrc2 |= gs->config.rsrc2 & ~(C_00B12C_SCRATCH_EN & C_00B12C_SO_EN & C_00B12C_SO_BASE0_EN & C_00B12C_SO_BASE1_EN &
                                     C_00B12C_SO_BASE2_EN & C_00B12C_SO_BASE3_EN);
       if (gs->info.is_ngg) {
-         lds_size = DIV_ROUND_UP(gs->info.ngg_info.lds_size, pdev->info.lds_encode_granularity);
+         lds_size = gs->info.ngg_info.lds_size;
       } else {
          lds_size = gs->info.gs_ring_info.lds_size;
       }
 
-      rsrc2 |= S_00B22C_LDS_SIZE(lds_size);
+      rsrc2 |= S_00B22C_LDS_SIZE(ac_shader_encode_lds_size(lds_size, pdev->info.gfx_level, MESA_SHADER_VERTEX));
 
       *rsrc2_out = rsrc2;
    }
@@ -2710,16 +2744,12 @@ radv_get_max_waves(const struct radv_device *device, const struct ac_shader_conf
    const uint8_t wave_size = info->wave_size;
    mesa_shader_stage stage = info->stage;
    unsigned max_simd_waves = gpu_info->max_waves_per_simd;
-   unsigned lds_per_workgroup = 0;
-   unsigned waves_per_workgroup = 1;
+   unsigned lds_increment = ac_shader_get_lds_alloc_granularity(gfx_level);
+   unsigned lds_per_workgroup = align(conf->lds_size, lds_increment);
+   unsigned waves_per_workgroup = DIV_ROUND_UP(info->workgroup_size, wave_size);
 
    if (stage == MESA_SHADER_FRAGMENT) {
-      lds_per_workgroup = conf->lds_size * gpu_info->lds_encode_granularity + info->ps.num_inputs * 48;
-      lds_per_workgroup = align(lds_per_workgroup, gpu_info->lds_alloc_granularity);
-   } else if (stage == MESA_SHADER_COMPUTE || stage == MESA_SHADER_TASK) {
-      unsigned max_workgroup_size = info->workgroup_size;
-      lds_per_workgroup = align(conf->lds_size * gpu_info->lds_encode_granularity, gpu_info->lds_alloc_granularity);
-      waves_per_workgroup = DIV_ROUND_UP(max_workgroup_size, wave_size);
+      lds_per_workgroup += align(info->ps.num_inputs * 48, lds_increment);
    }
 
    if (conf->num_sgprs && gfx_level < GFX10) {
@@ -2737,13 +2767,12 @@ radv_get_max_waves(const struct radv_device *device, const struct ac_shader_conf
       max_simd_waves = MIN2(max_simd_waves, physical_vgprs / vgprs);
    }
 
-   bool wgp_mode = radv_should_use_wgp_mode(device, stage, info);
    unsigned simd_per_cu_wgp = gpu_info->num_simd_per_compute_unit;
-   if (wgp_mode)
+   if (conf->wgp_mode)
       simd_per_cu_wgp *= 2;
 
    if (lds_per_workgroup) {
-      unsigned lds_per_cu_wgp = gpu_info->lds_size_per_workgroup / (gfx_level >= GFX10 && !wgp_mode ? 2 : 1);
+      unsigned lds_per_cu_wgp = gpu_info->lds_size_per_workgroup * (gfx_level >= GFX10 && conf->wgp_mode ? 2 : 1);
       unsigned max_cu_wgp_waves = lds_per_cu_wgp / lds_per_workgroup * waves_per_workgroup;
       max_simd_waves = MIN2(max_simd_waves, DIV_ROUND_UP(max_cu_wgp_waves, simd_per_cu_wgp));
    }
@@ -3346,7 +3375,8 @@ radv_create_rt_prolog(struct radv_device *device)
    struct radv_shader_info info = {0};
    info.stage = MESA_SHADER_COMPUTE;
    info.loads_push_constants = true;
-   info.desc_set_used_mask = -1; /* just to force indirection */
+   info.loads_dynamic_offsets = true;
+   info.force_indirect_descriptors = true;
    info.wave_size = pdev->rt_wave_size;
    info.workgroup_size = info.wave_size;
    info.user_data_0 = R_00B900_COMPUTE_USER_DATA_0;
@@ -3699,12 +3729,12 @@ radv_get_user_sgpr(const struct radv_shader *shader, int idx)
 void
 radv_get_tess_wg_info(const struct radv_physical_device *pdev, const ac_nir_tess_io_info *io_info,
                       unsigned tcs_vertices_out, unsigned tcs_num_input_vertices, unsigned tcs_num_lds_inputs,
-                      unsigned *num_patches_per_wg, unsigned *hw_lds_size)
+                      unsigned *num_patches_per_wg, unsigned *lds_size)
 {
    const uint32_t lds_input_vertex_size = get_tcs_input_vertex_stride(tcs_num_lds_inputs);
 
    ac_nir_compute_tess_wg_info(&pdev->info, io_info, tcs_vertices_out, pdev->ge_wave_size, false,
-                               tcs_num_input_vertices, lds_input_vertex_size, 0, num_patches_per_wg, hw_lds_size);
+                               tcs_num_input_vertices, lds_input_vertex_size, 0, num_patches_per_wg, lds_size);
 }
 
 VkResult

@@ -17,14 +17,10 @@
 #include "libpan_dgc.h"
 
 static bool
-copy_to_image_use_gfx_pipeline(struct panvk_device *dev,
-                               struct panvk_image *dst_img)
+copy_to_image_use_gfx_pipeline(struct panvk_image *dst_img)
 {
-   struct panvk_instance *instance =
-      to_panvk_instance(dev->vk.physical->instance);
-
    /* Don't force gfx-based copies if the format is bigger than 32-bit. */
-   if ((instance->debug_flags & PANVK_DEBUG_COPY_GFX) &&
+   if (PANVK_DEBUG(COPY_GFX) &&
        vk_format_get_blocksize(dst_img->vk.format) <= 4)
       return true;
 
@@ -398,7 +394,7 @@ panvk_per_arch(CmdCopyBufferToImage2)(
    if (lower_copy_buffer_to_image(commandBuffer, pCopyBufferToImageInfo))
       return;
 
-   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, img);
+   const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(img);
    struct vk_meta_copy_image_properties img_props =
       panvk_meta_copy_get_image_properties(img, use_gfx_pipeline, true);
 
@@ -555,7 +551,7 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
    if (lower_copy_image(commandBuffer, pCopyImageInfo))
       return;
 
-   bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dev, dst_img);
+   const bool use_gfx_pipeline = copy_to_image_use_gfx_pipeline(dst_img);
    struct vk_meta_copy_image_properties dst_img_props =
       panvk_meta_copy_get_image_properties(dst_img, use_gfx_pipeline, true);
    struct vk_meta_copy_image_properties src_img_props =
@@ -663,6 +659,20 @@ cmd_clear_afbc_metadata(VkCommandBuffer _cmdbuf,
    panvk_per_arch(cmd_meta_compute_end)(cmdbuf, &save);
 }
 
+static bool
+panvk_acquire_unmodified(const VkImageMemoryBarrier2 *barrier)
+{
+   if (barrier->srcQueueFamilyIndex != VK_QUEUE_FAMILY_EXTERNAL &&
+       barrier->srcQueueFamilyIndex != VK_QUEUE_FAMILY_FOREIGN_EXT)
+      return false;
+
+   const VkExternalMemoryAcquireUnmodifiedEXT *acquire_unmodified =
+      vk_find_struct_const(barrier->pNext,
+                           EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT);
+   return acquire_unmodified &&
+          acquire_unmodified->acquireUnmodifiedMemory == VK_TRUE;
+}
+
 /* TODO: pass less data than what's in a VkImageMemoryBarrier2 */
 
 struct panvk_image_layout_transition_handler {
@@ -676,7 +686,8 @@ panvk_get_image_layout_transition_handler(const VkImageMemoryBarrier2 *barrier)
 {
    VK_FROM_HANDLE(panvk_image, img, barrier->image);
 
-   if (barrier->oldLayout == barrier->newLayout)
+   if (barrier->oldLayout == barrier->newLayout ||
+       panvk_acquire_unmodified(barrier))
       return (struct panvk_image_layout_transition_handler){0};
 
    if (barrier->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&

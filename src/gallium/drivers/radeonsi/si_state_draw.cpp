@@ -39,6 +39,9 @@
 #error "Unknown gfx level"
 #endif
 
+#define SI_VERTEX_PIPELINE_STATE_DIRTY_MASK \
+   (BITFIELD_MASK(MESA_SHADER_FRAGMENT + 1) | SI_SQTT_STATE_DIRTY_BIT)
+
 template <amd_gfx_level GFX_VERSION, si_has_tess HAS_TESS, si_has_gs HAS_GS, si_has_ngg NGG>
 static bool si_update_shaders(struct si_context *sctx)
 {
@@ -55,6 +58,19 @@ static bool si_update_shaders(struct si_context *sctx)
    struct si_shader *old_vs = si_get_vs_inline(sctx, HAS_TESS, HAS_GS)->current;
    struct si_shader *old_ps = sctx->shader.ps.current;
    int r;
+
+   if (GFX_VERSION >= GFX9) {
+      /* For merged shaders, mark the next shader as dirty so its previous_stage is updated. */
+      if (is_vs_state_changed) {
+         if (HAS_TESS) {
+            is_tess_state_changed = true;
+         } else if (HAS_GS) {
+            is_gs_state_changed = true;
+         }
+      }
+      if ((sctx->dirty_shaders_mask & BITFIELD_BIT(MESA_SHADER_TESS_EVAL)) && HAS_GS && HAS_TESS)
+         is_gs_state_changed = true;
+   }
 
    /* Update TCS and TES. */
    if (HAS_TESS && is_tess_state_changed) {
@@ -502,7 +518,7 @@ static bool si_update_shaders(struct si_context *sctx)
    if (GFX_VERSION >= GFX10 && NGG)
       sctx->ngg_culling = si_get_vs_inline(sctx, HAS_TESS, HAS_GS)->current->key.ge.opt.ngg_culling;
 
-   sctx->dirty_shaders_mask = 0u;
+   sctx->dirty_shaders_mask &= ~SI_VERTEX_PIPELINE_STATE_DIRTY_MASK;
    return true;
 }
 
@@ -840,14 +856,6 @@ static void si_init_ia_multi_vgt_param_table(struct si_context *sctx)
                               sctx->ia_multi_vgt_param[key.index] =
                                  si_get_init_multi_vgt_param(sctx->screen, &key);
                            }
-}
-
-static bool si_is_line_stipple_enabled(struct si_context *sctx)
-{
-   struct si_state_rasterizer *rs = sctx->queued.named.rasterizer;
-
-   return rs->line_stipple_enable && sctx->current_rast_prim != MESA_PRIM_POINTS &&
-          (rs->polygon_mode_is_lines || util_prim_is_lines(sctx->current_rast_prim));
 }
 
 enum si_is_draw_vertex_state {
@@ -1201,7 +1209,7 @@ static void si_emit_draw_registers(struct si_context *sctx,
 
 static ALWAYS_INLINE void
 gfx11_emit_buffered_sh_regs_inline(struct si_context *sctx, unsigned *num_regs,
-                                   struct gfx11_reg_pair *reg_pairs)
+                                   struct ac_gfx11_reg_pair *reg_pairs)
 {
    unsigned reg_count = *num_regs;
 
@@ -1257,16 +1265,36 @@ void si_emit_buffered_compute_sh_regs(struct si_context *sctx)
 {
    if (sctx->gfx_level >= GFX12) {
       radeon_begin(&sctx->gfx_cs);
-      gfx12_emit_buffered_sh_regs_inline(&sctx->num_buffered_compute_sh_regs,
-                                         sctx->gfx12.buffered_compute_sh_regs);
+      gfx12_emit_buffered_sh_regs_inline(&sctx->buffered_compute_sh_regs.num,
+                                         sctx->buffered_compute_sh_regs.gfx12.regs);
       radeon_end();
    } else {
-      gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->num_buffered_compute_sh_regs,
-                                         sctx->gfx11.buffered_compute_sh_regs);
+      gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->buffered_compute_sh_regs.num,
+                                         sctx->buffered_compute_sh_regs.gfx11.regs);
+   }
+}
+
+/* Used by mesh pipeline only. */
+void si_emit_buffered_gfx_sh_regs_for_mesh(struct si_context *sctx)
+{
+   if (sctx->gfx_level >= GFX12) {
+      radeon_begin(&sctx->gfx_cs);
+      gfx12_emit_buffered_sh_regs_inline(&sctx->buffered_gfx_sh_regs.num,
+                                         sctx->buffered_gfx_sh_regs.gfx12.regs);
+      radeon_end();
+   } else {
+      gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->buffered_gfx_sh_regs.num,
+                                         sctx->buffered_gfx_sh_regs.gfx11.regs);
    }
 }
 
 #endif
+
+#define radeon_emit_alt_hiz_logic() do { \
+   static_assert(GFX_VERSION == GFX12 || !ALT_HIZ_LOGIC, ""); \
+   if (GFX_VERSION == GFX12 && ALT_HIZ_LOGIC) \
+      radeon_emit_alt_hiz_packets(); \
+} while (0)
 
 template <amd_gfx_level GFX_VERSION, si_has_tess HAS_TESS, si_has_gs HAS_GS, si_has_ngg NGG,
           si_is_draw_vertex_state IS_DRAW_VERTEX_STATE, si_has_sh_pairs_packed HAS_SH_PAIRS_PACKED,
@@ -1299,16 +1327,10 @@ static void si_emit_draw_packets(struct si_context *sctx, const struct pipe_draw
          /* Use PKT3_LOAD_CONTEXT_REG_INDEX instead of si_cp_copy_data to support state shadowing. */
          uint64_t va = t->buf_filled_size->gpu_address + t->buf_filled_size_draw_count_offset;
 
-         radeon_begin(cs);
-
          // TODO: GFX12: This may be discarded by PFP if the shadow base address is provided by the MQD.
-         radeon_emit(PKT3(PKT3_LOAD_CONTEXT_REG_INDEX, 3, 0));
-         radeon_emit(va);
-         radeon_emit(va >> 32);
-         radeon_emit((R_028B2C_VGT_STRMOUT_DRAW_OPAQUE_BUFFER_FILLED_SIZE - SI_CONTEXT_REG_OFFSET) >> 2);
-         radeon_emit(1);
-
-         radeon_end();
+         ac_emit_cp_load_context_reg_index(&cs->current,
+                                           R_028B2C_VGT_STRMOUT_DRAW_OPAQUE_BUFFER_FILLED_SIZE,
+                                           1, va, false);
       } else {
          si_cp_copy_data(sctx, &sctx->gfx_cs, COPY_DATA_REG, NULL,
                          R_028B2C_VGT_STRMOUT_DRAW_OPAQUE_BUFFER_FILLED_SIZE >> 2, COPY_DATA_SRC_MEM,
@@ -1415,12 +1437,12 @@ static void si_emit_draw_packets(struct si_context *sctx, const struct pipe_draw
       assert(indirect_va % 8 == 0);
 
       if (GFX_VERSION >= GFX12) {
-         gfx12_emit_buffered_sh_regs_inline(&sctx->num_buffered_gfx_sh_regs,
-                                            sctx->gfx12.buffered_gfx_sh_regs);
+         gfx12_emit_buffered_sh_regs_inline(&sctx->buffered_gfx_sh_regs.num,
+                                            sctx->buffered_gfx_sh_regs.gfx12.regs);
       } else if (HAS_SH_PAIRS_PACKED) {
          radeon_end();
-         gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->num_buffered_gfx_sh_regs,
-                                            sctx->gfx11.buffered_gfx_sh_regs);
+         gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->buffered_gfx_sh_regs.num,
+                                            sctx->buffered_gfx_sh_regs.gfx11.regs);
          radeon_begin_again(cs);
       }
 
@@ -1543,12 +1565,12 @@ static void si_emit_draw_packets(struct si_context *sctx, const struct pipe_draw
       }
 
       if (GFX_VERSION >= GFX12) {
-         gfx12_emit_buffered_sh_regs_inline(&sctx->num_buffered_gfx_sh_regs,
-                                            sctx->gfx12.buffered_gfx_sh_regs);
+         gfx12_emit_buffered_sh_regs_inline(&sctx->buffered_gfx_sh_regs.num,
+                                            sctx->buffered_gfx_sh_regs.gfx12.regs);
       } else if (HAS_SH_PAIRS_PACKED) {
          radeon_end();
-         gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->num_buffered_gfx_sh_regs,
-                                            sctx->gfx11.buffered_gfx_sh_regs);
+         gfx11_emit_buffered_sh_regs_inline(sctx, &sctx->buffered_gfx_sh_regs.num,
+                                            sctx->buffered_gfx_sh_regs.gfx11.regs);
          radeon_begin_again(cs);
       }
 
@@ -2047,37 +2069,6 @@ static void si_get_draw_start_count(struct si_context *sctx, const struct pipe_d
    }
 }
 
-ALWAYS_INLINE
-static void si_emit_all_states(struct si_context *sctx, uint64_t skip_atom_mask)
-{
-   /* Emit states by calling their emit functions. */
-   uint64_t dirty = sctx->dirty_atoms & ~skip_atom_mask;
-
-   if (dirty) {
-      sctx->dirty_atoms &= skip_atom_mask;
-
-      /* u_bit_scan64 is too slow on i386. */
-      if (sizeof(void*) == 8) {
-         do {
-            unsigned i = u_bit_scan64(&dirty);
-            sctx->atoms.array[i].emit(sctx, i);
-         } while (dirty);
-      } else {
-         unsigned dirty_lo = dirty;
-         unsigned dirty_hi = dirty >> 32;
-
-         while (dirty_lo) {
-            unsigned i = u_bit_scan(&dirty_lo);
-            sctx->atoms.array[i].emit(sctx, i);
-         }
-         while (dirty_hi) {
-            unsigned i = 32 + u_bit_scan(&dirty_hi);
-            sctx->atoms.array[i].emit(sctx, i);
-         }
-      }
-   }
-}
-
 #define DRAW_CLEANUP do {                                 \
       if (release_indexbuf) \
          pipe_resource_reference(&indexbuf, NULL);        \
@@ -2304,20 +2295,16 @@ static void si_draw(struct pipe_context *ctx,
          sctx->force_trivial_vs_inputs = true;
 
          /* Update shaders to disable VS input lowering. */
-         if (sctx->uses_nontrivial_vs_inputs) {
+         if (sctx->uses_nontrivial_vs_inputs)
             si_vs_key_update_inputs(sctx);
-            sctx->dirty_shaders_mask |= BITFIELD_BIT(MESA_SHADER_VERTEX);
-         }
       }
    } else {
       if (sctx->force_trivial_vs_inputs) {
          sctx->force_trivial_vs_inputs = false;
 
          /* Update shaders to possibly enable VS input lowering. */
-         if (sctx->uses_nontrivial_vs_inputs) {
+         if (sctx->uses_nontrivial_vs_inputs)
             si_vs_key_update_inputs(sctx);
-            sctx->dirty_shaders_mask |= BITFIELD_BIT(MESA_SHADER_VERTEX);
-         }
       }
    }
 
@@ -2372,7 +2359,15 @@ static void si_draw(struct pipe_context *ctx,
       }
    }
 
-   if (unlikely(sctx->dirty_shaders_mask)) {
+   /* Make sure that the MS is not set when vertex pipeline is used.
+    *
+    * This is ensured by mesa state tracker to always update all graphics shader
+    * stages in any pipeline's draw call, and set the other pipeline's shader stages
+    * to be NULL when internal draw operations.
+    */
+   assert(!sctx->ms_shader_state.cso);
+
+   if (unlikely(sctx->dirty_shaders_mask & SI_VERTEX_PIPELINE_STATE_DIRTY_MASK)) {
       if (unlikely(!(si_update_shaders<GFX_VERSION, HAS_TESS, HAS_GS, NGG>(sctx)))) {
          DRAW_CLEANUP;
          return;
@@ -2463,7 +2458,7 @@ static void si_draw(struct pipe_context *ctx,
     * It must be done after drawing. */
    if (((GFX_VERSION == GFX7 && sctx->family == CHIP_HAWAII) ||
         (GFX_VERSION == GFX8 && (sctx->family == CHIP_TONGA || sctx->family == CHIP_FIJI))) &&
-       si_get_strmout_en(sctx)) {
+       si_get_streamout_enable_state(sctx)) {
       radeon_begin(&sctx->gfx_cs);
       radeon_event_write(V_028A90_VGT_STREAMOUT_SYNC);
       radeon_end();

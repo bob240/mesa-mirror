@@ -937,11 +937,9 @@ zink_delete_sampler_state(struct pipe_context *pctx,
    struct zink_batch_state *bs = zink_context(pctx)->bs;
    /* may be called if context_create fails */
    if (bs) {
-      util_dynarray_append(&bs->zombie_samplers, VkSampler,
-                           sampler->sampler);
+      util_dynarray_append(&bs->zombie_samplers, sampler->sampler);
       if (sampler->sampler_clamped)
-         util_dynarray_append(&bs->zombie_samplers, VkSampler,
-                              sampler->sampler_clamped);
+         util_dynarray_append(&bs->zombie_samplers, sampler->sampler_clamped);
    }
    if (sampler->custom_border_color)
       p_atomic_dec(&zink_screen(pctx->screen)->cur_custom_border_color_samplers);
@@ -2503,7 +2501,7 @@ zink_delete_texture_handle(struct pipe_context *pctx, uint64_t handle)
    struct zink_descriptor_surface *ds = &bd->ds;
    _mesa_hash_table_remove(&ctx->di.bindless[is_buffer].tex_handles, he);
    uint32_t h = handle;
-   util_dynarray_append(&ctx->bs->bindless_releases[0], uint32_t, h);
+   util_dynarray_append(&ctx->bs->bindless_releases[0], h);
 
    pipe_resource_reference(&bd->pres, NULL);
    if (!ds->is_buffer) {
@@ -2612,9 +2610,9 @@ zink_make_texture_handle_resident(struct pipe_context *pctx, uint64_t handle, bo
       res->gfx_barrier |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
       res->barrier_access[0] |= VK_ACCESS_SHADER_READ_BIT;
       res->barrier_access[1] |= VK_ACCESS_SHADER_READ_BIT;
-      util_dynarray_append(&ctx->di.bindless[0].resident, struct zink_bindless_descriptor *, bd);
+      util_dynarray_append(&ctx->di.bindless[0].resident, bd);
       uint32_t h = is_buffer ? handle + ZINK_MAX_BINDLESS_HANDLES : handle;
-      util_dynarray_append(&ctx->di.bindless[0].updates, uint32_t, h);
+      util_dynarray_append(&ctx->di.bindless[0].updates, h);
    } else {
       zero_bindless_descriptor(ctx, handle, is_buffer, false);
       util_dynarray_delete_unordered(&ctx->di.bindless[0].resident, struct zink_bindless_descriptor *, bd);
@@ -2675,7 +2673,7 @@ zink_delete_image_handle(struct pipe_context *pctx, uint64_t handle)
    struct zink_descriptor_surface *ds = &bd->ds;
    _mesa_hash_table_remove(&ctx->di.bindless[is_buffer].img_handles, he);
    uint32_t h = handle;
-   util_dynarray_append(&ctx->bs->bindless_releases[1], uint32_t, h);
+   util_dynarray_append(&ctx->bs->bindless_releases[1], h);
 
    pipe_resource_reference(&bd->pres, NULL);
    free(ds);
@@ -2741,9 +2739,9 @@ zink_make_image_handle_resident(struct pipe_context *pctx, uint64_t handle, unsi
       res->gfx_barrier |= VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
       res->barrier_access[0] |= access;
       res->barrier_access[1] |= access;
-      util_dynarray_append(&ctx->di.bindless[1].resident, struct zink_bindless_descriptor *, bd);
+      util_dynarray_append(&ctx->di.bindless[1].resident, bd);
       uint32_t h = is_buffer ? handle + ZINK_MAX_BINDLESS_HANDLES : handle;
-      util_dynarray_append(&ctx->di.bindless[1].updates, uint32_t, h);
+      util_dynarray_append(&ctx->di.bindless[1].updates, h);
    } else {
       zero_bindless_descriptor(ctx, handle, is_buffer, true);
       util_dynarray_delete_unordered(&ctx->di.bindless[1].resident, struct zink_bindless_descriptor *, bd);
@@ -2884,24 +2882,22 @@ zink_update_fbfetch(struct zink_context *ctx)
    return ret;
 }
 
-void
+static void
 zink_update_vk_sample_locations(struct zink_context *ctx)
 {
-   if (ctx->gfx_pipeline_state.sample_locations_enabled && ctx->sample_locations_changed) {
-      unsigned samples = ctx->gfx_pipeline_state.rast_samples + 1;
-      unsigned idx = util_logbase2_ceil(MAX2(samples, 1));
-      VkExtent2D grid_size = zink_screen(ctx->base.screen)->maxSampleLocationGridSize[idx];
- 
-      for (unsigned pixel = 0; pixel < grid_size.width * grid_size.height; pixel++) {
-         for (unsigned sample = 0; sample < samples; sample++) {
-            unsigned pixel_x = pixel % grid_size.width;
-            unsigned pixel_y = pixel / grid_size.width;
-            unsigned wi = pixel * samples + sample;
-            unsigned ri = (pixel_y * grid_size.width + pixel_x % grid_size.width);
-            ri = ri * samples + sample;
-            ctx->vk_sample_locations[wi].x = (ctx->sample_locations[ri] & 0xf) / 16.0f;
-            ctx->vk_sample_locations[wi].y = (ctx->sample_locations[ri] >> 4) / 16.0f;
-         }
+   unsigned samples = ctx->gfx_pipeline_state.rast_samples + 1;
+   unsigned idx = util_logbase2_ceil(MAX2(samples, 1));
+   VkExtent2D grid_size = zink_screen(ctx->base.screen)->maxSampleLocationGridSize[idx];
+
+   for (unsigned pixel = 0; pixel < grid_size.width * grid_size.height; pixel++) {
+      for (unsigned sample = 0; sample < samples; sample++) {
+         unsigned pixel_x = pixel % grid_size.width;
+         unsigned pixel_y = pixel / grid_size.width;
+         unsigned wi = pixel * samples + sample;
+         unsigned ri = (pixel_y * grid_size.width + pixel_x % grid_size.width);
+         ri = ri * samples + sample;
+         ctx->vk_sample_locations[wi].x = (ctx->sample_locations[ri] & 0xf) / 16.0f;
+         ctx->vk_sample_locations[wi].y = (ctx->sample_locations[ri] >> 4) / 16.0f;
       }
    }
 }
@@ -3042,7 +3038,8 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
 {
    unsigned clear_buffers = 0;
    struct zink_screen *screen = zink_screen(ctx->base.screen);
-   zink_update_vk_sample_locations(ctx);
+   if (ctx->gfx_pipeline_state.custom_sample_locations && ctx->sample_locations_changed)
+      zink_update_vk_sample_locations(ctx);
    if (ctx->has_swapchain)
       zink_render_fixup_swapchain(ctx);
    bool has_depth = false;
@@ -3073,7 +3070,7 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
             else
                ctx->dynamic_fb.attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
          }
-         if (ctx->dynamic_fb.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
+         if (!ctx->blitting && ctx->dynamic_fb.attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
             msaa_expand_mask |= BITFIELD_BIT(i);
       }
 
@@ -3235,7 +3232,7 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
          if (prep_fb_attachment(ctx, res, i))
             /* swapchain acquire can change this surface */
             iv = zink_create_fb_surface(&ctx->base, &ctx->fb_state.cbufs[i])->image_view;
-         if (ctx->fb_state.cbufs[i].nr_samples && !has_msrtss) {
+         if (ctx->fb_state.cbufs[i].nr_samples && !has_msrtss && !ctx->blitting) {
             ctx->dynamic_fb.attachments[i].resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
             ctx->dynamic_fb.attachments[i].resolveImageView = iv;
             ctx->dynamic_fb.attachments[i].resolveImageLayout = res->layout;
@@ -3280,7 +3277,7 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
       struct zink_resource *res = zink_resource(ctx->fb_state.zsbuf.texture);
       prep_fb_attachment(ctx, res, ctx->fb_state.nr_cbufs);
       VkImageView iv = zink_create_fb_surface(&ctx->base, &ctx->fb_state.zsbuf)->image_view;
-      if (ctx->fb_state.zsbuf.nr_samples && !has_msrtss) {
+      if (ctx->fb_state.zsbuf.nr_samples && !has_msrtss && !ctx->blitting) {
          ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].resolveImageView = iv;
          ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].resolveImageLayout = res->layout;
          ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS+1].resolveImageView = iv;
@@ -3299,7 +3296,7 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
       ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS+1].imageView = iv;
       ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS+1].imageLayout = res->layout;
       assert(ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS+1].imageLayout != VK_IMAGE_LAYOUT_UNDEFINED);
-      if (ctx->transient_attachments & BITFIELD_BIT(PIPE_MAX_COLOR_BUFS)) {
+      if (ctx->transient_attachments & BITFIELD_BIT(PIPE_MAX_COLOR_BUFS) && !ctx->blitting) {
          ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
          ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS + 1].resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
       } else {
@@ -3369,9 +3366,8 @@ begin_rendering(struct zink_context *ctx, bool check_msaa_expand)
       VK_TRUE,
       ctx->gfx_pipeline_state.rast_samples + 1,
    };
+   ctx->dynamic_fb.info.pNext = ctx->transient_attachments && !ctx->blitting && has_msrtss ? &msrtss : NULL;
 
-   if (has_msrtss)
-      ctx->dynamic_fb.info.pNext = ctx->transient_attachments ? &msrtss : NULL;
    VKCTX(CmdBeginRendering)(ctx->bs->cmdbuf, &ctx->dynamic_fb.info);
    ctx->in_rp = true;
    return clear_buffers;
@@ -3608,9 +3604,9 @@ zink_init_vk_sample_locations(struct zink_context *ctx, VkSampleLocationsInfoEXT
    unsigned idx = util_logbase2_ceil(MAX2(ctx->gfx_pipeline_state.rast_samples + 1, 1));
    loc->sType = VK_STRUCTURE_TYPE_SAMPLE_LOCATIONS_INFO_EXT;
    loc->pNext = NULL;
-   loc->sampleLocationsPerPixel = 1 << idx;
-   loc->sampleLocationsCount = ctx->gfx_pipeline_state.rast_samples + 1;
    loc->sampleLocationGridSize = screen->maxSampleLocationGridSize[idx];
+   loc->sampleLocationsPerPixel = ctx->gfx_pipeline_state.rast_samples + 1;
+   loc->sampleLocationsCount = loc->sampleLocationGridSize.width * loc->sampleLocationGridSize.height * loc->sampleLocationsPerPixel;
    loc->pSampleLocations = ctx->vk_sample_locations;
 }
 
@@ -3828,7 +3824,7 @@ flush_batch(struct zink_context *ctx, bool sync)
       ctx->dd.bindless_bound = false;
       ctx->di.bindless_refs_dirty = true;
       ctx->index_buffer = NULL;
-      ctx->sample_locations_changed = ctx->gfx_pipeline_state.sample_locations_enabled;
+      ctx->sample_locations_changed = ctx->base.screen->caps.programmable_sample_locations;
       if (zink_screen(ctx->base.screen)->info.dynamic_state2_feats.extendedDynamicState2PatchControlPoints) {
          VKCTX(CmdSetPatchControlPointsEXT)(ctx->bs->cmdbuf, ctx->gfx_pipeline_state.dyn_state2.vertices_per_patch);
          VKCTX(CmdSetPatchControlPointsEXT)(ctx->bs->reordered_cmdbuf, 1);
@@ -4123,10 +4119,9 @@ zink_set_framebuffer_state(struct pipe_context *pctx,
       ctx->scissor_changed = true;
 
    uint8_t rast_samples = ctx->fb_state.samples - 1;
-   if (rast_samples != ctx->gfx_pipeline_state.rast_samples)
+   if (rast_samples != ctx->gfx_pipeline_state.rast_samples) {
       zink_update_fs_key_samples(ctx);
-   if (ctx->gfx_pipeline_state.rast_samples != rast_samples) {
-      ctx->sample_locations_changed |= ctx->gfx_pipeline_state.sample_locations_enabled;
+      ctx->sample_locations_changed |= ctx->gfx_pipeline_state.custom_sample_locations;
       if (screen->have_full_ds3)
          ctx->sample_mask_changed = true;
       else
@@ -4179,8 +4174,8 @@ zink_set_sample_locations(struct pipe_context *pctx, size_t size, const uint8_t 
 {
    struct zink_context *ctx = zink_context(pctx);
 
-   ctx->gfx_pipeline_state.sample_locations_enabled = size && locations;
-   ctx->sample_locations_changed = ctx->gfx_pipeline_state.sample_locations_enabled;
+   ctx->gfx_pipeline_state.custom_sample_locations = size && locations;
+   ctx->sample_locations_changed = true;
    if (size > sizeof(ctx->sample_locations))
       size = sizeof(ctx->sample_locations);
 
@@ -4296,11 +4291,11 @@ zink_flush(struct pipe_context *pctx,
       mfence->sem = export_sem;
       if (bs) {
          mfence->submit_count = bs->usage.submit_count;
-         util_dynarray_append(&bs->fence.mfences, struct zink_tc_fence *, mfence);
+         util_dynarray_append(&bs->fence.mfences, mfence);
       }
       if (export_sem) {
          pipe_reference(NULL, &mfence->reference);
-         util_dynarray_append(&ctx->bs->fences, struct zink_tc_fence*, mfence);
+         util_dynarray_append(&ctx->bs->fences, mfence);
       }
 
       if (deferred_fence) {
@@ -5547,6 +5542,7 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
    ctx->compute_pipeline_state.dirty = true;
    ctx->rp_changed = true;
    ctx->sample_mask_changed = true;
+   ctx->sample_locations_changed = pscreen->caps.programmable_sample_locations;
    ctx->gfx_pipeline_state.gfx_prim_mode = MESA_PRIM_COUNT;
    ctx->gfx_pipeline_state.shader_rast_prim = MESA_PRIM_COUNT;
    ctx->gfx_pipeline_state.rast_prim = MESA_PRIM_COUNT;

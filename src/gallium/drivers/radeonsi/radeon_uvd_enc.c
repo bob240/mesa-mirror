@@ -54,7 +54,7 @@ static void radeon_uvd_enc_session_info(struct radeon_uvd_encoder *enc)
    RADEON_ENC_BEGIN(RENC_UVD_IB_PARAM_SESSION_INFO);
    RADEON_ENC_CS(0x00000000); // reserved
    RADEON_ENC_CS(interface_version);
-   RADEON_ENC_READWRITE(enc->si->res->buf, enc->si->res->domains, 0x0);
+   RADEON_ENC_READWRITE(enc->si->buf, enc->si->domains, 0x0);
    RADEON_ENC_END();
 }
 
@@ -673,7 +673,7 @@ static void radeon_uvd_enc_ctx(struct radeon_uvd_encoder *enc)
    }
 
    RADEON_ENC_BEGIN(RENC_UVD_IB_PARAM_ENCODE_CONTEXT_BUFFER);
-   RADEON_ENC_READWRITE(enc->dpb.res->buf, enc->dpb.res->domains, 0);
+   RADEON_ENC_READWRITE(enc->dpb->buf, enc->dpb->domains, 0);
    RADEON_ENC_CS(0x00000000); // reserved
    RADEON_ENC_CS(enc->enc_pic.ctx_buf.swizzle_mode);
    RADEON_ENC_CS(enc->enc_pic.ctx_buf.rec_luma_pitch);
@@ -1077,8 +1077,10 @@ static void radeon_uvd_enc_begin_frame(struct pipe_video_codec *encoder,
 
    if (enc->dpb_slots < dpb_slots) {
       uint32_t dpb_size = setup_dpb(enc, dpb_slots);
-      if (!enc->dpb.res) {
-         if (!si_vid_create_buffer(enc->screen, &enc->dpb, dpb_size, PIPE_USAGE_DEFAULT)) {
+      if (!enc->dpb) {
+         enc->dpb = si_resource(pipe_buffer_create(enc->screen, PIPE_BIND_CUSTOM,
+                                                   PIPE_USAGE_DEFAULT, dpb_size));
+         if (!enc->dpb) {
             RVID_ERR("Can't create DPB buffer.\n");
             return;
          }
@@ -1089,14 +1091,13 @@ static void radeon_uvd_enc_begin_frame(struct pipe_video_codec *encoder,
    }
 
    if (!enc->si) {
-      struct rvid_buffer fb;
-      enc->si = CALLOC_STRUCT(rvid_buffer);
-      si_vid_create_buffer(enc->screen, enc->si, 128 * 1024, PIPE_USAGE_DEFAULT);
-      si_vid_create_buffer(enc->screen, &fb, 4096, PIPE_USAGE_STAGING);
-      enc->fb = &fb;
+      enc->si = si_resource(pipe_buffer_create(enc->screen, PIPE_BIND_CUSTOM, PIPE_USAGE_DEFAULT, 128 * 1024));
+      if (!enc->si) {
+         RVID_ERR("Can't create session buffer.\n");
+         return;
+      }
       begin(enc, picture);
       flush(enc, PIPE_FLUSH_ASYNC, NULL);
-      si_vid_destroy_buffer(&fb);
    }
 }
 
@@ -1182,14 +1183,16 @@ static void radeon_uvd_enc_encode_bitstream(struct pipe_video_codec *encoder,
    enc->bs_size = destination->width0;
    enc->bs_offset = 0;
 
-   *fb = enc->fb = CALLOC_STRUCT(rvid_buffer);
+   *fb = enc->fb = CALLOC_STRUCT(radeon_uvd_enc_fb_buffer);
 
-   if (!si_vid_create_buffer(enc->screen, enc->fb, 4096, PIPE_USAGE_STAGING)) {
+   enc->fb->res = si_resource(pipe_buffer_create(enc->screen, PIPE_BIND_CUSTOM,
+                                                 PIPE_USAGE_STAGING, 4096));
+   if (!enc->fb->res) {
       RVID_ERR("Can't create feedback buffer.\n");
       return;
    }
 
-   enc->fb->user_data = radeon_uvd_enc_encode_headers(enc);
+   enc->fb->data = radeon_uvd_enc_encode_headers(enc);
 
    enc->need_feedback = true;
    encode(enc);
@@ -1208,19 +1211,15 @@ static void radeon_uvd_enc_destroy(struct pipe_video_codec *encoder)
    struct radeon_uvd_encoder *enc = (struct radeon_uvd_encoder *)encoder;
 
    if (enc->si) {
-      struct rvid_buffer fb;
       enc->need_feedback = false;
-      si_vid_create_buffer(enc->screen, &fb, 512, PIPE_USAGE_STAGING);
-      enc->fb = &fb;
       destroy(enc);
       flush(enc, PIPE_FLUSH_ASYNC, NULL);
-      si_vid_destroy_buffer(enc->si);
+      si_resource_reference(&enc->si, NULL);
       FREE(enc->si);
-      si_vid_destroy_buffer(&fb);
    }
 
-   if (enc->dpb.res)
-      si_vid_destroy_buffer(&enc->dpb);
+   if (enc->dpb)
+      si_resource_reference(&enc->dpb, NULL);
    enc->ws->cs_destroy(&enc->cs);
    FREE(enc);
 }
@@ -1229,7 +1228,7 @@ static void radeon_uvd_enc_get_feedback(struct pipe_video_codec *encoder, void *
                                         unsigned *size, struct pipe_enc_feedback_metadata* metadata)
 {
    struct radeon_uvd_encoder *enc = (struct radeon_uvd_encoder *)encoder;
-   struct rvid_buffer *fb = feedback;
+   struct radeon_uvd_enc_fb_buffer *fb = feedback;
 
    radeon_uvd_enc_feedback_t *fb_data = (radeon_uvd_enc_feedback_t *)enc->ws->buffer_map(
       enc->ws, fb->res->buf, NULL, PIPE_MAP_READ_WRITE | RADEON_MAP_TEMPORARY);
@@ -1243,8 +1242,8 @@ static void radeon_uvd_enc_get_feedback(struct pipe_video_codec *encoder, void *
 
    metadata->present_metadata = PIPE_VIDEO_FEEDBACK_METADATA_TYPE_CODEC_UNIT_LOCATION;
 
-   if (fb->user_data) {
-      struct ruvd_enc_feedback_data *data = fb->user_data;
+   if (fb->data) {
+      struct ruvd_enc_feedback_data *data = fb->data;
       metadata->codec_unit_metadata_count = data->num_segments;
       for (unsigned i = 0; i < data->num_segments; i++) {
          metadata->codec_unit_metadata[i].offset = data->segments[i].offset;
@@ -1256,8 +1255,8 @@ static void radeon_uvd_enc_get_feedback(struct pipe_video_codec *encoder, void *
             metadata->codec_unit_metadata[i].flags = PIPE_VIDEO_CODEC_UNIT_LOCATION_FLAG_SINGLE_NALU;
          }
       }
-      FREE(fb->user_data);
-      fb->user_data = NULL;
+      FREE(fb->data);
+      fb->data = NULL;
    } else {
       metadata->codec_unit_metadata_count = 1;
       metadata->codec_unit_metadata[0].offset = 0;
@@ -1265,7 +1264,7 @@ static void radeon_uvd_enc_get_feedback(struct pipe_video_codec *encoder, void *
       metadata->codec_unit_metadata[0].flags = 0;
    }
 
-   si_vid_destroy_buffer(fb);
+   si_resource_reference(&fb->res, NULL);
    FREE(fb);
 }
 

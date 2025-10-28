@@ -638,6 +638,10 @@ mubuf_load_callback(Builder& bld, const LoadEmitInfo& info, unsigned bytes_neede
    else if (idxen)
       vaddr = Operand(info.idx);
 
+   bool atomic64 =
+      (info.sync.semantics & semantic_atomic) && info.component_size == 8 && align_ >= 8;
+   bool use_mtbuf = false;
+
    unsigned bytes_size = 0;
    aco_opcode op;
    if (bytes_needed == 1 || align_ % 2) {
@@ -651,9 +655,11 @@ mubuf_load_callback(Builder& bld, const LoadEmitInfo& info, unsigned bytes_neede
    } else if (bytes_needed <= 4) {
       bytes_size = 4;
       op = aco_opcode::buffer_load_dword;
-   } else if (bytes_needed <= 8) {
+   } else if (bytes_needed <= 8 || atomic64) {
       bytes_size = 8;
-      op = aco_opcode::buffer_load_dwordx2;
+      /* Use MTBUF for 64-bit atomic loads for correct bounds checking. */
+      use_mtbuf = atomic64;
+      op = use_mtbuf ? aco_opcode::tbuffer_load_format_xy : aco_opcode::buffer_load_dwordx2;
    } else if (bytes_needed <= 12 && bld.program->gfx_level > GFX6) {
       bytes_size = 12;
       op = aco_opcode::buffer_load_dwordx3;
@@ -661,19 +667,31 @@ mubuf_load_callback(Builder& bld, const LoadEmitInfo& info, unsigned bytes_neede
       bytes_size = 16;
       op = aco_opcode::buffer_load_dwordx4;
    }
-   aco_ptr<Instruction> mubuf{create_instruction(op, Format::MUBUF, 3 + 2 * info.disable_wqm, 1)};
+   aco_ptr<Instruction> mubuf{
+      create_instruction(op, use_mtbuf ? Format::MTBUF : Format::MUBUF, 3 + 2 * info.disable_wqm, 1)};
    mubuf->operands[0] = Operand(info.resource);
    mubuf->operands[1] = vaddr;
    mubuf->operands[2] = soffset;
-   mubuf->mubuf().offen = offen;
-   mubuf->mubuf().idxen = idxen;
-   mubuf->mubuf().cache = info.cache;
-   mubuf->mubuf().sync = info.sync;
-   mubuf->mubuf().offset = info.const_offset;
+   if (use_mtbuf) {
+      mubuf->mtbuf().offen = offen;
+      mubuf->mtbuf().idxen = idxen;
+      mubuf->mtbuf().cache = info.cache;
+      mubuf->mtbuf().sync = info.sync;
+      mubuf->mtbuf().offset = info.const_offset;
+      mubuf->mtbuf().dfmt = V_008F0C_BUF_DATA_FORMAT_32_32;
+      mubuf->mtbuf().nfmt = V_008F0C_BUF_NUM_FORMAT_UINT;
+      init_disable_wqm(bld, mubuf->mtbuf(), info.disable_wqm);
+   } else {
+      mubuf->mubuf().offen = offen;
+      mubuf->mubuf().idxen = idxen;
+      mubuf->mubuf().cache = info.cache;
+      mubuf->mubuf().sync = info.sync;
+      mubuf->mubuf().offset = info.const_offset;
+      init_disable_wqm(bld, mubuf->mubuf(), info.disable_wqm);
+   }
    RegClass rc = RegClass::get(RegType::vgpr, bytes_size);
    Temp val = rc == info.dst.regClass() ? info.dst : bld.tmp(rc);
    mubuf->definitions[0] = Definition(val);
-   init_disable_wqm(bld, mubuf->mubuf(), info.disable_wqm);
    bld.insert(std::move(mubuf));
 
    return val;
@@ -1825,6 +1843,8 @@ get_memory_sync_info(nir_intrinsic_instr* instr, storage_class storage, unsigned
       semantics |= semantic_volatile;
    if (access & ACCESS_CAN_REORDER)
       semantics |= semantic_can_reorder | semantic_private;
+   else if (access & ACCESS_ATOMIC)
+      semantics |= semantic_atomic;
 
    return memory_sync_info(storage, semantics);
 }
@@ -2080,6 +2100,11 @@ translate_buffer_image_atomic_op(const nir_atomic_op op, aco_opcode* buf_op, aco
       *buf_op64 = aco_opcode::buffer_atomic_add_x2;
       *image_op = aco_opcode::image_atomic_add;
       break;
+   case nir_atomic_op_isub:
+      *buf_op = aco_opcode::buffer_atomic_sub;
+      *buf_op64 = aco_opcode::buffer_atomic_sub_x2;
+      *image_op = aco_opcode::image_atomic_sub;
+      break;
    case nir_atomic_op_umin:
       *buf_op = aco_opcode::buffer_atomic_umin;
       *buf_op64 = aco_opcode::buffer_atomic_umin_x2;
@@ -2255,10 +2280,16 @@ visit_store_ssbo(isel_context* ctx, nir_intrinsic_instr* instr)
 
    memory_sync_info sync = get_memory_sync_info(instr, storage_buffer, 0);
 
+   /* 64-bit atomic stores need to be at most 8 bytes so that they can use MTBUF for correct bounds
+    * checking. */
+   bool use_mtbuf =
+      (sync.semantics & semantic_atomic) && elem_size_bytes == 8 && nir_intrinsic_align(instr) >= 8;
+   unsigned max_size = use_mtbuf ? 8 : 16;
+
    unsigned write_count = 0;
    Temp write_datas[32];
    unsigned offsets[32];
-   split_buffer_store(ctx, instr, false, RegType::vgpr, data, writemask, 16, &write_count,
+   split_buffer_store(ctx, instr, false, RegType::vgpr, data, writemask, max_size, &write_count,
                       write_datas, offsets);
 
    /* GFX6-7 are affected by a hw bug that prevents address clamping to work
@@ -2274,16 +2305,32 @@ visit_store_ssbo(isel_context* ctx, nir_intrinsic_instr* instr)
       if (write_datas[i].bytes() < 4)
          type = ac_access_type_store_subdword;
 
-      aco_ptr<Instruction> store{create_instruction(op, Format::MUBUF, 6, 0)};
+      if (use_mtbuf) {
+         assert(write_datas[i].bytes() == 8);
+         op = aco_opcode::tbuffer_store_format_xy;
+      }
+
+      aco_ptr<Instruction> store{
+         create_instruction(op, use_mtbuf ? Format::MTBUF : Format::MUBUF, 6, 0)};
       store->operands[0] = Operand(rsrc);
       store->operands[1] = offset.type() == RegType::vgpr ? Operand(offset) : Operand(v1);
       store->operands[2] = offset.type() == RegType::sgpr ? Operand(offset) : Operand::c32(0);
       store->operands[3] = Operand(write_datas[i]);
-      store->mubuf().offset = offsets[i];
-      store->mubuf().offen = (offset.type() == RegType::vgpr);
-      store->mubuf().cache = get_cache_flags(ctx, access, type);
-      store->mubuf().sync = sync;
-      init_disable_wqm(bld, store->mubuf(), true);
+      if (use_mtbuf) {
+         store->mtbuf().offset = offsets[i];
+         store->mtbuf().offen = (offset.type() == RegType::vgpr);
+         store->mtbuf().cache = get_cache_flags(ctx, access, type);
+         store->mtbuf().sync = sync;
+         store->mtbuf().dfmt = V_008F0C_BUF_DATA_FORMAT_32_32;
+         store->mtbuf().nfmt = V_008F0C_BUF_NUM_FORMAT_UINT;
+         init_disable_wqm(bld, store->mtbuf(), true);
+      } else {
+         store->mubuf().offset = offsets[i];
+         store->mubuf().offen = (offset.type() == RegType::vgpr);
+         store->mubuf().cache = get_cache_flags(ctx, access, type);
+         store->mubuf().sync = sync;
+         init_disable_wqm(bld, store->mubuf(), true);
+      }
       ctx->block->instructions.emplace_back(std::move(store));
    }
 }
@@ -2495,10 +2542,13 @@ visit_global_atomic(isel_context* ctx, nir_intrinsic_instr* instr)
 
    const nir_atomic_op nir_op = nir_intrinsic_atomic_op(instr);
    const bool cmpswap = nir_op == nir_atomic_op_cmpxchg;
+   unsigned offset_idx = 2;
 
-   if (cmpswap)
+   if (cmpswap) {
+      offset_idx = 3;
       data = bld.pseudo(aco_opcode::p_create_vector, bld.def(RegType::vgpr, data.size() * 2),
                         get_ssa_temp(ctx, instr->src[2].ssa), data);
+   }
 
    Temp dst = get_ssa_temp(ctx, &instr->def);
 
@@ -2507,7 +2557,8 @@ visit_global_atomic(isel_context* ctx, nir_intrinsic_instr* instr)
    Temp addr, offset;
    uint32_t const_offset;
    parse_global(ctx, instr, &addr, &const_offset, &offset);
-   Format format = lower_global_address(ctx, bld, 0, &addr, &const_offset, &offset, &instr->src[2]);
+   Format format =
+      lower_global_address(ctx, bld, 0, &addr, &const_offset, &offset, &instr->src[offset_idx]);
 
    if (format != Format::MUBUF) {
       bool global = format == Format::GLOBAL;
@@ -2515,6 +2566,10 @@ visit_global_atomic(isel_context* ctx, nir_intrinsic_instr* instr)
       case nir_atomic_op_iadd:
          op32 = global ? aco_opcode::global_atomic_add : aco_opcode::flat_atomic_add;
          op64 = global ? aco_opcode::global_atomic_add_x2 : aco_opcode::flat_atomic_add_x2;
+         break;
+      case nir_atomic_op_isub:
+         op32 = global ? aco_opcode::global_atomic_sub : aco_opcode::flat_atomic_sub;
+         op64 = global ? aco_opcode::global_atomic_sub_x2 : aco_opcode::flat_atomic_sub_x2;
          break;
       case nir_atomic_op_imin:
          op32 = global ? aco_opcode::global_atomic_smin : aco_opcode::flat_atomic_smin;
@@ -2802,32 +2857,6 @@ visit_store_buffer(isel_context* ctx, nir_intrinsic_instr* intrin)
    }
 }
 
-void
-visit_load_smem(isel_context* ctx, nir_intrinsic_instr* instr)
-{
-   Builder bld(ctx->program, ctx->block);
-   Temp dst = get_ssa_temp(ctx, &instr->def);
-   Temp base = bld.as_uniform(get_ssa_temp(ctx, instr->src[0].ssa));
-   Temp offset = bld.as_uniform(get_ssa_temp(ctx, instr->src[1].ssa));
-
-   assert(base.bytes() == 8);
-
-   aco_opcode opcode;
-   unsigned size;
-   assert(dst.bytes() <= 64);
-   std::tie(opcode, size) = get_smem_opcode(ctx->program->gfx_level, dst.bytes(), false, false);
-   size = util_next_power_of_two(size);
-
-   if (dst.size() != DIV_ROUND_UP(size, 4)) {
-      bld.pseudo(aco_opcode::p_extract_vector, Definition(dst),
-                 bld.smem(opcode, bld.def(RegClass::get(RegType::sgpr, size)), base, offset),
-                 Operand::c32(0u));
-   } else {
-      bld.smem(opcode, Definition(dst), base, offset);
-   }
-   emit_split_vector(ctx, dst, instr->def.num_components);
-}
-
 sync_scope
 translate_nir_scope(mesa_scope scope)
 {
@@ -2890,9 +2919,9 @@ emit_barrier(isel_context* ctx, nir_intrinsic_instr* instr)
 
    unsigned nir_semantics = nir_intrinsic_memory_semantics(instr);
    if (nir_semantics & NIR_MEMORY_ACQUIRE)
-      semantics |= semantic_acquire | semantic_release;
+      semantics |= semantic_acquire;
    if (nir_semantics & NIR_MEMORY_RELEASE)
-      semantics |= semantic_acquire | semantic_release;
+      semantics |= semantic_release;
 
    assert(!(nir_semantics & (NIR_MEMORY_MAKE_AVAILABLE | NIR_MEMORY_MAKE_VISIBLE)));
    assert(exec_scope != scope_workgroup || workgroup_scope_allowed);
@@ -2900,6 +2929,17 @@ emit_barrier(isel_context* ctx, nir_intrinsic_instr* instr)
    bld.barrier(aco_opcode::p_barrier,
                memory_sync_info((storage_class)storage, (memory_semantics)semantics, mem_scope),
                exec_scope);
+}
+
+/* The two 32 wide halves of a gfx10+ wave64 LDS instruction might be executed interleaved
+ * with LDS instructions from the other CU in WGP mode.
+ */
+bool
+lds_potential_non_atomic_split(isel_context* ctx, unsigned access)
+{
+   return ctx->options->gfx_level >= GFX10 && ctx->program->wave_size == 64 &&
+          ctx->program->workgroup_size > 64 && ctx->program->wgp_mode &&
+          ((access & ACCESS_ATOMIC) || !ctx->shader->info.assume_no_data_races);
 }
 
 void
@@ -2939,19 +2979,17 @@ visit_load_shared(isel_context* ctx, nir_intrinsic_instr* instr)
                        ? bld.def(RegClass::get(RegType::vgpr, bytes))
                        : Definition(dst);
    Instruction* ds = bld.ds(op, def, address, m, const_offset);
-   ds->ds().sync = memory_sync_info(storage_shared);
+   ds->ds().sync = get_memory_sync_info(instr, storage_shared, 0);
 
    if (m.isUndefined())
       ds->operands.pop_back();
 
    if (def.getTemp() != dst) {
-      /* The 2 separate loads for gfx10+ wave64 can see different values, even for uniform
-       * addresses, if another wave writes LDS in between. Use v_readfirstlane instead of
-       * p_as_uniform in order to avoid copy-propagation.
+      /* Use v_readfirstlane instead of p_as_uniform in order to avoid copy-propagation of
+       * potentially divergent value.
        */
-      bool readfirstlane_for_uniform = ctx->options->gfx_level >= GFX10 &&
-                                       ctx->program->wave_size == 64 &&
-                                       ctx->program->workgroup_size > 64;
+      bool readfirstlane_for_uniform =
+         lds_potential_non_atomic_split(ctx, nir_intrinsic_access(instr));
       emit_vector_as_uniform(ctx, def.getTemp(), dst, readfirstlane_for_uniform);
    }
 
@@ -2991,7 +3029,7 @@ visit_store_shared(isel_context* ctx, nir_intrinsic_instr* instr)
    assert(const_offset <= UINT16_MAX);
 
    Instruction* ds = bld.ds(op, address, data, m, const_offset);
-   ds->ds().sync = memory_sync_info(storage_shared);
+   ds->ds().sync = get_memory_sync_info(instr, storage_shared, 0);
 
    if (m.isUndefined())
       ds->operands.pop_back();
@@ -3014,6 +3052,12 @@ visit_shared_atomic(isel_context* ctx, nir_intrinsic_instr* instr)
       op64 = aco_opcode::ds_add_u64;
       op32_rtn = aco_opcode::ds_add_rtn_u32;
       op64_rtn = aco_opcode::ds_add_rtn_u64;
+      break;
+   case nir_atomic_op_isub:
+      op32 = aco_opcode::ds_sub_u32;
+      op64 = aco_opcode::ds_sub_u64;
+      op32_rtn = aco_opcode::ds_sub_rtn_u32;
+      op64_rtn = aco_opcode::ds_sub_rtn_u64;
       break;
    case nir_atomic_op_imin:
       op32 = aco_opcode::ds_min_i32;
@@ -3152,12 +3196,10 @@ visit_shared_append(isel_context* ctx, nir_intrinsic_instr* instr)
       ds = bld.ds(op, Definition(tmp), m, address);
    ds->ds().sync = memory_sync_info(storage_shared, semantic_atomicrmw);
 
-   /* In wave64 for hw with native wave32, ds_append seems to be split in a load for the low half
-    * and an atomic for the high half, and other LDS instructions can be scheduled between the two.
-    * Which means the result of the low half is unusable because it might be out of date.
+   /* If there is a write to the same LDS address between the split halves, only the second half
+    * will read the correct result.
     */
-   if (ctx->program->gfx_level >= GFX10 && ctx->program->wave_size == 64 &&
-       ctx->program->workgroup_size > 64) {
+   if (lds_potential_non_atomic_split(ctx, ACCESS_ATOMIC)) {
       Temp last_lane = bld.sop1(aco_opcode::s_flbit_i32_b64, bld.def(s1), Operand(exec, s2));
       last_lane = bld.sop2(aco_opcode::s_sub_u32, bld.def(s1), bld.def(s1, scc), Operand::c32(63),
                            last_lane);
@@ -3199,7 +3241,7 @@ visit_access_shared2_amd(isel_context* ctx, nir_intrinsic_instr* instr)
                            : (is64bit ? aco_opcode::ds_read2_b64 : aco_opcode::ds_read2_b32);
       ds = bld.ds(op, tmp_dst, address, m, offset0, offset1);
    }
-   ds->ds().sync = memory_sync_info(storage_shared);
+   ds->ds().sync = get_memory_sync_info(instr, storage_shared, 0);
    if (m.isUndefined())
       ds->operands.pop_back();
 
@@ -3207,9 +3249,8 @@ visit_access_shared2_amd(isel_context* ctx, nir_intrinsic_instr* instr)
       Temp dst = get_ssa_temp(ctx, &instr->def);
       if (dst.type() == RegType::sgpr) {
          /* Similar to load_shared. */
-         bool readfirstlane_for_uniform = ctx->options->gfx_level >= GFX10 &&
-                                          ctx->program->wave_size == 64 &&
-                                          ctx->program->workgroup_size > 64;
+         bool readfirstlane_for_uniform =
+            lds_potential_non_atomic_split(ctx, nir_intrinsic_access(instr));
 
          emit_split_vector(ctx, ds->definitions[0].getTemp(), dst.size());
          Temp comp[4];
@@ -4030,7 +4071,6 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
    case nir_intrinsic_load_typed_buffer_amd:
    case nir_intrinsic_load_buffer_amd: visit_load_buffer(ctx, instr); break;
    case nir_intrinsic_store_buffer_amd: visit_store_buffer(ctx, instr); break;
-   case nir_intrinsic_load_smem_amd: visit_load_smem(ctx, instr); break;
    case nir_intrinsic_load_global_amd: visit_load_global(ctx, instr); break;
    case nir_intrinsic_store_global_amd: visit_store_global(ctx, instr); break;
    case nir_intrinsic_global_atomic_amd:

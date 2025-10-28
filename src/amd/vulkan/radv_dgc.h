@@ -15,7 +15,6 @@
 
 struct radv_cmd_buffer;
 struct radv_device;
-enum radv_queue_family;
 
 struct radv_indirect_command_layout {
    struct vk_indirect_command_layout vk;
@@ -43,7 +42,7 @@ struct radv_indirect_execution_set {
    uint32_t cs_num_dw;
    bool uses_grid_base_sgpr;
    bool uses_upload_sgpr;
-   bool uses_indirect_desc_sets_sgpr;
+   bool uses_indirect_descriptors_sgpr;
    uint16_t push_constant_size;
 
    uint32_t compute_scratch_size_per_wave;

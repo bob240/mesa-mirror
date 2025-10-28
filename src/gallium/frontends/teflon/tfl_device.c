@@ -166,9 +166,22 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
                                   operation->conv.weight_tensor->dims[2] == 1;
       break;
    }
-   case kTfLiteBuiltinAveragePool2d:
+   case kTfLiteBuiltinMaxPool2d:
+      operation->pooling.type = PIPE_ML_POOLING_TYPE_MAX;
+      __attribute__((fallthrough));
+   case kTfLiteBuiltinAveragePool2d: {
+      TfLitePoolParams *params = node->builtin_data;
+
       operation->type = PIPE_ML_OPERATION_TYPE_POOLING;
+
+      /* Skip setting operation->pooling.type for PIPE_ML_POOLING_TYPE_AVG==0 */
+      operation->pooling.filter_height = params->filter_height;
+      operation->pooling.filter_width = params->filter_width;
+      operation->pooling.stride_x = params->stride_width;
+      operation->pooling.stride_y = params->stride_height;
+      operation->pooling.padding_same = params->padding == kTfLitePaddingSame;
       break;
+   }
    case kTfLiteBuiltinAdd:
       operation->type = PIPE_ML_OPERATION_TYPE_ADD;
       break;
@@ -242,6 +255,22 @@ fill_operation(struct teflon_delegate *delegate, TfLiteContext *tf_context, TfLi
 
       operation->type = PIPE_ML_OPERATION_TYPE_TRANSPOSE;
       memcpy(operation->transpose.perm, perm, 4 * sizeof(*operation->transpose.perm));
+      break;
+   }
+   case kTfLiteBuiltinStridedSlice: {
+      int *begin = tf_context->tensors[node->inputs->data[1]].data.data;
+      int *end = tf_context->tensors[node->inputs->data[2]].data.data;
+      int *strides = tf_context->tensors[node->inputs->data[3]].data.data;
+
+      operation->type = PIPE_ML_OPERATION_TYPE_STRIDED_SLICE;
+      memcpy(operation->slice.begin, begin, sizeof(operation->slice.begin));
+      memcpy(operation->slice.end, end, sizeof(operation->slice.end));
+      memcpy(operation->slice.strides, strides, sizeof(operation->slice.strides));
+
+      break;
+   }
+   case kTfLiteBuiltinResizeNearestNeighbor: {
+      operation->type = PIPE_ML_OPERATION_TYPE_RESIZE;
       break;
    }
    default:
@@ -391,6 +420,12 @@ dump_graph(struct pipe_tensor *tensors, unsigned tensor_count, struct pipe_ml_op
          break;
       case PIPE_ML_OPERATION_TYPE_TRANSPOSE:
          teflon_debug("%-6s ", "TRANSPOSE");
+         break;
+      case PIPE_ML_OPERATION_TYPE_STRIDED_SLICE:
+         teflon_debug("%-6s ", "STRIDED_SLICE");
+         break;
+      case PIPE_ML_OPERATION_TYPE_RESIZE:
+         teflon_debug("%-6s ", "RESIZE");
          break;
       }
 
@@ -573,6 +608,8 @@ tflite_builtin_op_name(TfLiteBuiltinOperator op)
       return "ADD";
    case kTfLiteBuiltinAveragePool2d:
       return "AVGPOOL";
+   case kTfLiteBuiltinMaxPool2d:
+      return "MAXPOOL";
    case kTfLiteBuiltinConv2d:
       return "CONV";
    case kTfLiteBuiltinDepthwiseConv2d:
@@ -597,6 +634,10 @@ tflite_builtin_op_name(TfLiteBuiltinOperator op)
       return "FC";
    case kTfLiteBuiltinMean:
       return "MEAN";
+   case kTfLiteBuiltinStridedSlice:
+      return "STRIDED_SLICE";
+   case kTfLiteBuiltinResizeNearestNeighbor:
+      return "RESIZE";
    default:
       return "unknown";
    }
@@ -814,7 +855,8 @@ find_accel_device()
    pipe_loader_accel_probe(devs, n);
 
    for (int i = 0; i < n; i++) {
-      if (strstr("rocket", devs[i]->driver_name))
+      if (strstr("rocket", devs[i]->driver_name) ||
+          strstr("ethosu", devs[i]->driver_name))
          device = devs[i];
       else
          pipe_loader_release(&devs[i], 1);

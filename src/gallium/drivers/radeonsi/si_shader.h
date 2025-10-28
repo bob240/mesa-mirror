@@ -190,6 +190,13 @@ enum
    SI_SGPR_ALPHA_REF,
    SI_PS_NUM_USER_SGPR,
 
+   /* TS only */
+   GFX10_SGPR_TS_TASK_RING_ADDR = SI_NUM_RESOURCE_SGPRS,
+   GFX10_SGPR_TS_TASK_RING_ENTRY,
+
+   /* MS only */
+   GFX11_SGPR_MS_ATTRIBUTE_RING_ADDR = SI_NUM_RESOURCE_SGPRS,
+
    /* The value has to be 12, because the hw requires that descriptors
     * are aligned to 4 SGPRs.
     */
@@ -845,6 +852,9 @@ struct si_shader {
          unsigned spi_shader_pgm_rsrc3_gs;
          unsigned spi_shader_pgm_rsrc4_gs;
          unsigned vgt_shader_stages_en;
+         unsigned spi_shader_gs_meshlet_dim;
+         unsigned spi_shader_gs_meshlet_exp_alloc;
+         unsigned spi_shader_gs_meshlet_ctrl;
       } ngg;
 
       struct {
@@ -913,6 +923,7 @@ struct nir_shader *si_deserialize_shader(struct si_shader_selector *sel);
 unsigned si_get_ps_num_interp(struct si_shader *ps);
 unsigned si_get_shader_prefetch_size(struct si_shader *shader);
 unsigned si_get_shader_binary_size(struct si_screen *screen, struct si_shader *shader);
+unsigned si_get_max_workgroup_size(const struct si_shader *shader);
 
 /* si_shader_info.c */
 void si_nir_scan_shader(struct si_screen *sscreen, struct nir_shader *nir,
@@ -973,8 +984,9 @@ static inline bool gfx10_has_variable_edgeflags(struct si_shader *shader)
 
 static inline bool si_shader_culling_enabled(struct si_shader *shader)
 {
-   /* Legacy VS/TES/GS and ES don't cull in the shader. */
-   if (!shader->key.ge.as_ngg || shader->key.ge.as_es) {
+   /* Legacy VS/TES/GS and ES/MS don't cull in the shader. */
+   if (!shader->key.ge.as_ngg || shader->key.ge.as_es ||
+       shader->selector->stage == MESA_SHADER_MESH) {
       assert(!shader->key.ge.opt.ngg_culling);
       return false;
    }

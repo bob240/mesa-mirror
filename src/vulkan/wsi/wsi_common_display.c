@@ -277,35 +277,25 @@ wsi_display_parse_edid(struct wsi_display_connector *connector, drmModePropertyB
  * property associated with the object.
  */
 static bool
-find_properties(struct wsi_display_connector *connector, int fd, uint32_t type)
+find_properties(struct wsi_display_connector *connector, uint32_t count_props, uint32_t *props, uint64_t *prop_values, int fd, uint32_t type)
 {
-   uint32_t *prop_id, prop_count, obj_id;
-   drmModeObjectProperties *props;
+   uint32_t *prop_id, prop_count;
 
    switch (type) {
    case DRM_MODE_OBJECT_CONNECTOR:
-      obj_id = connector->id;
       prop_id = connector->property;
       prop_count = ARRAY_SIZE(connector->property);
       break;
    case DRM_MODE_OBJECT_CRTC:
-      obj_id = connector->crtc_id;
       prop_id = connector->crtc_property;
       prop_count = ARRAY_SIZE(connector->crtc_property);
       break;
    case DRM_MODE_OBJECT_PLANE:
-      obj_id = connector->plane_id;
       prop_id = connector->plane_property;
       prop_count = ARRAY_SIZE(connector->plane_property);
       break;
    default:
       UNREACHABLE("unexpected drm object type");
-   }
-
-   props = drmModeObjectGetProperties(fd, obj_id, type);
-   if (!props) {
-      mesa_loge("Failed to drmModeObjectGetProperties(obj=%d, type=0x%08x)", obj_id, type);
-      return false;
    }
 
    memset(prop_id, 0, prop_count * sizeof(*prop_id));
@@ -325,12 +315,12 @@ find_properties(struct wsi_display_connector *connector, int fd, uint32_t type)
    /* Walk the list of properties seeing if their names match one of the
     * properties we care about controlling.
     */
-   for (int p = 0; p < props->count_props; p++) {
-      drmModePropertyPtr prop = drmModeGetProperty(fd, props->props[p]);
+   for (int p = 0; p < count_props; p++) {
+      drmModePropertyPtr prop = drmModeGetProperty(fd, props[p]);
       if (!prop)
          continue;
 
-#define PROPERTY(x) if (!strcmp(prop->name, #x)) prop_id[x] = props->props[p]
+#define PROPERTY(x) if (!strcmp(prop->name, #x)) prop_id[x] = props[p]
       switch (type) {
       case DRM_MODE_OBJECT_CONNECTOR:
          STATIC_ASSERT(CRTC_ID == (enum plane_property) CONN_CRTC_ID);
@@ -373,7 +363,7 @@ find_properties(struct wsi_display_connector *connector, int fd, uint32_t type)
       }
 
       if (!strcmp(prop->name, "EDID")) {
-         drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(fd, props->prop_values[p]);
+         drmModePropertyBlobRes *blob = drmModeGetPropertyBlob(fd, prop_values[p]);
          if (blob) {
             wsi_display_parse_edid(connector, blob);
             drmModeFreePropertyBlob(blob);
@@ -383,8 +373,6 @@ find_properties(struct wsi_display_connector *connector, int fd, uint32_t type)
       drmModeFreeProperty(prop);
    }
 
-   drmModeFreeObjectProperties(props);
-
    /* verify that all required properties were found */
    for (int i = 0; i < prop_count; i++) {
       if (!prop_id[i]) {
@@ -393,6 +381,43 @@ find_properties(struct wsi_display_connector *connector, int fd, uint32_t type)
       }
    }
    return true;
+}
+
+static bool
+find_object_properties(struct wsi_display_connector *connector, int fd, uint32_t type)
+{
+   drmModeObjectProperties *props;
+   uint32_t obj_id;
+   bool ret;
+
+   switch (type) {
+   case DRM_MODE_OBJECT_CONNECTOR:
+      obj_id = connector->id;
+      break;
+   case DRM_MODE_OBJECT_CRTC:
+      obj_id = connector->crtc_id;
+      break;
+   case DRM_MODE_OBJECT_PLANE:
+      obj_id = connector->plane_id;
+      break;
+   default:
+      UNREACHABLE("unexpected drm object type");
+   }
+
+   props = drmModeObjectGetProperties(fd, obj_id, type);
+   if (!props) {
+      mesa_loge("Failed to drmModeObjectGetProperties(obj=%d, type=0x%08x)", obj_id, type);
+      return false;
+   }
+   ret = find_properties(connector, props->count_props, props->props, props->prop_values, fd, type);
+   drmModeFreeObjectProperties(props);
+   return ret;
+}
+
+static bool
+find_connector_properties(struct wsi_display_connector *connector, drmModeConnectorPtr drm_connector, int fd)
+{
+   return find_properties(connector, drm_connector->count_props, drm_connector->props, drm_connector->prop_values, fd, DRM_MODE_OBJECT_CONNECTOR);
 }
 
 #define wsi_for_each_display_mode(_mode, _conn)                 \
@@ -592,7 +617,6 @@ wsi_display_is_crtc_available(const struct wsi_display * const wsi,
 
 static struct wsi_display_connector *
 wsi_display_alloc_connector(struct wsi_display *wsi,
-                            int fd,
                             uint32_t connector_id)
 {
    struct wsi_display_connector *connector =
@@ -601,29 +625,12 @@ wsi_display_alloc_connector(struct wsi_display *wsi,
    if (!connector)
       return NULL;
 
-   /* We set this flag because this is the common entrypoint before we start
-    * using atomic capabilities -- it's a simple bool setting in the kernel to
-    * make the properties we start querying be available, and re-setting it is
-    * harmless.  Otherwise, we'd need to push it up to all the entrypoints that
-    * a drm FD comes thorugh.
-    */
-   drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
-
    connector->id = connector_id;
    connector->wsi = wsi;
    connector->active = false;
    /* XXX use EDID name */
    connector->name = "monitor";
    list_inithead(&connector->display_modes);
-
-   /* note: drmModeConnector has props pointer, the extra
-    * drmModeObjectGetProperties here could be avoided
-    */
-   if (!find_properties(connector, fd, DRM_MODE_OBJECT_CONNECTOR)) {
-      mesa_logd("Failed to find properties for connector");
-      vk_free(wsi->alloc, connector);
-      return NULL;
-   }
 
    return connector;
 }
@@ -639,6 +646,14 @@ wsi_display_get_connector(struct wsi_device *wsi_device,
    if (drm_fd < 0)
       return NULL;
 
+   /* We set this flag because this is the common entrypoint before we start
+    * using atomic capabilities -- it's a simple bool setting in the kernel to
+    * make the properties we start querying be available, and re-setting it is
+    * harmless.  Otherwise, we'd need to push it up to all the entrypoints that
+    * a drm FD comes thorugh.
+    */
+   drmSetClientCap(drm_fd, DRM_CLIENT_CAP_ATOMIC, 1);
+
    drmModeConnectorPtr drm_connector =
       drmModeGetConnector(drm_fd, connector_id);
 
@@ -649,12 +664,18 @@ wsi_display_get_connector(struct wsi_device *wsi_device,
       wsi_display_find_connector(wsi_device, connector_id);
 
    if (!connector) {
-      connector = wsi_display_alloc_connector(wsi, drm_fd, connector_id);
+      connector = wsi_display_alloc_connector(wsi, connector_id);
       if (!connector) {
          drmModeFreeConnector(drm_connector);
          return NULL;
       }
       list_addtail(&connector->list, &wsi->connectors);
+   }
+
+   if (!find_connector_properties(connector, drm_connector, drm_fd)) {
+      mesa_logd("Failed to find properties for connector");
+      drmModeFreeConnector(drm_connector);
+      return NULL;
    }
 
    connector->connected = drm_connector->connection != DRM_MODE_DISCONNECTED;
@@ -2210,14 +2231,14 @@ wsi_display_setup_crtc(wsi_display_connector *connector)
 
    connector->crtc_id = wsi_display_select_crtc(connector, mode_res, drm_connector);
    if (!connector->crtc_id ||
-       !find_properties(connector, wsi->fd, DRM_MODE_OBJECT_CRTC))
+       !find_object_properties(connector, wsi->fd, DRM_MODE_OBJECT_CRTC))
       goto bail;
 
    /* Select the primary plane of that CRTC, and populate the
     * format/modifier lists for that plane */
    connector->plane_id = wsi_display_select_plane(connector, mode_res);
    if (!connector->plane_id ||
-       !find_properties(connector, wsi->fd, DRM_MODE_OBJECT_PLANE))
+       !find_object_properties(connector, wsi->fd, DRM_MODE_OBJECT_PLANE))
       goto bail;
 
    drmModePlanePtr plane = drmModeGetPlane(wsi->fd, connector->plane_id);
@@ -3585,7 +3606,7 @@ wsi_display_get_output(struct wsi_device *wsi_device,
       connector = wsi_display_find_connector(wsi_device, connector_id);
 
       if (connector == NULL) {
-         connector = wsi_display_alloc_connector(wsi, wsi->fd, connector_id);
+         connector = wsi_display_alloc_connector(wsi, connector_id);
          if (!connector) {
             return NULL;
          }

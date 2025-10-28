@@ -77,12 +77,19 @@ typedef enum {
    nir_divergence_uniform_load_tears = (1 << 7),
    /* If used, this allows phis for divergent merges with undef and a uniform source to be considered uniform */
    nir_divergence_ignore_undef_if_phi_srcs = (1 << 8),
+
    /* Whether to compute vertex divergence (meaning between vertices
     * of the same primitive) instead of subgroup invocation divergence
     * (between invocations of the same subgroup). For example, patch input
     * loads are always convergent, while subgroup intrinsics are divergent.
     */
    nir_divergence_vertex = (1 << 11),
+
+   /* Whether to compute divergence of subgroup operations as if multiple
+    * subgroups ran in lock-step (for example subgroup operations normally
+    * convergent are divergent).
+    */
+   nir_divergence_across_subgroups = (1 << 12),
 } nir_divergence_options;
 
 /** An instruction filtering callback
@@ -479,6 +486,19 @@ typedef struct nir_shader_compiler_options {
     */
    bool lower_bfloat16_conversions;
 
+   /**
+    * Set if f2u_sat (or f2i_sat) is supported for converting from 16-, 32-,
+    * or 64-bit float types to 8-, 16-, or 32-bit integer types (with small
+    * exceptions).
+    *
+    * Due to the prevalence of drivers using \c nir_split_conversion for
+    * conversions from 64-bit float to 8-bit integer, these flags will not
+    * enable generation of f2u_sat from 64-bit float types to 8-bit integer
+    * types.
+    */
+   bool has_f2u_sat;
+   bool has_f2i_sat;
+
    bool vectorize_tess_levels;
    bool lower_to_scalar;
    nir_instr_filter_cb lower_to_scalar_filter;
@@ -649,6 +669,12 @@ typedef struct nir_shader_compiler_options {
    /** Backend supports f2i32_rtne opcode. */
    bool has_f2i32_rtne;
 
+   /** Backend supports atomic isub. */
+   bool has_atomic_isub;
+
+   /** Backend supports atomic load/store. */
+   bool has_atomic_load_store;
+
    /**
     * Is this the Intel vec4 backend?
     *
@@ -760,6 +786,12 @@ typedef struct nir_shader_compiler_options {
 
    /** Whether derivative intrinsics must be scalarized. */
    bool scalarize_ddx;
+
+   /**
+    * Whether unspecified derivative intrinsics are always coarse.
+    * If this is false, they might be either coarse or fine.
+    */
+   bool coarse_ddx;
 
    /**
     * Assign a range of driver locations to per-view outputs, with unique

@@ -334,6 +334,12 @@ typedef struct shader_info {
     */
    enum gl_derivative_group derivative_group:2;
 
+   /* Assume that data races do not happen. If this isn't set, data races
+    * read/write undefined values, but do not cause undefined behaviour. This
+    * is set when the Vulkan memory model is used.
+    */
+   bool assume_no_data_races:1;
+
    union {
       struct {
          /* Which inputs are doubles */
@@ -347,7 +353,7 @@ typedef struct shader_info {
          uint8_t blit_sgprs_amd:4;
 
          /* Software TES executing as HW VS */
-         bool tes_agx:1;
+         bool tes_poly:1;
 
          /* True if the shader writes position in window space coordinates pre-transform */
          bool window_space_position:1;

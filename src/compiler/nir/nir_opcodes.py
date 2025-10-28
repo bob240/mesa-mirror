@@ -339,6 +339,19 @@ unop_numeric_convert_mp("u2f", tfloat16, tuint32)
 
 unop_numeric_convert("f2i32_rtne", tint32, tfloat32, "(int32_t)_mesa_roundevenf(src0)")
 
+# Note: 64-bit integers are intentionally not supported. Casting u_uintN_max
+# (and related signed values) to double is precisely representable for upto
+# 32-bit integers. To support these opcodes for 64-bit integers would require
+# a more complex implementation.
+for bits in (8, 16, 32):
+    unop_numeric_convert(f"f2u{bits}_sat", f"uint{bits}", tfloat,
+                         f"(uint{bits}_t)fmin(fmax(src0, 0.0), (double)u_uintN_max({bits}))",
+                         "Convert float to uint with clamping to uint range. NaN becomes zero.")
+
+    unop_numeric_convert(f"f2i{bits}_sat", f"int{bits}", tfloat,
+                         f"(int{bits}_t) isnan(src0) ? 0.0 : fmin(fmax(src0, (double)u_intN_min({bits})), (double)u_intN_max({bits}))",
+                         "Convert float to int with clamping to int range. NaN becomes zero.")
+
 # Unary floating-point rounding operations.
 
 
@@ -755,10 +768,12 @@ if (bit_size == 64) {
 }
 """, description = "High 32-bits of unsigned integer multiply")
 
-binop("umul_low", tuint32, _2src_commutative, """
-uint64_t mask = (1 << (bit_size / 2)) - 1;
-dst = ((uint64_t)src0 & mask) * ((uint64_t)src1 & mask);
-""", description = "Low 32-bits of unsigned integer multiply")
+binop("umul_16x16", tuint32, _2src_commutative,
+      "(uint32_t)(uint16_t)src0 * (uint32_t)(uint16_t)src1",
+      description = """
+Multiply low 16-bits of the sources, with zero extension, producing a 32-bit
+result
+      """)
 
 binop("imul_32x16", tint32, "", "src0 * (int16_t) src1",
       description = "Multiply 32-bits with low 16-bits, with sign extension")

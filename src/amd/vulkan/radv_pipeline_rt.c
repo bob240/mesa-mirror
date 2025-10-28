@@ -8,6 +8,7 @@
 #include "nir/nir_builder.h"
 #include "nir/nir_serialize.h"
 
+#include "ac_shader_util.h"
 #include "vk_shader_module.h"
 
 #include "nir/radv_nir.h"
@@ -394,6 +395,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
 
    uint32_t num_resume_shaders = 0;
    nir_shader **resume_shaders = NULL;
+   void *mem_ctx = ralloc_context(NULL);
 
    if (stage->stage != MESA_SHADER_INTERSECTION && !monolithic) {
       nir_builder b = nir_builder_at(nir_after_impl(nir_shader_get_entrypoint(stage->nir)));
@@ -406,11 +408,11 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
          .vectorizer_callback = ac_nir_mem_vectorize_callback,
          .vectorizer_data = &(struct ac_nir_config){pdev->info.gfx_level, !radv_use_llvm_for_stage(pdev, stage->stage)},
       };
-      nir_lower_shader_calls(stage->nir, &opts, &resume_shaders, &num_resume_shaders, stage->nir);
+      nir_lower_shader_calls(stage->nir, &opts, &resume_shaders, &num_resume_shaders, mem_ctx);
    }
 
    unsigned num_shaders = num_resume_shaders + 1;
-   nir_shader **shaders = ralloc_array(stage->nir, nir_shader *, num_shaders);
+   nir_shader **shaders = ralloc_array(mem_ctx, nir_shader *, num_shaders);
    if (!shaders)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
@@ -431,8 +433,12 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
       /* Info might be out-of-date after inlining in radv_nir_lower_rt_abi(). */
       nir_shader_gather_info(temp_stage.nir, nir_shader_get_entrypoint(temp_stage.nir));
 
+      radv_nir_shader_info_pass(device, temp_stage.nir, &stage->layout, &stage->key, NULL, RADV_PIPELINE_RAY_TRACING,
+                                false, &stage->info);
+
       radv_optimize_nir(temp_stage.nir, stage->key.optimisations_disabled);
       radv_postprocess_nir(device, NULL, &temp_stage);
+      stage->info.nir_shared_size = MAX2(stage->info.nir_shared_size, temp_stage.info.nir_shared_size);
 
       if (stage_info)
          radv_gather_unused_args(stage_info, shaders[i]);
@@ -469,6 +475,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
          if (dump_shader)
             simple_mtx_unlock(&instance->shader_dump_mtx);
 
+         ralloc_free(mem_ctx);
          free(binary);
          return result;
       }
@@ -490,6 +497,7 @@ radv_rt_nir_to_asm(struct radv_device *device, struct vk_pipeline_cache *cache,
    if (dump_shader)
       simple_mtx_unlock(&instance->shader_dump_mtx);
 
+   ralloc_free(mem_ctx);
    free(binary);
 
    *out_shader = shader;
@@ -827,7 +835,7 @@ compute_rt_stack_size(const VkRayTracingPipelineCreateInfoKHR *pCreateInfo, stru
 }
 
 static void
-combine_config(struct ac_shader_config *config, struct ac_shader_config *other)
+combine_config(struct ac_shader_config *config, const struct ac_shader_config *other)
 {
    config->num_sgprs = MAX2(config->num_sgprs, other->num_sgprs);
    config->num_vgprs = MAX2(config->num_vgprs, other->num_vgprs);
@@ -841,14 +849,15 @@ combine_config(struct ac_shader_config *config, struct ac_shader_config *other)
 }
 
 static void
-postprocess_rt_config(struct ac_shader_config *config, enum amd_gfx_level gfx_level, unsigned wave_size)
+postprocess_rt_config(struct ac_shader_config *config, const struct radeon_info *info, unsigned wave_size)
 {
    config->rsrc1 =
       (config->rsrc1 & C_00B848_VGPRS) | S_00B848_VGPRS((config->num_vgprs - 1) / (wave_size == 32 ? 8 : 4));
-   if (gfx_level < GFX10)
+   if (info->gfx_level < GFX10)
       config->rsrc1 = (config->rsrc1 & C_00B848_SGPRS) | S_00B848_SGPRS((config->num_sgprs - 1) / 8);
 
-   config->rsrc2 = (config->rsrc2 & C_00B84C_LDS_SIZE) | S_00B84C_LDS_SIZE(config->lds_size);
+   unsigned lds_alloc = ac_shader_encode_lds_size(config->lds_size, info->gfx_level, MESA_SHADER_COMPUTE);
+   config->rsrc2 = (config->rsrc2 & C_00B84C_LDS_SIZE) | S_00B84C_LDS_SIZE(lds_alloc);
    config->rsrc3 = (config->rsrc3 & C_00B8A0_SHARED_VGPR_CNT) | S_00B8A0_SHARED_VGPR_CNT(config->num_shared_vgprs / 8);
 }
 
@@ -856,21 +865,35 @@ static void
 compile_rt_prolog(struct radv_device *device, struct radv_ray_tracing_pipeline *pipeline)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   uint32_t push_constant_size = 0;
 
    pipeline->prolog = radv_create_rt_prolog(device);
 
    /* create combined config */
    struct ac_shader_config *config = &pipeline->prolog->config;
-   for (unsigned i = 0; i < pipeline->stage_count; i++)
-      if (pipeline->stages[i].shader)
-         combine_config(config, &pipeline->stages[i].shader->config);
+   for (unsigned i = 0; i < pipeline->stage_count; i++) {
+      const struct radv_shader *shader = pipeline->stages[i].shader;
 
-   if (pipeline->base.base.shaders[MESA_SHADER_INTERSECTION])
-      combine_config(config, &pipeline->base.base.shaders[MESA_SHADER_INTERSECTION]->config);
+      if (!shader)
+         continue;
 
-   postprocess_rt_config(config, pdev->info.gfx_level, pdev->rt_wave_size);
+      combine_config(config, &shader->config);
+
+      push_constant_size = MAX2(push_constant_size, shader->info.push_constant_size);
+   }
+
+   if (pipeline->base.base.shaders[MESA_SHADER_INTERSECTION]) {
+      const struct radv_shader *traversal_shader = pipeline->base.base.shaders[MESA_SHADER_INTERSECTION];
+
+      combine_config(config, &traversal_shader->config);
+
+      push_constant_size = MAX2(push_constant_size, traversal_shader->info.push_constant_size);
+   }
+
+   postprocess_rt_config(config, &pdev->info, pdev->rt_wave_size);
 
    pipeline->prolog->max_waves = radv_get_max_waves(device, config, &pipeline->prolog->info);
+   pipeline->prolog->info.push_constant_size = push_constant_size;
 }
 
 void
@@ -1288,7 +1311,7 @@ radv_GetRayTracingCaptureReplayShaderGroupHandlesKHR(VkDevice device, VkPipeline
          if (shader) {
             data[i].recursive_shader_alloc.offset = shader->alloc->offset;
             data[i].recursive_shader_alloc.size = shader->alloc->size;
-            data[i].recursive_shader_alloc.arena_va = shader->alloc->arena->bo->va;
+            data[i].recursive_shader_alloc.arena_va = radv_buffer_get_va(shader->alloc->arena->bo);
             data[i].recursive_shader_alloc.arena_size = shader->alloc->arena->size;
          }
       }

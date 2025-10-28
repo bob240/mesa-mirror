@@ -569,7 +569,6 @@ radv_graphics_pipeline_import_layout(struct radv_pipeline_layout *dst, const str
    }
 
    dst->independent_sets |= src->independent_sets;
-   dst->push_constant_size = MAX2(dst->push_constant_size, src->push_constant_size);
 }
 
 static void
@@ -607,7 +606,7 @@ radv_should_import_lib_binaries(const VkPipelineCreateFlags2 create_flags)
 
 static void
 radv_graphics_pipeline_import_lib(const struct radv_device *device, struct radv_graphics_pipeline *pipeline,
-                                  struct radv_graphics_lib_pipeline *lib)
+                                  struct radv_graphics_lib_pipeline *lib, bool import_pipeline_binaries)
 {
    bool import_binaries = false;
 
@@ -620,7 +619,8 @@ radv_graphics_pipeline_import_lib(const struct radv_device *device, struct radv_
    pipeline->active_stages |= lib->base.active_stages;
 
    /* Import binaries when LTO is disabled and when the library doesn't retain any shaders. */
-   if (lib->base.has_pipeline_binaries || radv_should_import_lib_binaries(pipeline->base.create_flags)) {
+   if (!import_pipeline_binaries &&
+       (lib->base.has_pipeline_binaries || radv_should_import_lib_binaries(pipeline->base.create_flags))) {
       import_binaries = true;
    }
 
@@ -2440,6 +2440,9 @@ radv_create_gs_copy_shader(struct radv_device *device, struct vk_pipeline_cache 
             AC_HW_VERTEX_SHADER, 64, 64, &gs_copy_stage.args.ac);
    NIR_PASS(_, nir, radv_nir_lower_abi, pdev->info.gfx_level, &gs_copy_stage, gfx_state, pdev->info.address32_hi);
 
+   NIR_PASS(_, nir, ac_nir_lower_global_access);
+   NIR_PASS(_, nir, nir_lower_int64);
+
    struct radv_graphics_pipeline_key key = {0};
    bool dump_shader = radv_can_dump_shader(device, nir);
 
@@ -2940,7 +2943,7 @@ radv_graphics_shaders_compile(struct radv_device *device, struct vk_pipeline_cac
 
       if ((gs_stage ? gs_stage : es_stage)->info.is_ngg) {
          gfx10_get_ngg_info(device, &es_stage->info, gs_stage ? &gs_stage->info : NULL, &stage->info.ngg_info);
-         stage->nir->info.shared_size = stage->info.ngg_info.lds_size;
+         stage->info.nir_shared_size = stage->info.ngg_info.lds_size;
       }
    }
 
@@ -2993,8 +2996,7 @@ radv_graphics_pipeline_state_finish(struct radv_device *device, struct radv_grap
       for (uint32_t i = 0; i < MESA_VULKAN_SHADER_STAGES; i++)
          ralloc_free(gfx_state->stages[i].nir);
 
-      if (gfx_state->stages[MESA_SHADER_GEOMETRY].gs_copy_shader)
-         ralloc_free(gfx_state->stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
+      ralloc_free(gfx_state->stages[MESA_SHADER_GEOMETRY].gs_copy_shader);
 
       free(gfx_state->stages);
    }
@@ -3329,8 +3331,8 @@ radv_pipeline_init_shader_stages_state(const struct radv_device *device, struct 
       bool shader_exists = !!pipeline->base.shaders[i];
       if (shader_exists || i < MESA_SHADER_COMPUTE) {
          if (shader_exists) {
-            pipeline->base.need_indirect_descriptor_sets |=
-               radv_shader_need_indirect_descriptor_sets(pipeline->base.shaders[i]);
+            pipeline->base.need_indirect_descriptors |=
+               radv_shader_need_indirect_descriptors(pipeline->base.shaders[i]);
             pipeline->base.need_push_constants_upload |=
                radv_shader_need_push_constants_upload(pipeline->base.shaders[i]);
          }
@@ -3439,6 +3441,9 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
    const VkPipelineLibraryCreateInfoKHR *libs_info =
       vk_find_struct_const(pCreateInfo->pNext, PIPELINE_LIBRARY_CREATE_INFO_KHR);
 
+   const VkPipelineBinaryInfoKHR *binary_info = vk_find_struct_const(pCreateInfo->pNext, PIPELINE_BINARY_INFO_KHR);
+   const bool import_pipeline_binaries = binary_info && binary_info->binaryCount > 0;
+
    /* If we have libraries, import them first. */
    if (libs_info) {
       for (uint32_t i = 0; i < libs_info->libraryCount; i++) {
@@ -3447,7 +3452,7 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
 
          assert(pipeline_lib->type == RADV_PIPELINE_GRAPHICS_LIB);
 
-         radv_graphics_pipeline_import_lib(device, pipeline, gfx_pipeline_lib);
+         radv_graphics_pipeline_import_lib(device, pipeline, gfx_pipeline_lib, import_pipeline_binaries);
       }
    }
 
@@ -3457,9 +3462,7 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
    if (result != VK_SUCCESS)
       return result;
 
-   const VkPipelineBinaryInfoKHR *binary_info = vk_find_struct_const(pCreateInfo->pNext, PIPELINE_BINARY_INFO_KHR);
-
-   if (binary_info && binary_info->binaryCount > 0) {
+   if (import_pipeline_binaries) {
       result = radv_graphics_pipeline_import_binaries(device, pipeline, binary_info);
    } else {
       if (gfx_state.compilation_required) {
@@ -3486,7 +3489,17 @@ radv_graphics_pipeline_init(struct radv_graphics_pipeline *pipeline, struct radv
    pipeline->uses_vrs_attachment = radv_pipeline_uses_vrs_attachment(pipeline, &gfx_state.vk);
    pipeline->uses_vrs_coarse_shading = !pipeline->uses_vrs && gfx103_pipeline_vrs_coarse_shading(device, pipeline);
 
-   pipeline->base.push_constant_size = gfx_state.layout.push_constant_size;
+   uint32_t push_constant_size = 0;
+   for (uint32_t i = 0; i < MESA_VULKAN_SHADER_STAGES; i++) {
+      const struct radv_shader *shader = pipeline->base.shaders[i];
+
+      if (!shader)
+         continue;
+
+      push_constant_size = MAX2(push_constant_size, shader->info.push_constant_size);
+   }
+
+   pipeline->base.push_constant_size = align(push_constant_size, 4);
    pipeline->base.dynamic_offset_count = gfx_state.layout.dynamic_offset_count;
 
    const VkGraphicsPipelineCreateInfoRADV *radv_info =
@@ -3561,6 +3574,9 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
 
    radv_pipeline_layout_init(device, &pipeline->layout, false);
 
+   const VkPipelineBinaryInfoKHR *binary_info = vk_find_struct_const(pCreateInfo->pNext, PIPELINE_BINARY_INFO_KHR);
+   const bool import_pipeline_binaries = binary_info && binary_info->binaryCount > 0;
+
    /* If we have libraries, import them first. */
    if (libs_info) {
       for (uint32_t i = 0; i < libs_info->libraryCount; i++) {
@@ -3571,7 +3587,7 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
 
          radv_graphics_pipeline_import_layout(&pipeline->layout, &gfx_pipeline_lib->layout);
 
-         radv_graphics_pipeline_import_lib(device, &pipeline->base, gfx_pipeline_lib);
+         radv_graphics_pipeline_import_lib(device, &pipeline->base, gfx_pipeline_lib, import_pipeline_binaries);
 
          pipeline->lib_flags |= gfx_pipeline_lib->lib_flags;
       }
@@ -3587,9 +3603,7 @@ radv_graphics_lib_pipeline_init(struct radv_graphics_lib_pipeline *pipeline, str
    if (pipeline_layout)
       radv_graphics_pipeline_import_layout(&pipeline->layout, pipeline_layout);
 
-   const VkPipelineBinaryInfoKHR *binary_info = vk_find_struct_const(pCreateInfo->pNext, PIPELINE_BINARY_INFO_KHR);
-
-   if (binary_info && binary_info->binaryCount > 0) {
+   if (import_pipeline_binaries) {
       result = radv_graphics_pipeline_import_binaries(device, &pipeline->base, binary_info);
    } else {
       struct radv_graphics_pipeline_state gfx_state;

@@ -104,7 +104,9 @@
 
 /* Allocations are always at least 64 byte aligned, so 1 is an invalid value.
  * We use it to indicate the free list is empty. */
-#define EMPTY UINT32_MAX
+#define ANV_FREE_LIST_EMPTY_VAL UINT32_MAX
+
+#define ANV_FREE_LIST_EMPTY ((union anv_free_list) { { ANV_FREE_LIST_EMPTY_VAL, 0 } })
 
 /* On FreeBSD PAGE_SIZE is already defined in
  * /usr/include/machine/param.h that is indirectly
@@ -329,7 +331,7 @@ anv_free_list_pop(union anv_free_list *list,
    union anv_free_list current, new, old;
 
    current.u64 = list->u64;
-   while (current.offset != EMPTY) {
+   while (current.offset != ANV_FREE_LIST_EMPTY_VAL) {
       __sync_synchronize();
       new.offset = table->map[current.offset].next;
       new.count = current.count + 1;
@@ -463,12 +465,17 @@ anv_block_pool_expand_range(struct anv_block_pool *pool, uint32_t size)
  * The returned pointer points to the map for the memory at the specified
  * offset. The offset parameter is relative to the "center" of the block pool
  * rather than the start of the block pool BO map.
+ *
+ * offset parameter here is a offset from the beginning of block_pool.
  */
-void*
-anv_block_pool_map(struct anv_block_pool *pool, int32_t offset, uint32_t size)
+void *
+anv_block_pool_map(struct anv_block_pool *pool, int64_t offset, uint32_t size)
 {
    struct anv_bo *bo = NULL;
-   int32_t bo_offset = 0;
+   int64_t bo_offset = 0;
+
+   assert(offset + size <= pool->max_size);
+
    anv_block_pool_foreach_bo(iter_bo, pool) {
       if (offset < bo_offset + iter_bo->size) {
          bo = iter_bo;
@@ -593,13 +600,13 @@ anv_block_pool_grow(struct anv_block_pool *pool, struct anv_block_state *state,
    return pool->size;
 }
 
-static VkResult
-anv_block_pool_alloc_new(struct anv_block_pool *pool,
-                         struct anv_block_state *pool_state,
-                         uint32_t block_size,
-                         int64_t *offset,
-                         uint32_t *padding)
+VkResult
+anv_block_pool_alloc(struct anv_block_pool *pool,
+                     uint32_t block_size,
+                     int64_t *offset,
+                     uint32_t *padding)
 {
+   struct anv_block_state *pool_state = &pool->state;
    struct anv_block_state state, old, new;
 
    /* Most allocations won't generate any padding */
@@ -654,14 +661,6 @@ anv_block_pool_alloc_new(struct anv_block_pool *pool,
          continue;
       }
    }
-}
-
-VkResult
-anv_block_pool_alloc(struct anv_block_pool *pool,
-                     uint32_t block_size,
-                     int64_t *offset, uint32_t *padding)
-{
-   return anv_block_pool_alloc_new(pool, &pool->state, block_size, offset, padding);
 }
 
 VkResult
@@ -780,7 +779,7 @@ anv_state_pool_get_bucket_size(uint32_t bucket)
  */
 static void
 anv_state_pool_return_blocks(struct anv_state_pool *pool,
-                             uint32_t chunk_offset, uint32_t count,
+                             uint64_t chunk_offset, uint32_t count,
                              uint32_t block_size)
 {
    /* Disallow returning 0 chunks */
@@ -796,10 +795,12 @@ anv_state_pool_return_blocks(struct anv_state_pool *pool,
       /* update states that were added back to the state table */
       struct anv_state *state_i = anv_state_table_get(&pool->table,
                                                       st_idx + i);
+      const int64_t offset = chunk_offset + block_size * i;
       state_i->alloc_size = block_size;
-      state_i->offset = pool->start_offset + chunk_offset + block_size * i;
+      state_i->offset = pool->start_offset + offset;
+
       state_i->map = anv_block_pool_map(&pool->block_pool,
-                                        state_i->offset,
+                                        offset,
                                         state_i->alloc_size);
    }
 
@@ -824,7 +825,7 @@ anv_state_pool_return_blocks(struct anv_state_pool *pool,
  */
 static void
 anv_state_pool_return_chunk(struct anv_state_pool *pool,
-                            uint32_t chunk_offset, uint32_t chunk_size,
+                            uint64_t chunk_offset, uint32_t chunk_size,
                             uint32_t small_size)
 {
    uint32_t divisor = pool->block_size;
@@ -837,7 +838,7 @@ anv_state_pool_return_chunk(struct anv_state_pool *pool,
        * aligned to divisor. Also anv_state_pool_return_blocks() only accepts
        * aligned chunks.
        */
-      uint32_t offset = chunk_offset + rest;
+      uint64_t offset = chunk_offset + rest;
       anv_state_pool_return_blocks(pool, offset, nblocks, divisor);
    }
 
@@ -890,7 +891,7 @@ anv_state_pool_alloc_no_vg(struct anv_state_pool *pool,
       state = anv_free_list_pop(&pool->buckets[b].free_list, &pool->table);
       if (state) {
          unsigned chunk_size = anv_state_pool_get_bucket_size(b);
-         int32_t chunk_offset = state->offset;
+         int64_t chunk_offset = state->offset - pool->start_offset;
 
          /* First lets update the state we got to its new size. offset and map
           * remain the same.
@@ -956,7 +957,7 @@ anv_state_pool_alloc_no_vg(struct anv_state_pool *pool,
    state->map = anv_block_pool_map(&pool->block_pool, offset, alloc_size);
 
    if (padding > 0) {
-      uint32_t return_offset = offset - padding;
+      uint64_t return_offset = offset - padding;
       anv_state_pool_return_chunk(pool, return_offset, padding, 0);
    }
 
@@ -1071,8 +1072,7 @@ anv_state_stream_alloc(struct anv_state_stream *stream,
       if (stream->block.alloc_size == 0)
          return ANV_STATE_NULL;
 
-      util_dynarray_append(&stream->all_blocks,
-                           struct anv_state, stream->block);
+      util_dynarray_append(&stream->all_blocks, stream->block);
       VG(VALGRIND_MAKE_MEM_NOACCESS(stream->block.map, block_size));
 
       /* Reset back to the start */

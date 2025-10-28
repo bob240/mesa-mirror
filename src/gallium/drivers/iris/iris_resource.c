@@ -980,23 +980,35 @@ iris_resource_init_aux_buf(struct iris_screen *screen,
 {
    const struct intel_device_info *devinfo = screen->devinfo;
 
-   if (isl_aux_usage_has_ccs(res->aux.usage) && devinfo->ver <= 11) {
-      /* Initialize the CCS on BDW-ICL to the PASS_THROUGH state. This avoids
-       * the need to ambiguate in some cases.
-       */
+   bool zero_aux = res->bo->zeroed;
+
+   /* Initialize CCS on BDW-ICL to the PASS_THROUGH state. We don't make use
+    * of the RESOLVED state for CCS, so this ensures that we won't have to
+    * perform an ambiguate operation.
+    */
+   if (isl_aux_usage_has_ccs(res->aux.usage) && devinfo->ver <= 11)
+      zero_aux = true;
+
+   /* Initialize HiZ on BDW-ICL to the CLEAR state. This allows us to skip
+    * initializing fast-clears and this ensures that we won't have to perform
+    * an ambiguate operation. Ambiguates are not allowed on non-8x4-aligned
+    * LODs for BDW and SKL.
+    */
+   if (res->aux.usage == ISL_AUX_USAGE_HIZ && devinfo->ver <= 11)
+      zero_aux = true;
+
+   if (zero_aux != res->bo->zeroed) {
       void* map = iris_bo_map(NULL, res->bo, MAP_WRITE | MAP_RAW);
       if (!map)
          return false;
 
       memset((char*)map + res->aux.offset, 0, res->aux.surf.size_B);
       iris_bo_unmap(res->bo);
-
-      res->aux.state = create_aux_state_map(res, ISL_AUX_STATE_PASS_THROUGH);
-   } else {
-      const enum isl_aux_state initial_state =
-         isl_aux_get_initial_state(devinfo, res->aux.usage, res->bo->zeroed);
-      res->aux.state = create_aux_state_map(res, initial_state);
    }
+
+   const enum isl_aux_state initial_state =
+      isl_aux_get_initial_state(devinfo, res->aux.usage, zero_aux);
+   res->aux.state = create_aux_state_map(res, initial_state);
    if (!res->aux.state)
       return false;
 

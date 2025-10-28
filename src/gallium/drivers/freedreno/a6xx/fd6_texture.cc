@@ -268,6 +268,13 @@ fd6_sampler_state_create(struct pipe_context *pctx,
    if (cso->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
       miplinear = true;
 
+   /* We don't know if the format is going to be YUV.  Setting CHROMA_LINEAR
+    * unconditionally seems fine.
+    */
+   bool chroma_linear =
+      cso->mag_img_filter == PIPE_TEX_FILTER_LINEAR &&
+      cso->min_img_filter == PIPE_TEX_FILTER_LINEAR;
+
    bool needs_border = false;
    so->descriptor[0] =
       COND(miplinear, A6XX_TEX_SAMP_0_MIPFILTER_LINEAR_NEAR) |
@@ -276,21 +283,21 @@ fd6_sampler_state_create(struct pipe_context *pctx,
       A6XX_TEX_SAMP_0_ANISO((enum a6xx_tex_aniso)aniso) |
       A6XX_TEX_SAMP_0_WRAP_S(tex_clamp(cso->wrap_s, &needs_border)) |
       A6XX_TEX_SAMP_0_WRAP_T(tex_clamp(cso->wrap_t, &needs_border)) |
-      A6XX_TEX_SAMP_0_WRAP_R(tex_clamp(cso->wrap_r, &needs_border));
+      A6XX_TEX_SAMP_0_WRAP_R(tex_clamp(cso->wrap_r, &needs_border)) |
+      A6XX_TEX_SAMP_0_LOD_BIAS(cso->lod_bias);
 
    so->descriptor[1] =
+      COND(cso->compare_mode, A6XX_TEX_SAMP_1_COMPARE_FUNC((enum adreno_compare_func)cso->compare_func)) |
       COND(cso->min_mip_filter == PIPE_TEX_MIPFILTER_NONE,
            A6XX_TEX_SAMP_1_MIPFILTER_LINEAR_FAR) |
       COND(!cso->seamless_cube_map, A6XX_TEX_SAMP_1_CUBEMAPSEAMLESSFILTOFF) |
-      COND(cso->unnormalized_coords, A6XX_TEX_SAMP_1_UNNORM_COORDS);
+      COND(cso->unnormalized_coords, A6XX_TEX_SAMP_1_UNNORM_COORDS) |
+      A6XX_TEX_SAMP_1_MIN_LOD(cso->min_lod) |
+      A6XX_TEX_SAMP_1_MAX_LOD(cso->max_lod);
 
-   so->descriptor[0] |= A6XX_TEX_SAMP_0_LOD_BIAS(cso->lod_bias);
-   so->descriptor[1] |= A6XX_TEX_SAMP_1_MIN_LOD(cso->min_lod) |
-                        A6XX_TEX_SAMP_1_MAX_LOD(cso->max_lod);
-
-   if (cso->compare_mode)
-      so->descriptor[1] |=
-         A6XX_TEX_SAMP_1_COMPARE_FUNC((enum adreno_compare_func)cso->compare_func); /* maps 1:1 */
+   so->descriptor[2] =
+      A6XX_TEX_SAMP_2_REDUCTION_MODE(reduction_mode(cso->reduction_mode)) |
+      COND(chroma_linear, A6XX_TEX_SAMP_2_CHROMA_LINEAR);
 
    if (needs_border) {
       bool fast_border_color_enable = false;
@@ -322,22 +329,12 @@ fd6_sampler_state_create(struct pipe_context *pctx,
       }
 
       if (fast_border_color_enable) {
-         so->descriptor[2] = A6XX_TEX_SAMP_2_FASTBORDERCOLOR(fast_border_color) |
-                             A6XX_TEX_SAMP_2_FASTBORDERCOLOREN;
+         so->descriptor[2] |= A6XX_TEX_SAMP_2_FASTBORDERCOLOR(fast_border_color) |
+                              A6XX_TEX_SAMP_2_FASTBORDERCOLOREN;
       } else {
-         so->descriptor[2] = A6XX_TEX_SAMP_2_BCOLOR(get_bcolor_offset(ctx, cso));
+         so->descriptor[2] |= A6XX_TEX_SAMP_2_BCOLOR(get_bcolor_offset(ctx, cso));
       }
    }
-
-   /* We don't know if the format is going to be YUV.  Setting CHROMA_LINEAR
-    * unconditionally seems fine.
-    */
-   if (cso->mag_img_filter == PIPE_TEX_FILTER_LINEAR &&
-       cso->min_img_filter == PIPE_TEX_FILTER_LINEAR)
-      so->descriptor[2] |= A6XX_TEX_SAMP_2_CHROMA_LINEAR;
-
-   so->descriptor[2] |=
-      A6XX_TEX_SAMP_2_REDUCTION_MODE(reduction_mode(cso->reduction_mode));
 
    return so;
 }
@@ -415,6 +412,7 @@ fd6_sampler_view_invalidate(struct fd_context *ctx,
    fd_screen_unlock(ctx->screen);
 }
 
+template <chip CHIP>
 static void
 fd6_sampler_view_update(struct fd_context *ctx,
                         struct fd6_pipe_sampler_view *so)
@@ -442,7 +440,6 @@ fd6_sampler_view_update(struct fd_context *ctx,
 
    if (cso->is_tex2d_from_buf) {
       struct fdl_view_args args = {
-         .chip = ctx->screen->gen,
          .iova = fd_bo_get_iova(rsc->bo),
          .base_miplevel = 0,
          .level_count = 1,
@@ -464,8 +461,8 @@ fd6_sampler_view_update(struct fd_context *ctx,
                                 &cso->u.tex2d_from_buf);
 
       struct fdl6_view view;
-      fdl6_view_init(&view, &layouts, &args,
-                     ctx->screen->info->a6xx.has_z24uint_s8uint);
+      fdl6_view_init<CHIP>(&view, &layouts, &args,
+                           ctx->screen->info->a6xx.has_z24uint_s8uint);
 
       memcpy(so->descriptor, view.descriptor, sizeof(so->descriptor));
    } else if (cso->target == PIPE_BUFFER) {
@@ -477,10 +474,9 @@ fd6_sampler_view_update(struct fd_context *ctx,
       uint32_t size = fd_clamp_buffer_size(cso->format, cso->u.buf.size,
                                            A4XX_MAX_TEXEL_BUFFER_ELEMENTS_UINT);
 
-      fdl6_buffer_view_init(so->descriptor, cso->format, swiz, iova, size);
+      fdl6_buffer_view_init<CHIP>(so->descriptor, cso->format, swiz, iova, size);
    } else {
       struct fdl_view_args args = {
-         .chip = ctx->screen->gen,
          .iova = fd_bo_get_iova(rsc->bo),
 
          .base_miplevel = fd_sampler_first_level(cso),
@@ -514,12 +510,13 @@ fd6_sampler_view_update(struct fd_context *ctx,
          plane2 ? &plane2->layout : &dummy_layout,
       };
       struct fdl6_view view;
-      fdl6_view_init(&view, layouts, &args,
-                     ctx->screen->info->a6xx.has_z24uint_s8uint);
+      fdl6_view_init<CHIP>(&view, layouts, &args,
+                           ctx->screen->info->a6xx.has_z24uint_s8uint);
       memcpy(so->descriptor, view.descriptor, sizeof(so->descriptor));
    }
 }
 
+template <chip CHIP>
 static void
 fd6_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
                       unsigned start, unsigned nr,
@@ -544,7 +541,7 @@ fd6_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
       struct fd_resource *rsc = fd_resource(so->base.texture);
 
       fd6_validate_format(ctx, rsc, so->base.format);
-      fd6_sampler_view_update(ctx, so);
+      fd6_sampler_view_update<CHIP>(ctx, so);
    }
 }
 
@@ -724,6 +721,7 @@ build_texture_state(struct fd_context *ctx, mesa_shader_stage type,
  * state.  And furthermore, this avoids cross-ctx (thread) sharing
  * of fd_ringbuffer's, avoiding their need for atomic refcnts.
  */
+template <chip CHIP>
 static void
 handle_invalidates(struct fd_context *ctx)
    assert_dt
@@ -751,13 +749,14 @@ handle_invalidates(struct fd_context *ctx)
          if (!so)
             continue;
 
-         fd6_sampler_view_update(ctx, so);
+         fd6_sampler_view_update<CHIP>(ctx, so);
       }
    }
 
    fd6_ctx->tex_cache_needs_invalidate = false;
 }
 
+template <chip CHIP>
 struct fd6_texture_state *
 fd6_texture_state(struct fd_context *ctx, mesa_shader_stage type)
 {
@@ -767,7 +766,7 @@ fd6_texture_state(struct fd_context *ctx, mesa_shader_stage type)
    struct fd6_texture_key key;
 
    if (unlikely(fd6_ctx->tex_cache_needs_invalidate))
-      handle_invalidates(ctx);
+      handle_invalidates<CHIP>(ctx);
 
    memset(&key, 0, sizeof(key));
 
@@ -836,6 +835,7 @@ out_unlock:
    fd_screen_unlock(ctx->screen);
    return state;
 }
+FD_GENX(fd6_texture_state);
 
 static void
 fd6_texture_state_destroy(struct fd6_texture_state *state)
@@ -870,6 +870,7 @@ fd6_rebind_resource(struct fd_context *ctx, struct fd_resource *rsc) assert_dt
    }
 }
 
+template <chip CHIP>
 void
 fd6_texture_init(struct pipe_context *pctx) disable_thread_safety_analysis
 {
@@ -882,7 +883,7 @@ fd6_texture_init(struct pipe_context *pctx) disable_thread_safety_analysis
 
    pctx->create_sampler_view = fd6_sampler_view_create;
    pctx->sampler_view_destroy = fd6_sampler_view_destroy;
-   pctx->set_sampler_views = fd6_set_sampler_views;
+   pctx->set_sampler_views = fd6_set_sampler_views<CHIP>;
 
    ctx->rebind_resource = fd6_rebind_resource;
 
@@ -897,6 +898,7 @@ fd6_texture_init(struct pipe_context *pctx) disable_thread_safety_analysis
    fd6_ctx->tex_cache = _mesa_hash_table_create(NULL, tex_key_hash, tex_key_equals);
    util_idalloc_init(&fd6_ctx->tex_ids, 256);
 }
+FD_GENX(fd6_texture_init);
 
 void
 fd6_texture_fini(struct pipe_context *pctx)

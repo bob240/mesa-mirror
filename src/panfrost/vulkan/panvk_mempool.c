@@ -98,8 +98,10 @@ panvk_pool_alloc_backing(struct panvk_pool *pool, size_t sz)
           * VK_ERROR_OUT_OF_HOST_MEMORY.
           * We expect the caller to check the returned pointer and catch the
           * host allocation failure with a call to panvk_error(). */
-         if (result == VK_ERROR_OUT_OF_HOST_MEMORY)
+         if (result == VK_ERROR_OUT_OF_HOST_MEMORY) {
+            assert(bo == NULL);
             errno = -ENOMEM;
+         }
       }
    }
 
@@ -149,7 +151,7 @@ panvk_pool_alloc_mem(struct panvk_pool *pool, struct panvk_pool_alloc_info info)
    unsigned offset = ALIGN_POT(pool->transient_offset, info.alignment);
 
    /* If we don't fit, allocate a new backing */
-   if (unlikely(bo == NULL || (offset + info.size) >= pool->base.slab_size)) {
+   if (unlikely(bo == NULL || offset + info.size > pan_kmod_bo_size(bo->bo))) {
       bo = panvk_pool_alloc_backing(pool, info.size);
       offset = 0;
    }

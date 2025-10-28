@@ -7,6 +7,7 @@
 #include "nir/nir.h"
 #include "nir/nir_xfb_info.h"
 #include "nir/radv_nir.h"
+#include "ac_shader_util.h"
 #include "nir_tcs_info.h"
 #include "radv_device.h"
 #include "radv_physical_device.h"
@@ -613,7 +614,7 @@ gather_shader_info_tcs(struct radv_device *device, const nir_shader *nir,
       radv_get_tess_wg_info(pdev, &info->tcs.io_info, nir->info.tess.tcs_vertices_out,
                             gfx_state->ts.patch_control_points,
                             /* TODO: This should be only inputs in LDS (not VGPR inputs) to reduce LDS usage */
-                            info->tcs.num_linked_inputs, &info->num_tess_patches, &info->tcs.num_lds_blocks);
+                            info->tcs.num_linked_inputs, &info->num_tess_patches, &info->tcs.lds_size);
    }
 }
 
@@ -663,13 +664,13 @@ radv_get_legacy_gs_info(const struct radv_device *device, struct radv_shader_inf
    ac_legacy_gs_compute_subgroup_info(gs_info->gs.input_prim, gs_info->gs.vertices_out, gs_info->gs.invocations,
                                       esgs_vertex_stride, &info);
 
-   const uint32_t lds_granularity = pdev->info.lds_encode_granularity;
+   const uint32_t lds_granularity = ac_shader_get_lds_alloc_granularity(pdev->info.gfx_level);
    const uint32_t total_lds_bytes = align(info.esgs_lds_size * 4, lds_granularity);
 
    out->gs_inst_prims_in_subgroup = info.gs_inst_prims_in_subgroup;
    out->es_verts_per_subgroup = info.es_verts_per_subgroup;
    out->gs_prims_per_subgroup = info.gs_prims_per_subgroup;
-   out->lds_size = total_lds_bytes / lds_granularity;
+   out->lds_size = total_lds_bytes;
 
    unsigned num_se = pdev->info.max_se;
    unsigned wave_size = 64;
@@ -1034,10 +1035,8 @@ radv_nir_shader_info_pass(struct radv_device *device, const struct nir_shader *n
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct nir_function *func = (struct nir_function *)exec_list_get_head_const(&nir->functions);
 
-   if (layout->use_dynamic_descriptors) {
-      info->loads_push_constants = true;
+   if (layout->use_dynamic_descriptors)
       info->loads_dynamic_offsets = true;
-   }
 
    nir_foreach_block (block, func->impl) {
       gather_info_block(nir, block, info, gfx_state, stage_key, consider_force_vrs);
@@ -1096,7 +1095,7 @@ radv_nir_shader_info_pass(struct radv_device *device, const struct nir_shader *n
 
    info->user_data_0 = radv_get_user_data_0(device, info);
    info->merged_shader_compiled_separately = radv_is_merged_shader_compiled_separately(device, info);
-   info->force_indirect_desc_sets = info->merged_shader_compiled_separately || stage_key->indirect_bindable;
+   info->force_indirect_descriptors = info->merged_shader_compiled_separately || stage_key->indirect_bindable;
 
    switch (nir->info.stage) {
    case MESA_SHADER_COMPUTE:

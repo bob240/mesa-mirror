@@ -39,8 +39,8 @@
 #define __pvr_make_address(addr_u64) PVR_DEV_ADDR(addr_u64)
 /* clang-format on */
 
-#include "csbgen/rogue_cdm.h"
-#include "csbgen/rogue_lls.h"
+#include "csbgen/rogue/cdm.h"
+#include "csbgen/rogue/lls.h"
 
 #undef __pvr_make_address
 #undef __pvr_get_address
@@ -449,7 +449,7 @@ rogue_max_wg_temps(const struct pvr_device_info *dev_info,
 {
    assert(wg_size <= rogue_get_max_total_instances(dev_info));
    if (!wg_size)
-      return rogue_get_compute_max_work_group_size(dev_info);
+      wg_size = rogue_get_compute_max_work_group_size(dev_info);
 
    if (wg_size > ROGUE_MAX_INSTANCES_PER_TASK && has_barrier) {
       /* Number of slots allocated for each workgroup. */

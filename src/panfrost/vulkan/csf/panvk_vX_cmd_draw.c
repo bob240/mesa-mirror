@@ -997,9 +997,7 @@ get_tiler_desc(struct panvk_cmd_buffer *cmdbuf)
       panvk_get_cs_builder(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(cmdbuf->vk.base.device->physical);
-   struct panvk_instance *instance =
-      to_panvk_instance(phys_dev->vk.instance);
-   bool tracing_enabled = instance->debug_flags & PANVK_DEBUG_TRACE;
+   const bool tracing_enabled = PANVK_DEBUG(TRACE);
    struct pan_tiler_features tiler_features =
       pan_query_tiler_features(&phys_dev->kmod.props);
    bool simul_use =
@@ -1205,7 +1203,8 @@ prepare_fb_desc(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
       .valhall.layer_offset = layer - (layer % MAX_LAYERS_PER_TILER_DESC),
    };
 
-   if (!(cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT)) {
+   if (!(cmdbuf->flags & VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) &&
+       (cmdbuf->state.gfx.render.tiler != 0)) {
       uint32_t td_idx = layer / MAX_LAYERS_PER_TILER_DESC;
 
       tiler_ctx.valhall.desc =
@@ -1964,6 +1963,10 @@ prepare_dcd(struct panvk_cmd_buffer *cmdbuf,
       dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_TEST_ENABLE) ||
       dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_OP) ||
       dyn_gfx_state_dirty(cmdbuf, DS_STENCIL_WRITE_MASK) ||
+      /* fpk enablement depends on vk_color_blend_attachment_state */
+      dyn_gfx_state_dirty(cmdbuf, CB_BLEND_ENABLES) ||
+      dyn_gfx_state_dirty(cmdbuf, CB_BLEND_EQUATIONS) ||
+      dyn_gfx_state_dirty(cmdbuf, CB_WRITE_MASKS) ||
       /* line mode needs primitive topology */
       dyn_gfx_state_dirty(cmdbuf, IA_PRIMITIVE_TOPOLOGY) ||
       dyn_gfx_state_dirty(cmdbuf, INPUT_ATTACHMENT_MAP) ||
@@ -2555,7 +2558,8 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
    uint32_t patch_attribs =
       cmdbuf->state.gfx.vi.attribs_changing_on_base_instance;
    uint32_t vs_res_table_size =
-      panvk_shader_res_table_count(&cmdbuf->state.gfx.vs.desc);
+      panvk_shader_res_table_count(&cmdbuf->state.gfx.vs.desc) *
+      pan_size(RESOURCE);
    bool patch_faus = shader_uses_sysval(vs, graphics, vs.first_vertex) ||
                      shader_uses_sysval(vs, graphics, vs.base_instance);
    struct cs_index draw_params_addr = cs_scratch_reg64(b, 0);
@@ -2580,6 +2584,9 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
 
    if (patch_faus)
       cs_move64_to(b, vs_fau_addr, cmdbuf->state.gfx.vs.push_uniforms);
+
+   if (patch_attribs != 0)
+      cs_move64_to(b, vs_drv_set, vs_desc_state->driver_set.dev_addr);
 
    cs_move64_to(b, draw_params_addr, draw->indirect.buffer_dev_addr);
    cs_move32_to(b, draw_id, 0);
@@ -2608,8 +2615,6 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
       }
 
       if (patch_attribs != 0) {
-         cs_move64_to(b, vs_drv_set, vs_desc_state->driver_set.dev_addr);
-
          /* If firstInstance=0, skip the offset adjustment. */
          cs_if(b, MALI_CS_CONDITION_NEQUAL,
                cs_sr_reg32(b, IDVS, INSTANCE_OFFSET)) {
@@ -2625,8 +2630,8 @@ panvk_cmd_draw_indirect(struct panvk_cmd_buffer *cmdbuf,
                /* Emulated immediate multiply: we walk the bits in
                 * base_instance, and accumulate (stride << bit_pos) if the bit
                 * is present. This is sub-optimal, but it's simple :-). */
-               cs_add32(b, multiplicand,
-                        cs_sr_reg32(b, IDVS, INSTANCE_OFFSET), 0);
+               cs_move_reg32(b, multiplicand,
+                             cs_sr_reg32(b, IDVS, INSTANCE_OFFSET));
 
                /* Flush the loads here so that we don't get automatic flushes
                 * over and over again due to the divergent nature of the if/else
@@ -3060,8 +3065,6 @@ static VkResult
 issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   struct panvk_instance *instance =
-      to_panvk_instance(dev->vk.physical->instance);
    const struct cs_tracing_ctx *tracing_ctx =
       &cmdbuf->state.cs[PANVK_SUBQUEUE_FRAGMENT].tracing;
    struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
@@ -3075,9 +3078,9 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
    /* Now initialize the fragment bits. */
    cs_update_frag_ctx(b) {
       cs_move32_to(b, cs_sr_reg32(b, FRAGMENT, BBOX_MIN),
-                   (fbinfo->extent.miny << 16) | fbinfo->extent.minx);
+                   (fbinfo->draw_extent.miny << 16) | fbinfo->draw_extent.minx);
       cs_move32_to(b, cs_sr_reg32(b, FRAGMENT, BBOX_MAX),
-                   (fbinfo->extent.maxy << 16) | fbinfo->extent.maxx);
+                   (fbinfo->draw_extent.maxy << 16) | fbinfo->draw_extent.maxx);
    }
 
    bool simul_use =
@@ -3155,7 +3158,7 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
     * invalidation even became implicit (done as part of the RUN_FRAGMENT) on
     * v13+. We don't do that in panvk, but we provide a debug flag to help
     * identify those issues. */
-   if (unlikely(instance->debug_flags & PANVK_DEBUG_IMPLICIT_OTHERS_INV)) {
+   if (PANVK_DEBUG(IMPLICIT_OTHERS_INV)) {
       cs_flush_caches(b, MALI_CS_FLUSH_MODE_NONE, MALI_CS_FLUSH_MODE_NONE,
                       MALI_CS_OTHER_FLUSH_MODE_INVALIDATE, length_reg,
                       cs_defer(0x0, SB_ID(IMM_FLUSH)));

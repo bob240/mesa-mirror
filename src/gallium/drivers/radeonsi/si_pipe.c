@@ -97,6 +97,8 @@ static const struct debug_named_value radeonsi_shader_debug_options[] = {
    {"tcs", DBG(TCS), "Print tessellation control shaders"},
    {"tes", DBG(TES), "Print tessellation evaluation shaders"},
    {"cs", DBG(CS), "Print compute shaders"},
+   {"ts", DBG(TS), "Print task shaders"},
+   {"ms", DBG(MS), "Print mesh shaders"},
 
    {"initnir", DBG(INIT_NIR), "Print initial input NIR when shaders are created"},
    {"nir", DBG(NIR), "Print final NIR after lowering when shader variants are created"},
@@ -519,14 +521,13 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 
    struct si_context *sctx = CALLOC_STRUCT(si_context);
    struct radeon_winsys *ws = sscreen->ws;
-   int shader, i;
 
    if (!sctx) {
       mesa_loge("can't allocate a context");
       return NULL;
    }
 
-   sctx->is_gfx_queue = sscreen->info.gfx_level == GFX6 ||
+   sctx->is_gfx_queue = sscreen->info.has_cs_regalloc_hang_bug ||
                         /* Compute queues hang on Raven and derivatives, see:
                          * https://gitlab.freedesktop.org/mesa/mesa/-/issues/12310 */
                         ((sscreen->info.family == CHIP_RAVEN ||
@@ -654,7 +655,6 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 #endif
 
    sctx->ngg = sscreen->use_ngg;
-   si_shader_change_notify(sctx);
 
    sctx->b.emit_string_marker = si_emit_string_marker;
    sctx->b.set_debug_callback = si_set_debug_callback;
@@ -770,9 +770,11 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
       }
       sctx->null_const_buf.buffer_size = sctx->null_const_buf.buffer->width0;
 
-      unsigned start_shader = sctx->is_gfx_queue ? 0 : MESA_SHADER_COMPUTE;
-      for (shader = start_shader; shader < SI_NUM_SHADERS; shader++) {
-         for (i = 0; i < SI_NUM_CONST_BUFFERS; i++) {
+      for (unsigned shader = 0; shader < SI_NUM_SHADERS; shader++) {
+         if (!sctx->is_gfx_queue && shader != MESA_SHADER_COMPUTE)
+            continue;
+
+         for (unsigned i = 0; i < SI_NUM_CONST_BUFFERS; i++) {
             sctx->b.set_constant_buffer(&sctx->b, shader, i, &sctx->null_const_buf);
          }
       }
@@ -1511,6 +1513,8 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
 
    if (!debug_get_bool_option("RADEON_DISABLE_PERFCOUNTERS", false))
       si_init_perfcounters(sscreen);
+
+   ac_get_task_info(&sscreen->info, &sscreen->task_info);
 
    if (sscreen->debug_flags & DBG(NO_OUT_OF_ORDER))
       sscreen->info.has_out_of_order_rast = false;

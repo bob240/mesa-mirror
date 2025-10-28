@@ -183,6 +183,7 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
          goto fail_upload;
 
       memset(dev->zero_page->map, 0, 0x1000);
+      nvkmd_mem_sync_map_to_gpu(dev->zero_page, 0, 0x1000);
       nvkmd_mem_unmap(dev->zero_page, 0);
 
       result = nvk_descriptor_table_init(dev, &dev->images,
@@ -249,7 +250,8 @@ nvk_CreateDevice(VkPhysicalDevice physicalDevice,
          goto fail_edb_bview_cache;
 
       result = nvk_heap_init(dev, &dev->event_heap,
-                             NVKMD_MEM_LOCAL, NVKMD_MEM_MAP_WR,
+                             NVKMD_MEM_LOCAL | NVKMD_MEM_COHERENT,
+                             NVKMD_MEM_MAP_WR,
                              0 /* overalloc */, false /* contiguous */);
       if (result != VK_SUCCESS)
          goto fail_shader_heap;

@@ -123,8 +123,7 @@ v3dv_destroy_pipeline(struct v3dv_pipeline *pipeline,
       pipeline->default_attribute_values = NULL;
    }
 
-   if (pipeline->executables.mem_ctx)
-      ralloc_free(pipeline->executables.mem_ctx);
+   ralloc_free(pipeline->executables.mem_ctx);
 
    if (pipeline->layout)
       v3dv_pipeline_layout_unref(device, pipeline->layout, pAllocator);
@@ -3520,8 +3519,7 @@ pipeline_collect_executable_data(struct v3dv_pipeline *pipeline)
          .nir_str = nir_str,
          .qpu_str = qpu_str,
       };
-      util_dynarray_append(&pipeline->executables.data,
-                           struct v3dv_pipeline_executable_data, data);
+      util_dynarray_append(&pipeline->executables.data, data);
    }
 }
 

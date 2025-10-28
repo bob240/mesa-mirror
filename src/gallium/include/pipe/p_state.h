@@ -1054,6 +1054,13 @@ enum pipe_ml_operation_type {
    PIPE_ML_OPERATION_TYPE_LOGISTIC,
    PIPE_ML_OPERATION_TYPE_SUBTRACT,
    PIPE_ML_OPERATION_TYPE_TRANSPOSE,
+   PIPE_ML_OPERATION_TYPE_STRIDED_SLICE,
+   PIPE_ML_OPERATION_TYPE_RESIZE,
+};
+
+enum pipe_ml_pooling_type {
+   PIPE_ML_POOLING_TYPE_AVG,
+   PIPE_ML_POOLING_TYPE_MAX,
 };
 
 /**
@@ -1124,6 +1131,12 @@ struct pipe_ml_operation
          unsigned dilation_height_factor;
       } conv;
       struct {
+
+         /**
+          * Type of pooling operation.
+          */
+         enum pipe_ml_pooling_type type;
+
          /**
           * Stride used to access the input tensor on the x axis.
           */
@@ -1221,6 +1234,12 @@ struct pipe_ml_operation
       struct {
          unsigned perm[4];
       } transpose;
+
+      struct {
+         int begin[4];
+         int end[4];
+         int strides[4];
+      } slice;
    };
 };
 

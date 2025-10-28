@@ -472,7 +472,7 @@ agx_block_add_successor(agx_block *block, agx_block *successor)
       }
 
       block->successors[i] = successor;
-      util_dynarray_append(&successor->predecessors, agx_block *, block);
+      util_dynarray_append(&successor->predecessors, block);
       return;
    }
 
@@ -3301,6 +3301,30 @@ lower_load_from_texture_handle(nir_builder *b, nir_intrinsic_instr *intr,
    return true;
 }
 
+static bool
+lower_sink_address(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_ro_sink_address_poly:
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(&intr->def, nir_imm_int64(b, AGX_ZERO_PAGE_ADDRESS));
+      return true;
+   case nir_intrinsic_ro_to_rw_poly: {
+      b->cursor = nir_before_instr(&intr->instr);
+      nir_def_replace(
+         &intr->def,
+         nir_bcsel(b, nir_ieq_imm(b, intr->src[0].ssa, AGX_ZERO_PAGE_ADDRESS),
+                   nir_imm_int64(b, AGX_SCRATCH_PAGE_ADDRESS),
+                   intr->src[0].ssa));
+      return true;
+   }
+   default:
+      break;
+   }
+
+   return false;
+}
+
 static void
 agx_remove_unreachable_block(agx_block *block)
 {
@@ -3672,6 +3696,9 @@ agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 void
 agx_preprocess_nir(nir_shader *nir)
 {
+   if (!nir)
+      return;
+
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 
    /* Lower large arrays to scratch and small arrays to csel */
@@ -3818,6 +3845,9 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
 
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_load_from_texture_handle,
+            nir_metadata_control_flow, NULL);
+
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_sink_address,
             nir_metadata_control_flow, NULL);
 
    info->push_count = key->reserved_preamble;

@@ -107,7 +107,7 @@ anv_copy_image_memory(struct anv_device *device,
       (binding->address.bo->flags & ANV_BO_ALLOC_HOST_COHERENT) == 0 &&
       device->physical->memory.need_flush;
    if (need_invalidate_flush && !mem_to_img)
-      intel_invalidate_range(img_ptr + start_tile_B, end_tile_B - start_tile_B);
+      util_flush_inval_range(img_ptr + start_tile_B, end_tile_B - start_tile_B);
 #endif
 
    uint32_t img_depth_or_layer = MAX2(base_img_array_layer + array_layer,
@@ -160,7 +160,7 @@ anv_copy_image_memory(struct anv_device *device,
 
 #ifdef SUPPORT_INTEL_INTEGRATED_GPUS
    if (need_invalidate_flush && mem_to_img)
-      intel_flush_range(img_ptr + start_tile_B, end_tile_B - start_tile_B);
+      util_flush_range(img_ptr + start_tile_B, end_tile_B - start_tile_B);
 #endif
 }
 
@@ -480,6 +480,9 @@ anv_CopyImageToMemory(
    return VK_SUCCESS;
 }
 
+/* This functions copies from one image to another through an intermediate
+ * linear buffer.
+ */
 static void
 copy_image_to_image(struct anv_device *device,
                     struct anv_image *src_image,
@@ -505,14 +508,11 @@ copy_image_to_image(struct anv_device *device,
    isl_surf_get_tile_info(src_surf, &src_tile);
    isl_surf_get_tile_info(dst_surf, &dst_tile);
 
-   uint32_t tile_width_B;
    uint32_t tile_width_el, tile_height_el;
    if (src_tile.phys_extent_B.w > dst_tile.phys_extent_B.w) {
-      tile_width_B   = src_tile.phys_extent_B.w;
       tile_width_el  = src_tile.logical_extent_el.w;
       tile_height_el = src_tile.logical_extent_el.h;
    } else {
-      tile_width_B   = dst_tile.phys_extent_B.w;
       tile_width_el  = dst_tile.logical_extent_el.w;
       tile_height_el = dst_tile.logical_extent_el.h;
    }
@@ -527,13 +527,17 @@ copy_image_to_image(struct anv_device *device,
    VkExtent3D extent_el =
       vk_extent3d_to_el(src_surf->format, region->extent);
 
+   uint32_t linear_stride_B;
    /* linear-to-linear case */
    if (tile_width_el == 1 && tile_height_el == 1) {
       tile_width_el = MIN2(4096 / (src_tile.format_bpb / 8),
                            extent_el.width);
       tile_height_el = 4096 / (tile_width_el * (src_tile.format_bpb / 8));
-      tile_width_B = tile_width_el * src_tile.format_bpb / 8;
+      linear_stride_B = tile_width_el * src_tile.format_bpb / 8;
+   } else {
+      linear_stride_B = src_tile.logical_extent_el.w * src_tile.format_bpb / 8;
    }
+
 
    uint32_t layer_count =
       vk_image_subresource_layer_count(&src_image->vk, &region->srcSubresource);
@@ -559,7 +563,7 @@ copy_image_to_image(struct anv_device *device,
                                      src_binding,
                                      src_anv_surf->memory_range.offset,
                                      tmp_map,
-                                     tile_width_B,
+                                     linear_stride_B,
                                      &src_offset, &extent,
                                      region->srcSubresource.mipLevel,
                                      region->srcSubresource.baseArrayLayer,
@@ -570,7 +574,7 @@ copy_image_to_image(struct anv_device *device,
                                      dst_binding,
                                      dst_anv_surf->memory_range.offset,
                                      tmp_map,
-                                     tile_width_B,
+                                     linear_stride_B,
                                      &dst_offset, &extent,
                                      region->dstSubresource.mipLevel,
                                      region->dstSubresource.baseArrayLayer,

@@ -208,8 +208,8 @@ tu_CreateDescriptorSetLayout(
       if (binding->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK)
          set_layout->has_inline_uniforms = true;
 
-      if (variable_flags && binding->binding < variable_flags->bindingCount &&
-          (variable_flags->pBindingFlags[binding->binding] &
+      if (variable_flags && j < variable_flags->bindingCount &&
+          (variable_flags->pBindingFlags[j] &
            VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
          assert(!binding->pImmutableSamplers); /* Terribly ill defined  how
                                                   many samplers are valid */
@@ -377,7 +377,7 @@ tu_GetDescriptorSetLayoutSupport(
       uint64_t max_count = MAX_SET_SIZE;
       unsigned descriptor_count = binding->descriptorCount;
       if (binding->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
-         max_count = MAX_SET_SIZE - size;
+         max_count = MAX_INLINE_UBO_RANGE - size;
          descriptor_count = descriptor_sz;
          descriptor_sz = 1;
       } else if (descriptor_sz) {
@@ -388,9 +388,9 @@ tu_GetDescriptorSetLayoutSupport(
          supported = false;
       }
 
-      if (variable_flags && binding->binding < variable_flags->bindingCount &&
+      if (variable_flags && i < variable_flags->bindingCount &&
           variable_count &&
-          (variable_flags->pBindingFlags[binding->binding] &
+          (variable_flags->pBindingFlags[i] &
            VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT)) {
          variable_count->maxVariableDescriptorCount =
             MIN2(UINT32_MAX, max_count);
@@ -972,6 +972,7 @@ tu_FreeDescriptorSets(VkDevice _device,
    return VK_SUCCESS;
 }
 
+template <chip CHIP>
 static void
 write_texel_buffer_descriptor_addr(uint32_t *dst,
                                    const VkDescriptorAddressInfoEXT *buffer_info)
@@ -981,9 +982,9 @@ write_texel_buffer_descriptor_addr(uint32_t *dst,
    } else {
       uint8_t swiz[4] = { PIPE_SWIZZLE_X, PIPE_SWIZZLE_Y, PIPE_SWIZZLE_Z,
                           PIPE_SWIZZLE_W };
-      fdl6_buffer_view_init(dst,
-                            vk_format_to_pipe_format(buffer_info->format),
-                            swiz, buffer_info->address, buffer_info->range);
+      fdl6_buffer_view_init<CHIP>(dst,
+                                  vk_format_to_pipe_format(buffer_info->format),
+                                  swiz, buffer_info->address, buffer_info->range);
    }
 }
 
@@ -1204,10 +1205,10 @@ tu_GetDescriptorEXT(
       write_buffer_descriptor_addr(device, dest, pDescriptorInfo->data.pStorageBuffer);
       break;
    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
-      write_texel_buffer_descriptor_addr(dest, pDescriptorInfo->data.pUniformTexelBuffer);
+      TU_CALLX(device, write_texel_buffer_descriptor_addr)(dest, pDescriptorInfo->data.pUniformTexelBuffer);
       break;
    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
-      write_texel_buffer_descriptor_addr(dest, pDescriptorInfo->data.pStorageTexelBuffer);
+      TU_CALLX(device, write_texel_buffer_descriptor_addr)(dest, pDescriptorInfo->data.pStorageTexelBuffer);
       break;
    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
       write_image_descriptor(dest, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,

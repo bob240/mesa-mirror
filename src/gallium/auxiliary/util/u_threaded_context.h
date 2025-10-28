@@ -531,6 +531,7 @@ struct tc_batch {
    uint64_t slots[TC_SLOTS_PER_BATCH];
    struct util_dynarray renderpass_infos;
 #if !defined(NDEBUG)
+   bool tc_set_vertex_elements_for_call_pending;
    bool closed;
 #endif
 };
@@ -734,7 +735,8 @@ tc_add_set_vertex_buffers_call(struct pipe_context *_pipe, unsigned count);
 
 struct pipe_vertex_buffer *
 tc_add_set_vertex_elements_and_buffers_call(struct pipe_context *_pipe,
-                                            unsigned count);
+                                            unsigned count,
+                                            bool account_for_unmaps);
 
 void
 tc_draw_vbo(struct pipe_context *_pipe, const struct pipe_draw_info *info,
@@ -864,9 +866,16 @@ tc_track_vertex_buffer(struct pipe_context *_pipe, unsigned index,
  * buffers.
  */
 static inline void
-tc_set_vertex_elements_for_call(struct pipe_vertex_buffer *buffers,
+tc_set_vertex_elements_for_call(struct pipe_context *_pipe,
+                                struct pipe_vertex_buffer *buffers,
                                 void *state)
 {
+#if !defined(NDEBUG)
+   struct threaded_context *tc = threaded_context(_pipe);
+   struct tc_batch *next = &tc->batch_slots[tc->next];
+   assert(next->tc_set_vertex_elements_for_call_pending);
+   next->tc_set_vertex_elements_for_call_pending = false;
+#endif
    void **ptr = (void**)buffers;
    ptr[-1] = state;
 }

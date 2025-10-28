@@ -48,7 +48,16 @@
 #define __pvr_make_address(addr_u64) PVR_DEV_ADDR(addr_u64)
 /* clang-format on */
 
-#include "csbgen/rogue_hwdefs.h"
+#include "csbgen/rogue/cdm.h"
+#include "csbgen/rogue/cr.h"
+#include "csbgen/rogue/ipf.h"
+#include "csbgen/rogue/kmd_stream.h"
+#include "csbgen/rogue/lls.h"
+#include "csbgen/rogue/pbestate.h"
+#include "csbgen/rogue/pds.h"
+#include "csbgen/rogue/ppp.h"
+#include "csbgen/rogue/texstate.h"
+#include "csbgen/rogue/vdm.h"
 
 /**
  * \brief Size of the individual csb buffer object.

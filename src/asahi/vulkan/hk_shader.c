@@ -8,10 +8,10 @@
  */
 #include "hk_shader.h"
 
+#include "poly/nir/poly_nir_lower_gs.h"
 #include "agx_debug.h"
 #include "agx_device.h"
 #include "agx_helpers.h"
-#include "agx_nir_lower_gs.h"
 #include "agx_nir_lower_vbo.h"
 #include "glsl_types.h"
 #include "hk_instance.h"
@@ -399,7 +399,7 @@ lower_load_global_bounded(nir_builder *b, nir_intrinsic_instr *intr)
       access |= ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER;
    }
 
-   nir_def *val = nir_build_load_global(
+   nir_def *val = nir_load_global(
       b, intr->def.num_components, intr->def.bit_size,
       nir_iadd(b, base, nir_u2u64(b, offset)),
       .align_mul = nir_intrinsic_align_mul(intr),
@@ -444,7 +444,7 @@ lower_load_global_constant_offset_instr(nir_builder *b,
    unsigned align_mul = nir_intrinsic_align_mul(intrin);
    unsigned align_offset = nir_intrinsic_align_offset(intrin);
 
-   nir_def *val = nir_build_load_global_constant(
+   nir_def *val = nir_load_global_constant(
       b, intrin->def.num_components, intrin->def.bit_size,
       nir_iadd(b, base_addr, nir_u2u64(b, offset)), .align_mul = align_mul,
       .align_offset = align_offset, .access = nir_intrinsic_access(intrin));
@@ -1114,13 +1114,13 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
          shader->info.tess.tcs_output_patch_size =
             nir->info.tess.tcs_vertices_out;
          shader->info.tess.tcs_per_vertex_outputs =
-            agx_tcs_per_vertex_outputs(nir);
+            poly_tcs_per_vertex_outputs(nir);
          shader->info.tess.tcs_nr_patch_outputs =
             util_last_bit(nir->info.patch_outputs_written);
-         shader->info.tess.tcs_output_stride = agx_tcs_output_stride(nir);
+         shader->info.tess.tcs_output_stride = poly_tcs_output_stride(nir);
       } else {
          /* This destroys info so it needs to happen after the gather */
-         NIR_PASS(_, nir, agx_nir_lower_tes, hw);
+         NIR_PASS(_, nir, poly_nir_lower_tes, hw);
       }
    }
 
@@ -1137,7 +1137,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
       if (hw) {
          hk_lower_hw_vs(nir, shader, kill_psiz);
       } else {
-         NIR_PASS(_, nir, agx_nir_lower_vs_before_gs);
+         NIR_PASS(_, nir, poly_nir_lower_vs_before_gs);
          nir->info.stage = MESA_SHADER_COMPUTE;
          memset(&nir->info.cs, 0, sizeof(nir->info.cs));
          nir->xfb_info = NULL;
@@ -1335,7 +1335,7 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
       hk_populate_vs_key(&key_tmp.vs, state);
       key = &key_tmp;
    } else if (sw_stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, agx_nir_lower_tcs);
+      NIR_PASS(_, nir, poly_nir_lower_tcs);
    }
 
    /* Compile all variants up front */
@@ -1345,8 +1345,12 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
 
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
 
-      NIR_PASS(_, nir, agx_nir_lower_gs, &count, &rast, &pre_gs,
+      NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
                &count_variant->info.gs);
+
+      agx_preprocess_nir(count);
+      agx_preprocess_nir(rast);
+      agx_preprocess_nir(pre_gs);
 
       struct hk_shader *shader = &obj->variants[HK_GS_VARIANT_RAST];
       hk_lower_hw_vs(rast, shader, false);

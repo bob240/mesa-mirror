@@ -110,9 +110,9 @@ struct radv_shader_info {
    bool inputs_linked;
    bool outputs_linked;
    bool merged_shader_compiled_separately; /* GFX9+ */
-   bool force_indirect_desc_sets;
+   bool force_indirect_descriptors;
    uint64_t gs_inputs_read;  /* Mask of GS inputs read (only used by linked ES) */
-   unsigned nir_shared_size; /* Only used by LLVM. */
+   unsigned nir_shared_size;
 
    struct {
       uint8_t output_usage_mask[VARYING_SLOT_VAR31 + 1];
@@ -237,7 +237,7 @@ struct radv_shader_info {
       uint64_t tes_inputs_read;
       uint64_t tes_patch_inputs_read;
       unsigned tcs_vertices_out;
-      uint32_t num_lds_blocks;
+      uint32_t lds_size;         /* in bytes */
       uint8_t num_linked_inputs; /* Number of reserved per-vertex input slots in LDS. */
       bool tes_reads_tess_factors : 1;
    } tcs;

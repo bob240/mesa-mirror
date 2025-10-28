@@ -34,8 +34,6 @@
 #include "aco_interface.h"
 #include "sid.h"
 #include "vk_format.h"
-#include "vk_nir_convert_ycbcr.h"
-#include "vk_ycbcr_conversion.h"
 
 bool
 radv_pipeline_capture_shaders(const struct radv_device *device, VkPipelineCreateFlags2 flags)
@@ -231,23 +229,8 @@ radv_shader_layout_init(const struct radv_pipeline_layout *pipeline_layout, mesa
       layout->set[i].dynamic_offset_start = pipeline_layout->set[i].dynamic_offset_start;
    }
 
-   layout->push_constant_size = pipeline_layout->push_constant_size;
    layout->use_dynamic_descriptors = pipeline_layout->dynamic_offset_count &&
                                      (pipeline_layout->dynamic_shader_stages & mesa_to_vk_shader_stage(stage));
-}
-
-static const struct vk_ycbcr_conversion_state *
-ycbcr_conversion_lookup(const void *data, uint32_t set, uint32_t binding, uint32_t array_index)
-{
-   const struct radv_shader_layout *layout = data;
-
-   const struct radv_descriptor_set_layout *set_layout = layout->set[set].layout;
-   const struct vk_ycbcr_conversion_state *ycbcr_samplers = radv_immutable_ycbcr_samplers(set_layout, binding);
-
-   if (!ycbcr_samplers)
-      return NULL;
-
-   return ycbcr_samplers + array_index;
 }
 
 static uint8_t
@@ -369,9 +352,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    };
    NIR_PASS(_, stage->nir, radv_nir_opt_tid_function, &tid_options);
 
-   nir_divergence_analysis(stage->nir);
-   NIR_PASS(_, stage->nir, ac_nir_flag_smem_for_loads, gfx_level, use_llvm, false);
-   NIR_PASS(_, stage->nir, radv_nir_opt_access_can_speculate);
+   NIR_PASS(_, stage->nir, ac_nir_flag_smem_for_loads, gfx_level, use_llvm);
 
    NIR_PASS(_, stage->nir, nir_lower_memory_model);
 
@@ -432,12 +413,6 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    if (progress)
       constant_fold_for_push_const = true;
 
-   progress = false;
-   NIR_PASS(progress, stage->nir, nir_vk_lower_ycbcr_tex, ycbcr_conversion_lookup, &stage->layout);
-   /* Gather info in the case that nir_vk_lower_ycbcr_tex might have emitted resinfo instructions. */
-   if (progress)
-      nir_shader_gather_info(stage->nir, nir_shader_get_entrypoint(stage->nir));
-
    NIR_PASS(_, stage->nir, ac_nir_lower_tex,
             &(ac_nir_lower_tex_options){
                .gfx_level = gfx_level,
@@ -455,6 +430,15 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    if (constant_fold_for_push_const && stage->args.ac.inline_push_const_mask)
       NIR_PASS(_, stage->nir, nir_opt_constant_folding);
 
+   /* Optimize NIR before NGG culling */
+   bool is_last_vgt_stage = radv_is_last_vgt_stage(stage);
+   bool lowered_ngg = stage->info.is_ngg && is_last_vgt_stage;
+   if (lowered_ngg && stage->nir->info.stage != MESA_SHADER_GEOMETRY && stage->info.has_ngg_culling)
+      radv_optimize_nir_algebraic_early(stage->nir);
+
+   /* This has to be done after nir_opt_algebraic for best descriptor vectorization, but also before
+    * NGG culling.
+    */
    NIR_PASS(_, stage->nir, radv_nir_apply_pipeline_layout, device, stage);
 
    NIR_PASS(_, stage->nir, nir_lower_alu_width, opt_vectorize_callback, device);
@@ -488,9 +472,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    }
 
    /* Lower I/O intrinsics to memory instructions. */
-   bool is_last_vgt_stage = radv_is_last_vgt_stage(stage);
    bool io_to_mem = radv_nir_lower_io_to_mem(device, stage);
-   bool lowered_ngg = stage->info.is_ngg && is_last_vgt_stage;
    if (lowered_ngg) {
       radv_lower_ngg(device, stage, gfx_state);
    } else if (is_last_vgt_stage) {
@@ -563,15 +545,11 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
       NIR_PASS(_, stage->nir, nir_clear_shared_memory, shared_size, chunk_size);
    }
 
-   NIR_PASS(_, stage->nir, ac_nir_lower_mem_access_bit_sizes, gfx_level, use_llvm);
-
    /* This must be after lowering resources to descriptor loads and before lowering intrinsics
     * to args and lowering int64.
     */
    if (!radv_use_llvm_for_stage(pdev, stage->stage))
       ac_nir_optimize_uniform_atomics(stage->nir);
-
-   NIR_PASS(_, stage->nir, nir_lower_int64);
 
    NIR_PASS(_, stage->nir, nir_opt_idiv_const, 8);
 
@@ -580,7 +558,6 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
                .allow_fp16 = gfx_level >= GFX9,
             });
 
-   NIR_PASS(_, stage->nir, ac_nir_lower_global_access);
    NIR_PASS(_, stage->nir, ac_nir_lower_intrinsics_to_args, gfx_level,
             pdev->info.has_ls_vgpr_init_bug && gfx_state && !gfx_state->vs.has_prolog,
             radv_select_hw_stage(&stage->info, gfx_level), stage->info.wave_size, stage->info.workgroup_size,
@@ -589,11 +566,14 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
 
    if (!stage->key.optimisations_disabled) {
       NIR_PASS(_, stage->nir, nir_opt_dce);
-      NIR_PASS(_, stage->nir, nir_opt_shrink_vectors, true);
 
       NIR_PASS(_, stage->nir, nir_copy_prop);
       NIR_PASS(_, stage->nir, nir_opt_constant_folding);
       NIR_PASS(_, stage->nir, nir_opt_cse);
+      NIR_PASS(_, stage->nir, nir_opt_shrink_vectors, true);
+
+      NIR_PASS(_, stage->nir, ac_nir_flag_smem_for_loads, gfx_level, use_llvm);
+      NIR_PASS(_, stage->nir, ac_nir_lower_mem_access_bit_sizes, gfx_level, use_llvm);
 
       nir_load_store_vectorize_options late_vectorize_opts = {
          .modes =
@@ -607,8 +587,11 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
          .has_shared2_amd = gfx_level >= GFX7,
       };
       NIR_PASS(_, stage->nir, nir_opt_load_store_vectorize, &late_vectorize_opts);
-      NIR_PASS(_, stage->nir, ac_nir_lower_mem_access_bit_sizes, gfx_level, use_llvm);
    }
+
+   NIR_PASS(_, stage->nir, ac_nir_lower_mem_access_bit_sizes, gfx_level, use_llvm);
+   NIR_PASS(_, stage->nir, ac_nir_lower_global_access);
+   NIR_PASS(_, stage->nir, nir_lower_int64);
 
    radv_optimize_nir_algebraic(
       stage->nir, io_to_mem || lowered_ngg || stage->stage == MESA_SHADER_COMPUTE || stage->stage == MESA_SHADER_TASK,
@@ -886,9 +869,6 @@ radv_GetPipelineExecutableStatisticsKHR(VkDevice _device, const VkPipelineExecut
    const struct radv_physical_device *pdev = radv_device_physical(device);
    const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
 
-   unsigned lds_increment =
-      gfx_level >= GFX11 && stage == MESA_SHADER_FRAGMENT ? 1024 : pdev->info.lds_encode_granularity;
-
    VK_OUTARRAY_MAKE_TYPED(VkPipelineExecutableStatisticKHR, out, pStatistics, pStatisticCount);
 
    struct amd_stats stats = {0};
@@ -900,7 +880,7 @@ radv_GetPipelineExecutableStatisticsKHR(VkDevice _device, const VkPipelineExecut
    stats.spillsgprs = shader->config.spilled_sgprs;
    stats.spillvgprs = shader->config.spilled_vgprs;
    stats.codesize = shader->exec_size;
-   stats.lds = shader->config.lds_size * lds_increment;
+   stats.lds = align(shader->config.lds_size, ac_shader_get_lds_alloc_granularity(gfx_level));
    stats.scratch = shader->config.scratch_bytes_per_wave;
    stats.maxwaves = shader->max_waves;
 

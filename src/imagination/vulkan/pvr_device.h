@@ -15,6 +15,7 @@
 #define PVR_DEVICE_H
 
 #include "vk_device.h"
+#include "vk_device_memory.h"
 #include "vk_instance.h"
 #include "vk_physical_device.h"
 
@@ -28,6 +29,19 @@
 #include "pvr_pds.h"
 #include "pvr_spm.h"
 #include "pvr_usc.h"
+
+#if defined(VK_USE_PLATFORM_DISPLAY_KHR)
+#   define PVR_USE_WSI_PLATFORM_DISPLAY true
+#else
+#   define PVR_USE_WSI_PLATFORM_DISPLAY false
+#endif
+
+#if defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
+    defined(VK_USE_PLATFORM_WAYLAND_KHR)
+#   define PVR_USE_WSI_PLATFORM true
+#else
+#   define PVR_USE_WSI_PLATFORM false
+#endif
 
 typedef struct _pco_ctx pco_ctx;
 
@@ -205,7 +219,7 @@ struct pvr_device {
 };
 
 struct pvr_device_memory {
-   struct vk_object_base base;
+   struct vk_device_memory vk;
    struct pvr_winsys_bo *bo;
 };
 
@@ -220,7 +234,7 @@ VK_DEFINE_HANDLE_CASTS(pvr_physical_device,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(pvr_device_memory,
-                               base,
+                               vk.base,
                                VkDeviceMemory,
                                VK_OBJECT_TYPE_DEVICE_MEMORY)
 

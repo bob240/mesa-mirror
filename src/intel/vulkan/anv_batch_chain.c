@@ -370,7 +370,7 @@ anv_batch_bo_link(struct anv_cmd_buffer *cmd_buffer,
 #ifdef SUPPORT_INTEL_INTEGRATED_GPUS
    if (cmd_buffer->device->physical->memory.need_flush &&
        anv_bo_needs_host_cache_flush(prev_bbo->bo->alloc_flags))
-      intel_flush_range(map, sizeof(uint64_t));
+      util_flush_range(map, sizeof(uint64_t));
 #endif
 }
 
@@ -706,8 +706,6 @@ anv_cmd_buffer_alloc_binding_table(struct anv_cmd_buffer *cmd_buffer,
    if (u_vector_length(&cmd_buffer->bt_block_states) == 0)
       return (struct anv_state) { 0 };
 
-   struct anv_state *bt_block = u_vector_head(&cmd_buffer->bt_block_states);
-
    uint32_t bt_size = align(entries * 4, 32);
 
    struct anv_state state = cmd_buffer->bt_next;
@@ -726,6 +724,8 @@ anv_cmd_buffer_alloc_binding_table(struct anv_cmd_buffer *cmd_buffer,
        */
       *state_offset = 0;
    } else {
+      struct anv_state *bt_block = u_vector_head(&cmd_buffer->bt_block_states);
+
       assert(bt_block->offset < 0);
       *state_offset = -bt_block->offset;
    }
@@ -1638,7 +1638,7 @@ anv_cmd_buffer_clflush(struct anv_cmd_buffer **cmd_buffers,
 
    for (uint32_t i = 0; i < num_cmd_buffers; i++) {
       u_vector_foreach(bbo, &cmd_buffers[i]->seen_bbos) {
-         intel_flush_range_no_fence((*bbo)->bo->map, (*bbo)->length);
+         util_flush_range_no_fence((*bbo)->bo->map, (*bbo)->length);
       }
    }
 
@@ -1666,7 +1666,7 @@ anv_async_submit_extend_batch(struct anv_batch *batch, uint32_t size,
    if (result != VK_SUCCESS)
       return result;
 
-   util_dynarray_append(&submit->batch_bos, struct anv_bo *, bo);
+   util_dynarray_append(&submit->batch_bos, bo);
 
    batch->end += 4 * GFX9_MI_BATCH_BUFFER_START_length;
 

@@ -48,6 +48,7 @@
 #include "vk_blend.h"
 #include "vk_cmd_enqueue_entrypoints.h"
 #include "vk_descriptor_update_template.h"
+#include "vk_synchronization.h"
 #include "vk_util.h"
 #include "vk_enum_to_str.h"
 
@@ -308,8 +309,9 @@ update_pcbuf(struct rendering_state *state, mesa_shader_stage pstage,
       cbuf.user_buffer = NULL;
       struct pipe_resource *releasebuf = NULL;
       u_upload_alloc(state->uploader, 0, size, 64, &cbuf.buffer_offset, &cbuf.buffer, &releasebuf, (void**)&mem);
-      if (releasebuf)
-         util_dynarray_append(&state->releasebufs, struct pipe_resource*, releasebuf);
+      if (releasebuf) {
+         util_dynarray_append(&state->releasebufs, releasebuf);
+      }
       memcpy(mem, state->push_constants, size);
       state->pctx->set_constant_buffer(state->pctx, pstage, 0, &cbuf);
    }
@@ -1166,7 +1168,7 @@ apply_dynamic_offsets(struct lvp_descriptor_set **out_set, const uint32_t *offse
    struct lvp_descriptor_set *set;
    lvp_descriptor_set_create(state->device, in_set->layout, &set);
 
-   util_dynarray_append(&state->push_desc_sets, struct lvp_descriptor_set *, set);
+   util_dynarray_append(&state->push_desc_sets, set);
 
    memcpy(set->map, in_set->map, in_set->bo->width0);
 
@@ -2792,14 +2794,8 @@ static void handle_event_set2(struct vk_cmd_queue_entry *cmd,
 {
    LVP_FROM_HANDLE(lvp_event, event, cmd->u.set_event2.event);
 
-   VkPipelineStageFlags2 src_stage_mask = 0;
-
-   for (uint32_t i = 0; i < cmd->u.set_event2.dependency_info->memoryBarrierCount; i++)
-      src_stage_mask |= cmd->u.set_event2.dependency_info->pMemoryBarriers[i].srcStageMask;
-   for (uint32_t i = 0; i < cmd->u.set_event2.dependency_info->bufferMemoryBarrierCount; i++)
-      src_stage_mask |= cmd->u.set_event2.dependency_info->pBufferMemoryBarriers[i].srcStageMask;
-   for (uint32_t i = 0; i < cmd->u.set_event2.dependency_info->imageMemoryBarrierCount; i++)
-      src_stage_mask |= cmd->u.set_event2.dependency_info->pImageMemoryBarriers[i].srcStageMask;
+   VkPipelineStageFlags2 src_stage_mask =
+      vk_collect_dependency_info_src_stages(cmd->u.set_event2.dependency_info);
 
    if (src_stage_mask & VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT)
       state->pctx->flush(state->pctx, NULL, 0);
@@ -3261,7 +3257,7 @@ static void handle_push_descriptor_set(struct vk_cmd_queue_entry *cmd,
    struct lvp_descriptor_set *set;
    lvp_descriptor_set_create(state->device, set_layout, &set);
 
-   util_dynarray_append(&state->push_desc_sets, struct lvp_descriptor_set *, set);
+   util_dynarray_append(&state->push_desc_sets, set);
 
    uint32_t types = lvp_pipeline_types_from_shader_stages(pds->stageFlags);
    u_foreach_bit(pipeline_type, types) {
@@ -3299,7 +3295,7 @@ static void handle_push_descriptor_set_with_template(struct vk_cmd_queue_entry *
    struct lvp_descriptor_set *set;
    lvp_descriptor_set_create(state->device, set_layout, &set);
 
-   util_dynarray_append(&state->push_desc_sets, struct lvp_descriptor_set *, set);
+   util_dynarray_append(&state->push_desc_sets, set);
 
    struct lvp_descriptor_set *base = state->desc_sets[lvp_pipeline_type_from_bind_point(templ->bind_point)][pds->set];
    if (base)
@@ -4360,8 +4356,9 @@ lvp_push_internal_buffer(struct rendering_state *state, mesa_shader_stage stage,
    uint8_t *mem;
    struct pipe_resource *releasebuf = NULL;
    u_upload_alloc(state->uploader, 0, size, 64, &buffer.buffer_offset, &buffer.buffer, &releasebuf, (void**)&mem);
-   if (releasebuf)
-      util_dynarray_append(&state->releasebufs, struct pipe_resource*, releasebuf);
+   if (releasebuf) {
+      util_dynarray_append(&state->releasebufs, releasebuf);
+   }
 
    state->pctx->set_shader_buffers(state->pctx, stage, 0, 1, &buffer, 0x1);
 

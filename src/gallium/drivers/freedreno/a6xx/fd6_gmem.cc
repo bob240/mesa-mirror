@@ -438,8 +438,6 @@ patch_fb_read_sysmem(struct fd_batch *batch)
       struct fd_resource *rsc = fd_resource(prsc);
 
       struct fdl_view_args args = {
-         .chip = CHIP,
-
          .iova = fd_bo_get_iova(rsc->bo),
 
          .base_miplevel = psurf->level,
@@ -458,8 +456,8 @@ patch_fb_read_sysmem(struct fd_batch *batch)
       };
       const struct fdl_layout *layouts[3] = {&rsc->layout, NULL, NULL};
       struct fdl6_view view;
-      fdl6_view_init(&view, layouts, &args,
-                     batch->ctx->screen->info->a6xx.has_z24uint_s8uint);
+      fdl6_view_init<CHIP>(&view, layouts, &args,
+                           batch->ctx->screen->info->a6xx.has_z24uint_s8uint);
       memcpy(patch->cs, view.descriptor, FDL6_TEX_CONST_DWORDS * 4);
    }
 
@@ -809,6 +807,7 @@ emit_common_fini(fd_cs &cs, struct fd_batch *batch)
  *
  * If we aren't using binning pass, this just emits a normal IB.
  */
+template <chip CHIP>
 static void
 emit_conditional_ib(fd_cs &cs, struct fd_batch *batch, const struct fd_tile *tile,
                     struct fd_ringbuffer *target)
@@ -818,14 +817,14 @@ emit_conditional_ib(fd_cs &cs, struct fd_batch *batch, const struct fd_tile *til
     * to do for this tile)
     */
    if (batch->cleared || !use_hw_binning(batch)) {
-      fd6_emit_ib(cs, target);
+      fd6_emit_ib<CHIP>(cs, target);
       return;
    }
 
    if (target->cur == target->start)
       return;
 
-   emit_marker6(cs, 6);
+   emit_marker6<CHIP>(cs, 6);
 
    unsigned count = fd_ringbuffer_cmd_count(target);
 
@@ -852,7 +851,7 @@ emit_conditional_ib(fd_cs &cs, struct fd_batch *batch, const struct fd_tile *til
       assert(dwords > 0);
    }
 
-   emit_marker6(cs, 6);
+   emit_marker6<CHIP>(cs, 6);
 }
 
 template <chip CHIP>
@@ -944,10 +943,10 @@ emit_binning_pass(fd_cs &cs, struct fd_batch *batch) assert_dt
 
    set_scissor<CHIP>(cs, 0, 0, gmem->width - 1, gmem->height - 1);
 
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
    fd_pkt7(cs, CP_SET_MARKER, 1)
       .add(A6XX_CP_SET_MARKER_0_MODE(RM6_BIN_VISIBILITY));
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
 
    fd_pkt7(cs, CP_SET_VISIBILITY_OVERRIDE, 1)
       .add(0x1);
@@ -979,7 +978,7 @@ emit_binning_pass(fd_cs &cs, struct fd_batch *batch) assert_dt
    trace_start_binning_ib(&batch->trace, cs.ring());
    foreach_subpass (subpass, batch) {
       emit_lrz<CHIP>(cs, batch, subpass);
-      fd6_emit_ib(cs, subpass->draw);
+      fd6_emit_ib<CHIP>(cs, subpass->draw);
    }
    trace_end_binning_ib(&batch->trace, cs.ring());
 
@@ -1052,13 +1051,12 @@ template <chip CHIP>
 static void
 fd7_emit_static_binning_regs(fd_cs &cs)
 {
-   fd_ncrb<CHIP> ncrb(cs, 6);
+   fd_ncrb<CHIP> ncrb(cs, 5);
 
-   ncrb.add(RB_UNKNOWN_8812(CHIP, 0x0));
+   ncrb.add(RB_BUFFER_CNTL(CHIP));
    ncrb.add(RB_CCU_DBG_ECO_CNTL(CHIP, 0x0));
-   ncrb.add(GRAS_UNKNOWN_8007(CHIP, 0x0));
+   ncrb.add(GRAS_LRZ_CB_CNTL(CHIP, 0x0));
    ncrb.add(GRAS_MODE_CNTL(CHIP, 0x2));
-   ncrb.add(RB_UNKNOWN_8E09(CHIP, 0x4));
    ncrb.add(RB_CLEAR_TARGET(CHIP, .clear_mode = CLEAR_MODE_GMEM));
 }
 
@@ -1117,7 +1115,7 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
 
    if (batch->prologue) {
       trace_start_prologue(&batch->trace, cs.ring());
-      fd6_emit_ib(cs, batch->prologue);
+      fd6_emit_ib<CHIP>(cs, batch->prologue);
       trace_end_prologue(&batch->trace, cs.ring());
    }
 
@@ -1250,11 +1248,11 @@ fd6_emit_tile_prep(struct fd_batch *batch, const struct fd_tile *tile)
    struct fd6_context *fd6_ctx = fd6_context(ctx);
    fd_cs cs(batch->gmem);
 
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
    fd_pkt7(cs, CP_SET_MARKER, 1)
       .add(A6XX_CP_SET_MARKER_0_MODE(RM6_BIN_RENDER_START) |
                   A6XX_CP_SET_MARKER_0_USES_GMEM);
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
 
    uint32_t x1 = tile->xoff;
    uint32_t y1 = tile->yoff;
@@ -1695,13 +1693,14 @@ fd6_emit_tile_mem2gmem(struct fd_batch *batch, const struct fd_tile *tile)
 }
 
 /* before IB to rendering cmds: */
+template <chip CHIP>
 static void
 fd6_emit_tile_renderprep(struct fd_batch *batch, const struct fd_tile *tile)
 {
    if (batch->tile_loads) {
       fd_cs cs(batch->gmem);
       trace_start_tile_loads(&batch->trace, cs.ring(), batch->restore);
-      emit_conditional_ib(cs, batch, tile, batch->tile_loads);
+      emit_conditional_ib<CHIP>(cs, batch, tile, batch->tile_loads);
       trace_end_tile_loads(&batch->trace, cs.ring());
    }
 }
@@ -1875,26 +1874,27 @@ fd6_emit_tile(struct fd_batch *batch, const struct fd_tile *tile)
    foreach_subpass (subpass, batch) {
       if (subpass->subpass_clears) {
          trace_start_clears(&batch->trace, cs.ring(), subpass->fast_cleared);
-         emit_conditional_ib(cs, batch, tile, subpass->subpass_clears);
+         emit_conditional_ib<CHIP>(cs, batch, tile, subpass->subpass_clears);
          trace_end_clears(&batch->trace, cs.ring());
       }
 
       emit_lrz<CHIP>(cs, batch, subpass);
 
-      fd6_emit_ib(cs, subpass->draw);
+      fd6_emit_ib<CHIP>(cs, subpass->draw);
    }
 
    if (batch->tile_epilogue)
-      fd6_emit_ib(cs, batch->tile_epilogue);
+      fd6_emit_ib<CHIP>(cs, batch->tile_epilogue);
 }
 
+template <chip CHIP>
 static void
 fd6_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
 {
    fd_cs cs(batch->gmem);
 
    if (batch->epilogue)
-      fd6_emit_ib(cs, batch->epilogue);
+      fd6_emit_ib<CHIP>(cs, batch->epilogue);
 
    if (use_hw_binning(batch)) {
       fd_pkt7(cs, CP_SET_MARKER, 1)
@@ -1908,14 +1908,14 @@ fd6_emit_tile_gmem2mem(struct fd_batch *batch, const struct fd_tile *tile)
    fd_pkt7(cs, CP_SKIP_IB2_ENABLE_LOCAL, 1)
       .add(0x0);
 
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
    fd_pkt7(cs, CP_SET_MARKER, 1)
       .add(A6XX_CP_SET_MARKER_0(.mode = RM6_BIN_RESOLVE, .uses_gmem = true));
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
 
    if (batch->tile_store) {
       trace_start_tile_stores(&batch->trace, cs.ring(), batch->resolve);
-      emit_conditional_ib(cs, batch, tile, batch->tile_store);
+      emit_conditional_ib<CHIP>(cs, batch, tile, batch->tile_store);
       trace_end_tile_stores(&batch->trace, cs.ring());
    }
 
@@ -2020,7 +2020,7 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
       if (!batch->nondraw) {
          trace_start_prologue(&batch->trace, cs.ring());
       }
-      fd6_emit_ib(cs, batch->prologue);
+      fd6_emit_ib<CHIP>(cs, batch->prologue);
       if (!batch->nondraw) {
          trace_end_prologue(&batch->trace, cs.ring());
       }
@@ -2045,7 +2045,7 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
          .add(GRAS_MODE_CNTL(CHIP, 0x2));
    }
 
-   with_crb (cs, 12) {
+   with_crb (cs, 11) {
       set_window_offset<CHIP>(crb, 0, 0);
 
       set_bin_size<CHIP>(crb, NULL, {
@@ -2054,20 +2054,30 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
       });
 
       if (CHIP >= A7XX) {
-         crb.add(RB_UNKNOWN_8812(CHIP, 0x3ff)); // all buffers in sysmem
+         crb.add(RB_BUFFER_CNTL(CHIP,
+            .z_sysmem = true,
+            .s_sysmem = true,
+            .rt0_sysmem = true,
+            .rt1_sysmem = true,
+            .rt2_sysmem = true,
+            .rt3_sysmem = true,
+            .rt4_sysmem = true,
+            .rt5_sysmem = true,
+            .rt6_sysmem = true,
+            .rt7_sysmem = true,
+         ));
          crb.add(RB_CCU_DBG_ECO_CNTL(CHIP, batch->ctx->screen->info->a6xx.magic.RB_CCU_DBG_ECO_CNTL));
-         crb.add(GRAS_UNKNOWN_8007(CHIP, 0x0));
-         crb.add(RB_UNKNOWN_8E09(CHIP, 0x4));
+         crb.add(GRAS_LRZ_CB_CNTL(CHIP, 0x0));
       }
 
       /* enable stream-out, with sysmem there is only one pass: */
       crb.add(VPC_SO_OVERRIDE(CHIP, false));
    }
 
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
    fd_pkt7(cs, CP_SET_MARKER, 1)
       .add(A6XX_CP_SET_MARKER_0_MODE(RM6_DIRECT_RENDER));
-   emit_marker6(cs, 7);
+   emit_marker6<CHIP>(cs, 7);
 
    fd_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1)
       .add(0x0);
@@ -2117,7 +2127,7 @@ fd6_emit_sysmem(struct fd_batch *batch)
 
       emit_lrz<CHIP>(cs, batch, subpass);
 
-      fd6_emit_ib(cs, subpass->draw);
+      fd6_emit_ib<CHIP>(cs, subpass->draw);
    }
 }
 
@@ -2130,10 +2140,10 @@ fd6_emit_sysmem_fini(struct fd_batch *batch) assert_dt
    emit_common_fini<CHIP>(cs, batch);
 
    if (batch->tile_epilogue)
-      fd6_emit_ib(cs, batch->tile_epilogue);
+      fd6_emit_ib<CHIP>(cs, batch->tile_epilogue);
 
    if (batch->epilogue)
-      fd6_emit_ib(cs, batch->epilogue);
+      fd6_emit_ib<CHIP>(cs, batch->epilogue);
 
    fd_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1)
       .add(0x0);
@@ -2155,9 +2165,9 @@ fd6_gmem_init(struct pipe_context *pctx)
    ctx->emit_tile_init = fd6_emit_tile_init<CHIP>;
    ctx->emit_tile_prep = fd6_emit_tile_prep<CHIP>;
    ctx->emit_tile_mem2gmem = fd6_emit_tile_mem2gmem;
-   ctx->emit_tile_renderprep = fd6_emit_tile_renderprep;
+   ctx->emit_tile_renderprep = fd6_emit_tile_renderprep<CHIP>;
    ctx->emit_tile = fd6_emit_tile<CHIP>;
-   ctx->emit_tile_gmem2mem = fd6_emit_tile_gmem2mem;
+   ctx->emit_tile_gmem2mem = fd6_emit_tile_gmem2mem<CHIP>;
    ctx->emit_tile_fini = fd6_emit_tile_fini<CHIP>;
    ctx->emit_sysmem_prep = fd6_emit_sysmem_prep<CHIP>;
    ctx->emit_sysmem = fd6_emit_sysmem<CHIP>;

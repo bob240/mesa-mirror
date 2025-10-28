@@ -1417,7 +1417,8 @@ static void si_bind_rs_state(struct pipe_context *ctx, void *state)
       sctx->dirty_shaders_mask |=
          BITFIELD_BIT(MESA_SHADER_VERTEX) |
          BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |
-         BITFIELD_BIT(MESA_SHADER_GEOMETRY);
+         BITFIELD_BIT(MESA_SHADER_GEOMETRY) |
+         BITFIELD_BIT(MESA_SHADER_MESH);
    }
 
    if (old_rs->line_smooth != rs->line_smooth ||
@@ -1763,7 +1764,8 @@ static void si_bind_dsa_state(struct pipe_context *ctx, void *state)
          BITFIELD_BIT(MESA_SHADER_VERTEX) |
          BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |
          BITFIELD_BIT(MESA_SHADER_GEOMETRY) |
-         BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+         BITFIELD_BIT(MESA_SHADER_FRAGMENT) |
+         BITFIELD_BIT(MESA_SHADER_MESH);
    }
 
    if (old_dsa->depth_enabled != dsa->depth_enabled ||
@@ -2805,7 +2807,8 @@ static void si_set_framebuffer_state(struct pipe_context *ctx,
       BITFIELD_BIT(MESA_SHADER_VERTEX) |
       BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |
       BITFIELD_BIT(MESA_SHADER_GEOMETRY) |
-      BITFIELD_BIT(MESA_SHADER_FRAGMENT);
+      BITFIELD_BIT(MESA_SHADER_FRAGMENT) |
+      BITFIELD_BIT(MESA_SHADER_MESH);
 
    if (sctx->gfx_level < GFX12 && !sctx->decompression_enabled) {
       /* Prevent textures decompression when the framebuffer state
@@ -4684,10 +4687,8 @@ static void si_bind_vertex_elements(struct pipe_context *ctx, void *state)
         * src_offset alignment, which is reflected in fix_fetch_opencode. */
        old->fix_fetch_opencode != v->fix_fetch_opencode ||
        memcmp(old->fix_fetch, v->fix_fetch, sizeof(v->fix_fetch[0]) *
-              MAX2(old->count, v->count))) {
+              MAX2(old->count, v->count)))
       si_vs_key_update_inputs(sctx);
-      sctx->dirty_shaders_mask |= BITFIELD_BIT(MESA_SHADER_VERTEX);
-   }
 
    if (v->instance_divisor_is_fetched) {
       struct pipe_constant_buffer cb;
@@ -4763,10 +4764,8 @@ static void si_set_vertex_buffers(struct pipe_context *ctx, unsigned count,
     * whether buffers are at least dword-aligned, since that should always
     * be the case in well-behaved applications anyway.
     */
-   if (sctx->vertex_elements->vb_alignment_check_mask & unaligned) {
+   if (sctx->vertex_elements->vb_alignment_check_mask & unaligned)
       si_vs_key_update_inputs(sctx);
-      sctx->dirty_shaders_mask |= BITFIELD_BIT(MESA_SHADER_VERTEX);
-   }
 }
 
 static struct pipe_vertex_state *

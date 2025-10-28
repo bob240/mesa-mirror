@@ -53,7 +53,7 @@ nir_intrinsics_h = custom_target(
   'nir_intrinsics.h',
   input : 'nir_intrinsics_h.py',
   output : 'nir_intrinsics.h',
-  command : [prog_python, '@INPUT@', '--outdir', meson.current_build_dir()],
+  command : [prog_python, '@INPUT@', '--out', '@OUTPUT@'],
   capture : false,
   depend_files : files('nir_intrinsics.py'),
 )
@@ -62,7 +62,7 @@ nir_intrinsics_indices_h = custom_target(
   'nir_intrinsics_indices.h',
   input : 'nir_intrinsics_indices_h.py',
   output : 'nir_intrinsics_indices.h',
-  command : [prog_python, '@INPUT@', '--outdir', meson.current_build_dir()],
+  command : [prog_python, '@INPUT@', '--out', '@OUTPUT@'],
   capture : false,
   depend_files : files('nir_intrinsics.py'),
 )
@@ -71,7 +71,7 @@ nir_intrinsics_c = custom_target(
   'nir_intrinsic.c',
   input : 'nir_intrinsics_c.py',
   output : 'nir_intrinsics.c',
-  command : [prog_python, '@INPUT@', '--outdir', meson.current_build_dir()],
+  command : [prog_python, '@INPUT@', '--out', '@OUTPUT@'],
   capture: false,
   depend_files : files('nir_intrinsics.py'),
 )
@@ -251,6 +251,7 @@ else
   'nir_normalize_cubemap_coords.c',
   'nir_opt_access.c',
   'nir_opt_barriers.c',
+  'nir_opt_barycentric.c',
   'nir_opt_call.c',
   'nir_opt_clip_cull_const.c',
   'nir_opt_combine_stores.c',
@@ -322,6 +323,7 @@ else
   'nir_search_helpers.h',
   'nir_serialize.c',
   'nir_serialize.h',
+  'nir_shader_bisect.c',
   'nir_shader_compiler_options.h',
   'nir_split_64bit_vec3_and_vec4.c',
   'nir_split_conversions.c',

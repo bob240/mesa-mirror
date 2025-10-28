@@ -54,7 +54,6 @@ panvk_image_can_use_afbc(
    VkImageCreateFlags flags)
 {
    unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
-   struct panvk_instance *instance = to_panvk_instance(phys_dev->vk.instance);
    enum pipe_format pfmt = vk_format_to_pipe_format(fmt);
 
    /* Disallow AFBC if either of these is true
@@ -76,12 +75,12 @@ panvk_image_can_use_afbc(
     * GetPhysicalDeviceImageFormatProperties2() and we don't have enough
     * information to conduct a full image property check in this context.
     */
-   return !(instance->debug_flags & PANVK_DEBUG_NO_AFBC) &&
+   return !PANVK_DEBUG(NO_AFBC) &&
           !(usage &
             (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT)) &&
           pan_query_afbc(&phys_dev->kmod.props) &&
           pan_afbc_supports_format(arch, pfmt) &&
-          tiling == VK_IMAGE_TILING_OPTIMAL && type != VK_IMAGE_TYPE_1D &&
+          tiling != VK_IMAGE_TILING_LINEAR && type != VK_IMAGE_TYPE_1D &&
           (type != VK_IMAGE_TYPE_3D || arch >= 7) &&
           (!(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || arch >= 9) &&
           (!(flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT));
@@ -125,7 +124,8 @@ get_iusage(struct panvk_image *image, const VkImageCreateInfo *create_info)
 
    iusage.host_copy =
       !!(image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
-   iusage.scanout = wsi_info && wsi_info->scanout;
+   iusage.legacy_scanout = wsi_info && wsi_info->scanout;
+   iusage.wsi = wsi_info != NULL;
 
    return iusage;
 }
@@ -208,24 +208,21 @@ panvk_image_can_use_mod(struct panvk_image *image,
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(image->vk.base.device->physical);
    unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
-   struct panvk_instance *instance =
-      to_panvk_instance(image->vk.base.device->physical->instance);
-   bool forced_linear = (instance->debug_flags & PANVK_DEBUG_LINEAR) ||
-                        image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
-                        image->vk.image_type == VK_IMAGE_TYPE_1D;
+   const bool forced_linear = PANVK_DEBUG(LINEAR) ||
+                              image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
+                              image->vk.image_type == VK_IMAGE_TYPE_1D;
 
    /* If the image is meant to be linear, don't bother testing the
     * other cases. */
    if (forced_linear)
       return mod == DRM_FORMAT_MOD_LINEAR;
 
+   assert(image->vk.tiling == VK_IMAGE_TILING_OPTIMAL ||
+          image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT);
+
    if (drm_is_afbc(mod)) {
       /* AFBC explicitly disabled. */
-      if (instance->debug_flags & PANVK_DEBUG_NO_AFBC)
-         return false;
-
-      /* Non-optimal tiling requested. */
-      if (image->vk.tiling != VK_IMAGE_TILING_OPTIMAL)
+      if (PANVK_DEBUG(NO_AFBC))
          return false;
 
       /* Can't do AFBC if store/host copy is requested. */
@@ -248,6 +245,13 @@ panvk_image_can_use_mod(struct panvk_image *image,
        */
       if (image->vk.base.device->enabled_features.separateDepthStencilLayouts &&
           panvk_image_is_interleaved_depth_stencil(image))
+         return false;
+
+      /* Aliased images not supported yet for single <-> multiplanar.
+       * The disjoint flag is what limits this to single <-> multiplanar.
+       * TODO: this can be relaxed once we have multiplanar AFBC. */
+      if ((image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT) &&
+          (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT))
          return false;
    }
 
@@ -369,6 +373,11 @@ panvk_image_get_mod(struct panvk_image *image,
       assert(!"Missing modifier info");
    }
 
+   /* legacy scanout (images without any external modifier info) should default to LINEAR. */
+   if (iusage.legacy_scanout)
+      return DRM_FORMAT_MOD_LINEAR;
+
+   /* Without external dependencies, pick the best modifier that supports the image. */
    return panvk_image_get_mod_from_list(image, &iusage, NULL, 0);
 }
 
@@ -479,10 +488,8 @@ panvk_image_pre_mod_select_meta_adjustments(struct panvk_image *image)
       if (aspects & VK_IMAGE_ASPECT_DEPTH_BIT)
          image->vk.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
 
-      if (aspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+      if (aspects & VK_IMAGE_ASPECT_COLOR_BIT)
          image->vk.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-         image->vk.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-      }
    }
 
    if (image->vk.stencil_usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT)
@@ -511,6 +518,20 @@ panvk_image_pre_mod_select_meta_adjustments(struct panvk_image *image)
        * vk_meta copies. */
       image->vk.create_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                                 VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
+   }
+}
+
+static void
+panvk_image_post_mod_select_meta_adjustments(struct panvk_image *image)
+{
+   const VkImageAspectFlags aspects = vk_format_aspects(image->vk.format);
+
+   /* If the image didn't end up using AFBC, we should add the storage flag
+    * to allow vkmeta to take the compute based copying path. */
+   if ((image->vk.usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) &&
+       (aspects & VK_IMAGE_ASPECT_COLOR_BIT) &&
+       !drm_is_afbc(image->vk.drm_format_mod)) {
+      image->vk.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
    }
 }
 
@@ -550,6 +571,12 @@ panvk_image_init(struct panvk_image *image,
    /* Now that we've patched the create/usage flags, we can proceed with the
     * modifier selection. */
    image->vk.drm_format_mod = panvk_image_get_mod(image, pCreateInfo);
+
+   /* Some modifiers like AFBC affect some decisions we make for vkmeta, but
+    * we don't want to outright prevent these modifiers. If those weren't used,
+    * we apply additional flags here. */
+   panvk_image_post_mod_select_meta_adjustments(image);
+
    return panvk_image_init_layouts(image, pCreateInfo);
 }
 
@@ -578,8 +605,6 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
    VK_FROM_HANDLE(panvk_device, dev, device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
-   struct panvk_instance *instance =
-      to_panvk_instance(phys_dev->vk.instance);
    VkResult result;
 
    if (panvk_android_is_gralloc_image(pCreateInfo)) {
@@ -636,7 +661,7 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
       }
 
       if ((image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) ||
-          (instance->debug_flags & PANVK_DEBUG_FORCE_BLACKHOLE)) {
+          PANVK_DEBUG(FORCE_BLACKHOLE)) {
          /* Map last so that we don't have a possibility of getting any more
           * errors, in which case we'd have to unmap.
           */
@@ -712,11 +737,10 @@ get_image_subresource_layout(const struct panvk_image *image,
    layout->arrayPitch = image->planes[plane].plane.layout.array_stride_B;
 
    if (drm_is_afbc(image->vk.drm_format_mod)) {
-      /* row/depth pitch expressed in AFBC superblocks. */
-      layout->rowPitch = pan_afbc_stride_blocks(
-         image->vk.drm_format_mod, slice_layout->afbc.header.row_stride_B);
-      layout->depthPitch = pan_afbc_stride_blocks(
-         image->vk.drm_format_mod, slice_layout->afbc.header.surface_size_B);
+      /* row/depth pitch expressed in (AFBC superblocks * payload size). */
+      layout->rowPitch = pan_image_get_wsi_row_pitch(
+         &image->planes[plane].image, plane, subres->mipLevel);
+      layout->depthPitch = slice_layout->afbc.surface_stride_B;
    } else {
       layout->rowPitch = slice_layout->tiled_or_linear.row_stride_B;
       layout->depthPitch = slice_layout->tiled_or_linear.surface_stride_B;

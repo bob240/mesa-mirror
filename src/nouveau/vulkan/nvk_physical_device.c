@@ -149,6 +149,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_maintenance7 = true,
       .KHR_maintenance8 = true,
       .KHR_maintenance9 = true,
+      .KHR_maintenance10 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
       .KHR_pipeline_executable_properties = true,
@@ -214,6 +215,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_descriptor_buffer = info->cls_eng3d >= MAXWELL_A,
       .EXT_descriptor_indexing = true,
       .EXT_device_generated_commands = info->cls_eng3d >= MAXWELL_B,
+      .EXT_discard_rectangles = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
@@ -290,6 +292,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .MESA_image_alignment_control = true,
       .NV_compute_shader_derivatives = info->cls_eng3d >= TURING_A,
       .NV_shader_sm_builtins = true,
+      .NVX_image_view_handle = info->cls_eng3d >= MAXWELL_A, /* needs true bindless descriptors */
       .VALVE_mutable_descriptor_type = true,
    };
 }
@@ -483,6 +486,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_KHR_maintenance9 */
       .maintenance9 = true,
+
+      /* VK_KHR_maintenance10 */
+      .maintenance10 = true,
 
       /* VK_KHR_pipeline_executable_properties */
       .pipelineExecutableInfo = true,
@@ -872,7 +878,8 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .standardSampleLocations = true,
       .optimalBufferCopyOffsetAlignment = 1,
       .optimalBufferCopyRowPitchAlignment = 1,
-      .nonCoherentAtomSize = 64,
+      /* Default to 64 if we don't know the atom size */
+      .nonCoherentAtomSize = info->nc_atom_size_B ? info->nc_atom_size_B : 64,
 
       /* Vulkan 1.0 sparse properties */
       .sparseResidencyNonResidentStrict = true,
@@ -970,7 +977,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
       .requiredSubgroupSizeStages = 0,
-      .maxInlineUniformBlockSize = 1 << 16,
+      .maxInlineUniformBlockSize = NVK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
       .maxDescriptorSetInlineUniformBlocks = 6 * 32,
@@ -1016,6 +1023,9 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       /* VK_KHR_cooperative_matrix */
       .cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
 
+      /* VK_KHR_discard_rectangles */
+      .maxDiscardRectangles = NVK_MAX_DISCARD_RECTANGLES,
+
       /* VK_KHR_compute_shader_derivatives */
       .meshAndTaskShaderDerivatives = false,
 
@@ -1043,7 +1053,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .maxSamplerDescriptorBufferBindings = 32,
       .maxEmbeddedImmutableSamplerBindings = 32,
       .maxEmbeddedImmutableSamplers = 4000,
-      .bufferCaptureReplayDescriptorDataSize = 0,
+      .bufferCaptureReplayDescriptorDataSize = sizeof(uint64_t),
       .imageCaptureReplayDescriptorDataSize = 0,
       .imageViewCaptureReplayDescriptorDataSize =
          sizeof(struct nvk_image_view_capture),
@@ -1111,6 +1121,11 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .defaultVertexAttributeValue =
          VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ZERO_KHR,
 
+      /* VK_KHR_maintenance10 */
+      .rgba4OpaqueBlackSwizzled = true,
+      .resolveSrgbFormatAppliesTransferFunction = true,
+      .resolveSrgbFormatSupportsTransferFunctionControl = true,
+
       /* VK_EXT_legacy_vertex_attributes */
       .nativeUnalignedPerformance = true,
 
@@ -1139,8 +1154,13 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .robustStorageBufferAccessSizeAlignment = NVK_SSBO_BOUNDS_CHECK_ALIGNMENT,
       .robustUniformBufferAccessSizeAlignment = nvk_min_cbuf_alignment(info),
 
-      /* VK_EXT_sample_locations */
-      .sampleLocationSampleCounts = sample_counts,
+      /* VK_EXT_sample_locations
+       *
+       * There's a weird HW issue with per-sample interpolation for 1x.  It
+       * always interpolates at (0.5, 0.5) so we just disable custom sample
+       * locations for 1x.
+       */
+      .sampleLocationSampleCounts = sample_counts & ~VK_SAMPLE_COUNT_1_BIT,
       .maxSampleLocationGridSize = (VkExtent2D){ 1, 1 },
       .sampleLocationCoordinateRange[0] = 0.0f,
       .sampleLocationCoordinateRange[1] = 0.9375f,
@@ -1264,6 +1284,9 @@ nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
 
    _mesa_sha1_update(&sha_ctx, instance->driver_build_sha,
                      sizeof(instance->driver_build_sha));
+
+   _mesa_sha1_update(&sha_ctx, &pdev->info.chipset,
+                     sizeof(pdev->info.chipset));
 
    const uint64_t compiler_flags = nvk_physical_device_compiler_flags(pdev);
    _mesa_sha1_update(&sha_ctx, &compiler_flags, sizeof(compiler_flags));
@@ -1479,20 +1502,42 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
    uint32_t sysmem_heap_idx = pdev->mem_heap_count++;
    pdev->mem_heaps[sysmem_heap_idx] = (struct nvk_memory_heap) {
       .size = sysmem_size_B,
-      /* If we don't have any VRAM (iGPU), claim sysmem as DEVICE_LOCAL */
-      .flags = pdev->info.vram_size_B == 0
-               ? VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
-               : 0,
+      .flags = 0,
       .available = nvk_get_sysmem_heap_available,
    };
 
-   pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
-      /* TODO: What's the right thing to do here on Tegra? */
-      .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
-                       VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-      .heapIndex = sysmem_heap_idx,
-   };
+   if (pdev->info.type == NV_DEVICE_TYPE_SOC) {
+      /* On Tegra, we only have sysmem so we claim it's DEVICE_LOCAL.  The
+       * only difference in memory types is between cached and uncached (but
+       * coherent) maps.
+       */
+      assert(pdev->info.vram_size_B == 0);
+      assert(pdev->mem_heap_count == 1);
+      pdev->mem_heaps[sysmem_heap_idx].flags |= VK_MEMORY_HEAP_DEVICE_LOCAL_BIT;
+
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+   } else {
+      /* On discrete GPUs, all sysmem maps are cached+coherent and the GPU
+       * snoops the CPU caches when it accesses memory across the PCI bus.
+       */
+      pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType) {
+         .propertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                          VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                          VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+         .heapIndex = sysmem_heap_idx,
+      };
+   }
 
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));

@@ -1,0 +1,64 @@
+/*
+ * Copyright 2023 Valve Corporation
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "compiler/nir/nir_builder.h"
+#include "poly/cl/libpoly.h"
+#include "poly/geometry.h"
+#include "nir.h"
+
+/* XXX: Remove me later */
+nir_def *poly_nir_load_vertex_id(struct nir_builder *b, nir_def *id,
+                                 unsigned index_size_B);
+
+bool poly_nir_lower_sw_vs(struct nir_shader *s, unsigned index_size_B);
+
+/*
+ * This file implements basic input assembly in software. It runs on software
+ * vertex shaders, as part of geometry/tessellation lowering. It does not apply
+ * the topology, which happens in the geometry shader.
+ */
+nir_def *
+poly_nir_load_vertex_id(nir_builder *b, nir_def *id, unsigned index_size_B)
+{
+   /* If drawing with an index buffer, pull the vertex ID. Otherwise, the
+    * vertex ID is just the index as-is.
+    */
+   if (index_size_B) {
+      nir_def *ia = nir_load_input_assembly_buffer_poly(b);
+      id = poly_load_index_buffer(b, ia, id, nir_imm_int(b, index_size_B));
+   }
+
+   /* Add the "start", either an index bias or a base vertex. This must happen
+    * after indexing for proper index bias behaviour.
+    */
+   return nir_iadd(b, id, nir_load_first_vertex(b));
+}
+
+static bool
+lower(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   unsigned *index_size_B = data;
+   b->cursor = nir_before_instr(&intr->instr);
+
+   if (intr->intrinsic == nir_intrinsic_load_vertex_id) {
+      nir_def *id = nir_channel(b, nir_load_global_invocation_id(b, 32), 0);
+      nir_def_replace(&intr->def,
+                      poly_nir_load_vertex_id(b, id, *index_size_B));
+      return true;
+   } else if (intr->intrinsic == nir_intrinsic_load_instance_id) {
+      nir_def_replace(&intr->def,
+                      nir_channel(b, nir_load_global_invocation_id(b, 32), 1));
+      return true;
+   }
+
+   return false;
+}
+
+bool
+poly_nir_lower_sw_vs(nir_shader *s, unsigned index_size_B)
+{
+   return nir_shader_intrinsics_pass(s, lower, nir_metadata_control_flow,
+                                     &index_size_B);
+}

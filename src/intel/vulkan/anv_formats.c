@@ -410,8 +410,10 @@ static const struct anv_format ycbcr_formats[] = {
              ycbcr_plane(1, ISL_FORMAT_R8_UNORM, RGBA),
              ycbcr_plane(2, ISL_FORMAT_R8_UNORM, RGBA)),
 
-   fmt_unsupported(VK_FORMAT_R10X6_UNORM_PACK16),
-   fmt_unsupported(VK_FORMAT_R10X6G10X6_UNORM_2PACK16),
+   ycbcr_fmt(VK_FORMAT_R10X6_UNORM_PACK16, 1, false, true,
+             ycbcr_plane(0, ISL_FORMAT_R16_UNORM, RGBA)),
+   ycbcr_fmt(VK_FORMAT_R10X6G10X6_UNORM_2PACK16, 1, false, true,
+             ycbcr_plane(0, ISL_FORMAT_R16G16_UNORM, RGBA)),
    fmt_unsupported(VK_FORMAT_R10X6G10X6B10X6A10X6_UNORM_4PACK16),
    fmt_unsupported(VK_FORMAT_G10X6B10X6G10X6R10X6_422_UNORM_4PACK16),
    fmt_unsupported(VK_FORMAT_B10X6G10X6R10X6G10X6_422_UNORM_4PACK16),
@@ -697,6 +699,20 @@ anv_get_image_format_features2(const struct anv_physical_device *physical_device
                   VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
       }
 
+      /* Notes on VK_KHR_maintenance10:
+       *
+       * Intel HW can only write depth HiZ surfaces from the 3D pipeline depth
+       * output. So Depth on compute or transfer queues is not possible. Here
+       * we choose to not support stencil either, although it could be
+       * possible on Gfx20+ but would probably be confusing to application. So
+       * no support for:
+       *    - VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_COMPUTE_QUEUE_BIT_KHR
+       *    - VK_FORMAT_FEATURE_2_DEPTH_COPY_ON_TRANSFER_QUEUE_BIT_KHR
+       *    - VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_COMPUTE_QUEUE_BIT_KHR
+       *    - VK_FORMAT_FEATURE_2_STENCIL_COPY_ON_TRANSFER_QUEUE_BIT_KHR
+       */
+
+
       return flags;
    }
 
@@ -792,7 +808,7 @@ anv_get_image_format_features2(const struct anv_physical_device *physical_device
     * it for the list of shader storage extended formats [1]. Before that,
     * this applies to all VkFormats.
     *
-    * [1] : https://registry.khronos.org/vulkan/specs/latest/html/vkspec.html#features-shaderStorageImageExtendedFormats
+    * [1] : https://docs.vulkan.org/spec/latest/chapters/features.html#features-shaderStorageImageExtendedFormats
     */
    if ((flags & VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT) ||
        (anv_format->flags & ANV_FORMAT_FLAG_STORAGE_FORMAT_EMULATED))

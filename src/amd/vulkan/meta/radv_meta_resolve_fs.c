@@ -431,15 +431,16 @@ emit_depth_stencil_resolve(struct radv_cmd_buffer *cmd_buffer, struct radv_image
 }
 
 void
-radv_meta_resolve_fragment_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image,
-                                 VkImageLayout src_image_layout, struct radv_image *dst_image,
+radv_meta_resolve_fragment_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkFormat src_format,
+                                 VkImageLayout src_image_layout, struct radv_image *dst_image, VkFormat dst_format,
                                  VkImageLayout dst_image_layout, const VkImageResolve2 *region)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_meta_saved_state saved_state;
 
-   radv_meta_save(&saved_state, cmd_buffer,
-                  RADV_META_SAVE_GRAPHICS_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS);
+   radv_meta_save(
+      &saved_state, cmd_buffer,
+      RADV_META_SAVE_GRAPHICS_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS | RADV_META_SAVE_RENDER);
 
    assert(region->srcSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT);
    assert(region->dstSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT);
@@ -473,7 +474,7 @@ radv_meta_resolve_fragment_image(struct radv_cmd_buffer *cmd_buffer, struct radv
                            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                            .image = radv_image_to_handle(src_image),
                            .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                           .format = src_image->vk.format,
+                           .format = src_format,
                            .subresourceRange =
                               {
                                  .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -492,7 +493,7 @@ radv_meta_resolve_fragment_image(struct radv_cmd_buffer *cmd_buffer, struct radv
                            .flags = VK_IMAGE_VIEW_CREATE_DRIVER_INTERNAL_BIT_MESA,
                            .image = radv_image_to_handle(dst_image),
                            .viewType = radv_meta_get_view_type(dst_image),
-                           .format = dst_image->vk.format,
+                           .format = dst_format,
                            .subresourceRange =
                               {
                                  .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -530,56 +531,6 @@ radv_meta_resolve_fragment_image(struct radv_cmd_buffer *cmd_buffer, struct radv
 
    radv_image_view_finish(&src_iview);
    radv_image_view_finish(&dst_iview);
-
-   radv_meta_restore(&saved_state, cmd_buffer);
-}
-
-void
-radv_cmd_buffer_resolve_rendering_fs(struct radv_cmd_buffer *cmd_buffer, struct radv_image_view *src_iview,
-                                     VkImageLayout src_layout, struct radv_image_view *dst_iview,
-                                     VkImageLayout dst_layout)
-{
-   const struct radv_rendering_state *render = &cmd_buffer->state.render;
-   struct radv_meta_saved_state saved_state;
-   VkRect2D resolve_area = render->area;
-
-   radv_meta_save(
-      &saved_state, cmd_buffer,
-      RADV_META_SAVE_GRAPHICS_PIPELINE | RADV_META_SAVE_CONSTANTS | RADV_META_SAVE_DESCRIPTORS | RADV_META_SAVE_RENDER);
-
-   radv_CmdSetViewport(radv_cmd_buffer_to_handle(cmd_buffer), 0, 1,
-                       &(VkViewport){.x = resolve_area.offset.x,
-                                     .y = resolve_area.offset.y,
-                                     .width = resolve_area.extent.width,
-                                     .height = resolve_area.extent.height,
-                                     .minDepth = 0.0f,
-                                     .maxDepth = 1.0f});
-
-   radv_CmdSetScissor(radv_cmd_buffer_to_handle(cmd_buffer), 0, 1, &resolve_area);
-
-   const VkRenderingAttachmentInfo color_att = {
-      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-      .imageView = radv_image_view_to_handle(dst_iview),
-      .imageLayout = dst_layout,
-      .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
-      .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
-   };
-
-   const VkRenderingInfo rendering_info = {
-      .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-      .flags = VK_RENDERING_INPUT_ATTACHMENT_NO_CONCURRENT_WRITES_BIT_MESA,
-      .renderArea = saved_state.render.area,
-      .layerCount = 1,
-      .viewMask = saved_state.render.view_mask,
-      .colorAttachmentCount = 1,
-      .pColorAttachments = &color_att,
-   };
-
-   radv_CmdBeginRendering(radv_cmd_buffer_to_handle(cmd_buffer), &rendering_info);
-
-   emit_resolve(cmd_buffer, src_iview, dst_iview, &resolve_area.offset, &resolve_area.offset);
-
-   radv_CmdEndRendering(radv_cmd_buffer_to_handle(cmd_buffer));
 
    radv_meta_restore(&saved_state, cmd_buffer);
 }

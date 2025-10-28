@@ -902,7 +902,7 @@ radv_create_gfx_preamble(struct radv_device *device)
    struct radv_cmd_stream *cs;
    VkResult result;
 
-   result = radv_create_cmd_stream(device, RADV_QUEUE_GENERAL, false, &cs);
+   result = radv_create_cmd_stream(device, AMD_IP_GFX, false, &cs);
    if (result != VK_SUCCESS)
       return;
 
@@ -1195,21 +1195,28 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
 
    device->ws = pdev->ws;
    device->vk.sync = device->ws->get_sync_provider(device->ws);
+   device->vk.copy_sync_payloads = pdev->ws->copy_sync_payloads;
 
-   /* With update after bind we can't attach bo's to the command buffer
-    * from the descriptor set anymore, so we have to use a global BO list.
-    */
-   device->use_global_bo_list = (instance->perftest_flags & RADV_PERFTEST_BO_LIST) ||
-                                device->vk.enabled_features.bufferDeviceAddress ||
-                                device->vk.enabled_features.descriptorIndexing ||
-                                device->vk.enabled_features.descriptorBindingUniformBufferUpdateAfterBind ||
-                                device->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind ||
-                                device->vk.enabled_features.descriptorBindingStorageImageUpdateAfterBind ||
-                                device->vk.enabled_features.descriptorBindingStorageBufferUpdateAfterBind ||
-                                device->vk.enabled_features.descriptorBindingUniformTexelBufferUpdateAfterBind ||
-                                device->vk.enabled_features.descriptorBindingStorageTexelBufferUpdateAfterBind ||
-                                device->vk.enabled_features.descriptorBindingUpdateUnusedWhilePending ||
-                                device->vk.enabled_features.descriptorBindingPartiallyBound;
+   /* Enable the global BO list by default. */
+   /* TODO: Remove the per cmdbuf BO list tracking after few Mesa releases if no blockers. */
+   device->use_global_bo_list = !pdev->info.is_virtio;
+
+   /* Disable it for debugging purposes if no features require it. */
+   if (instance->debug_flags & RADV_DEBUG_NO_BO_LIST) {
+      if (!device->vk.enabled_features.bufferDeviceAddress && !device->vk.enabled_features.descriptorIndexing &&
+          !device->vk.enabled_features.descriptorBindingUniformBufferUpdateAfterBind &&
+          !device->vk.enabled_features.descriptorBindingSampledImageUpdateAfterBind &&
+          !device->vk.enabled_features.descriptorBindingStorageImageUpdateAfterBind &&
+          !device->vk.enabled_features.descriptorBindingStorageBufferUpdateAfterBind &&
+          !device->vk.enabled_features.descriptorBindingUniformTexelBufferUpdateAfterBind &&
+          !device->vk.enabled_features.descriptorBindingStorageTexelBufferUpdateAfterBind &&
+          !device->vk.enabled_features.descriptorBindingUpdateUnusedWhilePending &&
+          !device->vk.enabled_features.descriptorBindingPartiallyBound) {
+         device->use_global_bo_list = false;
+      } else {
+         fprintf(stderr, "radv: Can't disable the global BO list because some features require it!\n");
+      }
+   }
 
    radv_init_shader_arenas(device);
 
@@ -1378,7 +1385,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
        device->vk.enabled_features.extendedDynamicState3ColorBlendEquation)
       radv_shader_part_cache_init(&device->ps_epilogs, &ps_epilog_ops);
 
-   if (pdev->info.has_graphics && !(instance->debug_flags & RADV_DEBUG_NO_IBS))
+   if (pdev->info.has_graphics && !(instance->debug_flags & RADV_DEBUG_NO_IB_CHAINING))
       radv_create_gfx_preamble(device);
 
    if (!device->vk.disable_internal_cache) {

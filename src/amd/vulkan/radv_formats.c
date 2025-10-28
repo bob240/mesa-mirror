@@ -483,8 +483,9 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
       buffer = 0;
    }
 
-   /* No depth/stencil support yet due to VKCTS issues. */
-   if (radv_host_image_copy_enabled(pdev) && !vk_format_is_depth_or_stencil(format)) {
+   /* No depth and stencil support yet. */
+   if (radv_host_image_copy_enabled(pdev) &&
+       (format != VK_FORMAT_D32_SFLOAT_S8_UINT && format != VK_FORMAT_D16_UNORM_S8_UINT)) {
       if (linear & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT)
          linear |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
 
@@ -892,7 +893,6 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
    uint32_t maxArraySize;
    VkSampleCountFlags sampleCounts = VK_SAMPLE_COUNT_1_BIT;
    const struct util_format_description *desc = radv_format_description(format);
-   enum amd_gfx_level gfx_level = pdev->info.gfx_level;
    VkImageTiling tiling = info->tiling;
    const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *mod_info =
       vk_find_struct_const(info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
@@ -921,33 +921,28 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
    default:
       UNREACHABLE("bad vkimage type\n");
    case VK_IMAGE_TYPE_1D:
-      maxExtent.width = 16384;
+      maxExtent.width = pdev->image_props.max_dims.width;
       maxExtent.height = 1;
       maxExtent.depth = 1;
-      maxMipLevels = 15; /* log2(maxWidth) + 1 */
-      maxArraySize = gfx_level >= GFX10 ? 8192 : 2048;
+      maxArraySize = pdev->image_props.max_array_layers;
       break;
    case VK_IMAGE_TYPE_2D:
-      maxExtent.width = 16384;
-      maxExtent.height = 16384;
+      maxExtent.width = pdev->image_props.max_dims.width;
+      maxExtent.height = pdev->image_props.max_dims.height;
       maxExtent.depth = 1;
-      maxMipLevels = 15; /* log2(maxWidth) + 1 */
-      maxArraySize = gfx_level >= GFX10 ? 8192 : 2048;
+      maxArraySize = pdev->image_props.max_array_layers;
       break;
-   case VK_IMAGE_TYPE_3D:
-      if (gfx_level >= GFX10) {
-         maxExtent.width = 8192;
-         maxExtent.height = 8192;
-         maxExtent.depth = 8192;
-      } else {
-         maxExtent.width = 2048;
-         maxExtent.height = 2048;
-         maxExtent.depth = 2048;
-      }
-      maxMipLevels = util_logbase2(maxExtent.width) + 1;
+   case VK_IMAGE_TYPE_3D: {
+      const uint32_t extent = pdev->image_props.max_dims.depth;
+      maxExtent.width = extent;
+      maxExtent.height = extent;
+      maxExtent.depth = extent;
       maxArraySize = 1;
       break;
    }
+   }
+
+   maxMipLevels = util_logbase2(maxExtent.width) + 1;
 
    if (desc->layout == UTIL_FORMAT_LAYOUT_SUBSAMPLED) {
       /* Might be able to support but the entire format support is
@@ -1308,8 +1303,16 @@ radv_GetPhysicalDeviceImageFormatProperties2(VkPhysicalDevice physicalDevice,
             !(instance->debug_flags & RADV_DEBUG_NO_DCC) && (base_info->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
       }
 
-      host_perf_props->optimalDeviceAccess = pdev->info.gfx_level >= GFX12 || !might_enable_compression;
-      host_perf_props->identicalMemoryLayout = pdev->info.gfx_level >= GFX12 || !might_enable_compression;
+      /**
+       * The Vulkan spec says:
+       *
+       *  "If VkPhysicalDeviceImageFormatInfo2::format is a block-compressed format and
+       *   vkGetPhysicalDeviceImageFormatProperties2 returns VK_SUCCESS, the implementation must
+       *   return VK_TRUE in optimalDeviceAccess."
+       */
+      host_perf_props->optimalDeviceAccess =
+         vk_format_is_block_compressed(format) || pdev->info.gfx_level >= GFX12 || !might_enable_compression;
+      host_perf_props->identicalMemoryLayout = base_info->tiling == VK_IMAGE_TILING_LINEAR;
    }
 
    return VK_SUCCESS;

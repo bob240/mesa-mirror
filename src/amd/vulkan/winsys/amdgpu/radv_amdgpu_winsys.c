@@ -148,6 +148,9 @@ radv_amdgpu_winsys_destroy(struct radeon_winsys *rws)
    u_rwlock_destroy(&ws->global_bo_list.lock);
    free(ws->global_bo_list.bos);
 
+   ac_drm_cs_destroy_syncobj(ws->dev, ws->vm_timeline_syncobj);
+   simple_mtx_destroy(&ws->vm_ioctl_lock);
+
    if (ws->reserve_vmid)
       ac_drm_vm_unreserve_vmid(ws->dev, 0);
 
@@ -185,8 +188,8 @@ radv_amdgpu_winsys_get_sync_provider(struct radeon_winsys *rws)
 static uint64_t
 radv_amdgpu_winsys_filter_perftest_flags(uint64_t perftest_flags)
 {
-   return perftest_flags & (RADV_PERFTEST_NO_GTT_SPILL | RADV_PERFTEST_LOCAL_BOS | RADV_PERFTEST_NO_SAM |
-                            RADV_PERFTEST_SAM | RADV_PERFTEST_BO_LIST);
+   return perftest_flags &
+          (RADV_PERFTEST_NO_GTT_SPILL | RADV_PERFTEST_LOCAL_BOS | RADV_PERFTEST_NO_SAM | RADV_PERFTEST_SAM);
 }
 
 VkResult
@@ -223,9 +226,9 @@ radv_amdgpu_winsys_create(int fd, uint64_t debug_flags, uint64_t perftest_flags,
       ++ws->refcount;
    }
 
-   if (is_virtio && (perftest_flags & (RADV_PERFTEST_BO_LIST | RADV_PERFTEST_LOCAL_BOS))) {
+   if (is_virtio && (perftest_flags & RADV_PERFTEST_LOCAL_BOS)) {
       /* virtio doesn't support VM_ALWAYS_VALID, so disable options that requires it. */
-      fprintf(stderr, "localbos and bolist options are not supported values for RADV_PERFTEST with virtio.\n");
+      fprintf(stderr, "RADV_PERFTEST=localbos is not supported with virtio.\n");
       return VK_ERROR_INITIALIZATION_FAILED;
    }
 
@@ -236,7 +239,7 @@ radv_amdgpu_winsys_create(int fd, uint64_t debug_flags, uint64_t perftest_flags,
       /* Check that options don't differ from the existing winsys. */
       if (((debug_flags & RADV_DEBUG_ALL_BOS) && !ws->debug_all_bos) ||
           ((debug_flags & RADV_DEBUG_HANG) && !ws->debug_log_bos) ||
-          ((debug_flags & RADV_DEBUG_NO_IBS) && ws->use_ib_bos) || (perftest_flags != ws->perftest)) {
+          ((debug_flags & RADV_DEBUG_NO_IB_CHAINING) && ws->chain_ib) || (perftest_flags != ws->perftest)) {
          fprintf(stderr, "radv/amdgpu: Found options that differ from the existing winsys.\n");
          return VK_ERROR_INITIALIZATION_FAILED;
       }
@@ -283,12 +286,9 @@ radv_amdgpu_winsys_create(int fd, uint64_t debug_flags, uint64_t perftest_flags,
    ws->info.ip[AMD_IP_SDMA].num_queues = MIN2(ws->info.ip[AMD_IP_SDMA].num_queues, MAX_RINGS_PER_TYPE);
    ws->info.ip[AMD_IP_COMPUTE].num_queues = MIN2(ws->info.ip[AMD_IP_COMPUTE].num_queues, MAX_RINGS_PER_TYPE);
 
-   ws->use_ib_bos = true;
-
+   ws->chain_ib = !(debug_flags & RADV_DEBUG_NO_IB_CHAINING);
    ws->debug_all_bos = !!(debug_flags & RADV_DEBUG_ALL_BOS);
    ws->debug_log_bos = debug_flags & RADV_DEBUG_HANG;
-   if (debug_flags & RADV_DEBUG_NO_IBS)
-      ws->use_ib_bos = false;
 
    if (debug_flags & RADV_DEBUG_DUMP_BO_HISTORY) {
       ws->bo_history_logfile = fopen("/tmp/radv_bo_history.log", "w+");
@@ -326,6 +326,11 @@ radv_amdgpu_winsys_create(int fd, uint64_t debug_flags, uint64_t perftest_flags,
    ws->sync_types[num_sync_types++] = NULL;
    assert(num_sync_types <= ARRAY_SIZE(ws->sync_types));
 
+   if (ac_drm_cs_create_syncobj2(ws->dev, 0, &ws->vm_timeline_syncobj))
+      goto winsys_fail;
+
+   simple_mtx_init(&ws->vm_ioctl_lock, mtx_plain);
+
    ws->perftest = perftest_flags;
    ws->zero_all_vram_allocs = debug_flags & RADV_DEBUG_ZERO_VRAM;
    u_rwlock_init(&ws->global_bo_list.lock);
@@ -340,6 +345,7 @@ radv_amdgpu_winsys_create(int fd, uint64_t debug_flags, uint64_t perftest_flags,
    ws->base.get_fd = radv_amdgpu_winsys_get_fd;
    ws->base.get_sync_types = radv_amdgpu_winsys_get_sync_types;
    ws->base.get_sync_provider = radv_amdgpu_winsys_get_sync_provider;
+   ws->base.copy_sync_payloads = vk_drm_syncobj_copy_payloads;
    radv_amdgpu_bo_init_functions(ws);
    radv_amdgpu_cs_init_functions(ws);
 

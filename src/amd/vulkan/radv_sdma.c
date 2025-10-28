@@ -13,6 +13,7 @@
 #include "radv_cs.h"
 #include "radv_formats.h"
 
+#include "ac_cmdbuf_sdma.h"
 #include "ac_formats.h"
 
 struct radv_sdma_chunked_copy_info {
@@ -348,56 +349,8 @@ radv_sdma_get_surf(const struct radv_device *const device, const struct radv_ima
 void
 radv_sdma_emit_nop(const struct radv_device *device, struct radv_cmd_stream *cs)
 {
-   /* SDMA NOP acts as a fence command and causes the SDMA engine to wait for pending copy operations. */
    radeon_check_space(device->ws, cs->b, 1);
-   radeon_begin(cs);
-   radeon_emit(SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0));
-   radeon_end();
-}
-
-void
-radv_sdma_emit_write_timestamp(struct radv_cmd_stream *cs, uint64_t va)
-{
-   radeon_begin(cs);
-   radeon_emit(SDMA_PACKET(SDMA_OPCODE_TIMESTAMP, SDMA_TS_SUB_OPCODE_GET_GLOBAL_TIMESTAMP, 0));
-   radeon_emit(va);
-   radeon_emit(va >> 32);
-   radeon_end();
-}
-
-void
-radv_sdma_emit_fence(struct radv_cmd_stream *cs, uint64_t va, uint32_t fence)
-{
-   radeon_begin(cs);
-   radeon_emit(SDMA_PACKET(SDMA_OPCODE_FENCE, 0, SDMA_FENCE_MTYPE_UC));
-   radeon_emit(va);
-   radeon_emit(va >> 32);
-   radeon_emit(fence);
-   radeon_end();
-}
-
-void
-radv_sdma_emit_wait_mem(struct radv_cmd_stream *cs, uint32_t op, uint64_t va, uint32_t ref, uint32_t mask)
-{
-   radeon_begin(cs);
-   radeon_emit(SDMA_PACKET(SDMA_OPCODE_POLL_REGMEM, 0, 0) | op << 28 | SDMA_POLL_MEM);
-   radeon_emit(va);
-   radeon_emit(va >> 32);
-   radeon_emit(ref);
-   radeon_emit(mask);
-   radeon_emit(SDMA_POLL_INTERVAL_160_CLK | SDMA_POLL_RETRY_INDEFINITELY << 16);
-   radeon_end();
-}
-
-void
-radv_sdma_emit_write_data_head(struct radv_cmd_stream *cs, uint64_t va, uint32_t count)
-{
-   radeon_begin(cs);
-   radeon_emit(SDMA_PACKET(SDMA_OPCODE_WRITE, SDMA_WRITE_SUB_OPCODE_LINEAR, 0));
-   radeon_emit(va);
-   radeon_emit(va >> 32);
-   radeon_emit(count - 1);
-   radeon_end();
+   ac_emit_sdma_nop(cs->b);
 }
 
 void
@@ -722,7 +675,7 @@ radv_sdma_copy_buffer_image_unaligned(const struct radv_device *device, struct r
    const struct radv_sdma_chunked_copy_info info = radv_sdma_get_chunked_copy_info(device, img_in, base_extent);
    struct radv_sdma_surf img = *img_in;
    struct radv_sdma_surf tmp = {
-      .va = temp_bo->va,
+      .va = radv_buffer_get_va(temp_bo),
       .bpp = img.bpp,
       .blk_w = img.blk_w,
       .blk_h = img.blk_h,
@@ -871,7 +824,7 @@ radv_sdma_copy_image_t2t_scanline(const struct radv_device *device, struct radv_
    const struct radv_sdma_chunked_copy_info info = radv_sdma_get_chunked_copy_info(device, src, extent);
    struct radv_sdma_surf t2l_src = *src;
    struct radv_sdma_surf t2l_dst = {
-      .va = temp_bo->va,
+      .va = radv_buffer_get_va(temp_bo),
       .bpp = src->bpp,
       .blk_w = src->blk_w,
       .blk_h = src->blk_h,
@@ -879,7 +832,7 @@ radv_sdma_copy_image_t2t_scanline(const struct radv_device *device, struct radv_
    };
    struct radv_sdma_surf l2t_dst = *dst;
    struct radv_sdma_surf l2t_src = {
-      .va = temp_bo->va,
+      .va = radv_buffer_get_va(temp_bo),
       .bpp = dst->bpp,
       .blk_w = dst->blk_w,
       .blk_h = dst->blk_h,

@@ -1438,6 +1438,33 @@ rpt_has_unique_merge_set(struct ir3_instruction *instr)
    return true;
 }
 
+/* Handles this case when a reg's merge set has a preferred reg but is currently
+ * unavailable. In this case, it's often preferable to reset its preferred reg
+ * and assign a new one, as this potentially reduces the number of movs needed
+ * for the as of yet unallocated regs.
+ */
+void
+ir3_ra_handle_unavailable_merge_set(struct ir3_register *reg)
+{
+   unsigned num_unallocated = 0;
+
+   for (unsigned i = 0; i < reg->merge_set->regs_count; i++) {
+      if (reg->merge_set->regs[i]->num == INVALID_REG) {
+         num_unallocated++;
+
+         /* Only reset the preferred reg if there are at least two still
+          * unallocated regs. It doesn't make sense to reassign the merge set
+          * for a single reg, and increasing the bound more doesn't seem to
+          * improve shader stats.
+          */
+         if (num_unallocated >= 2) {
+            reg->merge_set->preferred_reg = (physreg_t)~0;
+            return;
+         }
+      }
+   }
+}
+
 /* This is the main entrypoint for picking a register. Pick a free register
  * for "reg", shuffling around sources if necessary. In the normal case where
  * "is_source" is false, this register can overlap with killed sources
@@ -1458,6 +1485,8 @@ get_reg(struct ra_ctx *ctx, struct ra_file *file, struct ir3_register *reg)
           preferred_reg % reg_elem_size(reg) == 0 &&
           get_reg_specified(ctx, file, reg, preferred_reg, false))
          return preferred_reg;
+
+      ir3_ra_handle_unavailable_merge_set(reg);
    }
 
    /* For repeated instructions whose merge set is unique (i.e., only used for
@@ -2300,6 +2329,17 @@ insert_live_out_moves(struct ra_ctx *ctx)
    insert_file_live_out_moves(ctx, &ctx->shared);
 }
 
+static bool
+has_merge_set_preferred_reg(struct ir3_register *reg)
+{
+   assert(reg->merge_set);
+   assert(reg->num != INVALID_REG);
+
+   return reg->merge_set->preferred_reg != (physreg_t)~0 &&
+          ra_reg_get_physreg(reg) ==
+             reg->merge_set->preferred_reg + reg->merge_set_offset;
+}
+
 static void
 handle_block(struct ra_ctx *ctx, struct ir3_block *block)
 {
@@ -2338,17 +2378,15 @@ handle_block(struct ra_ctx *ctx, struct ir3_block *block)
          struct ir3_register *dst = input->dsts[0];
          assert(dst->num != INVALID_REG);
 
-         physreg_t dst_start = ra_reg_get_physreg(dst);
          physreg_t dst_end;
 
-         if (dst->merge_set) {
+         if (dst->merge_set && has_merge_set_preferred_reg(dst)) {
             /* Take the whole merge set into account to prevent its range being
              * allocated for defs not part of the merge set.
              */
-            assert(dst_start >= dst->merge_set_offset);
-            dst_end = dst_start - dst->merge_set_offset + dst->merge_set->size;
+            dst_end = dst->merge_set->preferred_reg + dst->merge_set->size;
          } else {
-            dst_end = dst_start + reg_size(dst);
+            dst_end = ra_reg_get_physreg(dst) + reg_size(dst);
          }
 
          struct ra_file *file = ra_get_file(ctx, dst);

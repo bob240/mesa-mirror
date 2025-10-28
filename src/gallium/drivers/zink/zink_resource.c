@@ -141,7 +141,7 @@ zink_debug_mem_print_stats(struct zink_screen *screen)
    hash_table_foreach(screen->debug_mem_sizes, entry)
    {
       struct zink_debug_mem_entry *debug_bos = entry->data;
-      util_dynarray_append(&dyn, struct zink_debug_mem_entry *, debug_bos);
+      util_dynarray_append(&dyn, debug_bos);
       size += debug_bos->size / 1024;
       count += debug_bos->count;
    }
@@ -414,28 +414,27 @@ get_image_usage_for_feats(struct zink_screen *screen, VkFormatFeatureFlags2 feat
    *need_extended = false;
 
    if (bind & ZINK_BIND_TRANSIENT)
-      usage |= VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
-   else {
-      /* sadly, gallium doesn't let us know if it'll ever need this, so we have to assume */
-      if (is_planar || (feats & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT))
-         usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-      if (is_planar || (feats & VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
-         usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-      if (feats & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
-         usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+         return util_format_is_depth_or_stencil(templ->format) ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-      if ((is_planar || (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) && (bind & PIPE_BIND_SHADER_IMAGE)) {
-         assert(templ->nr_samples <= 1 || screen->info.feats.features.shaderStorageImageMultisample);
-         usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-      }
+   /* sadly, gallium doesn't let us know if it'll ever need this, so we have to assume */
+   if (is_planar || (feats & VK_FORMAT_FEATURE_TRANSFER_SRC_BIT))
+      usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+   if (is_planar || (feats & VK_FORMAT_FEATURE_TRANSFER_DST_BIT))
+      usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+   if (feats & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)
+      usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+
+   if ((is_planar || (feats & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT)) && (bind & PIPE_BIND_SHADER_IMAGE)) {
+      assert(templ->nr_samples <= 1 || screen->info.feats.features.shaderStorageImageMultisample);
+      usage |= VK_IMAGE_USAGE_STORAGE_BIT;
    }
 
    if (bind & PIPE_BIND_RENDER_TARGET) {
       if (feats & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) {
          usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-         if (!(bind & ZINK_BIND_TRANSIENT) && (bind & (PIPE_BIND_LINEAR | PIPE_BIND_SHARED)) != (PIPE_BIND_LINEAR | PIPE_BIND_SHARED))
+         if ((bind & (PIPE_BIND_LINEAR | PIPE_BIND_SHARED)) != (PIPE_BIND_LINEAR | PIPE_BIND_SHARED))
             usage |= VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
-         if (!(bind & ZINK_BIND_TRANSIENT) && screen->info.have_EXT_attachment_feedback_loop_layout)
+         if (screen->info.have_EXT_attachment_feedback_loop_layout)
             usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
       } else {
          /* trust that gallium isn't going to give us anything wild */
@@ -1096,9 +1095,6 @@ update_alloc_info_flags(struct zink_screen *screen, const struct pipe_resource *
             templ->usage == PIPE_USAGE_STAGING)
       alloc_info->flags |= VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
-   if (templ->bind & ZINK_BIND_TRANSIENT)
-      alloc_info->flags |= VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
-
    if (alloc_info->user_mem) {
       VkExternalMemoryHandleTypeFlagBits handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
       VkMemoryHostPointerPropertiesEXT memory_host_pointer_properties = {0};
@@ -1270,7 +1266,8 @@ create_image(struct zink_screen *screen, struct zink_resource_object *obj,
    /* we often need to be able to mutate between srgb and linear, but we don't need general
     * image view/shader image format compatibility (that path means losing fast clears or compression on some hardware).
     */
-   if (!(templ->bind & ZINK_BIND_MUTABLE) && (!alloc_info->whandle || alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE)) {
+   bool can_srgb = screen->driver_workarounds.srgb_dmabufs || (!alloc_info->whandle || alloc_info->whandle->type == ZINK_EXTERNAL_MEMORY_HANDLE);
+   if (!(templ->bind & ZINK_BIND_MUTABLE) && can_srgb) {
       srgb = util_format_is_srgb(templ->format) ? util_format_linear(templ->format) : util_format_srgb(templ->format);
       /* why do these helpers have different default return values? */
       if (srgb == templ->format)
@@ -3007,7 +3004,7 @@ zink_resource_copy_box_add(struct zink_context *ctx, struct zink_resource *res, 
          }
       }
    }
-   util_dynarray_append(&res->obj->copies[level], struct pipe_box, *box);
+   util_dynarray_append(&res->obj->copies[level], *box);
    if (!res->copies_warned && util_dynarray_num_elements(&res->obj->copies[level], struct pipe_box) > 100) {
       perf_debug(ctx, "zink: PERF WARNING! > 100 copy boxes detected for %p\n", res);
       mesa_logw("zink: PERF WARNING! > 100 copy boxes detected for %p\n", res);

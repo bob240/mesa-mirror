@@ -277,16 +277,16 @@ CDX12EncHMFT::PrepareForEncodeHelper( LPDX12EncodeContext pDX12EncodeContext, bo
    if( pPicInfo->picture_type == PIPE_H2645_ENC_PICTURE_TYPE_IDR )
    {
       struct pipe_enc_raw_header header_vps = { /* type */ PIPE_H265_NAL_VPS };
-      util_dynarray_append( &pPicInfo->raw_headers, struct pipe_enc_raw_header, header_vps );
+      util_dynarray_append( &pPicInfo->raw_headers, header_vps );
       struct pipe_enc_raw_header header_sps = { /* type */ PIPE_H265_NAL_SPS };
-      util_dynarray_append( &pPicInfo->raw_headers, struct pipe_enc_raw_header, header_sps );
+      util_dynarray_append( &pPicInfo->raw_headers, header_sps );
       struct pipe_enc_raw_header header_pps = { /* type */ PIPE_H265_NAL_PPS };
-      util_dynarray_append( &pPicInfo->raw_headers, struct pipe_enc_raw_header, header_pps );
+      util_dynarray_append( &pPicInfo->raw_headers, header_pps );
    }
 
    // Always insert AUD
    struct pipe_enc_raw_header header_aud = { /* type */ PIPE_H265_NAL_AUD };
-   util_dynarray_append( &pPicInfo->raw_headers, struct pipe_enc_raw_header, header_aud );
+   util_dynarray_append( &pPicInfo->raw_headers, header_aud );
 
    pPicInfo->not_referenced = !cur_frame_desc->gop_info->is_used_as_future_reference;
    assert( ( cur_frame_desc->gop_info->frame_type == PIPE_H2645_ENC_PICTURE_TYPE_B ) == pPicInfo->not_referenced );
@@ -472,7 +472,9 @@ CDX12EncHMFT::PrepareForEncodeHelper( LPDX12EncodeContext pDX12EncodeContext, bo
       {
          // Use current encoder slice config for when NOT doing an intra-refresh wave
          intra_refresh_slices_config non_ir_wave_slices_config = {};
-         CHECKBOOL_GOTO( (m_EncoderCapabilities.m_HWSupportsIntraRefreshModes != PIPE_VIDEO_ENC_INTRA_REFRESH_NONE), MF_E_UNEXPECTED, done );
+         CHECKBOOL_GOTO( ( m_EncoderCapabilities.m_HWSupportsIntraRefreshModes != PIPE_VIDEO_ENC_INTRA_REFRESH_NONE ),
+                         MF_E_UNEXPECTED,
+                         done );
          non_ir_wave_slices_config.slice_mode = pPicInfo->slice_mode;
          non_ir_wave_slices_config.num_slice_descriptors = pPicInfo->num_slice_descriptors;
          memcpy( non_ir_wave_slices_config.slices_descriptors,
@@ -922,14 +924,12 @@ CDX12EncHMFT::CreateGOPTracker( uint32_t textureWidth, uint32_t textureHeight )
 {
    HRESULT hr = S_OK;
    uint32_t MaxHWL0Ref = m_EncoderCapabilities.m_uiMaxHWSupportedL0References;
-   uint32_t MaxHWL1Ref = m_EncoderCapabilities.m_uiMaxHWSupportedL1References;
    MaxHWL0Ref = std::min( 1u, MaxHWL0Ref );   // we only support 1
-   MaxHWL1Ref = 0;
    std::unique_ptr<dpb_buffer_manager> upTwoPassDPBManager;
 
    SAFE_DELETE( m_pGOPTracker );
-   // B Frame not supported by HW
-   CHECKBOOL_GOTO( ( m_uiBFrameCount == 0 ) || ( MaxHWL1Ref > 0 ), E_INVALIDARG, done );
+   // B Frame not supported
+   CHECKBOOL_GOTO( ( m_uiBFrameCount == 0 ), E_INVALIDARG, done );
    // Requested number of temporal layers higher than max supported by HW
    CHECKBOOL_GOTO( m_uiLayerCount <= m_EncoderCapabilities.m_uiMaxTemporalLayers, MF_E_OUT_OF_RANGE, done );
    // Validate logic expression (m_uiLayerCount > 1) => (m_uiBFrameCount == 0)
@@ -951,7 +951,6 @@ CDX12EncHMFT::CreateGOPTracker( uint32_t textureWidth, uint32_t textureHeight )
    assert( m_uiMaxNumRefFrame == m_pPipeVideoCodec->max_references );
    assert( 1 + m_uiMaxLongTermReferences <= m_uiMaxNumRefFrame );
    assert( MaxHWL0Ref <= m_uiMaxNumRefFrame );
-   assert( MaxHWL1Ref <= m_uiMaxNumRefFrame );
 
    if( m_pPipeVideoCodec->two_pass.enable && ( m_pPipeVideoCodec->two_pass.pow2_downscale_factor > 0 ) )
    {
@@ -974,7 +973,6 @@ CDX12EncHMFT::CreateGOPTracker( uint32_t textureWidth, uint32_t textureHeight )
                                                       m_uiLayerCount,
                                                       m_bLowLatency,
                                                       MaxHWL0Ref,
-                                                      MaxHWL1Ref,
                                                       m_pPipeVideoCodec->max_references,
                                                       m_uiMaxLongTermReferences,
                                                       std::move( upTwoPassDPBManager ) );

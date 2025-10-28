@@ -32,6 +32,7 @@
 #include "vk_framebuffer.h"
 #include "vk_image.h"
 #include "vk_util.h"
+#include "vk_android.h"
 
 #include "util/log.h"
 
@@ -340,6 +341,7 @@ vk_render_pass_attachment_init(struct vk_render_pass_attachment *att,
 {
    *att = (struct vk_render_pass_attachment) {
       .format                 = desc->format,
+      .flags                  = desc->flags,
       .aspects                = vk_format_aspects(desc->format),
       .samples                = desc->samples,
       .view_mask              = 0,
@@ -351,6 +353,8 @@ vk_render_pass_attachment_init(struct vk_render_pass_attachment *att,
       .final_layout           = desc->finalLayout,
       .initial_stencil_layout = vk_att_desc_stencil_layout(desc, false),
       .final_stencil_layout   = vk_att_desc_stencil_layout(desc, true),
+      .has_external_format =
+         vk_android_rp_attachment_has_external_format(desc),
    };
 }
 
@@ -1029,6 +1033,26 @@ vk_get_command_buffer_inheritance_rendering_info(
                                COMMAND_BUFFER_INHERITANCE_RENDERING_INFO);
 }
 
+VkRenderingAttachmentFlagsKHR
+vk_get_rendering_attachment_flags(const VkRenderingAttachmentInfo *att)
+{
+   const VkRenderingAttachmentFlagsInfoKHR *flags_info =
+      vk_find_struct_const(att->pNext, RENDERING_ATTACHMENT_FLAGS_INFO_KHR);
+
+   return flags_info != NULL ? flags_info->flags : 0;
+}
+
+static VkRenderingAttachmentFlagBitsKHR
+vk_attachment_description_flags_to_rendering_flags(VkAttachmentDescriptionFlags flags)
+{
+   VkRenderingAttachmentFlagBitsKHR ret = 0;
+   if (flags & VK_ATTACHMENT_DESCRIPTION_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR)
+      ret |= VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR;
+   if (flags & VK_ATTACHMENT_DESCRIPTION_RESOLVE_ENABLE_TRANSFER_FUNCTION_BIT_KHR)
+      ret |= VK_RENDERING_ATTACHMENT_RESOLVE_ENABLE_TRANSFER_FUNCTION_BIT_KHR;
+   return ret;
+}
+
 const VkRenderingInfo *
 vk_get_command_buffer_inheritance_as_rendering_resume(
    VkCommandBufferLevel level,
@@ -1078,20 +1102,32 @@ vk_get_command_buffer_inheritance_as_rendering_resume(
    };
 
    VkRenderingAttachmentInfo *attachments = data->attachments;
+   VkRenderingAttachmentFlagsInfoKHR *attachments_flags = (VkRenderingAttachmentFlagsInfoKHR *)
+      (data->attachments + subpass->color_count +
+       2 * (subpass->depth_stencil_attachment != NULL));
 
    for (unsigned i = 0; i < subpass->color_count; i++) {
       const struct vk_subpass_attachment *sp_att =
          &subpass->color_attachments[i];
       if (sp_att->attachment == VK_ATTACHMENT_UNUSED) {
          attachments[i] = (VkRenderingAttachmentInfo) {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
             .imageView = VK_NULL_HANDLE,
          };
          continue;
       }
 
       assert(sp_att->attachment < pass->attachment_count);
+
+      attachments_flags[i] = (VkRenderingAttachmentFlagsInfoKHR) {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+         .flags = vk_attachment_description_flags_to_rendering_flags(
+            pass->attachments[sp_att->attachment].flags),
+      };
+
       attachments[i] = (VkRenderingAttachmentInfo) {
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .pNext = &attachments_flags[i],
          .imageView = fb->attachments[sp_att->attachment],
          .imageLayout = sp_att->layout,
          .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -1706,8 +1742,14 @@ transition_attachment(struct vk_command_buffer *cmd_buffer,
       if (image_view->image->image_type == VK_IMAGE_TYPE_3D) {
          /* 3D is stupidly special. See transition_view_mask() */
          assert(view == 0);
-         range.baseArrayLayer = 0;
-         range.layerCount = image_view->extent.depth;
+         if (image_view->view_type == VK_IMAGE_VIEW_TYPE_2D &&
+             cmd_buffer->base.device->enabled_features.maintenance9) {
+            range.baseArrayLayer = image_view->base_array_layer;
+            range.layerCount = image_view->layer_count;
+         } else {
+            range.baseArrayLayer = 0;
+            range.layerCount = image_view->extent.depth;
+         }
       } else if (pass->is_multiview) {
          range.baseArrayLayer = image_view->base_array_layer + view;
          range.layerCount = 1;
@@ -1763,8 +1805,14 @@ load_attachment(struct vk_command_buffer *cmd_buffer,
    if (!need_load_store)
       return;
 
+   const VkRenderingAttachmentFlagsInfoKHR att_flags = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+      .flags = vk_attachment_description_flags_to_rendering_flags(rp_att->flags),
+   };
+
    const VkRenderingAttachmentInfo att = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .pNext = &att_flags,
       .imageView = vk_image_view_to_handle(att_state->image_view),
       .imageLayout = layout,
       .loadOp = rp_att->load_op,
@@ -1774,6 +1822,7 @@ load_attachment(struct vk_command_buffer *cmd_buffer,
 
    const VkRenderingAttachmentInfo stencil_att = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+      .pNext = &att_flags,
       .imageView = vk_image_view_to_handle(att_state->image_view),
       .imageLayout = stencil_layout,
       .loadOp = rp_att->stencil_load_op,
@@ -1822,6 +1871,8 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
     * or quick vkCmdBegin/EndRendering to do the load op.
     */
 
+   STACK_ARRAY(VkRenderingAttachmentFlagsInfoKHR, color_attachments_flags,
+               subpass->color_count);
    STACK_ARRAY(VkRenderingAttachmentInfo, color_attachments,
                subpass->color_count);
    STACK_ARRAY(VkRenderingAttachmentInitialLayoutInfoMESA,
@@ -1831,6 +1882,8 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
    for (uint32_t i = 0; i < subpass->color_count; i++) {
       const struct vk_subpass_attachment *sp_att =
          &subpass->color_attachments[i];
+      VkRenderingAttachmentFlagsInfoKHR *color_attachment_flags =
+         &color_attachments_flags[i];
       VkRenderingAttachmentInfo *color_attachment = &color_attachments[i];
 
       if (sp_att->attachment == VK_ATTACHMENT_UNUSED) {
@@ -1847,8 +1900,13 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
       struct vk_attachment_state *att_state =
          &cmd_buffer->attachments[sp_att->attachment];
 
+      *color_attachment_flags = (VkRenderingAttachmentFlagsInfoKHR) {
+         .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+      };
+
       *color_attachment = (VkRenderingAttachmentInfo) {
          .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+         .pNext = color_attachment_flags,
          .imageView = vk_image_view_to_handle(att_state->image_view),
          .imageLayout = sp_att->layout,
       };
@@ -1912,7 +1970,11 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
           */
          res_att_state->views_loaded |= subpass->view_mask;
 
-         if (vk_format_is_int(res_att_state->image_view->format))
+         const struct vk_render_pass_attachment *resolve_att =
+            &pass->attachments[sp_att->resolve->attachment];
+         if (resolve_att->has_external_format)
+            color_attachment->resolveMode = VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID;
+         else if (vk_format_is_int(res_att_state->image_view->format))
             color_attachment->resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
          else
             color_attachment->resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
@@ -1920,6 +1982,9 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
          color_attachment->resolveImageView =
             vk_image_view_to_handle(res_att_state->image_view);
          color_attachment->resolveImageLayout = sp_att->resolve->layout;
+
+         color_attachment_flags->flags =
+            vk_attachment_description_flags_to_rendering_flags(resolve_att->flags);
       } else if (subpass->mrtss.multisampledRenderToSingleSampledEnable &&
                  rp_att->samples == VK_SAMPLE_COUNT_1_BIT) {
          if (vk_format_is_int(att_state->image_view->format))
@@ -1934,6 +1999,12 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
    };
    VkRenderingAttachmentInfo stencil_attachment = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+   };
+   VkRenderingAttachmentFlagsInfoKHR depth_attachment_flags = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
+   };
+   VkRenderingAttachmentFlagsInfoKHR stencil_attachment_flags = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_FLAGS_INFO_KHR,
    };
    VkRenderingAttachmentInitialLayoutInfoMESA depth_initial_layout = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INITIAL_LAYOUT_INFO_MESA,
@@ -1958,13 +2029,22 @@ begin_subpass(struct vk_command_buffer *cmd_buffer,
          depth_attachment.imageView =
             vk_image_view_to_handle(att_state->image_view);
          depth_attachment.imageLayout = sp_att->layout;
+         depth_attachment_flags.flags =
+            vk_attachment_description_flags_to_rendering_flags(rp_att->flags);
       }
 
       if (rp_att->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
          stencil_attachment.imageView =
             vk_image_view_to_handle(att_state->image_view);
          stencil_attachment.imageLayout = sp_att->stencil_layout;
+         stencil_attachment_flags.flags =
+            vk_attachment_description_flags_to_rendering_flags(rp_att->flags);
       }
+
+      __vk_append_struct(&depth_attachment,
+                         &depth_attachment_flags);
+      __vk_append_struct(&stencil_attachment,
+                         &stencil_attachment_flags);
 
       if (!(subpass->view_mask & att_state->views_loaded)) {
          /* None of these views have been used before */
@@ -2594,7 +2674,8 @@ vk_common_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
        *    VkImageViewCreateInfo::format equal to the corresponding value of
        *    VkAttachmentDescription::format in renderPass"
        */
-      assert(image_view->format == pass_att->format);
+      if (!pass_att->has_external_format)
+         assert(image_view->format == pass_att->format);
 
       /* From the Vulkan 1.3.204 spec:
        *

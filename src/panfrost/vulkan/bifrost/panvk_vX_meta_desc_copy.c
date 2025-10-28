@@ -100,10 +100,11 @@ set_to_table_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
    {
       nir_def *src_offset =
          nir_u2u64(b, nir_imul_imm(b, src_desc_idx, PANVK_DESCRIPTOR_SIZE));
-      nir_def *desc = nir_load_global(b, nir_iadd(b, set_ptr, src_offset),
-                                      element_size, element_size / 4, 32);
-      nir_store_global(b, nir_iadd(b, table_ptr, dst_offset), element_size,
-                       desc, ~0);
+      nir_def *desc = nir_load_global(b, element_size / 4, 32,
+                                      nir_iadd(b, set_ptr, src_offset),
+                                      .align_mul = element_size);
+      nir_store_global(b, desc, nir_iadd(b, table_ptr, dst_offset),
+                       .align_mul = element_size);
    }
    nir_push_else(b, NULL);
    {
@@ -115,8 +116,8 @@ set_to_table_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
       };
 
       nir_def *desc = nir_build_imm(b, element_size / 4, 32, v);
-      nir_store_global(b, nir_iadd(b, table_ptr, dst_offset), element_size,
-                       desc, ~0);
+      nir_store_global(b, desc, nir_iadd(b, table_ptr, dst_offset),
+                       .align_mul = element_size);
    }
    nir_pop_if(b, NULL);
 }
@@ -143,8 +144,9 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
          get_input_field(b, desc_copy.attrib_buf_idx_offset);
       nir_def *src_offset =
          nir_u2u64(b, nir_imul_imm(b, src_desc_idx, PANVK_DESCRIPTOR_SIZE));
-      nir_def *src_desc = nir_load_global(b, nir_iadd(b, set_ptr, src_offset),
-                                          element_size, element_size / 4, 32);
+      nir_def *src_desc = nir_load_global(b, element_size / 4, 32,
+                                          nir_iadd(b, set_ptr, src_offset),
+                                          .align_mul = element_size);
       nir_def *fmt = nir_iand_imm(b, nir_channel(b, src_desc, 2), 0xfffffc00);
 
       /* Each image descriptor takes two attribute buffer slots, and we need
@@ -157,9 +159,10 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
 
       nir_def *attrib_desc = nir_vec2(b, attrib_w1, nir_imm_int(b, 0));
 
-      nir_store_global(b, nir_iadd(b, attrib_table_ptr, attrib_offset),
-                       pan_size(ATTRIBUTE), attrib_desc,
-                       nir_component_mask(attrib_comps));
+      nir_store_global(b, attrib_desc,
+                       nir_iadd(b, attrib_table_ptr, attrib_offset),
+                       .align_mul = pan_size(ATTRIBUTE),
+                       .write_mask = nir_component_mask(attrib_comps));
 
       nir_def *attrib_buf_desc = nir_vec8(
          b, nir_channel(b, src_desc, 0), nir_channel(b, src_desc, 1),
@@ -167,9 +170,10 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
          nir_channel(b, src_desc, 3), nir_channel(b, src_desc, 4),
          nir_channel(b, src_desc, 5), nir_channel(b, src_desc, 6),
          nir_channel(b, src_desc, 7));
-      nir_store_global(b, nir_iadd(b, attrib_buf_table_ptr, attrib_buf_offset),
-                       element_size, attrib_buf_desc,
-                       nir_component_mask(attrib_buf_comps));
+      nir_store_global(b, attrib_buf_desc,
+                       nir_iadd(b, attrib_buf_table_ptr, attrib_buf_offset),
+                       .align_mul = element_size,
+                       .write_mask = nir_component_mask(attrib_buf_comps));
    }
    nir_push_else(b, NULL);
    {
@@ -183,11 +187,13 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
       nir_def *desc =
          nir_build_imm(b, MAX2(attrib_buf_comps, attrib_comps), 32, v);
 
-      nir_store_global(b, nir_iadd(b, attrib_buf_table_ptr, attrib_buf_offset),
-                       pan_size(ATTRIBUTE), desc,
-                       nir_component_mask(attrib_buf_comps));
-      nir_store_global(b, nir_iadd(b, attrib_table_ptr, attrib_offset),
-                       element_size, desc, nir_component_mask(attrib_comps));
+      nir_store_global(b, desc,
+                       nir_iadd(b, attrib_buf_table_ptr, attrib_buf_offset),
+                       .align_mul = pan_size(ATTRIBUTE),
+                       .write_mask = nir_component_mask(attrib_buf_comps));
+      nir_store_global(b, desc, nir_iadd(b, attrib_table_ptr, attrib_offset),
+                       .align_mul = element_size,
+                       .write_mask = nir_component_mask(attrib_comps));
    }
    nir_pop_if(b, NULL);
 }
@@ -198,7 +204,7 @@ single_desc_copy(nir_builder *b, nir_def *desc_copy_idx)
    nir_def *desc_copy_offset = nir_imul_imm(b, desc_copy_idx, sizeof(uint32_t));
    nir_def *desc_copy_ptr = nir_iadd(b, get_input_field(b, desc_copy.table),
                                      nir_u2u64(b, desc_copy_offset));
-   nir_def *src_copy_handle = nir_load_global(b, desc_copy_ptr, 4, 1, 32);
+   nir_def *src_copy_handle = nir_load_global(b, 1, 32, desc_copy_ptr);
 
    nir_def *set_idx, *src_desc_idx;
    extract_desc_info_from_handle(b, src_copy_handle, &set_idx, &src_desc_idx);

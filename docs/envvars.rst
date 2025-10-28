@@ -5,6 +5,14 @@ Normally, no environment variables need to be set. Most of the
 environment variables used by Mesa/Gallium are for debugging purposes,
 but they can sometimes be useful for debugging end-user issues.
 
+Android System Properties
+-------------------------
+
+Android (generally) uses system properties rather than environment variables to
+control Mesa/Gallium behavior, although there are some exceptions to this. See
+:ref:`Android System Properties <android-android-system-properties>` for
+details on naming and how to set and get system property values.
+
 LibGL environment variables
 ---------------------------
 
@@ -1422,6 +1430,8 @@ RADV driver environment variables
       disable dithering for alpha to coverage
    ``nobinning``
       disable primitive binning
+   ``nobolist``
+      disable the global BO list when no features require it
    ``nocache``
       disable shaders cache
    ``nocompute``
@@ -1442,8 +1452,8 @@ RADV driver environment variables
       disable VK_EXT_graphics_pipeline_library
    ``nohiz``
       disable HIZ for depthstencil images
-   ``noibs``
-      disable directly recording command buffers in GPU-visible memory
+   ``noibchaining``
+      disable chaining IB buffers
    ``nomeshshader``
       disable mesh shader support on GFX10.3+
    ``nongg``
@@ -1536,8 +1546,6 @@ RADV driver environment variables
 
    a comma-separated list of named flags, which do various things:
 
-   ``bolist``
-      enable the global BO list
    ``cswave32``
       enable wave32 for compute shaders (GFX10+)
    ``dccmsaa``

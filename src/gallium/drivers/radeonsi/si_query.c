@@ -841,16 +841,10 @@ static void si_query_hw_do_emit_start(struct si_context *sctx, struct si_query_h
          si_set_internal_shader_buffer(sctx, SI_GS_QUERY_EMULATED_COUNTERS_BUF, &sbuf);
          SET_FIELD(sctx->current_gs_state, GS_STATE_PIPELINE_STATS_EMU, 1);
 
-         const uint32_t zero = 0;
-         radeon_begin(cs);
          /* Clear the emulated counter end value. We don't clear start because it's unused. */
          va += si_query_pipestat_end_dw_offset(sctx->screen, query->index) * 4;
-         radeon_emit(PKT3(PKT3_WRITE_DATA, 2 + 1, 0));
-         radeon_emit(S_370_DST_SEL(V_370_MEM) | S_370_WR_CONFIRM(1) | S_370_ENGINE_SEL(V_370_PFP));
-         radeon_emit(va);
-         radeon_emit(va >> 32);
-         radeon_emit(zero);
-         radeon_end();
+
+         ac_emit_cp_write_data_imm(&cs->current, V_370_PFP, va, 0);
 
          sctx->num_pipeline_stat_emulated_queries++;
       } else {
@@ -1039,19 +1033,7 @@ static void emit_set_predicate(struct si_context *ctx, struct si_resource *buf, 
 {
    struct radeon_cmdbuf *cs = &ctx->gfx_cs;
 
-   radeon_begin(cs);
-
-   if (ctx->gfx_level >= GFX9) {
-      radeon_emit(PKT3(PKT3_SET_PREDICATION, 2, 0));
-      radeon_emit(op);
-      radeon_emit(va);
-      radeon_emit(va >> 32);
-   } else {
-      radeon_emit(PKT3(PKT3_SET_PREDICATION, 1, 0));
-      radeon_emit(va);
-      radeon_emit(op | ((va >> 32) & 0xFF));
-   }
-   radeon_end();
+   ac_emit_cp_set_predication(&cs->current, ctx->gfx_level, va, op);
 
    radeon_add_to_buffer_list(ctx, &ctx->gfx_cs, buf, RADEON_USAGE_READ | RADEON_PRIO_QUERY);
 }
@@ -1343,7 +1325,7 @@ static void si_get_hw_query_result_shader_params(struct si_context *sctx,
    }
 }
 
-static unsigned si_query_read_result(void *map, unsigned start_index, unsigned end_index,
+static uint64_t si_query_read_result(void *map, unsigned start_index, unsigned end_index,
                                      bool test_status_bit)
 {
    uint32_t *current_result = (uint32_t *)map;
@@ -1352,7 +1334,7 @@ static unsigned si_query_read_result(void *map, unsigned start_index, unsigned e
    start = (uint64_t)current_result[start_index] | (uint64_t)current_result[start_index + 1] << 32;
    end = (uint64_t)current_result[end_index] | (uint64_t)current_result[end_index + 1] << 32;
 
-   if (!test_status_bit || ((start & 0x8000000000000000UL) && (end & 0x8000000000000000UL))) {
+   if (!test_status_bit || ((start & BITFIELD64_BIT(63)) && (end & BITFIELD64_BIT(63)))) {
       return end - start;
    }
    return 0;

@@ -18,10 +18,12 @@
 
 #include "vk_pipeline_layout.h"
 #include "vk_synchronization.h"
+#include "util/compiler.h"
 
 #include "clb097.h"
 #include "clcb97.h"
 #include "nv_push_cl906f.h"
+#include "nv_push_cla16f.h"
 #include "nv_push_cl9097.h"
 #include "nv_push_cl90b5.h"
 #include "nv_push_cla097.h"
@@ -190,7 +192,7 @@ nvk_cmd_buffer_flush_push(struct nvk_cmd_buffer *cmd, bool incomplete)
          .range = nv_push_dw_count(&cmd->push) * 4,
          .incomplete = incomplete,
       };
-      util_dynarray_append(&cmd->pushes, struct nvk_cmd_push, push);
+      util_dynarray_append(&cmd->pushes, push);
 
       cmd->prev_subc = NVC0_FIFO_SUBC_FROM_PKHDR(cmd->push.last_hdr_dw);
    }
@@ -235,7 +237,7 @@ nvk_cmd_buffer_push_indirect(struct nvk_cmd_buffer *cmd,
       .no_prefetch = true,
    };
 
-   util_dynarray_append(&cmd->pushes, struct nvk_cmd_push, push);
+   util_dynarray_append(&cmd->pushes, push);
 }
 
 VkResult
@@ -368,12 +370,26 @@ nvk_BeginCommandBuffer(VkCommandBuffer commandBuffer,
    return VK_SUCCESS;
 }
 
+static void
+flush_mem_list(struct nvk_cmd_buffer *cmd, struct list_head *mem_list)
+{
+   list_for_each_entry_safe(struct nvk_cmd_mem, mem, mem_list, link)
+      nvkmd_mem_sync_map_to_gpu(mem->mem, 0, mem->mem->size_B);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 nvk_EndCommandBuffer(VkCommandBuffer commandBuffer)
 {
    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
 
    nvk_cmd_buffer_flush_push(cmd, false);
+
+   /* We only need to flush the memory objects we own because, if there are
+    * secondaries, they will have been flushed in their EndCommandBuffer()
+    * call.
+    */
+   flush_mem_list(cmd, &cmd->owned_mem);
+   flush_mem_list(cmd, &cmd->owned_gart_mem);
 
    return vk_command_buffer_get_record_result(&cmd->vk);
 }
@@ -434,14 +450,14 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
 }
 
 enum nvk_barrier {
-   NVK_BARRIER_RENDER_WFI              = 1 << 0,
-   NVK_BARRIER_COMPUTE_WFI             = 1 << 1,
-   NVK_BARRIER_FLUSH_SHADER_DATA       = 1 << 2,
-   NVK_BARRIER_INVALIDATE_SHADER_DATA  = 1 << 3,
-   NVK_BARRIER_INVALIDATE_TEX_DATA     = 1 << 4,
-   NVK_BARRIER_INVALIDATE_CONSTANT     = 1 << 5,
-   NVK_BARRIER_INVALIDATE_MME_DATA     = 1 << 6,
-   NVK_BARRIER_INVALIDATE_QMD_DATA     = 1 << 7,
+   NVK_BARRIER_WFI                     = 1 << 0,
+   NVK_BARRIER_FLUSH_SHADER_DATA       = 1 << 1,
+   NVK_BARRIER_INVALIDATE_SHADER_DATA  = 1 << 2,
+   NVK_BARRIER_INVALIDATE_TEX_DATA     = 1 << 3,
+   NVK_BARRIER_INVALIDATE_CONSTANT     = 1 << 4,
+   NVK_BARRIER_INVALIDATE_MME_DATA     = 1 << 5,
+   NVK_BARRIER_INVALIDATE_QMD_DATA     = 1 << 6,
+   NVK_BARRIER_INVALIDATE_RASTER_CACHE = 1 << 7,
 };
 
 static enum nvk_barrier
@@ -453,30 +469,15 @@ nvk_barrier_flushes_waits(VkPipelineStageFlags2 stages,
 
    enum nvk_barrier barriers = 0;
 
-   if (access & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT) {
+   if (stages &
+       vk_expand_pipeline_stage_flags2(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
+      barriers |= NVK_BARRIER_WFI;
+
+   if (access & VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
       barriers |= NVK_BARRIER_FLUSH_SHADER_DATA;
 
-      if (vk_pipeline_stage_flags2_has_graphics_shader(stages))
-         barriers |= NVK_BARRIER_RENDER_WFI;
-
-      if (vk_pipeline_stage_flags2_has_compute_shader(stages))
-         barriers |= NVK_BARRIER_COMPUTE_WFI;
-   }
-
-   if (access & (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                 VK_ACCESS_2_TRANSFORM_FEEDBACK_WRITE_BIT_EXT))
-      barriers |= NVK_BARRIER_RENDER_WFI;
-
-   if ((access & VK_ACCESS_2_TRANSFER_WRITE_BIT) &&
-       (stages & (VK_PIPELINE_STAGE_2_RESOLVE_BIT |
-                  VK_PIPELINE_STAGE_2_BLIT_BIT |
-                  VK_PIPELINE_STAGE_2_CLEAR_BIT)))
-      barriers |= NVK_BARRIER_RENDER_WFI;
-
    if (access & VK_ACCESS_2_COMMAND_PREPROCESS_WRITE_BIT_EXT)
-      barriers |= NVK_BARRIER_FLUSH_SHADER_DATA |
-                  NVK_BARRIER_COMPUTE_WFI;
+      barriers |= NVK_BARRIER_FLUSH_SHADER_DATA;
 
    return barriers;
 }
@@ -517,6 +518,9 @@ nvk_barrier_invalidates(VkPipelineStageFlags2 stages,
                   VK_PIPELINE_STAGE_2_BLIT_BIT)))
       barriers |= NVK_BARRIER_INVALIDATE_TEX_DATA;
 
+   if (access & VK_ACCESS_2_FRAGMENT_SHADING_RATE_ATTACHMENT_READ_BIT_KHR)
+      barriers |= NVK_BARRIER_INVALIDATE_RASTER_CACHE;
+
    return barriers;
 }
 
@@ -526,6 +530,21 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
                        bool wait)
 {
    enum nvk_barrier barriers = 0;
+
+   /* For asymmetric, we don't know what the access flags will be yet.
+    * Handle this by setting access to everything.
+    */
+   if (dep->dependencyFlags & VK_DEPENDENCY_ASYMMETRIC_EVENT_BIT_KHR) {
+      /* VUID-vkCmdSetEvent2-dependencyFlags-10785, 10786, 10787 */
+      assert(dep->memoryBarrierCount == 1 &&
+             dep->bufferMemoryBarrierCount == 0 &&
+             dep->imageMemoryBarrierCount == 0);
+
+      const VkMemoryBarrier2 *bar = &dep->pMemoryBarriers[0];
+      barriers |= nvk_barrier_flushes_waits(bar->srcStageMask,
+                                            VK_ACCESS_2_MEMORY_READ_BIT |
+                                            VK_ACCESS_2_MEMORY_WRITE_BIT);
+   }
 
    for (uint32_t i = 0; i < dep->memoryBarrierCount; i++) {
       const VkMemoryBarrier2 *bar = &dep->pMemoryBarriers[i];
@@ -548,30 +567,59 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
    if (!barriers)
       return;
 
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
-
    if (barriers & NVK_BARRIER_FLUSH_SHADER_DATA) {
-      assert(barriers & (NVK_BARRIER_RENDER_WFI | NVK_BARRIER_COMPUTE_WFI));
-      if (barriers & NVK_BARRIER_RENDER_WFI) {
+      struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+
+      /* This is also implicitly a WFI */
+      if (nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NVA097) {
          P_IMMD(p, NVA097, INVALIDATE_SHADER_CACHES, {
             .data = DATA_TRUE,
             .flush_data = FLUSH_DATA_TRUE,
          });
-      }
-
-      if (barriers & NVK_BARRIER_COMPUTE_WFI) {
+      } else {
          P_IMMD(p, NVA0C0, INVALIDATE_SHADER_CACHES, {
             .data = DATA_TRUE,
             .flush_data = FLUSH_DATA_TRUE,
          });
       }
-   } else if (barriers & NVK_BARRIER_RENDER_WFI) {
-      /* If this comes from a vkCmdSetEvent, we don't need to wait */
-      if (wait)
-         P_IMMD(p, NVA097, WAIT_FOR_IDLE, 0);
-   } else {
-      /* Compute WFI only happens when shader data is flushed */
-      assert(!(barriers & NVK_BARRIER_COMPUTE_WFI));
+   } else if ((barriers & NVK_BARRIER_WFI) && wait) {
+      /* If this comes from a vkCmdSetEvent, we don't need to wait
+       *
+       * We only need to WFI on a single channel. The others will implicitly get
+       * a WFI from the channel switch.
+       */
+      switch (nvk_cmd_buffer_last_subchannel(cmd)) {
+      case SUBC_NV9097: {
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+         P_IMMD(p, NV9097, WAIT_FOR_IDLE, 0);
+         break;
+      }
+      case SUBC_NV90C0: {
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
+         P_IMMD(p, NVA0C0, WAIT_FOR_IDLE, 0);
+         break;
+      }
+      default:
+         assert(!"Unknown subc");
+         FALLTHROUGH;
+      case SUBC_NV90B5: {
+         struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
+         P_MTHD(p, NV90B5, LINE_LENGTH_IN);
+         P_NV90B5_LINE_LENGTH_IN(p, 0);
+         P_NV90B5_LINE_COUNT(p, 0);
+
+         P_IMMD(p, NV90B5, LAUNCH_DMA, {
+            .data_transfer_type = DATA_TRANSFER_TYPE_NON_PIPELINED,
+            .multi_line_enable = false,
+            .flush_enable = FLUSH_ENABLE_TRUE,
+            /* Note: FLUSH_TYPE=SYS implicitly for NVC3B5+ */
+            .src_memory_layout = SRC_MEMORY_LAYOUT_PITCH,
+            .dst_memory_layout = DST_MEMORY_LAYOUT_PITCH,
+            .remap_enable = REMAP_ENABLE_TRUE,
+         });
+         break;
+      }
+      }
    }
 }
 
@@ -610,7 +658,7 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
    if (!barriers)
       return;
 
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 16);
+   struct nv_push *p = nvk_cmd_buffer_push(cmd, 18);
 
    if (barriers & NVK_BARRIER_INVALIDATE_TEX_DATA) {
       if (pdev->info.cls_eng3d >= MAXWELL_A) {
@@ -640,6 +688,10 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
          }
       }
    }
+
+   if (barriers & NVK_BARRIER_INVALIDATE_RASTER_CACHE &&
+       dev->vk.enabled_features.pipelineFragmentShadingRate)
+      P_IMMD(p, NVC597, INVALIDATE_RASTER_CACHE_NO_WFI, 0);
 
    if (barriers & (NVK_BARRIER_INVALIDATE_SHADER_DATA &
                    NVK_BARRIER_INVALIDATE_CONSTANT)) {

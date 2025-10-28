@@ -980,6 +980,7 @@ system_value("layer_id", 1)
 system_value("view_index", 1)
 system_value("subgroup_size", 1)
 system_value("subgroup_invocation", 1)
+system_value("amplification_id_kk", 1)
 
 # These intrinsics provide a bitmask for all invocations, with one bit per
 # invocation starting with the least significant bit, according to the
@@ -1254,9 +1255,9 @@ load("per_view_output", [1, 1], [BASE, RANGE, COMPONENT, DEST_TYPE, IO_SEMANTICS
 # src[] = { primitive, offset }.
 load("per_primitive_output", [1, 1], [BASE, COMPONENT, DEST_TYPE, IO_SEMANTICS], [CAN_ELIMINATE])
 # src[] = { offset }.
-load("shared", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+load("shared", [1], [BASE, ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 # src[] = { offset }.
-load("task_payload", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+load("task_payload", [1], [BASE, ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 # src[] = { offset }.
 load("push_constant", [1], [BASE, RANGE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE, CAN_REORDER])
 # src[] = { offset }.
@@ -1302,9 +1303,9 @@ store("per_primitive_output", [1, 1], [BASE, RANGE, WRITE_MASK, COMPONENT, SRC_T
 # src[] = { value, block_index, offset }
 store("ssbo", [-1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET, OFFSET_SHIFT])
 # src[] = { value, offset }.
-store("shared", [1], [BASE, WRITE_MASK, ALIGN_MUL, ALIGN_OFFSET])
+store("shared", [1], [BASE, ACCESS, WRITE_MASK, ALIGN_MUL, ALIGN_OFFSET])
 # src[] = { value, offset }.
-store("task_payload", [1], [BASE, WRITE_MASK, ALIGN_MUL, ALIGN_OFFSET])
+store("task_payload", [1], [BASE, ACCESS, WRITE_MASK, ALIGN_MUL, ALIGN_OFFSET])
 # src[] = { value, address }.
 store("global", [1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 # src[] = { value, address }.
@@ -1407,6 +1408,13 @@ intrinsic("select_vertex_poly", src_comp=[1], indices=[STREAM_ID])
 # Sources: (index offset, first vertex, number of vertices, # of XFB primitives before).
 intrinsic("emit_primitive_poly", src_comp=[1, 1, 1, 1], indices=[STREAM_ID])
 
+# Transform a given address to be used as read-write,
+# allowing to transition a "sink" read-only address to the read-write address.
+intrinsic("ro_to_rw_poly", src_comp=[1], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[64])
+
+# Get the address representing the read-only "sink" address (always read 0)
+system_value("ro_sink_address_poly", 1, bit_sizes=[64])
+
 # mesa_prim for the input topology (in a geometry shader)
 system_value("input_topology_poly", 1)
 
@@ -1425,6 +1433,9 @@ system_value("geometry_param_buffer_poly", 1, bit_sizes=[64])
 
 # Address of the parameter buffer for poly tessellation shaders
 system_value("tess_param_buffer_poly", 1, bit_sizes=[64])
+
+# Address of the pipeline statistic query result indexed by BASE
+system_value("stat_query_address_poly", 1, bit_sizes=[64], indices=[BASE])
 
 # IR3-specific version of most SSBO intrinsics. The only different
 # compare to the originals is that they add an extra source to hold
@@ -1953,20 +1964,11 @@ intrinsic("load_vector_arg_amd", dest_comp=0, bit_sizes=[32],
 store("scalar_arg_amd", [], [BASE])
 store("vector_arg_amd", [], [BASE])
 
-# src[] = { 32/64-bit base address, 32-bit offset }.
-#
-# Similar to load_global_constant, the memory accessed must be read-only. This
-# restriction justifies the CAN_REORDER flag. Additionally, the base/offset must
-# be subgroup uniform.
-intrinsic("load_smem_amd", src_comp=[1, 1], dest_comp=0, bit_sizes=[32],
-                           indices=[ALIGN_MUL, ALIGN_OFFSET, ACCESS],
-                           flags=[CAN_ELIMINATE, CAN_REORDER])
-
 # src[] = { offset }.
-intrinsic("load_shared2_amd", [1], dest_comp=2, indices=[OFFSET0, OFFSET1, ST64], flags=[CAN_ELIMINATE])
+intrinsic("load_shared2_amd", [1], dest_comp=2, indices=[ACCESS, OFFSET0, OFFSET1, ST64], flags=[CAN_ELIMINATE])
 
 # src[] = { value, offset }.
-intrinsic("store_shared2_amd", [2, 1], indices=[OFFSET0, OFFSET1, ST64])
+intrinsic("store_shared2_amd", [2, 1], indices=[ACCESS, OFFSET0, OFFSET1, ST64])
 
 # Vertex stride in LS-HS buffer
 system_value("lshs_vertex_stride_amd", 1)
@@ -2335,9 +2337,6 @@ barrier("fence_pbe_to_tex_pixel_agx")
 
 # Unknown fence used in the helper program on exit.
 barrier("fence_helper_exit_agx")
-
-# Address of the pipeline statistic query result indexed by BASE
-system_value("stat_query_address_agx", 1, bit_sizes=[64], indices=[BASE])
 
 # Helper shader intrinsics
 # src[] = { value }.
@@ -2801,3 +2800,17 @@ intrinsic("load_packed_sample_location_pco", src_comp=[1], dest_comp=1, flags=[C
 
 # src[] = { buffer_index/deref }.
 intrinsic("is_null_descriptor", src_comp=[-1], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[1])
+
+# KosmicKrisp-specific intrinsics
+
+# Represents a pointer to the start of an argument buffer at the
+# given binding
+load("buffer_ptr_kk", [], [BINDING], [CAN_ELIMINATE, CAN_REORDER])
+# Opaque texture<T> handle, with DEST_TYPE representing T
+load("texture_handle_kk", [1], [DEST_TYPE, IMAGE_DIM, IMAGE_ARRAY, FLAGS], [CAN_ELIMINATE])
+# Same as above but for depth<T> textures, T is always float
+load("depth_texture_kk", [1], [IMAGE_DIM, IMAGE_ARRAY], [CAN_ELIMINATE])
+# Load a bindless sampler handle mapping a binding table sampler.
+intrinsic("load_sampler_handle_kk", [1], 1, [],
+          flags=[CAN_ELIMINATE, CAN_REORDER],
+          bit_sizes=[16])

@@ -143,13 +143,14 @@ static void radeon_enc_cdf_default_table(struct radeon_encoder *enc)
    bool use_cdf_default = enc->enc_pic.frame_type == PIPE_AV1_ENC_FRAME_TYPE_KEY ||
                           enc->enc_pic.frame_type == PIPE_AV1_ENC_FRAME_TYPE_INTRA_ONLY ||
                           enc->enc_pic.frame_type == PIPE_AV1_ENC_FRAME_TYPE_SWITCH ||
+                          enc->enc_pic.av1.primary_ref_frame == 7 /* PRIMARY_REF_NONE */ ||
                           (enc->enc_pic.enable_error_resilient_mode);
 
    enc->enc_pic.av1_cdf_default_table.use_cdf_default = use_cdf_default ? 1 : 0;
 
    RADEON_ENC_BEGIN(enc->cmd.cdf_default_table_av1);
    RADEON_ENC_CS(enc->enc_pic.av1_cdf_default_table.use_cdf_default);
-   RADEON_ENC_READWRITE(enc->cdf->res->buf, enc->cdf->res->domains, 0);
+   RADEON_ENC_READWRITE(enc->cdf->buf, enc->cdf->domains, 0);
    RADEON_ENC_ADDR_SWAP();
    RADEON_ENC_END();
 }
@@ -447,7 +448,7 @@ void radeon_enc_av1_frame_header_common(struct radeon_encoder *enc, struct radeo
 
    if (!frame_is_intra && !error_resilient_mode)
       /*  primary_ref_frame  */
-      radeon_bs_code_fixed_bits(bs, av1->primary_ref_frame, 3);
+      radeon_bs_code_fixed_bits(bs, enc->enc_pic.av1.primary_ref_frame, 3);
 
    if ((enc->enc_pic.frame_type != PIPE_AV1_ENC_FRAME_TYPE_SWITCH) &&
        (enc->enc_pic.frame_type != PIPE_AV1_ENC_FRAME_TYPE_KEY || !av1->show_frame))
@@ -658,7 +659,7 @@ static void radeon_enc_ctx(struct radeon_encoder *enc)
    enc->enc_pic.ctx_buf.two_pass_search_center_map_offset = 0;
 
    RADEON_ENC_BEGIN(enc->cmd.ctx);
-   RADEON_ENC_READWRITE(enc->dpb->res->buf, enc->dpb->res->domains, 0);
+   RADEON_ENC_READWRITE(enc->dpb->buf, enc->dpb->domains, 0);
    RADEON_ENC_CS(enc->enc_pic.ctx_buf.swizzle_mode);
    RADEON_ENC_CS(enc->enc_pic.ctx_buf.rec_luma_pitch);
    RADEON_ENC_CS(enc->enc_pic.ctx_buf.rec_chroma_pitch);

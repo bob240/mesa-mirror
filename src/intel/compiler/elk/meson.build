@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: MIT
 
 libintel_compiler_elk_files = files(
+  '../brw_list.h',
+  '../intel_prim.h',
   'elk_cfg.cpp',
   'elk_cfg.h',
   'elk_clip.h',
@@ -76,7 +78,6 @@ libintel_compiler_elk_files = files(
   'elk_nir_private.h',
   'elk_packed_float.c',
   'elk_predicated_break.cpp',
-  'elk_prim.h',
   'elk_private.h',
   'elk_reg.h',
   'elk_reg_type.c',
@@ -128,11 +129,12 @@ elk_nir_trig = custom_target(
 
 libintel_compiler_elk = static_library(
   'intel_compiler_elk',
-  [libintel_compiler_elk_files, intel_nir_files, elk_nir_trig, ir_expression_operation_h],
+  [libintel_compiler_elk_files, elk_nir_trig, ir_expression_operation_h],
   include_directories : [inc_include, inc_src, inc_intel],
   c_args : [no_override_init_args],
   cpp_args : ['-Werror=vla'],
   gnu_symbol_visibility : 'hidden',
+  link_with : libintel_compiler_nir,
   dependencies : [idep_nir_headers, idep_mesautil, idep_intel_dev, idep_vtn],
   build_by_default : false,
 )

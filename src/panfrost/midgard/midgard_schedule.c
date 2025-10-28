@@ -93,7 +93,7 @@ mark_access(struct util_dynarray *table, unsigned index, uint16_t mask,
       if (!(mask & (1 << i)))
          continue;
 
-      util_dynarray_append(&table[(BYTE_COUNT * index) + i], unsigned, parent);
+      util_dynarray_append(&table[(BYTE_COUNT * index) + i], parent);
    }
 }
 
@@ -113,8 +113,7 @@ mir_create_dependency_graph(midgard_instruction **instructions, unsigned count,
 
    /* Initialize dependency graph */
    for (unsigned i = 0; i < count; ++i) {
-      instructions[i]->dependents =
-         calloc(BITSET_WORDS(count), sizeof(BITSET_WORD));
+      instructions[i]->dependents = BITSET_CALLOC(count);
 
       instructions[i]->nr_dependencies = 0;
    }
@@ -1499,7 +1498,7 @@ schedule_block(compiler_context *ctx, midgard_block *block)
          bundle.instructions[i]->bundle_id =
             ctx->quadword_count + block->quadword_count;
 
-      util_dynarray_append(&bundles, midgard_bundle, bundle);
+      util_dynarray_append(&bundles, bundle);
       block->quadword_count += midgard_tag_props[bundle.tag].size;
    }
 
@@ -1509,7 +1508,7 @@ schedule_block(compiler_context *ctx, midgard_block *block)
 
    util_dynarray_init(&block->bundles, block);
    util_dynarray_foreach_reverse(&bundles, midgard_bundle, bundle) {
-      util_dynarray_append(&block->bundles, midgard_bundle, *bundle);
+      util_dynarray_append(&block->bundles, *bundle);
    }
    util_dynarray_fini(&bundles);
 

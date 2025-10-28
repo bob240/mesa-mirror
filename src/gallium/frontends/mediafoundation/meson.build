@@ -66,6 +66,8 @@ mediafoundation_files = files(
   'reference_frames_tracker_av1.cpp',
   'reference_frames_tracker_h264.cpp',
   'reference_frames_tracker_hevc.cpp',
+  'stats_buffer_manager.cpp',
+  'd3d12_suballoc_mediabuffer.cpp',
   'videobufferlock.cpp',
   'wpptrace.cpp',
 )

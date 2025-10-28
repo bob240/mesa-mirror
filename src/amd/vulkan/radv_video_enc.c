@@ -75,39 +75,27 @@ radv_probe_video_encode(struct radv_physical_device *pdev)
          return;
       if (pdev->info.vcn_enc_minor_version < RENCODE_V4_FW_INTERFACE_MINOR_VERSION)
          return;
-
-      /* VCN 4 FW 1.22 has all the necessary pieces to pass CTS */
-      if (pdev->info.vcn_enc_minor_version >= 22) {
-         pdev->video_encode_enabled = true;
-         return;
-      }
    } else if (pdev->info.vcn_ip_version >= VCN_3_0_0) {
       if (pdev->info.vcn_enc_major_version != RENCODE_V3_FW_INTERFACE_MAJOR_VERSION)
          return;
       if (pdev->info.vcn_enc_minor_version < RENCODE_V3_FW_INTERFACE_MINOR_VERSION)
          return;
-
-      /* VCN 3 FW 1.33 has all the necessary pieces to pass CTS */
-      if (pdev->info.vcn_enc_minor_version >= 33) {
-         pdev->video_encode_enabled = true;
-         return;
-      }
    } else if (pdev->info.vcn_ip_version >= VCN_2_0_0) {
       if (pdev->info.vcn_enc_major_version != RENCODE_V2_FW_INTERFACE_MAJOR_VERSION)
          return;
       if (pdev->info.vcn_enc_minor_version < RENCODE_V2_FW_INTERFACE_MINOR_VERSION)
          return;
-
-      /* VCN 2 FW 1.24 has all the necessary pieces to pass CTS */
-      if (pdev->info.vcn_enc_minor_version >= 24) {
-         pdev->video_encode_enabled = true;
-         return;
-      }
    } else {
       if (pdev->info.vcn_enc_major_version != RENCODE_FW_INTERFACE_MAJOR_VERSION)
          return;
       if (pdev->info.vcn_enc_minor_version < RENCODE_FW_INTERFACE_MINOR_VERSION)
          return;
+   }
+
+   /* WRITE_MEMORY is needed for SetEvent and is required to pass CTS */
+   if (radv_video_write_memory_supported(pdev)) {
+      pdev->video_encode_enabled = true;
+      return;
    }
 
    pdev->video_encode_enabled = !!(instance->perftest_flags & RADV_PERFTEST_VIDEO_ENCODE);
@@ -902,7 +890,6 @@ radv_enc_slice_header(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
    uint32_t num_bits[RENCODE_SLICE_HEADER_TEMPLATE_MAX_NUM_INSTRUCTIONS] = {0};
    const struct VkVideoEncodeH264PictureInfoKHR *h264_picture_info =
       vk_find_struct_const(enc_info->pNext, VIDEO_ENCODE_H264_PICTURE_INFO_KHR);
-   int slice_count = h264_picture_info->naluSliceEntryCount;
    const StdVideoEncodeH264PictureInfo *pic = h264_picture_info->pStdPictureInfo;
    const StdVideoH264SequenceParameterSet *sps =
       vk_video_find_h264_enc_std_sps(cmd_buffer->video.params, pic->seq_parameter_set_id);
@@ -914,8 +901,6 @@ radv_enc_slice_header(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
    unsigned int cdw_start = 0;
    unsigned int cdw_filled = 0;
    unsigned int bits_copied = 0;
-
-   assert(slice_count <= 1);
 
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
@@ -2775,8 +2760,10 @@ radv_vcn_encode_video(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
    if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_5)
       radv_enc_qp_map_input(cmd_buffer, enc_info);
 
-   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_4)
-      radv_vcn_sq_header(cs, &cmd_buffer->video.sq, RADEON_VCN_ENGINE_TYPE_ENCODE, false);
+   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_2) {
+      radv_vcn_sq_header(cs, &cmd_buffer->video.sq, RADEON_VCN_ENGINE_TYPE_ENCODE,
+                         pdev->enc_hw_ver < RADV_VIDEO_ENC_HW_4);
+   }
 
    const struct VkVideoInlineQueryInfoKHR *inline_queries = NULL;
    if (vid->vk.flags & VK_VIDEO_SESSION_CREATE_INLINE_QUERIES_BIT_KHR) {
@@ -2869,8 +2856,10 @@ radv_vcn_encode_video(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
 
    *enc->p_task_size = enc->total_task_size;
 
-   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_4)
+   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_2) {
       radv_vcn_sq_tail(cs, &cmd_buffer->video.sq);
+      radv_vcn_write_memory(cmd_buffer, feedback_query_va + RADV_ENC_FEEDBACK_STATUS_IDX * sizeof(uint32_t), 1);
+   }
 }
 
 static void
@@ -3427,4 +3416,19 @@ radv_video_encode_qp_map_supported(const struct radv_physical_device *pdev)
    if (pdev->info.vcn_ip_version >= VCN_5_0_0)
       return radv_check_vcn_fw_version(pdev, 9, 9, 28);
    return true;
+}
+
+bool
+radv_video_write_memory_supported(const struct radv_physical_device *pdev)
+{
+   if (pdev->info.vcn_ip_version >= VCN_5_0_0)
+      return true;
+   else if (pdev->info.vcn_ip_version >= VCN_4_0_0)
+      return pdev->info.vcn_enc_minor_version >= 22;
+   else if (pdev->info.vcn_ip_version >= VCN_3_0_0)
+      return pdev->info.vcn_enc_minor_version >= 33;
+   else if (pdev->info.vcn_ip_version >= VCN_2_0_0)
+      return pdev->info.vcn_enc_minor_version >= 24;
+   else /* VCN 1 and UVD */
+      return false;
 }

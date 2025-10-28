@@ -30,10 +30,12 @@
 #include <string.h>
 #include <sys/mman.h>
 
+#include "lib/pan_props.h"
+#include "util/log.h"
 #include "util/macros.h"
 #include "util/u_debug.h"
 #include "util/u_hexdump.h"
-#include "lib/pan_props.h"
+#include "util/u_process.h"
 #include "decode.h"
 
 #include "compiler/bifrost/disassemble.h"
@@ -94,8 +96,7 @@ pandecode_find_mapped_gpu_mem_containing(struct pandecode_context *ctx,
    if (mem && mem->addr && !mem->ro) {
       mprotect(mem->addr, mem->length, PROT_READ);
       mem->ro = true;
-      util_dynarray_append(&ctx->ro_mappings, struct pandecode_mapped_memory *,
-                           mem);
+      util_dynarray_append(&ctx->ro_mappings, mem);
    }
 
    return mem;
@@ -259,14 +260,24 @@ pandecode_dump_file_open(struct pandecode_context *ctx)
       ctx->dump_stream = stderr;
    else if (!ctx->dump_stream) {
       char buffer[1024];
-      snprintf(buffer, sizeof(buffer), "%s.ctx-%d.%04d", dump_file_base,
-               ctx->id, ctx->dump_frame_count);
-      printf("pandecode: dump command stream to file %s\n", buffer);
+      snprintf(buffer, sizeof(buffer), "%s.%s.ctx-%d.%04d", dump_file_base,
+               util_get_process_name(), ctx->id, ctx->dump_frame_count);
+      mesa_logd("pandecode: dump command stream to file %s", buffer);
       ctx->dump_stream = fopen(buffer, "w");
-      if (!ctx->dump_stream)
-         fprintf(stderr,
-                 "pandecode: failed to open command stream log file %s\n",
-                 buffer);
+      if (!ctx->dump_stream) {
+         mesa_loge("pandecode: failed to open command stream log file %s",
+                   buffer);
+
+         /* Storage access on Android is quite restricted and varies across
+          * different processes. Meanwhile, PANDECODE_DUMP_FILE option is
+          * global on Android. So we have to fallback to log command stream to
+          * stderr (though won't show up in Android logcat) for those unable to
+          * create the dump file but involved during app launch animation (e.g.
+          * system_server priviledged process).
+          */
+         mesa_loge("pandecode: fall back to log command stream to stderr");
+         ctx->dump_stream = stderr;
+      }
    }
 }
 

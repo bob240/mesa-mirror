@@ -8,3 +8,4 @@ deqp_args = [
 ]
 version_check = "GL ES 2.0.*git"
 renderer_check = "GC3000"
+extensions_check = "/install/etnaviv-gc3000-r5450-gles2-extensions.txt"

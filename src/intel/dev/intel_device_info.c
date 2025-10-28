@@ -78,6 +78,7 @@ static const struct {
    { "lnl", 0x64a0 },
    { "bmg", 0xe202 },
    { "ptl", 0xb080 },
+   { "nvl-u", 0xd740 },
 };
 
 /**
@@ -552,7 +553,6 @@ static const struct intel_device_info intel_device_info_chv = {
    CMAT_PRE_XEHP_CONFIGURATIONS,                    \
    .ver = 9,                                        \
    .has_sample_with_hiz = true,                     \
-   .has_illegal_ccs_values = true,                  \
    .timestamp_frequency = 12000000
 
 #define GFX9_MAX_THREADS                            \
@@ -595,7 +595,6 @@ static const struct intel_device_info intel_device_info_chv = {
    .has_integer_dword_mul = false,                 \
    .has_llc = false,                               \
    .has_sample_with_hiz = true,                    \
-   .has_illegal_ccs_values = true,                 \
    .num_slices = 1,                                \
    .num_thread_per_eu = 6,                         \
    .max_eus_per_subslice = 6,                      \
@@ -917,7 +916,6 @@ static const struct intel_device_info intel_device_info_ehl_2x4 = {
 #define GFX12_FEATURES                              \
    GFX11_FEATURES,                                  \
    .ver = 12,                                       \
-   .has_illegal_ccs_values = false,                 \
    .has_aux_map = true
 
 #define GFX12_MAX_THREADS                           \
@@ -1233,6 +1231,17 @@ static const struct intel_device_info intel_device_info_wcl = {
    XE3_CONFIG(WCL),
    .has_local_mem = false,
    .has_ray_tracing = false,
+};
+
+static const struct intel_device_info intel_device_info_nvl_s_hx_ul = {
+   XE3_CONFIG(NVL_U),
+   .has_local_mem = false,
+   .has_ray_tracing = false,
+};
+
+static const struct intel_device_info intel_device_info_nvl_u_h = {
+   XE3_CONFIG(NVL_U),
+   .has_local_mem = false,
 };
 
 void

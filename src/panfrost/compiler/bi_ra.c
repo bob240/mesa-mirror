@@ -255,11 +255,8 @@ bi_compute_liveness_ra(bi_context *ctx)
    bi_worklist_init(ctx, &worklist);
 
    bi_foreach_block(ctx, block) {
-      if (block->live_in)
-         ralloc_free(block->live_in);
-
-      if (block->live_out)
-         ralloc_free(block->live_out);
+      ralloc_free(block->live_in);
+      ralloc_free(block->live_out);
 
       block->live_in = rzalloc_array(block, uint8_t, ctx->ssa_alloc);
       block->live_out = rzalloc_array(block, uint8_t, ctx->ssa_alloc);
@@ -596,8 +593,7 @@ static signed
 bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
 {
    /* Pick a node satisfying bi_spill_register's preconditions */
-   BITSET_WORD *no_spill =
-      calloc(sizeof(BITSET_WORD), BITSET_WORDS(l->node_count));
+   BITSET_WORD *no_spill = BITSET_CALLOC(l->node_count);
 
    bi_foreach_instr_global(ctx, ins) {
       bi_foreach_dest(ins, d) {
@@ -690,14 +686,14 @@ bi_tls_ptr(bool hi)
 }
 
 bi_instr *
-bi_load_tl(bi_builder *b, unsigned bits, bi_index src, unsigned offset)
+bi_load_tl(bi_builder *b, unsigned bits, bi_index dst, unsigned offset)
 {
    if (b->shader->arch >= 9) {
       assert(offset < 0x8000);  /* valhall has 16 bit signed offset */
-      return bi_load_to(b, bits, src, bi_tls_ptr(false), bi_tls_ptr(true),
+      return bi_load_to(b, bits, dst, bi_tls_ptr(false), bi_tls_ptr(true),
                         BI_SEG_TL, offset);
    } else {
-      return bi_load_to(b, bits, src, bi_imm_u32(offset), bi_zero(), BI_SEG_TL,
+      return bi_load_to(b, bits, dst, bi_imm_u32(offset), bi_zero(), BI_SEG_TL,
                         0);
    }
 }
@@ -741,7 +737,8 @@ bi_compute_reg_alignment(bi_context *ctx)
 /* Once we've chosen a spill node, spill it and return new (aligned) offset */
 
 static unsigned
-bi_spill_register(bi_context *ctx, bi_index index, uint32_t offset)
+bi_spill_register(bi_context *ctx, bi_index index, uint32_t offset,
+                  bi_index spill_point)
 {
    bi_builder b = {.shader = ctx};
    unsigned alignment = 4;
@@ -759,36 +756,45 @@ bi_spill_register(bi_context *ctx, bi_index index, uint32_t offset)
    offset = ALIGN_POT(offset, alignment);
 
    /* Spill after every store, fill before every load */
-   bi_foreach_instr_global_safe(ctx, I) {
-      bi_foreach_dest(I, d) {
-         if (!bi_is_equiv(I->dest[d], index))
-            continue;
+   bi_foreach_block(ctx, block) {
+      bool fill = true;
+      bool found_spill_point = false;
+      bi_foreach_instr_in_block_safe(block, I) {
+         bi_foreach_dest(I, d) {
+            if (bi_is_equiv(I->dest[d], spill_point)) {
+               found_spill_point = true;
+               fill = true;
+            }
+            if (!bi_is_equiv(I->dest[d], index))
+               continue;
 
-         unsigned extra = I->dest[d].offset;
-         bi_index tmp = bi_temp(ctx);
+            unsigned count = bi_count_write_registers(I, d);
+            unsigned extra = I->dest[d].offset;
 
-         I->dest[d] = bi_replace_index(I->dest[d], tmp);
-         I->no_spill = true;
+            channels = MAX2(channels, extra + count);
+            I->no_spill = true;
 
-         unsigned count = bi_count_write_registers(I, d);
-         unsigned bits = count * 32;
+            if (channels == extra + count) {
+               b.cursor = bi_after_instr(I);
+               bi_store_tl(&b, channels * 32, index, offset);
 
-         b.cursor = bi_after_instr(I);
-         bi_store_tl(&b, bits, tmp, offset + 4 * extra);
-         ctx->spills++;
-         channels = MAX2(channels, extra + count);
-      }
+               ctx->spills++;
+               /* Don't disable filling if spill_point is before index. */
+               fill = found_spill_point;
+            }
+         }
 
-      if (bi_has_arg(I, index)) {
-         b.cursor = bi_before_instr(I);
-         bi_index tmp = bi_temp(ctx);
+         if (bi_has_arg(I, index) && fill) {
+            b.cursor = bi_before_instr(I);
+            bi_index tmp = bi_temp(ctx);
 
-         unsigned bits = bi_count_read_index(I, index) * 32;
-         bi_rewrite_index_src_single(I, index, tmp);
+            unsigned bits = bi_count_read_index(I, index) * 32;
+            bi_rewrite_index_src_single(I, index, tmp);
 
-         bi_instr *ld = bi_load_tl(&b, bits, tmp, offset);
-         ld->no_spill = true;
-         ctx->fills++;
+            bi_instr *ld = bi_load_tl(&b, bits, tmp, offset);
+            ld->no_spill = true;
+            ctx->fills++;
+         }
       }
    }
 
@@ -1042,10 +1048,8 @@ bi_out_of_ssa(bi_context *ctx)
     * algorithm is quadratic. This will go away when we go out of SSA after
     * RA.
     */
-   BITSET_WORD *used =
-      calloc(sizeof(BITSET_WORD), BITSET_WORDS(ctx->ssa_alloc));
-   BITSET_WORD *multiple_uses =
-      calloc(sizeof(BITSET_WORD), BITSET_WORDS(ctx->ssa_alloc));
+   BITSET_WORD *used = BITSET_CALLOC(ctx->ssa_alloc);
+   BITSET_WORD *multiple_uses = BITSET_CALLOC(ctx->ssa_alloc);
 
    bi_foreach_instr_global(ctx, I) {
       bi_foreach_ssa_src(I, s) {
@@ -1190,8 +1194,6 @@ bi_register_allocate(bi_context *ctx)
          ctx->info.work_reg_count = BI_MAX_REGS;
       } else {
          signed spill_node = bi_choose_spill_node(ctx, l);
-         lcra_free(l);
-         l = NULL;
 
          if (spill_node == -1)
             UNREACHABLE("Failed to choose spill node\n");
@@ -1200,8 +1202,11 @@ bi_register_allocate(bi_context *ctx)
             UNREACHABLE("Blend shaders may not spill");
 
          spill_count =
-            bi_spill_register(ctx, bi_get_index(spill_node), spill_count);
+            bi_spill_register(ctx, bi_get_index(spill_node), spill_count,
+                              bi_get_index(l->spill_node));
 
+         lcra_free(l);
+         l = NULL;
          /* In case the spill affected an instruction with tied
           * operands, we need to fix up.
           */

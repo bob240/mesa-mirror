@@ -11,6 +11,7 @@
 #ifndef RADV_CMD_BUFFER_H
 #define RADV_CMD_BUFFER_H
 
+#include "ac_cmdbuf.h"
 #include "ac_vcn.h"
 
 #include "vk_command_buffer.h"
@@ -244,14 +245,15 @@ struct radv_descriptor_state {
    uint32_t valid;
    struct radv_push_descriptor_set push_set;
    uint32_t dynamic_buffers[4 * MAX_DYNAMIC_BUFFERS];
+   uint32_t dynamic_offset_count;
+   bool dirty_dynamic;
    uint64_t descriptor_buffers[MAX_SETS];
-   bool need_indirect_descriptor_sets;
+   bool need_indirect_descriptors;
    uint64_t indirect_descriptor_sets_va;
 };
 
 struct radv_push_constant_state {
    uint32_t size;
-   uint32_t dynamic_offset_count;
    bool need_upload;
 };
 
@@ -571,23 +573,15 @@ struct radv_cmd_buffer_upload {
    struct list_head list;
 };
 
-/* A pair of values for SET_*_REG_PAIRS. */
-struct gfx12_reg {
-   uint32_t reg_offset;
-   uint32_t reg_value;
-};
-
 struct radv_cmd_stream {
-   struct radeon_cmdbuf *b;
+   struct ac_cmdbuf *b;
 
    bool context_roll_without_scissor_emitted;
 
    struct radv_tracked_regs tracked_regs;
+   enum amd_ip_type hw_ip;
 
-   uint32_t num_buffered_sh_regs;
-   struct {
-      struct gfx12_reg buffered_sh_regs[256];
-   } gfx12;
+   struct ac_buffered_sh_regs buffered_sh_regs;
 };
 
 struct radv_cmd_buffer {
@@ -891,8 +885,6 @@ void radv_emit_set_predication_state(struct radv_cmd_buffer *cmd_buffer, bool dr
 void radv_begin_conditional_rendering(struct radv_cmd_buffer *cmd_buffer, uint64_t va, bool draw_visible);
 
 void radv_end_conditional_rendering(struct radv_cmd_buffer *cmd_buffer);
-
-uint64_t radv_descriptor_get_va(const struct radv_descriptor_state *descriptors_state, unsigned set_idx);
 
 struct radv_vbo_info {
    uint64_t va;

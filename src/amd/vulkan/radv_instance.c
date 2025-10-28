@@ -35,7 +35,7 @@ static const struct debug_control radv_debug_options[] = {{"nofastclears", RADV_
                                                           {"nohiz", RADV_DEBUG_NO_HIZ},
                                                           {"nocompute", RADV_DEBUG_NO_COMPUTE_QUEUE},
                                                           {"allbos", RADV_DEBUG_ALL_BOS},
-                                                          {"noibs", RADV_DEBUG_NO_IBS},
+                                                          {"noibchaining", RADV_DEBUG_NO_IB_CHAINING},
                                                           {"spirv", RADV_DEBUG_DUMP_SPIRV},
                                                           {"zerovram", RADV_DEBUG_ZERO_VRAM},
                                                           {"syncshaders", RADV_DEBUG_SYNC_SHADERS},
@@ -90,6 +90,7 @@ static const struct debug_control radv_debug_options[] = {{"nofastclears", RADV_
                                                           {"novideo", RADV_DEBUG_NO_VIDEO},
                                                           {"validatevas", RADV_DEBUG_VALIDATE_VAS},
                                                           {"bo_history", RADV_DEBUG_DUMP_BO_HISTORY},
+                                                          {"nobolist", RADV_DEBUG_NO_BO_LIST},
                                                           {NULL, 0}};
 
 const char *
@@ -105,7 +106,6 @@ radv_get_debug_option_name(int id)
 
 static const struct debug_control radv_perftest_options[] = {{"localbos", RADV_PERFTEST_LOCAL_BOS},
                                                              {"dccmsaa", RADV_PERFTEST_DCC_MSAA},
-                                                             {"bolist", RADV_PERFTEST_BO_LIST},
                                                              {"cswave32", RADV_PERFTEST_CS_WAVE_32},
                                                              {"pswave32", RADV_PERFTEST_PS_WAVE_32},
                                                              {"gewave32", RADV_PERFTEST_GE_WAVE_32},
@@ -200,6 +200,7 @@ static const driOptionDescription radv_dri_options[] = {
       DRI_CONF_RADV_EMULATE_RT(false)
       DRI_CONF_RADV_ENABLE_FLOAT16_GFX8(false)
       DRI_CONF_RADV_COOPERATIVE_MATRIX2_NV(false)
+      DRI_CONF_RADV_WAIT_FOR_VM_MAP_UPDATES(false)
    DRI_CONF_SECTION_END
 };
 // clang-format on
@@ -235,6 +236,7 @@ radv_init_dri_debug_options(struct radv_instance *instance)
    drirc->debug.split_fma = driQueryOptionb(&drirc->options, "radv_split_fma");
    drirc->debug.ssbo_non_uniform = driQueryOptionb(&drirc->options, "radv_ssbo_non_uniform");
    drirc->debug.tex_non_uniform = driQueryOptionb(&drirc->options, "radv_tex_non_uniform");
+   drirc->debug.wait_for_vm_map_updates = driQueryOptionb(&drirc->options, "radv_wait_for_vm_map_updates");
    drirc->debug.zero_vram = driQueryOptionb(&drirc->options, "radv_zero_vram");
    drirc->debug.app_layer = driQueryOptionstr(&drirc->options, "radv_app_layer");
 

@@ -192,11 +192,10 @@ struct radeon_info {
    bool cp_dma_use_L2;
    unsigned pc_lines;
    uint32_t lds_size_per_workgroup;
-   uint32_t lds_alloc_granularity;
-   uint32_t lds_encode_granularity;
 
    /* CP info. */
    bool gfx_ib_pad_with_type2;
+   bool can_chain_ib2;
    bool has_cp_dma;
    uint32_t me_fw_version;
    uint32_t me_fw_feature;

@@ -46,16 +46,16 @@
 #include "common/intel_gem.h"
 #include "common/intel_l3_config.h"
 #include "common/intel_measure.h"
-#include "common/intel_mem.h"
 #include "common/intel_sample_positions.h"
 #include "decoder/intel_decoder.h"
 #include "dev/intel_device_info.h"
 #include "blorp/blorp.h"
-#include "compiler/brw_compiler.h"
-#include "compiler/brw_rt.h"
+#include "compiler/brw/brw_compiler.h"
+#include "compiler/brw/brw_rt.h"
 #include "ds/intel_driver_ds.h"
 #include "util/bitset.h"
 #include "util/bitscan.h"
+#include "util/cache_ops.h"
 #include "util/detect_os.h"
 #include "util/macros.h"
 #include "util/hash_table.h"
@@ -708,8 +708,6 @@ union anv_free_list {
    alignas(8) uint64_t u64;
 };
 
-#define ANV_FREE_LIST_EMPTY ((union anv_free_list) { { UINT32_MAX, 0 } })
-
 struct anv_block_state {
    union {
       struct {
@@ -777,6 +775,9 @@ anv_block_pool_size(struct anv_block_pool *pool)
 }
 
 struct anv_state {
+   /* The offset within the VA of the anv_state_pool of this anv_state.
+    *    offset = <actual VMA address> - <anv_state_pool->anv_block_pool.start_address> - <anv_state_pool->start_offset>
+    */
    int64_t offset;
    uint32_t alloc_size;
    uint32_t idx;
@@ -880,8 +881,7 @@ VkResult anv_block_pool_alloc(struct anv_block_pool *pool,
                               uint32_t block_size,
                               int64_t *offset,
                               uint32_t *padding);
-void* anv_block_pool_map(struct anv_block_pool *pool, int32_t offset, uint32_t
-size);
+void *anv_block_pool_map(struct anv_block_pool *pool, int64_t offset, uint32_t size);
 
 struct anv_state_pool_params {
    const char *name;
@@ -1782,7 +1782,7 @@ struct anv_push_descriptor_info;
 
 extern const struct vk_pipeline_cache_object_ops *const anv_cache_import_ops[2];
 
-struct anv_shader_bin *
+struct anv_shader_internal *
 anv_device_search_for_kernel(struct anv_device *device,
                              struct vk_pipeline_cache *cache,
                              const void *key_data, uint32_t key_size,
@@ -1790,7 +1790,7 @@ anv_device_search_for_kernel(struct anv_device *device,
 
 struct anv_shader_upload_params;
 
-struct anv_shader_bin *
+struct anv_shader_internal *
 anv_device_upload_kernel(struct anv_device *device,
                          struct vk_pipeline_cache *cache,
                          const struct anv_shader_upload_params *params);
@@ -2161,8 +2161,15 @@ struct anv_gfx_dynamic_state {
       uint32_t SampleMask;
    } sm;
 
+   /* 3DSTATE_DS */
+   struct {
+      bool ComputeWCoordinateEnable;
+   } ds;
+
    /* 3DSTATE_TE */
    struct {
+      uint32_t TEDomain;
+      uint32_t Partitioning;
       uint32_t OutputTopology;
       uint32_t TessellationDistributionMode;
    } te;
@@ -2251,7 +2258,7 @@ struct anv_gfx_dynamic_state {
       uint32_t BackfaceStencilPassDepthPassOp;
       uint32_t BackfaceStencilPassDepthFailOp;
       uint32_t BackfaceStencilTestFunction;
-   } ds;
+   } wm_ds;
 
    /* 3DSTATE_TBIMR_TILE_PASS_INFO */
    struct {
@@ -2553,16 +2560,16 @@ struct anv_device {
      */
     struct anv_bo                              *ray_query_bo[2];
 
-    struct anv_shader_bin                      *rt_trampoline;
-    struct anv_shader_bin                      *rt_trivial_return;
-    struct anv_shader_bin                      *rt_null_ahs;
+    struct anv_shader_internal                 *rt_trampoline;
+    struct anv_shader_internal                 *rt_trivial_return;
+    struct anv_shader_internal                 *rt_null_ahs;
 
     /** Draw generation shader
      *
      * Generates direct draw calls out of indirect parameters. Used to
      * workaround slowness with indirect draw calls.
      */
-    struct anv_shader_bin                      *internal_kernels[ANV_INTERNAL_KERNEL_COUNT];
+    struct anv_shader_internal                 *internal_kernels[ANV_INTERNAL_KERNEL_COUNT];
     const struct intel_l3_config               *internal_kernels_l3_config;
 
     pthread_mutex_t                             mutex;
@@ -4214,6 +4221,8 @@ struct anv_attachment {
    VkResolveModeFlagBits resolve_mode;
    const struct anv_image_view *resolve_iview;
    VkImageLayout resolve_layout;
+
+   bool skip_srgb_decode;
 };
 
 /** State tracking for vertex buffer flushes
@@ -4291,7 +4300,7 @@ struct anv_simple_shader {
    /* Where to emit the commands (can be different from cmd_buffer->batch) */
    struct anv_batch *batch;
    /* Shader to use */
-   struct anv_shader_bin *kernel;
+   struct anv_shader_internal *kernel;
 
    /* Managed by the simpler shader helper*/
    struct anv_state bt_state;
@@ -5134,7 +5143,7 @@ anv_device_get_embedded_samplers(struct anv_device *device,
                                  struct anv_embedded_sampler **out_samplers,
                                  const struct anv_pipeline_bind_map *bind_map);
 
-struct anv_shader_bin {
+struct anv_shader_internal {
    struct vk_pipeline_cache_object base;
 
    mesa_shader_stage stage;
@@ -5161,8 +5170,8 @@ struct anv_shader_bin {
    struct anv_embedded_sampler **embedded_samplers;
 };
 
-static inline struct anv_shader_bin *
-anv_shader_bin_ref(struct anv_shader_bin *shader)
+static inline struct anv_shader_internal *
+anv_shader_internal_ref(struct anv_shader_internal *shader)
 {
    vk_pipeline_cache_object_ref(&shader->base);
 
@@ -5170,7 +5179,7 @@ anv_shader_bin_ref(struct anv_shader_bin *shader)
 }
 
 static inline void
-anv_shader_bin_unref(struct anv_device *device, struct anv_shader_bin *shader)
+anv_shader_internal_unref(struct anv_device *device, struct anv_shader_internal *shader)
 {
    vk_pipeline_cache_object_unref(&device->vk, &shader->base);
 }
@@ -6019,6 +6028,9 @@ anv_attachment_msaa_resolve(struct anv_cmd_buffer *cmd_buffer,
                             const struct anv_attachment *att,
                             VkImageLayout layout,
                             VkImageAspectFlagBits aspect);
+void
+anv_attachment_external_resolve(struct anv_cmd_buffer *cmd_buffer,
+                                const struct anv_attachment *att);
 
 static inline union isl_color_value
 anv_image_hiz_clear_value(const struct anv_image *image)
@@ -6697,7 +6709,7 @@ VkResult anv_device_init_internal_kernels(struct anv_device *device);
 void anv_device_finish_internal_kernels(struct anv_device *device);
 VkResult anv_device_get_internal_shader(struct anv_device *device,
                                         enum anv_internal_kernel_name name,
-                                        struct anv_shader_bin **out_bin);
+                                        struct anv_shader_internal **out_bin);
 
 VkResult anv_device_init_astc_emu(struct anv_device *device);
 void anv_device_finish_astc_emu(struct anv_device *device);

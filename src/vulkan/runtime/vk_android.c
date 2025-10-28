@@ -757,6 +757,13 @@ get_ahb_buffer_format_properties2(
    if (!gpu_usage)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
+   /* No known gralloc implementations currently allocate with a
+    * layers > 1. So return an error if we happen to get one since
+    * the rest of mesa won't handle it properly.
+    */
+   if (desc.layers > 1)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR;
+
    /* Fill properties fields based on description. */
    VkAndroidHardwareBufferFormatProperties2ANDROID *p = pProperties;
 
@@ -1052,6 +1059,16 @@ vk_android_get_ahb_buffer_properties(
       .compatibleHandleTypes =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID,
    };
+}
+
+bool vk_android_rp_attachment_has_external_format(
+   const VkAttachmentDescription2 *desc)
+{
+   const VkExternalFormatANDROID *format_info =
+      vk_find_struct_const(desc->pNext,
+                           EXTERNAL_FORMAT_ANDROID);
+   return (desc->format == VK_FORMAT_UNDEFINED) &&
+          (format_info != NULL);
 }
 
 #endif /* ANDROID_API_LEVEL >= 26 */

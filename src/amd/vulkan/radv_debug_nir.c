@@ -174,14 +174,14 @@ radv_build_printf_args(nir_builder *b, nir_def *cond, const char *format_string,
    offset = nir_read_first_invocation(b, nir_if_phi(b, offset, undef));
 
    nir_def *buffer_size = nir_load_global(
-      b, nir_imm_int64(b, device->printf.buffer_addr + offsetof(struct radv_printf_buffer_header, size)), 4, 1, 32);
+      b, 1, 32, nir_imm_int64(b, device->printf.buffer_addr + offsetof(struct radv_printf_buffer_header, size)));
 
    nir_push_if(b, nir_ige(b, buffer_size, nir_iadd(b, offset, size)));
    {
       nir_def *addr = nir_iadd_imm(b, nir_u2u64(b, offset), device->printf.buffer_addr);
 
       /* header */
-      nir_store_global(b, addr, 4, nir_ior_imm(b, active_invocation_count, format_index << 16), 1);
+      nir_store_global(b, nir_ior_imm(b, active_invocation_count, format_index << 16), addr);
       addr = nir_iadd_imm(b, addr, 4);
 
       for (uint32_t i = 0; i < argc; i++) {
@@ -190,10 +190,9 @@ radv_build_printf_args(nir_builder *b, nir_def *cond, const char *format_string,
          if (arg->divergent) {
             nir_def *invocation_index = nir_mbcnt_amd(b, ballot, nir_imm_int(b, 0));
             nir_store_global(
-               b, nir_iadd(b, addr, nir_u2u64(b, nir_imul_imm(b, invocation_index, format.element_sizes[i]))), 4, arg,
-               1);
+               b, arg, nir_iadd(b, addr, nir_u2u64(b, nir_imul_imm(b, invocation_index, format.element_sizes[i]))));
          } else {
-            nir_store_global(b, addr, 4, arg, 1);
+            nir_store_global(b, arg, addr, );
          }
 
          addr = nir_iadd(b, addr, nir_u2u64(b, strides[i]));
@@ -210,7 +209,7 @@ radv_build_printf_args(nir_builder *b, nir_def *cond, const char *format_string,
    free(args);
    free(strides);
 
-   util_dynarray_append(&device->printf.formats, struct radv_printf_format, format);
+   util_dynarray_append(&device->printf.formats, format);
 }
 
 void
@@ -470,7 +469,7 @@ radv_build_is_valid_va(nir_builder *b, nir_def *addr)
       nir_def *index = nir_u2u32(b, nir_udiv_imm(b, masked_addr, RADV_VA_VALIDATION_GRANULARITY_BYTES));
       nir_def *offset = nir_imul_imm(b, nir_udiv_imm(b, index, 32), 4);
       nir_def *dword =
-         nir_build_load_global(b, 1, 32, nir_iadd_imm(b, nir_u2u64(b, offset), device->valid_vas_addr), .align_mul = 4);
+         nir_load_global(b, 1, 32, nir_iadd_imm(b, nir_u2u64(b, offset), device->valid_vas_addr), .align_mul = 4);
       index = nir_umod_imm(b, index, 32);
       then_valid = nir_bitnz(b, dword, index);
    }

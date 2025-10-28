@@ -955,13 +955,17 @@ static constexpr unsigned d3d12_max_planes = 3;
  * Get stride and offset for the given pipe resource without the need to get
  * a winsys_handle.
  */
-void
-d3d12_resource_get_info(struct pipe_screen *pscreen,
-                        struct pipe_resource *pres,
-                        unsigned *stride,
-                        unsigned *offset)
+static bool
+d3d12_resource_get_param(struct pipe_screen *pscreen,
+                         struct pipe_context *context,
+                         struct pipe_resource *pres,
+                         unsigned plane,
+                         unsigned layer,
+                         unsigned level,
+                         enum pipe_resource_param param,
+                         unsigned handle_usage,
+                         uint64_t *value)
 {
-
    struct d3d12_resource* res = d3d12_resource(pres);
    unsigned num_planes = util_format_get_num_planes(res->overall_format);
 
@@ -980,12 +984,33 @@ d3d12_resource_get_info(struct pipe_screen *pscreen,
       &staging_res_size
    );
 
-   if(stride) {
-      *stride = strides[res->plane_slice];
-   }
+   switch (param) {
+   case PIPE_RESOURCE_PARAM_NPLANES:
+      *value = num_planes;
+      return true;
 
-   if(offset) {
-      *offset = offsets[res->plane_slice];
+   case PIPE_RESOURCE_PARAM_STRIDE:
+      *value = strides[res->plane_slice];
+      return true;
+
+   case PIPE_RESOURCE_PARAM_OFFSET:
+      *value = offsets[res->plane_slice];
+      return true;
+
+   case PIPE_RESOURCE_PARAM_LAYER_STRIDE:
+      *value = layer_strides[res->plane_slice];
+      return true;
+
+   case PIPE_RESOURCE_PARAM_DISJOINT_PLANES:
+      *value = num_planes > 1;
+      return true;
+
+   case PIPE_RESOURCE_PARAM_MODIFIER:
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED:
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD:
+   default:
+      return false;
    }
 }
 
@@ -1106,7 +1131,7 @@ d3d12_screen_resource_init(struct pipe_screen *pscreen)
    pscreen->resource_from_handle = d3d12_resource_from_handle;
    pscreen->resource_get_handle = d3d12_resource_get_handle;
    pscreen->resource_destroy = d3d12_resource_destroy;
-   pscreen->resource_get_info = d3d12_resource_get_info;
+   pscreen->resource_get_param = d3d12_resource_get_param;
 
    pscreen->memobj_create_from_handle = d3d12_memobj_create_from_handle;
    pscreen->memobj_destroy = d3d12_memobj_destroy;

@@ -1214,6 +1214,12 @@ nir_ushr_imm(nir_builder *build, nir_def *x, uint32_t y)
 }
 
 static inline nir_def *
+nir_shr(nir_builder *build, bool is_signed, nir_def *x, nir_def *y)
+{
+   return is_signed ? nir_ishr(build, x, y) : nir_ushr(build, x, y);
+}
+
+static inline nir_def *
 nir_imod_imm(nir_builder *build, nir_def *x, uint64_t y)
 {
    return nir_imod(build, x, nir_imm_intN_t(build, y, x->bit_size));
@@ -2054,52 +2060,6 @@ nir_store_array_var_imm(nir_builder *build, nir_variable *var, int64_t index,
    nir_deref_instr *deref =
       nir_build_deref_array_imm(build, nir_build_deref_var(build, var), index);
    nir_store_deref(build, deref, value, writemask);
-}
-
-#undef nir_load_global
-static inline nir_def *
-nir_load_global(nir_builder *build, nir_def *addr, unsigned align,
-                unsigned num_components, unsigned bit_size)
-{
-   nir_intrinsic_instr *load =
-      nir_intrinsic_instr_create(build->shader, nir_intrinsic_load_global);
-   load->num_components = (uint8_t)num_components;
-   load->src[0] = nir_src_for_ssa(addr);
-   nir_intrinsic_set_align(load, align, 0);
-   nir_def_init(&load->instr, &load->def, num_components, bit_size);
-   nir_builder_instr_insert(build, &load->instr);
-   return &load->def;
-}
-
-#undef nir_store_global
-static inline void
-nir_store_global(nir_builder *build, nir_def *addr, unsigned align,
-                 nir_def *value, nir_component_mask_t write_mask)
-{
-   nir_intrinsic_instr *store =
-      nir_intrinsic_instr_create(build->shader, nir_intrinsic_store_global);
-   store->num_components = value->num_components;
-   store->src[0] = nir_src_for_ssa(value);
-   store->src[1] = nir_src_for_ssa(addr);
-   nir_intrinsic_set_write_mask(store,
-                                write_mask & BITFIELD_MASK(value->num_components));
-   nir_intrinsic_set_align(store, align, 0);
-   nir_builder_instr_insert(build, &store->instr);
-}
-
-#undef nir_load_global_constant
-static inline nir_def *
-nir_load_global_constant(nir_builder *build, nir_def *addr, unsigned align,
-                         unsigned num_components, unsigned bit_size)
-{
-   nir_intrinsic_instr *load =
-      nir_intrinsic_instr_create(build->shader, nir_intrinsic_load_global_constant);
-   load->num_components = (uint8_t)num_components;
-   load->src[0] = nir_src_for_ssa(addr);
-   nir_intrinsic_set_align(load, align, 0);
-   nir_def_init(&load->instr, &load->def, num_components, bit_size);
-   nir_builder_instr_insert(build, &load->instr);
-   return &load->def;
 }
 
 #undef nir_load_param

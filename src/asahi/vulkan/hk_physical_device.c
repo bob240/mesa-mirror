@@ -94,6 +94,12 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_multiview = true,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
+#ifdef HK_USE_WSI_PLATFORM
+      .KHR_present_id = true,
+      .KHR_present_id2 = true,
+      .KHR_present_wait = true,
+      .KHR_present_wait2 = true,
+#endif
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
@@ -401,10 +407,16 @@ hk_get_device_features(
       .pipelineExecutableInfo = true,
 
       /* VK_KHR_present_id */
-      .presentId = false,
+      .presentId = true,
+
+      /* VK_KHR_present_id2 */
+      .presentId2 = true,
 
       /* VK_KHR_present_wait */
-      .presentWait = false,
+      .presentWait = true,
+
+      /* VK_KHR_present_wait2 */
+      .presentWait2 = true,
 
       /* VK_KHR_shader_clock */
       .shaderSubgroupClock = false,
@@ -859,7 +871,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxSubgroupSize = 32,
       .maxComputeWorkgroupSubgroups = 1024 / 32,
       .requiredSubgroupSizeStages = 0,
-      .maxInlineUniformBlockSize = 1 << 16,
+      .maxInlineUniformBlockSize = HK_MAX_INLINE_UNIFORM_BLOCK_SIZE,
       .maxPerStageDescriptorInlineUniformBlocks = 32,
       .maxPerStageDescriptorUpdateAfterBindInlineUniformBlocks = 32,
       .maxDescriptorSetInlineUniformBlocks = 6 * 32,
@@ -953,7 +965,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .robustUniformBufferAccessSizeAlignment = HK_MIN_UBO_ALIGNMENT,
 
       /* VK_EXT_sample_locations */
-      .sampleLocationSampleCounts = sample_counts,
+      .sampleLocationSampleCounts = sample_counts & ~VK_SAMPLE_COUNT_1_BIT,
       .maxSampleLocationGridSize = (VkExtent2D){1, 1},
       .sampleLocationCoordinateRange[0] = 0.0f,
       .sampleLocationCoordinateRange[1] = 0.9375f,

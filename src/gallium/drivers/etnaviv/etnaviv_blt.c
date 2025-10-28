@@ -290,6 +290,7 @@ etna_blit_clear_color_blt(struct pipe_context *pctx, unsigned idx,
    uint64_t new_clear_value = etna_clear_blit_pack_rgba(dst->format, color);
    bool fast_clear = etna_blt_will_fastclear(dst_level, scissor_state);
    int msaa_xscale = 1, msaa_yscale = 1;
+   bool is_128bit_format = format_is_128bit(dst->format);
 
    translate_samples_to_xyscale(dst->texture->nr_samples,
                                 &msaa_xscale, &msaa_yscale);
@@ -333,7 +334,20 @@ etna_blit_clear_color_blt(struct pipe_context *pctx, unsigned idx,
       clr.rect_h = dst_level->height * msaa_yscale;
    }
 
+   if (is_128bit_format) {
+      clr.clear_value[0] = color->ui[0];
+      clr.clear_value[1] = color->ui[1];
+   }
+
    emit_blt_clearimage(ctx->stream, &clr);
+
+   if (is_128bit_format) {
+      clr.clear_value[0] = color->ui[2];
+      clr.clear_value[1] = color->ui[3];
+      clr.dest.addr.offset += (dst_level->size * dst_level->depth) / 2;
+
+      emit_blt_clearimage(ctx->stream, &clr);
+   }
 
    /* This made the TS valid */
    if (dst_level->ts_size) {
@@ -629,15 +643,17 @@ etna_try_blt_blit(struct pipe_context *pctx,
       return false;
    }
 
+   const enum pipe_format fmt = translate_format_128bit_to_64bit(blit_info->dst.format);
+
    /* try to find a exact format match first */
-   uint32_t format = translate_blt_format(blit_info->dst.format);
+   uint32_t format = translate_blt_format(fmt);
    /* When not resolving MSAA, but only doing a layout conversion, we can get
     * away with a fallback format of matching size.
     */
    if (format == ETNA_NO_MATCH && !downsample_x && !downsample_y)
-      format = etna_compatible_blt_format(blit_info->dst.format);
+      format = etna_compatible_blt_format(fmt);
    if (format == ETNA_NO_MATCH) {
-      DBG("format not supported: %s", util_format_short_name(blit_info->dst.format));
+      DBG("format not supported: %s", util_format_short_name(fmt));
       return false;
    }
 
@@ -755,6 +771,13 @@ etna_try_blt_blit(struct pipe_context *pctx,
       etna_set_state(ctx->stream, VIVS_GL_FLUSH_CACHE, 0x00000c23);
       etna_set_state(ctx->stream, VIVS_TS_FLUSH_CACHE, 0x00000001);
       emit_blt_copyimage(ctx->stream, &op);
+
+      if (format_is_128bit(blit_info->dst.format)) {
+         op.src.addr.offset += src_lev->layer_stride;
+         op.dest.addr.offset += dst_lev->layer_stride;
+
+         emit_blt_copyimage(ctx->stream, &op);
+      }
    }
 
    /* Make FE wait for BLT, in case we want to do something with the image next.

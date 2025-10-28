@@ -282,7 +282,10 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
       cswap->scci.surface = cdt->surface;
       cswap->scci.flags = zink_kopper_has_srgb(cdt) ? VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR : 0;
       cswap->scci.imageFormat = cdt->formats[0];
-      cswap->scci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+      if (cdt->type == KOPPER_WAYLAND)
+          cswap->scci.imageColorSpace = VK_COLOR_SPACE_PASS_THROUGH_EXT;
+      else
+          cswap->scci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
       // TODO: This is where you'd hook up stereo
       cswap->scci.imageArrayLayers = 1;
       cswap->scci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
@@ -832,7 +835,7 @@ kopper_present(void *data, void *gdata, int thread_idx)
       util_dynarray_init(arr, NULL);
       _mesa_hash_table_insert(swapchain->presents, (void*)(uintptr_t)next, arr);
    }
-   util_dynarray_append(arr, VkSemaphore, cpi->sem);
+   util_dynarray_append(arr, cpi->sem);
 out:
    if (thread_idx != -1) {
       p_atomic_dec(&swapchain->async_presents);
@@ -931,6 +934,12 @@ zink_kopper_present_queue(struct zink_screen *screen, struct zink_resource *res,
    memset(&res->damage, 0, sizeof(res->damage));
    cdt->swapchain->images[res->obj->dt_idx].acquired = NULL;
    res->obj->dt_idx = UINT32_MAX;
+   /* pick up pending present mode updates here */
+   if (cdt->present_mode != cdt->swapchain->scci.presentMode) {
+      VkResult ret = update_swapchain(screen, cdt, cdt->caps.currentExtent.width, cdt->caps.currentExtent.height);
+      if (ret != VK_SUCCESS)
+         mesa_loge("zink: failed to set swap interval!");
+   }
 }
 
 void
@@ -1073,7 +1082,7 @@ zink_kopper_present_readback(struct zink_context *ctx, struct zink_resource *res
    simple_mtx_unlock(&screen->queue_lock);
 
    simple_mtx_lock(&screen->semaphores_lock);
-   util_dynarray_append(&screen->semaphores, VkSemaphore, acquire);
+   util_dynarray_append(&screen->semaphores, acquire);
    simple_mtx_unlock(&screen->semaphores_lock);
 
    cdt->age_locked = false;
@@ -1202,11 +1211,13 @@ zink_kopper_set_swap_interval(struct pipe_screen *pscreen, struct pipe_resource 
 
    if (old_present_mode == cdt->present_mode)
       return;
-   VkResult ret = update_swapchain(screen, cdt, cdt->caps.currentExtent.width, cdt->caps.currentExtent.height);
-   if (ret == VK_SUCCESS)
-      return;
    cdt->present_mode = old_present_mode;
-   mesa_loge("zink: failed to set swap interval!");
+   if (res->obj->dt_idx == UINT32_MAX) {
+      /* only update swapchain when there is no current acquire to avoid flickering */
+      VkResult ret = update_swapchain(screen, cdt, cdt->caps.currentExtent.width, cdt->caps.currentExtent.height);
+      if (ret != VK_SUCCESS)
+         mesa_loge("zink: failed to set swap interval!");
+   }
 }
 
 int

@@ -100,6 +100,15 @@ radv_video_encode_queue_enabled(const struct radv_physical_device *pdev)
 bool
 radv_compute_queue_enabled(const struct radv_physical_device *pdev)
 {
+   /* Compute queues may run compute dispatches in parallel with
+    * the graphics queue, even from other processes/apps.
+    * At the moment we can't make sure that all compute shaders
+    * use a workgroup size of 256 to mitigate the regalloc hang,
+    * so disable compute queues on affected chips.
+    */
+   if (pdev->info.has_cs_regalloc_hang_bug)
+      return false;
+
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
 
    return pdev->info.ip[AMD_IP_COMPUTE].num_queues > 0 &&
@@ -756,6 +765,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_shader_stencil_export = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
+      .EXT_shader_uniform_buffer_unsized_array = true,
       .EXT_shader_viewport_index_layer = true,
       .EXT_subgroup_size_control = true,
 #ifdef RADV_USE_WSI_PLATFORM
@@ -1407,6 +1417,9 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
 
       /* VK_EXT_ycbcr_2plane_444_formats */
       .ycbcr2plane444Formats = true,
+
+      /* VK_EXT_shader_uniform_buffer_unsized_array */
+      .shaderUniformBufferUnsizedArray = true,
    };
 }
 
@@ -1467,6 +1480,34 @@ radv_get_compiler_string(struct radv_physical_device *pdev)
 }
 
 static void
+radv_init_image_properties(struct radv_physical_device *pdev)
+{
+   uint32_t width, height, depth;
+
+   if (pdev->info.gfx_level >= GFX12) {
+      /* GFX12 supports 64K but it's not reported because this would prevent 16-bit texture compiler
+       * optimizations.
+       */
+      width = 32768;
+      height = 32768;
+      depth = 16384;
+   } else if (pdev->info.gfx_level >= GFX10) {
+      width = 16384;
+      height = 16384;
+      depth = 8192;
+   } else {
+      width = 16384;
+      height = 16384;
+      depth = 2048;
+   }
+
+   pdev->image_props.max_dims.width = width;
+   pdev->image_props.max_dims.height = height;
+   pdev->image_props.max_dims.depth = depth;
+   pdev->image_props.max_array_layers = pdev->info.gfx_level >= GFX10 ? 8192 : 2048;
+}
+
+static void
 radv_get_physical_device_properties(struct radv_physical_device *pdev)
 {
    VkSampleCountFlags sample_counts = 0xf;
@@ -1495,6 +1536,8 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
    uint64_t os_page_size = 4096;
    os_get_page_size(&os_page_size);
 
+   radv_init_image_properties(pdev);
+
    pdev->vk.properties = (struct vk_properties){
 #ifdef ANDROID_STRICT
       .apiVersion = RADV_API_VERSION,
@@ -1505,11 +1548,12 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .vendorID = ATI_VENDOR_ID,
       .deviceID = pdev->info.pci_id,
       .deviceType = device_type,
-      .maxImageDimension1D = (1 << 14),
-      .maxImageDimension2D = (1 << 14),
-      .maxImageDimension3D = (1 << 11),
-      .maxImageDimensionCube = (1 << 14),
-      .maxImageArrayLayers = (1 << 11),
+      .maxImageDimension1D = pdev->image_props.max_dims.width,
+      .maxImageDimension2D = MIN2(pdev->image_props.max_dims.width, pdev->image_props.max_dims.height),
+      .maxImageDimension3D =
+         MIN3(pdev->image_props.max_dims.width, pdev->image_props.max_dims.height, pdev->image_props.max_dims.depth),
+      .maxImageDimensionCube = MIN2(pdev->image_props.max_dims.width, pdev->image_props.max_dims.height),
+      .maxImageArrayLayers = pdev->image_props.max_array_layers,
       .maxTexelBufferElements = UINT32_MAX,
       .maxUniformBufferRange = UINT32_MAX,
       .maxStorageBufferRange = UINT32_MAX,
@@ -2438,7 +2482,8 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
    mesa_bytes_to_hex(buf, pdev->cache_uuid, VK_UUID_SIZE);
    pdev->vk.disk_cache = disk_cache_create(pdev->name, buf, 0);
 
-   pdev->disk_cache_meta = disk_cache_create_custom(pdev->name, buf, 0, "radv_builtin_shaders", 1024 * 32 /* 32MiB */);
+   pdev->disk_cache_meta =
+      disk_cache_create_custom(pdev->name, buf, 0, "radv_builtin_shaders", 1024 * 1024 * 32 /* 32MiB */);
 
    radv_get_physical_device_properties(pdev);
 

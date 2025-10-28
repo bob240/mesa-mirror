@@ -1189,41 +1189,7 @@ transition_color_buffer(struct anv_cmd_buffer *cmd_buffer,
        * clear.
        */
       must_init_fast_clear_state = devinfo->ver < 20;
-
-      if (isl_aux_usage_has_mcs(image->planes[plane].aux_usage) ||
-          devinfo->has_illegal_ccs_values) {
-
-         must_init_aux_surface = true;
-
-      } else {
-         assert(isl_aux_usage_has_ccs_e(image->planes[plane].aux_usage));
-
-         /* We can start using the CCS immediately without ambiguating. The
-          * two conditions that enable this are:
-          *
-          * 1) The device treats all possible CCS values as legal. In other
-          *    words, we can't confuse the hardware with random bits in the
-          *    CCS.
-          *
-          * 2) We enable compression on all writable image layouts. The CCS
-          *    will receive all writes and will therefore always be in sync
-          *    with the main surface.
-          *
-          *    If we were to disable compression on some writable layouts, the
-          *    CCS could get out of sync with the main surface and the app
-          *    could lose the data it wrote previously. For example, this
-          *    could happen if an app: transitions from UNDEFINED w/o
-          *    ambiguating -> renders with AUX_NONE -> samples with AUX_CCS.
-          *
-          * The second condition is asserted below, but could be moved
-          * elsewhere for more coverage (we're only checking transitions from
-          * an undefined layout).
-          */
-         assert(vk_image_layout_is_read_only(final_layout, aspect) ||
-                (final_aux_usage != ISL_AUX_USAGE_NONE));
-
-         must_init_aux_surface = false;
-      }
+      must_init_aux_surface = initial_aux_usage == ISL_AUX_USAGE_NONE;
    } else if (private_binding_acquire && !acquire_unmodified) {
       /* The fast clear state lives in a driver-private bo, and therefore the
        * external/foreign queue is unaware of it.
@@ -2533,6 +2499,16 @@ emit_pipe_control(struct anv_batch *batch,
    if (bits & ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT)
       bits |= ANV_PIPE_HDC_PIPELINE_FLUSH_BIT;
 #endif
+
+   /* BSpec 47112 (xe), 56551 (xe2): Instruction_PIPE_CONTROL (ComputeCS):
+    * SW must follow below programming restrictions when programming
+    * PIPE_CONTROL command:
+    *
+    * "Command Streamer Stall Enable" must be always set.
+    * ...
+    */
+   if (batch->engine_class == INTEL_ENGINE_CLASS_COMPUTE)
+      bits |= ANV_PIPE_CS_STALL_BIT;
 
 #if GFX_VER < 12
    if (bits & ANV_PIPE_HDC_PIPELINE_FLUSH_BIT)
@@ -5441,6 +5417,7 @@ void genX(CmdBeginRendering)(
          gfx->color_att[i].iview = NULL;
          gfx->color_att[i].layout = VK_IMAGE_LAYOUT_UNDEFINED;
          gfx->color_att[i].aux_usage = ISL_AUX_USAGE_NONE;
+         gfx->color_att[i].skip_srgb_decode = false;
          continue;
       }
 
@@ -5448,6 +5425,9 @@ void genX(CmdBeginRendering)(
          &pRenderingInfo->pColorAttachments[i];
       ANV_FROM_HANDLE(anv_image_view, iview, att->imageView);
       const VkImageLayout initial_layout = attachment_initial_layout(att);
+
+      const VkRenderingAttachmentFlagsInfoKHR *att_flags_info =
+         vk_find_struct_const(att->pNext, RENDERING_ATTACHMENT_FLAGS_INFO_KHR);
 
       assert(render_area.offset.x + render_area.extent.width <=
              iview->vk.extent.width);
@@ -5475,6 +5455,9 @@ void genX(CmdBeginRendering)(
       gfx->color_att[i].iview = iview;
       gfx->color_att[i].layout = att->imageLayout;
       gfx->color_att[i].aux_usage = aux_usage;
+      gfx->color_att[i].skip_srgb_decode = att_flags_info &&
+         (att_flags_info->flags &
+          VK_RENDERING_ATTACHMENT_RESOLVE_SKIP_TRANSFER_FUNCTION_BIT_KHR);
 
       union isl_color_value fast_clear_color = { .u32 = { 0, } };
 
@@ -5932,8 +5915,9 @@ cmd_buffer_mark_attachment_written(struct anv_cmd_buffer *cmd_buffer,
 #endif
 }
 
-void genX(CmdEndRendering)(
-    VkCommandBuffer                             commandBuffer)
+void genX(CmdEndRendering2KHR)(
+   VkCommandBuffer                             commandBuffer,
+   const VkRenderingEndInfoKHR*                pRenderingEndInfo)
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    struct anv_cmd_graphics_state *gfx = &cmd_buffer->state.gfx;
@@ -6028,11 +6012,12 @@ void genX(CmdEndRendering)(
 
       for (uint32_t i = 0; i < gfx->color_att_count; i++) {
          const struct anv_attachment *att = &gfx->color_att[i];
-         if (att->resolve_mode == VK_RESOLVE_MODE_NONE)
-            continue;
-
-         anv_attachment_msaa_resolve(cmd_buffer, att, att->layout,
-                                     VK_IMAGE_ASPECT_COLOR_BIT);
+         if (att->resolve_mode ==
+             VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID)
+            anv_attachment_external_resolve(cmd_buffer, att);
+         else if (att->resolve_mode != VK_RESOLVE_MODE_NONE)
+            anv_attachment_msaa_resolve(cmd_buffer, att, att->layout,
+                                        VK_IMAGE_ASPECT_COLOR_BIT);
       }
 
       if (has_depth_resolve) {
@@ -6183,14 +6168,8 @@ void genX(CmdSetEvent2)(
 
    case INTEL_ENGINE_CLASS_RENDER:
    case INTEL_ENGINE_CLASS_COMPUTE: {
-      VkPipelineStageFlags2 src_stages = 0;
-
-      for (uint32_t i = 0; i < pDependencyInfo->memoryBarrierCount; i++)
-         src_stages |= pDependencyInfo->pMemoryBarriers[i].srcStageMask;
-      for (uint32_t i = 0; i < pDependencyInfo->bufferMemoryBarrierCount; i++)
-         src_stages |= pDependencyInfo->pBufferMemoryBarriers[i].srcStageMask;
-      for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++)
-         src_stages |= pDependencyInfo->pImageMemoryBarriers[i].srcStageMask;
+      VkPipelineStageFlags2 src_stages =
+         vk_collect_dependency_info_src_stages(pDependencyInfo);
 
       cmd_buffer->state.pending_pipe_bits |= ANV_PIPE_POST_SYNC_BIT;
       genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);

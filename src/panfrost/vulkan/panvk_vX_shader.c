@@ -651,9 +651,9 @@ move_push_constant(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
 
       /* We assume an alignment of 64-bit max for packed push-constants. */
       align = MIN2(align, FAU_WORD_SIZE);
-      nir_def *value =
-         nir_load_global(b, nir_iadd(b, push_const_buf, nir_u2u64(b, offset)),
-                         align, intr->def.num_components, intr->def.bit_size);
+      nir_def *value = nir_load_global(
+         b, intr->def.num_components, intr->def.bit_size,
+         nir_iadd(b, push_const_buf, nir_u2u64(b, offset)), .align_mul = align);
 
       nir_def_replace(&intr->def, value);
    }
@@ -774,8 +774,6 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
                 const struct pan_compile_inputs *compile_input,
                 struct panvk_shader_variant *shader)
 {
-   struct panvk_instance *instance =
-      to_panvk_instance(dev->vk.physical->instance);
    mesa_shader_stage stage = nir->info.stage;
 
    const nir_opt_access_options access_options = {
@@ -914,7 +912,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-   if (unlikely(instance->debug_flags & PANVK_DEBUG_NIR)) {
+   if (PANVK_DEBUG(NIR)) {
       fprintf(stderr, "translated nir:\n");
       nir_print_shader(nir, stderr);
    }
@@ -1553,10 +1551,12 @@ shader_desc_info_deserialize(struct panvk_device *dev,
 #if PAN_ARCH < 9
    shader->desc_info.dyn_ubos.count = blob_read_uint32(blob);
    blob_copy_bytes(blob, shader->desc_info.dyn_ubos.map,
-                   shader->desc_info.dyn_ubos.count);
+                   sizeof(*shader->desc_info.dyn_ubos.map) *
+                      shader->desc_info.dyn_ubos.count);
    shader->desc_info.dyn_ssbos.count = blob_read_uint32(blob);
    blob_copy_bytes(blob, shader->desc_info.dyn_ssbos.map,
-                   shader->desc_info.dyn_ssbos.count);
+                   sizeof(*shader->desc_info.dyn_ssbos.map) *
+                      shader->desc_info.dyn_ssbos.count);
 
    uint32_t others_count = 0;
    for (unsigned i = 0; i < ARRAY_SIZE(shader->desc_info.others.count); i++) {
@@ -1584,6 +1584,7 @@ shader_desc_info_deserialize(struct panvk_device *dev,
    blob_copy_bytes(blob, shader->desc_info.dyn_bufs.map,
                    sizeof(*shader->desc_info.dyn_bufs.map) *
                       shader->desc_info.dyn_bufs.count);
+   shader->desc_info.max_varying_loads = blob_read_uint32(blob);
 #endif
 
    return VK_SUCCESS;
@@ -1639,8 +1640,25 @@ panvk_deserialize_shader_variant(struct vk_device *vk_dev,
    if (result != VK_SUCCESS)
       return panvk_error(device, result);
 
+   uint32_t nir_str_size = blob_read_uint32(blob);
+   uint32_t asm_str_size = blob_read_uint32(blob);
+   const char *nir_str = blob_read_bytes(blob, nir_str_size);
+   const char *asm_str = blob_read_bytes(blob, asm_str_size);
+
    if (blob->overrun)
       return panvk_error(device, VK_ERROR_INCOMPATIBLE_SHADER_BINARY_EXT);
+
+   if (nir_str_size > 0) {
+      shader->nir_str = ralloc_strndup(NULL, nir_str, nir_str_size);
+      if (shader->nir_str == NULL)
+         return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
+
+   if (asm_str_size > 0) {
+      shader->asm_str = strndup(asm_str, asm_str_size);
+      if (shader->asm_str == NULL)
+         return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+   }
 
    result = panvk_shader_upload(device, shader, pAllocator);
 
@@ -1716,6 +1734,7 @@ shader_desc_info_serialize(struct blob *blob,
    blob_write_bytes(blob, shader->desc_info.dyn_bufs.map,
                     sizeof(*shader->desc_info.dyn_bufs.map) *
                        shader->desc_info.dyn_bufs.count);
+   blob_write_uint32(blob, shader->desc_info.max_varying_loads);
 #endif
 }
 
@@ -1724,13 +1743,6 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
                                const struct panvk_shader_variant *shader,
                                struct blob *blob)
 {
-   /**
-    * We can't currently cache assembly
-    * TODO: Implement seriaization with assembly
-    **/
-   if (shader->nir_str != NULL || shader->asm_str != NULL)
-      return false;
-
    blob_write_bytes(blob, &shader->info, sizeof(shader->info));
    blob_write_bytes(blob, &shader->fau, sizeof(shader->fau));
 
@@ -1753,6 +1765,14 @@ panvk_shader_serialize_variant(struct vk_device *vk_dev,
    blob_write_uint32(blob, shader->bin_size);
    blob_write_bytes(blob, shader->bin_ptr, shader->bin_size);
    shader_desc_info_serialize(blob, shader);
+
+   /* Include the terminating NULL in the serialization */
+   uint32_t nir_str_size = shader->nir_str ? strlen(shader->nir_str) + 1 : 0;
+   uint32_t asm_str_size = shader->asm_str ? strlen(shader->asm_str) + 1 : 0;
+   blob_write_uint32(blob, nir_str_size);
+   blob_write_uint32(blob, asm_str_size);
+   blob_write_bytes(blob, shader->nir_str, nir_str_size);
+   blob_write_bytes(blob, shader->asm_str, asm_str_size);
 
    return !blob->out_of_memory;
 }

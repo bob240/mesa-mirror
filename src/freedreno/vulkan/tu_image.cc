@@ -185,11 +185,10 @@ tu_cs_image_flag_ref(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t l
    tu_cs_emit(cs, iview->FLAG_BUFFER_PITCH);
 }
 
-static void
+void
 tu_image_view_init(struct tu_device *device,
                    struct tu_image_view *iview,
-                   const VkImageViewCreateInfo *pCreateInfo,
-                   bool has_z24uint_s8uint)
+                   const VkImageViewCreateInfo *pCreateInfo)
 {
    VK_FROM_HANDLE(tu_image, image, pCreateInfo->image);
    const VkImageSubresourceRange *range = &pCreateInfo->subresourceRange;
@@ -238,7 +237,6 @@ tu_image_view_init(struct tu_device *device,
                                         iview->swizzle);
 
    struct fdl_view_args args = {};
-   args.chip = device->physical_device->info->chip;
    args.iova = image->iova;
    args.base_array_layer = range->baseArrayLayer;
    args.base_miplevel = range->baseMipLevel;
@@ -288,7 +286,7 @@ tu_image_view_init(struct tu_device *device,
       args.chroma_offsets[1] = (enum fdl_chroma_location) conversion->state.chroma_offsets[1];
    }
 
-   fdl6_view_init(&iview->view, layouts, &args, has_z24uint_s8uint);
+   TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
 
    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
       struct fdl_layout *layout = &image->layout[0];
@@ -648,7 +646,7 @@ format_list_ubwc_possible(struct tu_device *dev,
    return true;
 }
 
-static VkResult
+VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
               const VkImageCreateInfo *pCreateInfo)
 {
@@ -1383,7 +1381,7 @@ tu_CreateImageView(VkDevice _device,
    if (view == NULL)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   tu_image_view_init(device, view, pCreateInfo, device->use_z24uint_s8uint);
+   tu_image_view_init(device, view, pCreateInfo);
 
    *pView = tu_image_view_to_handle(view);
 

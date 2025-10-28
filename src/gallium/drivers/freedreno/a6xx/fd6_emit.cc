@@ -36,6 +36,7 @@
 
 /* Helper to get tex stateobj.
  */
+template <chip CHIP>
 static struct fd_ringbuffer *
 tex_state(struct fd_context *ctx, mesa_shader_stage type)
    assert_dt
@@ -43,7 +44,7 @@ tex_state(struct fd_context *ctx, mesa_shader_stage type)
    if (ctx->tex[type].num_textures == 0)
       return NULL;
 
-   return fd_ringbuffer_ref(fd6_texture_state(ctx, type)->stateobj);
+   return fd_ringbuffer_ref(fd6_texture_state<CHIP>(ctx, type)->stateobj);
 }
 
 static struct fd_ringbuffer *
@@ -560,7 +561,7 @@ fd6_emit_3d_state(fd_cs &cs, struct fd6_emit *emit)
    const struct fd6_program_state *prog = fd6_emit_get_prog(emit);
    const struct ir3_shader_variant *fs = emit->fs;
 
-   emit_marker6(cs, 5);
+   emit_marker6<CHIP>(cs, 5);
 
    /* Special case, we need to re-emit bindless FS state w/ the
     * fb-read state appended:
@@ -668,23 +669,23 @@ fd6_emit_3d_state(fd_cs &cs, struct fd6_emit *emit)
          }
          break;
       case FD6_GROUP_VS_TEX:
-         state = tex_state(ctx, MESA_SHADER_VERTEX);
+         state = tex_state<CHIP>(ctx, MESA_SHADER_VERTEX);
          fd6_state_take_group(&emit->state, state, FD6_GROUP_VS_TEX);
          break;
       case FD6_GROUP_HS_TEX:
-         state = tex_state(ctx, MESA_SHADER_TESS_CTRL);
+         state = tex_state<CHIP>(ctx, MESA_SHADER_TESS_CTRL);
          fd6_state_take_group(&emit->state, state, FD6_GROUP_HS_TEX);
          break;
       case FD6_GROUP_DS_TEX:
-         state = tex_state(ctx, MESA_SHADER_TESS_EVAL);
+         state = tex_state<CHIP>(ctx, MESA_SHADER_TESS_EVAL);
          fd6_state_take_group(&emit->state, state, FD6_GROUP_DS_TEX);
          break;
       case FD6_GROUP_GS_TEX:
-         state = tex_state(ctx, MESA_SHADER_GEOMETRY);
+         state = tex_state<CHIP>(ctx, MESA_SHADER_GEOMETRY);
          fd6_state_take_group(&emit->state, state, FD6_GROUP_GS_TEX);
          break;
       case FD6_GROUP_FS_TEX:
-         state = tex_state(ctx, MESA_SHADER_FRAGMENT);
+         state = tex_state<CHIP>(ctx, MESA_SHADER_FRAGMENT);
          fd6_state_take_group(&emit->state, state, FD6_GROUP_FS_TEX);
          break;
       case FD6_GROUP_SO:
@@ -744,7 +745,7 @@ fd6_emit_cs_state(struct fd_context *ctx, fd_cs &cs, struct fd6_compute_state *c
       case FD6_GROUP_CS_TEX:
          fd6_state_take_group(
                &state,
-               tex_state(ctx, MESA_SHADER_COMPUTE),
+               tex_state<CHIP>(ctx, MESA_SHADER_COMPUTE),
                FD6_GROUP_CS_TEX);
          break;
       case FD6_GROUP_CS_BINDLESS:
@@ -877,14 +878,14 @@ fd6_emit_static_non_context_regs(struct fd_context *ctx, fd_cs &cs)
       ncrb.add(HLSQ_UNKNOWN_BE01(CHIP));
    }
 
-   ncrb.add(A6XX_VPC_DBG_ECO_CNTL(.dword = screen->info->a6xx.magic.VPC_DBG_ECO_CNTL));
-   ncrb.add(A6XX_GRAS_DBG_ECO_CNTL(.dword = screen->info->a6xx.magic.GRAS_DBG_ECO_CNTL));
+   ncrb.add(VPC_DBG_ECO_CNTL(CHIP, .dword = screen->info->a6xx.magic.VPC_DBG_ECO_CNTL));
+   ncrb.add(GRAS_DBG_ECO_CNTL(CHIP, .dword = screen->info->a6xx.magic.GRAS_DBG_ECO_CNTL));
    if (CHIP == A6XX)
       ncrb.add(HLSQ_DBG_ECO_CNTL(CHIP, .dword = screen->info->a6xx.magic.HLSQ_DBG_ECO_CNTL));
    ncrb.add(A6XX_SP_CHICKEN_BITS(.dword = screen->info->a6xx.magic.SP_CHICKEN_BITS));
 
-   ncrb.add(A6XX_UCHE_UNKNOWN_0E12(.dword = screen->info->a6xx.magic.UCHE_UNKNOWN_0E12));
-   ncrb.add(A6XX_UCHE_CLIENT_PF(.dword = screen->info->a6xx.magic.UCHE_CLIENT_PF));
+   ncrb.add(UCHE_UNKNOWN_0E12(CHIP, .dword = screen->info->a6xx.magic.UCHE_UNKNOWN_0E12));
+   ncrb.add(UCHE_CLIENT_PF(CHIP, .dword = screen->info->a6xx.magic.UCHE_CLIENT_PF));
 
    if (CHIP == A6XX) {
       ncrb.add(HLSQ_SHARED_CONSTS(CHIP));
@@ -892,7 +893,7 @@ fd6_emit_static_non_context_regs(struct fd_context *ctx, fd_cs &cs)
    }
 
    ncrb.add(GRAS_SC_SCREEN_SCISSOR_CNTL(CHIP));
-   ncrb.add(A6XX_VPC_UNKNOWN_9602());
+   ncrb.add(VPC_LB_MODE_CNTL(CHIP));
 
    /* These regs are blocked (CP_PROTECT) on a6xx: */
    if (CHIP >= A7XX) {
@@ -908,7 +909,10 @@ fd6_emit_static_non_context_regs(struct fd_context *ctx, fd_cs &cs)
       ncrb.add(RB_BIN_FOVEAT(CHIP));
    }
 
-   ncrb.add(A6XX_PC_UNKNOWN_9E72());
+   ncrb.add(PC_CONTEXT_SWITCH_GFX_PREEMPTION_MODE(CHIP));
+
+   if (CHIP == A7XX)
+      ncrb.add(RB_UNKNOWN_8E09(CHIP, 0x4));
 }
 
 /**
@@ -925,9 +929,9 @@ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
    fd_crb crb(cs, 80);
 
    crb.add(SP_GFX_USIZE(CHIP));
-   crb.add(A6XX_SP_UNKNOWN_B182());
+   crb.add(A6XX_TPL1_PS_ROTATION_CNTL());
 
-   crb.add(A6XX_RB_UNKNOWN_8E01(.dword = screen->info->a6xx.magic.RB_UNKNOWN_8E01));
+   crb.add(A6XX_RB_RBP_CNTL(.dword = screen->info->a6xx.magic.RB_RBP_CNTL));
    crb.add(A6XX_SP_UNKNOWN_A9A8());
 
    crb.add(A6XX_SP_MODE_CNTL(
@@ -940,7 +944,7 @@ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
    crb.add(A6XX_VFD_MODE_CNTL(.vertex = true, .instance = true));
    if (CHIP == A6XX)
       crb.add(VPC_UNKNOWN_9107(CHIP));
-   crb.add(A6XX_RB_UNKNOWN_8811(.dword = 0x00000010));
+   crb.add(A6XX_RB_MODE_CNTL(.dword = 0x00000010));
    crb.add(PC_MODE_CNTL(CHIP, .dword=screen->info->a6xx.magic.PC_MODE_CNTL));
    crb.add(GRAS_LRZ_PS_INPUT_CNTL(CHIP));
    crb.add(A6XX_GRAS_LRZ_PS_SAMPLEFREQ_CNTL());
@@ -968,7 +972,7 @@ fd6_emit_static_context_regs(struct fd_context *ctx, fd_cs &cs)
       crb.add(VPC_RAST_STREAM_CNTL_V2(CHIP));
 
    crb.add(PC_STEREO_RENDERING_CNTL(CHIP));
-   crb.add(A6XX_SP_UNKNOWN_B183());
+   crb.add(A6XX_TPL1_PS_SWIZZLE_CNTL());
    crb.add(GRAS_SU_CONSERVATIVE_RAS_CNTL(CHIP));
    crb.add(GRAS_SU_VS_SIV_CNTL(CHIP));
    crb.add(GRAS_SC_CNTL(CHIP, .ccusinglecachelinesize = 2));
@@ -1112,7 +1116,7 @@ fd6_emit_restore(fd_cs &cs, struct fd_batch *batch)
 
    fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
 
-   fd6_emit_ib(cs, fd6_context(ctx)->restore);
+   fd6_emit_ib<CHIP>(cs, fd6_context(ctx)->restore);
    fd6_emit_ccu_cntl<CHIP>(cs, screen, false);
 
    uint32_t dwords;

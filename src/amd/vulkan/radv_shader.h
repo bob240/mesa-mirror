@@ -249,7 +249,6 @@ struct radv_shader_layout {
       uint32_t dynamic_offset_start;
    } set[MAX_SETS];
 
-   uint32_t push_constant_size;
    uint32_t dynamic_offset_count;
    bool use_dynamic_descriptors;
 };
@@ -487,6 +486,8 @@ struct radv_shader_dma_submission {
 struct radv_shader_stage;
 
 void radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively);
+void radv_optimize_nir_algebraic_early(nir_shader *shader);
+void radv_optimize_nir_algebraic_late(nir_shader *shader);
 void radv_optimize_nir_algebraic(nir_shader *shader, bool opt_offsets, bool opt_mqsad,
                                  enum amd_gfx_level gfx_level);
 
@@ -646,7 +647,7 @@ get_tcs_input_vertex_stride(unsigned tcs_num_inputs)
 
 void radv_get_tess_wg_info(const struct radv_physical_device *pdev, const ac_nir_tess_io_info *io_info,
                            unsigned tcs_vertices_out, unsigned tcs_num_input_vertices, unsigned tcs_num_lds_inputs,
-                           unsigned *num_patches_per_wg, unsigned *hw_lds_size);
+                           unsigned *num_patches_per_wg, unsigned *lds_size);
 
 void radv_lower_ngg(struct radv_device *device, struct radv_shader_stage *ngg_stage,
                     const struct radv_graphics_state_key *gfx_state);
@@ -708,9 +709,9 @@ uint32_t radv_get_user_sgpr_loc(const struct radv_shader *shader, int idx);
 uint32_t radv_get_user_sgpr(const struct radv_shader *shader, int idx);
 
 static inline bool
-radv_shader_need_indirect_descriptor_sets(const struct radv_shader *shader)
+radv_shader_need_indirect_descriptors(const struct radv_shader *shader)
 {
-   const struct radv_userdata_info *loc = radv_get_user_sgpr_info(shader, AC_UD_INDIRECT_DESCRIPTOR_SETS);
+   const struct radv_userdata_info *loc = radv_get_user_sgpr_info(shader, AC_UD_INDIRECT_DESCRIPTORS);
    return loc->sgpr_idx != -1;
 }
 
