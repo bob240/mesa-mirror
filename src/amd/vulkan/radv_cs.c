@@ -21,10 +21,7 @@ radv_cs_emit_write_event_eop(struct radv_cmd_stream *cs, enum amd_gfx_level gfx_
                              unsigned event_flags, unsigned dst_sel, unsigned int_sel, unsigned data_sel, uint64_t va,
                              uint32_t new_fence, uint64_t gfx9_eop_bug_va)
 {
-   if (cs->hw_ip == AMD_IP_SDMA) {
-      ac_emit_sdma_fence(cs->b, va, new_fence);
-      return;
-   }
+   assert(cs->hw_ip == AMD_IP_GFX || cs->hw_ip == AMD_IP_COMPUTE);
 
    /* The EOP bug is specific to GFX9. Though, RadeonSI also implements it for GFX6-8 but it
     * shouldn't be necessary because it's using SURFACE_SYNC to flush L2. See
@@ -53,15 +50,21 @@ gfx10_cs_emit_cache_flush(struct radv_cmd_stream *cs, enum amd_gfx_level gfx_lev
       *sqtt_flush_bits |= RGP_FLUSH_INVAL_ICACHE;
    }
    if (flush_bits & RADV_CMD_FLAG_INV_SCACHE) {
-      gcr_cntl |= S_586_GL1_INV(1) | S_586_GLK_INV(1);
+      gcr_cntl |= S_586_GLK_INV(1);
 
       *sqtt_flush_bits |= RGP_FLUSH_INVAL_SMEM_L0;
    }
    if (flush_bits & RADV_CMD_FLAG_INV_VCACHE) {
-      gcr_cntl |= S_586_GL1_INV(1) | S_586_GLV_INV(1);
+      gcr_cntl |= S_586_GLV_INV(1);
 
-      *sqtt_flush_bits |= RGP_FLUSH_INVAL_VMEM_L0 | RGP_FLUSH_INVAL_L1;
+      *sqtt_flush_bits |= RGP_FLUSH_INVAL_VMEM_L0;
    }
+   if (flush_bits & (RADV_CMD_FLAG_INV_SCACHE | RADV_CMD_FLAG_INV_VCACHE) && gfx_level < GFX12) {
+      gcr_cntl |= S_586_GL1_INV(1);
+
+      *sqtt_flush_bits |= RGP_FLUSH_INVAL_L1;
+   }
+
    if (flush_bits & RADV_CMD_FLAG_INV_L2) {
       /* Writeback and invalidate everything in L2. */
       gcr_cntl |= S_586_GL2_INV(1) | S_586_GL2_WB(1);
@@ -150,8 +153,10 @@ gfx10_cs_emit_cache_flush(struct radv_cmd_stream *cs, enum amd_gfx_level gfx_lev
          /* Send an event that flushes caches. */
          ac_emit_cp_release_mem_pws(cs->b, gfx_level, cs->hw_ip, cb_db_event, gcr_cntl);
 
-         gcr_cntl &= C_586_GLM_WB & C_586_GLM_INV & C_586_GLK_WB & C_586_GLK_INV & C_586_GLV_INV & C_586_GL1_INV &
-                     C_586_GL2_INV & C_586_GL2_WB; /* keep SEQ */
+         gcr_cntl &= C_586_GLK_WB & C_586_GLK_INV & C_586_GLV_INV & C_586_GL2_INV & C_586_GL2_WB; /* keep SEQ */
+
+         if (gfx_level < GFX12)
+            gcr_cntl &= C_586_GLM_WB & C_586_GLM_INV & C_586_GL1_INV;
 
          /* Wait for the event and invalidate remaining caches if needed. */
          ac_emit_cp_acquire_mem_pws(cs->b, gfx_level, cs->hw_ip, cb_db_event, V_580_CP_PFP, 0, gcr_cntl);
@@ -202,7 +207,7 @@ gfx10_cs_emit_cache_flush(struct radv_cmd_stream *cs, enum amd_gfx_level gfx_lev
    }
 
    /* Ignore fields that only modify the behavior of other fields. */
-   if (gcr_cntl & C_586_GL1_RANGE & C_586_GL2_RANGE & C_586_SEQ) {
+   if (gcr_cntl & C_586_GL2_RANGE & C_586_SEQ & (gfx_level >= GFX12 ? ~0 : C_586_GL1_RANGE)) {
       ac_emit_cp_acquire_mem(cs->b, gfx_level, cs->hw_ip, V_580_CP_PFP, gcr_cntl);
    } else if ((cb_db_event || (flush_bits & (RADV_CMD_FLAG_VS_PARTIAL_FLUSH | RADV_CMD_FLAG_PS_PARTIAL_FLUSH |
                                              RADV_CMD_FLAG_CS_PARTIAL_FLUSH))) &&

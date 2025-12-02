@@ -557,30 +557,30 @@ r2d_teardown(struct tu_cmd_buffer *cmd,
 static void
 r2d_run(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
-   if (cmd->device->physical_device->info->a6xx.magic.RB_DBG_ECO_CNTL_blit !=
-       cmd->device->physical_device->info->a6xx.magic.RB_DBG_ECO_CNTL) {
+   if (cmd->device->physical_device->info->magic.RB_DBG_ECO_CNTL_blit !=
+       cmd->device->physical_device->info->magic.RB_DBG_ECO_CNTL) {
       /* This a non-context register, so we have to WFI before changing. */
       tu_cs_emit_wfi(cs);
       tu_cs_emit_write_reg(
          cs, REG_A6XX_RB_DBG_ECO_CNTL,
-         cmd->device->physical_device->info->a6xx.magic.RB_DBG_ECO_CNTL_blit);
+         cmd->device->physical_device->info->magic.RB_DBG_ECO_CNTL_blit);
    }
 
    /* TODO: try to track when there has been a draw without any intervening
     * WFI or CP_EVENT_WRITE and only WFI then.
     */
-   if (cmd->device->physical_device->info->a6xx.blit_wfi_quirk)
+   if (cmd->device->physical_device->info->props.blit_wfi_quirk)
       tu_cs_emit_wfi(cs);
 
    tu_cs_emit_pkt7(cs, CP_BLIT, 1);
    tu_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
 
-   if (cmd->device->physical_device->info->a6xx.magic.RB_DBG_ECO_CNTL_blit !=
-       cmd->device->physical_device->info->a6xx.magic.RB_DBG_ECO_CNTL) {
+   if (cmd->device->physical_device->info->magic.RB_DBG_ECO_CNTL_blit !=
+       cmd->device->physical_device->info->magic.RB_DBG_ECO_CNTL) {
       tu_cs_emit_wfi(cs);
       tu_cs_emit_write_reg(
          cs, REG_A6XX_RB_DBG_ECO_CNTL,
-         cmd->device->physical_device->info->a6xx.magic.RB_DBG_ECO_CNTL);
+         cmd->device->physical_device->info->magic.RB_DBG_ECO_CNTL);
    }
 }
 
@@ -767,8 +767,8 @@ compile_shader(struct tu_device *dev, struct nir_shader *nir,
 {
    nir->options = ir3_get_compiler_options(dev->compiler);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs, nir->info.stage);
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs, nir->info.stage);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 
    struct ir3_const_allocations const_allocs = {};
    if (consts > 0)
@@ -889,8 +889,6 @@ r3d_common(struct tu_cmd_buffer *cmd, struct tu_cs *cs, enum r3d_type type,
    tu6_emit_vpc<CHIP>(cs, vs, NULL, NULL, NULL, fs);
 
    if (CHIP >= A7XX) {
-      tu_cs_emit_regs(cs, GRAS_MODE_CNTL(CHIP, 0x2));
-
       tu_cs_emit_regs(cs, A7XX_SP_RENDER_CNTL(.fs_disable = false));
    }
 
@@ -1581,7 +1579,7 @@ r3d_setup(struct tu_cmd_buffer *cmd,
    if (!cmd->state.pass) {
       tu_emit_cache_flush_ccu<CHIP>(cmd, cs, TU_CMD_CCU_SYSMEM);
       tu6_emit_window_scissor(cs, 0, 0, 0x3fff, 0x3fff);
-      if (cmd->device->physical_device->info->a7xx.has_hw_bin_scaling) {
+      if (cmd->device->physical_device->info->props.has_hw_bin_scaling) {
          tu_cs_emit_regs(cs, A7XX_GRAS_BIN_FOVEAT());
          tu_cs_emit_regs(cs, A7XX_RB_BIN_FOVEAT());
       }
@@ -1609,8 +1607,6 @@ r3d_setup(struct tu_cmd_buffer *cmd,
             .rt6_sysmem = true,
             .rt7_sysmem = true,
          ));
-         tu_cs_emit_regs(cs,
-            A7XX_RB_CCU_DBG_ECO_CNTL(cmd->device->physical_device->info->a6xx.magic.RB_CCU_DBG_ECO_CNTL));
       }
    }
 
@@ -2133,18 +2129,22 @@ tu6_clear_lrz(struct tu_cmd_buffer *cmd,
     */
    tu_emit_event_write<CHIP>(cmd, &cmd->cs, FD_CACHE_CLEAN);
 
-   ops->setup(cmd, cs, PIPE_FORMAT_Z16_UNORM, PIPE_FORMAT_Z16_UNORM,
-              VK_IMAGE_ASPECT_DEPTH_BIT, 0, true, false,
-              VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT);
-   ops->clear_value(cmd, cs, PIPE_FORMAT_Z16_UNORM, value);
-   ops->dst_buffer(cs, PIPE_FORMAT_Z16_UNORM,
-                   image->iova + image->lrz_layout.lrz_offset,
-                   image->lrz_layout.lrz_pitch * 2, PIPE_FORMAT_Z16_UNORM);
-   uint32_t lrz_height = image->lrz_layout.lrz_height * image->vk.array_layers;
-   ops->coords(cmd, cs, (VkOffset2D) {}, blt_no_coord,
-               (VkExtent2D) { image->lrz_layout.lrz_pitch, lrz_height });
-   ops->run(cmd, cs);
-   ops->teardown(cmd, cs);
+   const unsigned lrz_buffers = CHIP >= A7XX ? 2 : 1;
+   for (unsigned i = 0; i < lrz_buffers; i++) {
+      ops->setup(cmd, cs, PIPE_FORMAT_Z16_UNORM, PIPE_FORMAT_Z16_UNORM,
+                 VK_IMAGE_ASPECT_DEPTH_BIT, 0, true, false,
+                 VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT);
+      ops->clear_value(cmd, cs, PIPE_FORMAT_Z16_UNORM, value);
+      ops->dst_buffer(cs, PIPE_FORMAT_Z16_UNORM,
+                      image->iova + image->lrz_layout.lrz_offset +
+                      i * image->lrz_layout.lrz_buffer_size,
+                      image->lrz_layout.lrz_pitch * 2, PIPE_FORMAT_Z16_UNORM);
+      uint32_t lrz_height = image->lrz_layout.lrz_height * image->vk.array_layers;
+      ops->coords(cmd, cs, (VkOffset2D) {}, blt_no_coord,
+                  (VkExtent2D) { image->lrz_layout.lrz_pitch, lrz_height });
+      ops->run(cmd, cs);
+      ops->teardown(cmd, cs);
+   }
 
    /* Clearing writes via CCU color in the PS stage, and LRZ is read via
     * UCHE in the earlier GRAS stage.
@@ -3889,7 +3889,7 @@ use_generic_clear_for_image_clear(struct tu_cmd_buffer *cmd,
                                   struct tu_image *image)
 {
    const struct fd_dev_info *info = cmd->device->physical_device->info;
-   return info->a7xx.has_generic_clear &&
+   return info->props.has_generic_clear &&
           /* A7XX supports R9G9B9E5_FLOAT as color attachment and supports
            * generic clears for it. A7XX TODO: allow R9G9B9E5_FLOAT
            * attachments.
@@ -3899,7 +3899,7 @@ use_generic_clear_for_image_clear(struct tu_cmd_buffer *cmd,
            * dimensions (e.g. 960x540), and having GMEM renderpass afterwards
            * may lead to a GPU fault on A7XX.
            */
-          !(info->a7xx.r8g8_faulty_fast_clear_quirk && image_is_r8g8(image));
+          !(info->props.r8g8_faulty_fast_clear_quirk && image_is_r8g8(image));
 }
 
 template <chip CHIP>
@@ -4683,7 +4683,7 @@ tu_CmdClearAttachments(VkCommandBuffer commandBuffer,
       tu_lrz_disable_during_renderpass<CHIP>(cmd, "CmdClearAttachments");
    }
 
-   if (cmd->device->physical_device->info->a7xx.has_generic_clear &&
+   if (cmd->device->physical_device->info->props.has_generic_clear &&
        /* Both having predication and not knowing layout could be solved
         * by cs patching, which is exactly what prop driver is doing.
         * We don't implement it because we don't expect a reasonable impact.

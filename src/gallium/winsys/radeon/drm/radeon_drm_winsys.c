@@ -244,7 +244,6 @@ static bool do_winsys_init(struct radeon_drm_winsys *ws)
 #define CHIPSET(pci_id, cfamily) \
    case pci_id: \
    ws->info.family = CHIP_##cfamily; \
-   ws->info.name = #cfamily; \
    ws->gen = DRV_SI; \
    break;
 #include "pci_ids/radeonsi_pci_ids.h"
@@ -629,7 +628,7 @@ static bool do_winsys_init(struct radeon_drm_winsys *ws)
    ws->info.tcc_cache_line_size = 64; /* TC L2 line size on GCN */
    ws->info.has_bo_metadata = false;
    ws->info.has_eqaa_surface_allocator = false;
-   ws->info.has_sparse_vm_mappings = false;
+   ws->info.has_sparse = false;
    ws->info.max_alignment = 1024*1024;
    ws->info.has_graphics = true;
    ws->info.cpdma_prefetch_writes_memory = true;

@@ -75,7 +75,7 @@ wsi_device_init(struct wsi_device *wsi,
    const char *present_mode;
    UNUSED VkResult result;
 
-   WSI_DEBUG = parse_debug_string(getenv("MESA_VK_WSI_DEBUG"), debug_control);
+   WSI_DEBUG = parse_debug_string(os_get_option("MESA_VK_WSI_DEBUG"), debug_control);
 
    util_cpu_trace_init();
 
@@ -249,7 +249,7 @@ wsi_device_init(struct wsi_device *wsi,
       goto fail;
 #endif
 
-   present_mode = getenv("MESA_VK_WSI_PRESENT_MODE");
+   present_mode = os_get_option("MESA_VK_WSI_PRESENT_MODE");
    if (present_mode) {
       if (!strcmp(present_mode, "fifo")) {
          wsi->override_present_mode = VK_PRESENT_MODE_FIFO_KHR;
@@ -281,6 +281,12 @@ wsi_device_init(struct wsi_device *wsi,
          wsi->force_swapchain_to_currentExtent =
             driQueryOptionb(dri_options, "vk_wsi_force_swapchain_to_current_extent");
       }
+
+      if (driCheckOption(dri_options, "vk_wsi_disable_unordered_submits",  DRI_BOOL)) {
+         wsi->disable_unordered_submits =
+            driQueryOptionb(dri_options, "vk_wsi_disable_unordered_submits");
+      }
+
    }
 
    /* can_present_on_device is a function pointer used to determine if images
@@ -1044,7 +1050,13 @@ wsi_CreateSwapchainKHR(VkDevice _device,
          .sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
       };
       iface->get_capabilities2(surface, wsi_device, NULL, &caps2);
-      info.imageExtent = caps2.surfaceCapabilities.currentExtent;
+
+      /* 0xffffffff (UINT32_MAX) indicates that the surface has no intrinsic extent, so the size of the
+       * surface will be the size of the swapchain. In this case, overriding the swapchain size makes
+       * no sense.
+       */
+      if (caps2.surfaceCapabilities.currentExtent.width != UINT32_MAX)
+         info.imageExtent = caps2.surfaceCapabilities.currentExtent;
    }
 
    /* Ignore DEFERRED_MEMORY_ALLOCATION_BIT. Would require deep plumbing to be able to take advantage of it.
@@ -1125,8 +1137,8 @@ wsi_DestroySwapchainKHR(VkDevice _device,
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-wsi_ReleaseSwapchainImagesEXT(VkDevice _device,
-                              const VkReleaseSwapchainImagesInfoEXT *pReleaseInfo)
+wsi_ReleaseSwapchainImagesKHR(VkDevice _device,
+                              const VkReleaseSwapchainImagesInfoKHR *pReleaseInfo)
 {
    VK_FROM_HANDLE(wsi_swapchain, swapchain, pReleaseInfo->swapchain);
 
@@ -1366,7 +1378,8 @@ wsi_queue_submit2_unordered(const struct wsi_device *wsi,
                             uint32_t fence_count,
                             const VkFence *fences)
 {
-   if (info->commandBufferInfoCount == 0 &&
+   if (!wsi->disable_unordered_submits &&
+       info->commandBufferInfoCount == 0 &&
        queue->base.device->copy_sync_payloads != NULL) {
       /* This helper is unordered so if there are no command buffers, we can
        * just signal the signal semaphores and fences with the wait semaphores
@@ -1506,8 +1519,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
       vk_find_struct_const(pPresentInfo->pNext, PRESENT_ID_KHR);
    const VkPresentId2KHR *present_ids2 =
       vk_find_struct_const(pPresentInfo->pNext, PRESENT_ID_2_KHR);
-   const VkSwapchainPresentFenceInfoEXT *present_fence_info =
-      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_FENCE_INFO_EXT);
+   const VkSwapchainPresentFenceInfoKHR *present_fence_info =
+      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_FENCE_INFO_KHR);
 
    /* Gather up all the semaphores and fences we need to signal per-image */
    STACK_ARRAY(struct wsi_image_signal_info, image_signal_infos,
@@ -1713,8 +1726,8 @@ wsi_common_queue_present(const struct wsi_device *wsi,
    /* Finally, we can present */
    const VkPresentRegionsKHR *regions =
       vk_find_struct_const(pPresentInfo->pNext, PRESENT_REGIONS_KHR);
-   const VkSwapchainPresentModeInfoEXT *present_mode_info =
-      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_MODE_INFO_EXT);
+   const VkSwapchainPresentModeInfoKHR *present_mode_info =
+      vk_find_struct_const(pPresentInfo->pNext, SWAPCHAIN_PRESENT_MODE_INFO_KHR);
 
    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
       VK_FROM_HANDLE(wsi_swapchain, swapchain, pPresentInfo->pSwapchains[i]);

@@ -484,6 +484,7 @@ vtn_pointer_dereference(struct vtn_builder *b,
       nir_def *index = vtn_access_link_as_ssa(b, deref_chain->link[0], 1,
                                                   tail->def.bit_size);
       tail = nir_build_deref_ptr_as_array(&b->nb, tail, index);
+      tail->arr.in_bounds = deref_chain->in_bounds;
       idx++;
    }
 
@@ -506,8 +507,8 @@ vtn_pointer_dereference(struct vtn_builder *b,
             type = type->array_element;
          }
          tail = nir_build_deref_array(&b->nb, tail, arr_index);
+         tail->arr.in_bounds = deref_chain->in_bounds;
       }
-      tail->arr.in_bounds = deref_chain->in_bounds;
 
       access |= type->access;
    }
@@ -597,7 +598,7 @@ get_deref_tail(nir_deref_instr *deref)
       nir_def_as_deref(deref->parent.ssa);
 
    if (parent->deref_type == nir_deref_type_cast &&
-       parent->parent.ssa->parent_instr->type == nir_instr_type_deref) {
+       nir_def_is_deref(parent->parent.ssa)) {
       nir_deref_instr *grandparent =
          nir_def_as_deref(parent->parent.ssa);
 
@@ -940,16 +941,17 @@ vtn_get_builtin_location(struct vtn_builder *b,
       break;
    case SpvBuiltInLayer:
    case SpvBuiltInLayerPerViewNV:
-      *location = VARYING_SLOT_LAYER;
       if (b->shader->info.stage == MESA_SHADER_FRAGMENT) {
-         *mode = nir_var_shader_in;
-         *interp_mode = INTERP_MODE_FLAT;
+         *location = SYSTEM_VALUE_LAYER_ID;
+         set_mode_system_value(b, mode);
       } else if (b->shader->info.stage == MESA_SHADER_GEOMETRY) {
+         *location = VARYING_SLOT_LAYER;
          *mode = nir_var_shader_out;
       } else if (b->supported_capabilities.ShaderViewportIndexLayerEXT &&
                (b->shader->info.stage == MESA_SHADER_VERTEX ||
                 b->shader->info.stage == MESA_SHADER_TESS_EVAL ||
                 b->shader->info.stage == MESA_SHADER_MESH)) {
+         *location = VARYING_SLOT_LAYER;
          *mode = nir_var_shader_out;
       } else {
          vtn_fail("invalid stage for SpvBuiltInLayer");

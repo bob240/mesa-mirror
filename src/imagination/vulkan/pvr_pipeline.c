@@ -47,6 +47,7 @@
 #include "pvr_hw_pass.h"
 #include "pvr_pass.h"
 #include "pvr_pds.h"
+#include "pvr_physical_device.h"
 #include "pvr_robustness.h"
 #include "pvr_types.h"
 #include "pvr_usc.h"
@@ -101,7 +102,7 @@ static VkResult pvr_pds_coeff_program_create_and_upload(
                               allocator,
                               staging_buffer_size,
                               8,
-                              VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!staging_buffer)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -152,7 +153,7 @@ static VkResult pvr_pds_fragment_program_create(
                               allocator,
                               staging_buffer_size,
                               8,
-                              VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
    if (!staging_buffer)
       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
@@ -979,7 +980,7 @@ static VkResult pvr_compute_pipeline_compile(
 {
    struct vk_pipeline_layout *layout = compute_pipeline->base.layout;
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    pco_ctx *pco_ctx = device->pdevice->pco_ctx;
    void *shader_mem_ctx = ralloc_context(NULL);
    pco_data shader_data = { 0 };
@@ -2604,7 +2605,7 @@ pvr_graphics_pipeline_compile(struct pvr_device *const device,
 {
    struct vk_pipeline_layout *layout = gfx_pipeline->base.layout;
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    VkResult result;
 
    struct pvr_vertex_shader_state *vertex_state =

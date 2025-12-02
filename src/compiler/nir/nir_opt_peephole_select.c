@@ -92,8 +92,8 @@ block_check_for_allowed_instrs(nir_block *block, unsigned *count,
          }
 
          case nir_instr_type_call:
+         case nir_instr_type_cmat_call:
          case nir_instr_type_jump:
-         case nir_instr_type_parallel_copy:
             return false;
          }
       }

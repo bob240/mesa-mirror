@@ -305,13 +305,13 @@ emit_lrz_clears(struct fd_batch *batch)
 
          fd6_emit_flushes<CHIP>(ctx, cs, FD6_FLUSH_CACHE);
 
-         if (ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL_blit !=
-             ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL) {
+         if (ctx->screen->info->magic.RB_DBG_ECO_CNTL_blit !=
+             ctx->screen->info->magic.RB_DBG_ECO_CNTL) {
             /* This a non-context register, so we have to WFI before changing. */
             fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
             fd_pkt4(cs, 1)
                .add(A6XX_RB_DBG_ECO_CNTL(
-                  .dword = ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL_blit
+                  .dword = ctx->screen->info->magic.RB_DBG_ECO_CNTL_blit
                ));
          }
       }
@@ -325,12 +325,12 @@ emit_lrz_clears(struct fd_batch *batch)
    if (count > 0) {
       fd_cs cs(fd_batch_get_prologue(batch));
 
-      if (ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL_blit !=
-          ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL) {
+      if (ctx->screen->info->magic.RB_DBG_ECO_CNTL_blit !=
+          ctx->screen->info->magic.RB_DBG_ECO_CNTL) {
          fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
          fd_pkt4(cs, 1)
             .add(A6XX_RB_DBG_ECO_CNTL(
-               .dword = ctx->screen->info->a6xx.magic.RB_DBG_ECO_CNTL
+               .dword = ctx->screen->info->magic.RB_DBG_ECO_CNTL
             ));
       }
 
@@ -457,7 +457,7 @@ patch_fb_read_sysmem(struct fd_batch *batch)
       const struct fdl_layout *layouts[3] = {&rsc->layout, NULL, NULL};
       struct fdl6_view view;
       fdl6_view_init<CHIP>(&view, layouts, &args,
-                           batch->ctx->screen->info->a6xx.has_z24uint_s8uint);
+                           batch->ctx->screen->info->props.has_z24uint_s8uint);
       memcpy(patch->cs, view.descriptor, FDL6_TEX_CONST_DWORDS * 4);
    }
 
@@ -513,7 +513,7 @@ update_render_cntl(fd_cs &cs, struct fd_screen *screen,
          .flag_mrts = mrts_ubwc_enable,
    );
 
-   if (screen->info->a6xx.has_cp_reg_write) {
+   if (screen->info->props.has_cp_reg_write) {
       fd_pkt7(cs, CP_REG_WRITE, 3)
          .add(CP_REG_WRITE_0(TRACK_RENDER_CNTL))
          .add(CP_REG_WRITE_1(rb_render_cntl.reg))
@@ -734,7 +734,7 @@ emit_common_init(fd_cs &cs, struct fd_batch *batch)
    fd_pkt4(cs, 1)
       .add(A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
 
-   if (!ctx->screen->info->a7xx.has_event_write_sample_count) {
+   if (!ctx->screen->info->props.has_event_write_sample_count) {
       fd_pkt4(cs, 2)
          .add(A6XX_RB_SAMPLE_COUNTER_BASE(
             results_ptr(at, result[result->idx].samples_start)
@@ -773,7 +773,7 @@ emit_common_fini(fd_cs &cs, struct fd_batch *batch)
 
    cs.attach_bo(at->results_mem);
 
-   if (!ctx->screen->info->a7xx.has_event_write_sample_count) {
+   if (!ctx->screen->info->props.has_event_write_sample_count) {
       with_crb (cs, 3) {
          crb.add(A6XX_RB_SAMPLE_COUNTER_CNTL(.copy = true));
          crb.add(A6XX_RB_SAMPLE_COUNTER_BASE(
@@ -961,13 +961,6 @@ emit_binning_pass(fd_cs &cs, struct fd_batch *batch) assert_dt
 
    update_vsc_pipe<CHIP>(cs, batch);
 
-   if (CHIP == A6XX) {
-      fd_pkt4(cs, 1)
-         .add(A6XX_PC_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
-      fd_pkt4(cs, 1)
-         .add(A6XX_VFD_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
-   }
-
    fd6_event_write<CHIP>(batch->ctx, cs, FD_VSC_BINNING_START);
 
    fd_crb(cs, 2)
@@ -1071,12 +1064,7 @@ fd6_build_preemption_preamble(struct fd_context *ctx)
    fd6_emit_static_regs<CHIP>(cs, ctx);
    fd6_emit_ccu_cntl<CHIP>(cs, screen, false);
 
-   if (CHIP == A6XX) {
-      fd_pkt4(cs, 1)
-         .add(A6XX_PC_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
-      fd_pkt4(cs, 1)
-         .add(A6XX_VFD_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
-   } else if (CHIP >= A7XX) {
+   if (CHIP >= A7XX) {
       fd7_emit_static_binning_regs<CHIP>(cs);
    }
 
@@ -1172,21 +1160,14 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
 
          set_bin_size<CHIP>(crb, gmem, {
                .render_mode = RENDERING_PASS,
-               .force_lrz_write_dis = !screen->info->a6xx.has_lrz_feedback,
+               .force_lrz_write_dis = !screen->info->props.has_lrz_feedback,
                .buffers_location = BUFFERS_IN_GMEM,
-               .lrz_feedback_zmode_mask = screen->info->a6xx.has_lrz_feedback
+               .lrz_feedback_zmode_mask = screen->info->props.has_lrz_feedback
                                              ? LRZ_FEEDBACK_EARLY_Z_LATE_Z
                                              : LRZ_FEEDBACK_NONE,
          });
 
          crb.add(A6XX_VFD_RENDER_MODE(RENDERING_PASS));
-      }
-
-      if (CHIP == A6XX) {
-         fd_pkt4(cs, 1)
-            .add(A6XX_PC_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
-         fd_pkt4(cs, 1)
-            .add(A6XX_VFD_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
       }
 
       fd_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1)
@@ -1210,10 +1191,10 @@ fd6_emit_tile_init(struct fd_batch *batch) assert_dt
 
          set_bin_size<CHIP>(crb, gmem, {
                .render_mode = RENDERING_PASS,
-               .force_lrz_write_dis = !screen->info->a6xx.has_lrz_feedback,
+               .force_lrz_write_dis = !screen->info->props.has_lrz_feedback,
                .buffers_location = BUFFERS_IN_GMEM,
                .lrz_feedback_zmode_mask =
-                  screen->info->a6xx.has_lrz_feedback
+                  screen->info->props.has_lrz_feedback
                      ? LRZ_FEEDBACK_EARLY_Z_OR_EARLY_Z_LATE_Z
                      : LRZ_FEEDBACK_NONE,
          });
@@ -1312,21 +1293,14 @@ fd6_emit_tile_prep(struct fd_batch *batch, const struct fd_tile *tile)
 
          set_bin_size<CHIP>(crb, gmem, {
                .render_mode = RENDERING_PASS,
-               .force_lrz_write_dis = !screen->info->a6xx.has_lrz_feedback,
+               .force_lrz_write_dis = !screen->info->props.has_lrz_feedback,
                .buffers_location = BUFFERS_IN_GMEM,
-               .lrz_feedback_zmode_mask = screen->info->a6xx.has_lrz_feedback
+               .lrz_feedback_zmode_mask = screen->info->props.has_lrz_feedback
                                              ? LRZ_FEEDBACK_EARLY_Z_LATE_Z
                                              : LRZ_FEEDBACK_NONE,
          });
 
          crb.add(A6XX_VFD_RENDER_MODE(RENDERING_PASS));
-      }
-
-      if (CHIP == A6XX) {
-         fd_pkt4(cs, 1)
-            .add(A6XX_PC_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
-         fd_pkt4(cs, 1)
-            .add(A6XX_VFD_POWER_CNTL(screen->info->a6xx.magic.PC_POWER_CNTL));
       }
 
       fd_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1)
@@ -1345,9 +1319,9 @@ fd6_emit_tile_prep(struct fd_batch *batch, const struct fd_tile *tile)
 
       set_bin_size<CHIP>(crb, gmem, {
             .render_mode = RENDERING_PASS,
-            .force_lrz_write_dis = !screen->info->a6xx.has_lrz_feedback,
+            .force_lrz_write_dis = !screen->info->props.has_lrz_feedback,
             .buffers_location = BUFFERS_IN_GMEM,
-            .lrz_feedback_zmode_mask = screen->info->a6xx.has_lrz_feedback
+            .lrz_feedback_zmode_mask = screen->info->props.has_lrz_feedback
                                           ? LRZ_FEEDBACK_EARLY_Z_LATE_Z
                                           : LRZ_FEEDBACK_NONE,
       });
@@ -1366,8 +1340,8 @@ set_blit_scissor(struct fd_batch *batch, fd_cs &cs)
 
    blit_scissor.minx = 0;
    blit_scissor.miny = 0;
-   blit_scissor.maxx = ALIGN(pfb->width, 16);
-   blit_scissor.maxy = ALIGN(pfb->height, 4);
+   blit_scissor.maxx = align(pfb->width, 16);
+   blit_scissor.maxy = align(pfb->height, 4);
 
    fd_pkt4(cs, 2)
       .add(A6XX_RB_RESOLVE_CNTL_1(.x = blit_scissor.minx, .y = blit_scissor.miny))
@@ -2045,7 +2019,7 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
          .add(GRAS_MODE_CNTL(CHIP, 0x2));
    }
 
-   with_crb (cs, 11) {
+   with_crb (cs, 10) {
       set_window_offset<CHIP>(crb, 0, 0);
 
       set_bin_size<CHIP>(crb, NULL, {
@@ -2066,7 +2040,6 @@ fd6_emit_sysmem_prep(struct fd_batch *batch) assert_dt
             .rt6_sysmem = true,
             .rt7_sysmem = true,
          ));
-         crb.add(RB_CCU_DBG_ECO_CNTL(CHIP, batch->ctx->screen->info->a6xx.magic.RB_CCU_DBG_ECO_CNTL));
          crb.add(GRAS_LRZ_CB_CNTL(CHIP, 0x0));
       }
 

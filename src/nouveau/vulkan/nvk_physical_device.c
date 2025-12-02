@@ -37,6 +37,7 @@
 #include "cla0c0.h"
 #include "cla197.h"
 #include "cla1c0.h"
+#include "cla297.h"
 #include "clb097.h"
 #include "clb0c0.h"
 #include "clb197.h"
@@ -97,6 +98,13 @@ nvk_is_conformant(const struct nv_device_info *info)
    return false;
 }
 
+static bool
+nvk_has_astc(const struct nv_device_info *info)
+{
+   /* ASTC only exists on Tegra TK1 and later */
+   return info->type == NV_DEVICE_TYPE_SOC && info->cls_eng3d >= KEPLER_C;
+}
+
 static void
 nvk_get_device_extensions(const struct nvk_instance *instance,
                           const struct nv_device_info *info,
@@ -152,6 +160,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_maintenance10 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
+      .KHR_pipeline_binary = true,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
 #ifdef NVK_USE_WSI_PLATFORM
@@ -186,6 +195,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .KHR_storage_buffer_storage_class = true,
 #ifdef NVK_USE_WSI_PLATFORM
       .KHR_swapchain = true,
+      .KHR_swapchain_maintenance1 = true,
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
@@ -270,6 +280,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
       .EXT_shader_viewport_index_layer = info->cls_eng3d >= MAXWELL_B,
+      .EXT_shader_uniform_buffer_unsized_array = true,
       .EXT_subgroup_size_control = true,
 #ifdef NVK_USE_WSI_PLATFORM
       .EXT_swapchain_maintenance1 = true,
@@ -329,7 +340,7 @@ nvk_get_device_features(const struct nv_device_info *info,
       .samplerAnisotropy = true,
       .textureCompressionETC2 = false,
       .textureCompressionBC = true,
-      .textureCompressionASTC_LDR = false,
+      .textureCompressionASTC_LDR = nvk_has_astc(info),
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
       .vertexPipelineStoresAndAtomics = true,
@@ -490,6 +501,9 @@ nvk_get_device_features(const struct nv_device_info *info,
       /* VK_KHR_maintenance10 */
       .maintenance10 = true,
 
+      /* VK_KHR_pipeline_binary */
+      .pipelineBinaries = true,
+
       /* VK_KHR_pipeline_executable_properties */
       .pipelineExecutableInfo = true,
 
@@ -645,7 +659,7 @@ nvk_get_device_features(const struct nv_device_info *info,
       .imageSlicedViewOf3D = true,
 
 #ifdef NVK_USE_WSI_PLATFORM
-      /* VK_EXT_swapchain_maintenance1 */
+      /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 #endif
 
@@ -704,6 +718,9 @@ nvk_get_device_features(const struct nv_device_info *info,
 
       /* VK_EXT_shader_replicated_composites */
       .shaderReplicatedComposites = true,
+
+      /* VK_EXT_shader_uniform_buffer_unsized_array */
+      .shaderUniformBufferUnsizedArray = true,
 
       /* VK_EXT_texel_buffer_alignment */
       .texelBufferAlignment = true,
@@ -1029,6 +1046,13 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       /* VK_KHR_compute_shader_derivatives */
       .meshAndTaskShaderDerivatives = false,
 
+      /* VK_KHR_pipeline_binary
+       *
+       * InternalCache properties are set by
+       * nvk_physical_device_init_pipeline_cache()
+       */
+      .pipelineBinaryCompressedData = false,
+
       /* VK_EXT_conservative_rasterization */
       .primitiveOverestimationSize = info->cls_eng3d >= VOLTA_A ? 1.0f / 512.0f : 0.0,
       .maxExtraPrimitiveOverestimationSize = 0.75,
@@ -1223,7 +1247,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
 
    /* VK_EXT_host_image_copy */
 
-   /* Not sure if there are layout specific things, so for now just reporting 
+   /* Not sure if there are layout specific things, so for now just reporting
     * all layouts from extensions.
     */
    static const VkImageLayout supported_layouts[] = {
@@ -1309,6 +1333,12 @@ nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
 
    const uint64_t driver_flags = nvk_physical_device_compiler_flags(pdev);
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+   if (pdev->vk.disk_cache != NULL) {
+      pdev->vk.properties.pipelineBinaryInternalCache = true;
+      pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
+      pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;
+      pdev->vk.properties.pipelineBinaryPrecompiledInternalCache = true;
+   }
 #endif
 }
 

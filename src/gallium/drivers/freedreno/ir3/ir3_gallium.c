@@ -293,7 +293,7 @@ ir3_shader_compute_state_create(struct pipe_context *pctx,
    if (ctx->screen->gen >= 6)
       ir3_nir_lower_io_to_bindless(nir);
 
-   if (ctx->screen->gen >= 6 && !ctx->screen->info->a6xx.supports_double_threadsize) {
+   if (ctx->screen->gen >= 6 && !ctx->screen->info->props.supports_double_threadsize) {
       api_wavesize = IR3_SINGLE_ONLY;
       real_wavesize = IR3_SINGLE_ONLY;
    }
@@ -481,7 +481,8 @@ ir3_fixup_shader_state(struct pipe_context *pctx, struct ir3_shader_key *key)
 }
 
 static void
-ir3_screen_finalize_nir(struct pipe_screen *pscreen, struct nir_shader *nir)
+ir3_screen_finalize_nir(struct pipe_screen *pscreen, struct nir_shader *nir,
+                        bool optimize)
 {
    struct fd_screen *screen = fd_screen(pscreen);
 
@@ -647,7 +648,7 @@ ir3_get_private_mem(struct fd_context *ctx, const struct ir3_shader_variant *so)
       if (ctx->pvtmem[so->pvtmem_per_wave].bo)
          fd_bo_del(ctx->pvtmem[so->pvtmem_per_wave].bo);
 
-      uint32_t per_sp_size = ALIGN(per_fiber_size * fibers_per_sp, 1 << 12);
+      uint32_t per_sp_size = align(per_fiber_size * fibers_per_sp, 1 << 12);
       uint32_t total_size = per_sp_size * num_sp_cores;
 
       ctx->pvtmem[so->pvtmem_per_wave].per_fiber_size = per_fiber_size;

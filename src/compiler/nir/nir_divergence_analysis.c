@@ -224,6 +224,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_subgroup_id_shift_ir3:
    case nir_intrinsic_load_base_instance:
    case nir_intrinsic_load_base_vertex:
+   case nir_intrinsic_load_raw_vertex_offset_pan:
    case nir_intrinsic_load_first_vertex:
    case nir_intrinsic_load_draw_id:
    case nir_intrinsic_load_is_indexed_draw:
@@ -357,6 +358,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_core_max_id_arm:
    case nir_intrinsic_load_warp_max_id_arm:
    case nir_intrinsic_load_tess_config_intel:
+   case nir_intrinsic_load_urb_input_handle_intel:
+   case nir_intrinsic_load_urb_output_handle_intel:
       is_divergent = false;
       break;
 
@@ -382,6 +385,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
     * successive SIMD lanes.
     */
    case nir_intrinsic_load_global_block_intel:
+   case nir_intrinsic_load_urb_input_handle_indexed_intel:
       is_divergent = true;
       break;
 
@@ -579,6 +583,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_ubo_vec4:
    case nir_intrinsic_ldc_nv:
    case nir_intrinsic_ldcx_nv:
+   case nir_intrinsic_load_texel_buf_index_address_pan:
       is_divergent = (src_divergent(instr->src[0], state) &&
                       (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM)) ||
                      src_divergent(instr->src[1], state);
@@ -620,7 +625,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    }
 
    case nir_intrinsic_get_ssbo_size:
+   case nir_intrinsic_ssbo_descriptor_amd:
    case nir_intrinsic_deref_buffer_array_length:
+   case nir_intrinsic_load_texel_buf_conv_pan:
       is_divergent = src_divergent(instr->src[0], state) &&
                      (nir_intrinsic_access(instr) & ACCESS_NON_UNIFORM);
       break;
@@ -726,6 +733,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_vulkan_descriptor:
    case nir_intrinsic_load_input_attachment_target_pan:
    case nir_intrinsic_load_input_attachment_conv_pan:
+   case nir_intrinsic_load_converted_mem_pan:
    case nir_intrinsic_atomic_counter_read:
    case nir_intrinsic_atomic_counter_read_deref:
    case nir_intrinsic_quad_swizzle_amd:
@@ -757,7 +765,9 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_frag_offset_ir3:
    case nir_intrinsic_bindless_resource_ir3:
    case nir_intrinsic_ray_intersection_ir3:
-   case nir_intrinsic_read_attribute_payload_intel:
+   case nir_intrinsic_load_attribute_payload_intel:
+   case nir_intrinsic_load_urb_vec4_intel:
+   case nir_intrinsic_load_urb_lsc_intel:
    case nir_intrinsic_load_buffer_ptr_kk:
    case nir_intrinsic_load_texture_handle_kk:
    case nir_intrinsic_load_depth_texture_kk:
@@ -844,6 +854,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_sample_pos_or_center:
    case nir_intrinsic_load_vertex_id_zero_base:
    case nir_intrinsic_load_vertex_id:
+   case nir_intrinsic_load_raw_vertex_id_pan:
    case nir_intrinsic_load_invocation_id:
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_local_invocation_index:
@@ -992,6 +1003,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_store_shared_unlock_nv:
    case nir_intrinsic_bvh_stack_rtn_amd:
    case nir_intrinsic_cmat_load_shared_nv:
+   case nir_intrinsic_cmat_mov_transpose_nv:
       is_divergent = true;
       break;
 
@@ -1212,9 +1224,9 @@ instr_is_loop_invariant(nir_instr *instr, struct divergence_state *state)
    case nir_instr_type_tex:
       return nir_foreach_src(instr, src_invariant, state->loop);
    case nir_instr_type_call:
+   case nir_instr_type_cmat_call:
       return false;
    case nir_instr_type_phi:
-   case nir_instr_type_parallel_copy:
    default:
       UNREACHABLE("NIR divergence analysis: Unsupported instruction type.");
    }
@@ -1240,7 +1252,6 @@ update_instr_divergence(nir_instr *instr, struct divergence_state *state)
       return false;
    case nir_instr_type_jump:
    case nir_instr_type_phi:
-   case nir_instr_type_parallel_copy:
    default:
       UNREACHABLE("NIR divergence analysis: Unsupported instruction type.");
    }
@@ -1297,7 +1308,7 @@ visit_if_merge_phi(nir_phi_instr *phi, bool if_cond_divergent, bool ignore_undef
          phi->def.divergent = true;
          return true;
       }
-      if (src->src.ssa->parent_instr->type != nir_instr_type_undef) {
+      if (!nir_src_is_undef(src->src)) {
          defined_srcs++;
       }
    }

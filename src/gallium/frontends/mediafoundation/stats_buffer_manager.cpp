@@ -65,13 +65,15 @@ ULONG __stdcall stats_buffer_manager::Release()
 }
 
 HRESULT
-stats_buffer_manager::Create( struct vl_screen *pVlScreen,
+stats_buffer_manager::Create( void *logId,
+                              struct vl_screen *pVlScreen,
                               struct pipe_context *pPipeContext,
                               REFGUID guidExtension,
                               uint32_t width,
                               uint16_t height,
                               enum pipe_format buffer_format,
-                              unsigned pool_size,
+                              unsigned initial_pool_size,
+                              unsigned max_pool_size,
                               stats_buffer_manager **ppInstance )
 {
    if( !ppInstance )
@@ -79,9 +81,19 @@ stats_buffer_manager::Create( struct vl_screen *pVlScreen,
 
    *ppInstance = nullptr;
 
+   assert( initial_pool_size <= max_pool_size );
+
    HRESULT hr;
-   auto pInstance = new ( std::nothrow )
-      stats_buffer_manager( pVlScreen, pPipeContext, guidExtension, width, height, buffer_format, pool_size, hr );
+   auto pInstance = new ( std::nothrow ) stats_buffer_manager( logId,
+                                                               pVlScreen,
+                                                               pPipeContext,
+                                                               guidExtension,
+                                                               width,
+                                                               height,
+                                                               buffer_format,
+                                                               initial_pool_size,
+                                                               max_pool_size,
+                                                               hr );
    if( !pInstance )
       return E_OUTOFMEMORY;
 
@@ -105,11 +117,21 @@ stats_buffer_manager::get_new_tracked_buffer()
    {
       if( !entry.used )
       {
+         if( !entry.buffer )
+         {
+            entry.buffer = m_pVlScreen->pscreen->resource_create( m_pVlScreen->pscreen, &m_template );
+            if( !entry.buffer )
+            {
+               MFE_ERROR( "[dx12 hmft 0x%p] dynamic resource_create failed", m_logId );
+               break;
+            }
+         }
          entry.used = true;
          return entry.buffer;
       }
    }
 
+   MFE_ERROR( "[dx12 hmft 0x%p] failed to find a free buffer", m_logId );
    assert( false );   // Did not find an unused buffer
    return NULL;
 }
@@ -119,28 +141,47 @@ void
 stats_buffer_manager::release_tracked_buffer( void *target )
 {
    auto lock = std::lock_guard<std::mutex>( m_lock );
+   bool found = false;
    for( auto &entry : m_pool )
    {
+      bool ret;
       struct winsys_handle whandle = {};
       whandle.type = WINSYS_HANDLE_TYPE_D3D12_RES;
-      m_pVlScreen->pscreen->resource_get_handle( m_pVlScreen->pscreen, m_pPipeContext, entry.buffer, &whandle, 0u );
+      ret = m_pVlScreen->pscreen->resource_get_handle( m_pVlScreen->pscreen, m_pPipeContext, entry.buffer, &whandle, 0u );
+      if( !ret )
+      {
+         MFE_ERROR( "[dx12 hmft 0x%p] resource_get_handle failed", m_logId );
+         break;
+      }
       if( whandle.com_obj == target )
       {
          entry.used = false;
+         found = true;
          break;
       }
    }
+
+   if( !found )
+   {
+      MFE_ERROR( "[dx12 hmft 0x%p] returned buffer was not found in the pool", m_logId );
+   }
 }
 
-stats_buffer_manager::stats_buffer_manager( struct vl_screen *pVlScreen,
+stats_buffer_manager::stats_buffer_manager( void *logId,
+                                            struct vl_screen *pVlScreen,
                                             struct pipe_context *pPipeContext,
                                             REFGUID resourceGUID,
                                             uint32_t width,
                                             uint16_t height,
                                             enum pipe_format buffer_format,
-                                            unsigned pool_size,
+                                            unsigned initial_pool_size,
+                                            unsigned max_pool_size,
                                             HRESULT &hr )
-   : m_pVlScreen( pVlScreen ), m_pPipeContext( pPipeContext ), m_resourceGUID( resourceGUID ), m_pool( pool_size, { NULL, false } )
+   : m_logId( logId ),
+     m_pVlScreen( pVlScreen ),
+     m_pPipeContext( pPipeContext ),
+     m_resourceGUID( resourceGUID ),
+     m_pool( max_pool_size, { NULL, false } )
 {
    hr = S_OK;
    m_template.target = PIPE_TEXTURE_2D;
@@ -152,14 +193,20 @@ stats_buffer_manager::stats_buffer_manager( struct vl_screen *pVlScreen,
    m_template.height0 = height;
    m_template.format = buffer_format;
 
+   unsigned buffer_count = 0;
    for( auto &entry : m_pool )
    {
-      entry.buffer = m_pVlScreen->pscreen->resource_create( m_pVlScreen->pscreen, &m_template );
-      if( !entry.buffer )
+      if( buffer_count < initial_pool_size )
       {
-         assert( true );
-         hr = E_FAIL;
-         break;
+         entry.buffer = m_pVlScreen->pscreen->resource_create( m_pVlScreen->pscreen, &m_template );
+         if( !entry.buffer )
+         {
+            MFE_ERROR( "[dx12 hmft 0x%p] resource_create failed", m_logId );
+            assert( false );
+            hr = E_FAIL;
+            break;
+         }
+         buffer_count++;
       }
    }
 
@@ -199,6 +246,7 @@ stats_buffer_manager::OnSampleAvailable( IMFAsyncResult *pResult )
    ComPtr<IMFD3D12SynchronizationObject> spSyncObj;
    ComPtr<ID3D12Resource> spDXGISurface;
    HANDLE hFree = NULL;
+   HMFT_ETW_EVENT_START( "OnSampleAvailable", this );
 
    CHECKHR_GOTO( pResult->GetState( &spUnk ), done );
    CHECKHR_GOTO( spUnk.As( &spSample ), done );
@@ -224,6 +272,7 @@ done:
    {
       CloseHandle( hFree );
    }
+   HMFT_ETW_EVENT_STOP( "OnSampleAvailable", this );
    return hr;
 }
 

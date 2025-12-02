@@ -207,6 +207,7 @@ get_device_extensions(const struct anv_physical_device *device,
          (intel_perf_has_hold_preemption(device->perf) ||
           INTEL_DEBUG(DEBUG_NO_OACONFIG)) &&
          !(device->instance->debug & ANV_DEBUG_NO_SECONDARY_CALL),
+      .KHR_pipeline_binary                   = true,
       .KHR_pipeline_executable_properties    = true,
       .KHR_pipeline_library                  = true,
 #ifdef ANV_USE_WSI_PLATFORM
@@ -246,6 +247,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_storage_buffer_storage_class      = true,
 #ifdef ANV_USE_WSI_PLATFORM
       .KHR_swapchain                         = true,
+      .KHR_swapchain_maintenance1            = true,
       .KHR_swapchain_mutable_format          = true,
 #endif
       .KHR_synchronization2                  = true,
@@ -309,7 +311,7 @@ get_device_extensions(const struct anv_physical_device *device,
                                                VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR,
       .EXT_graphics_pipeline_library         = !(device->instance->debug & ANV_DEBUG_NO_GPL),
       .EXT_hdr_metadata = true,
-      .EXT_host_image_copy                   = !device->emu_astc_ldr,
+      .EXT_host_image_copy                   = true,
       .EXT_host_query_reset                  = true,
       .EXT_image_2d_view_of_3d               = true,
       /* Because of Xe2 PAT selected compression and the Vulkan spec
@@ -573,7 +575,7 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_acceleration_structure */
       .accelerationStructure = rt_enabled,
-      .accelerationStructureCaptureReplay = false, /* TODO */
+      .accelerationStructureCaptureReplay = true,
       .accelerationStructureIndirectBuild = false, /* TODO */
       .accelerationStructureHostCommands = false,
       .descriptorBindingAccelerationStructureUpdateAfterBind = rt_enabled,
@@ -914,7 +916,7 @@ get_features(const struct anv_physical_device *pdevice,
       .shaderQuadControl = true,
 
 #ifdef ANV_USE_WSI_PLATFORM
-      /* VK_EXT_swapchain_maintenance1 */
+      /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 #endif
 
@@ -996,6 +998,9 @@ get_features(const struct anv_physical_device *pdevice,
 
       /* VK_KHR_maintenance10 */
       .maintenance10 = true,
+
+      /* VK_KHR_pipeline_binary */
+      .pipelineBinaries = true,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -1349,7 +1354,7 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxTessellationControlPerVertexInputComponents = 128,
       .maxTessellationControlPerVertexOutputComponents = 128,
       .maxTessellationControlPerPatchOutputComponents = 128,
-      .maxTessellationControlTotalOutputComponents = 2048,
+      .maxTessellationControlTotalOutputComponents = 4096,
       .maxTessellationEvaluationInputComponents = 128,
       .maxTessellationEvaluationOutputComponents = 128,
       .maxGeometryShaderInvocations             = 32,
@@ -1362,7 +1367,8 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxFragmentDualSrcAttachments            = 1,
       .maxFragmentCombinedOutputResources       = MAX_RTS + desc_limits.max_ssbos +
                                                   desc_limits.max_images,
-      .maxComputeSharedMemorySize               = intel_device_info_get_max_slm_size(&pdevice->info),
+      .maxComputeSharedMemorySize               = MIN2(MAX_SLM_SIZE,
+                                                       intel_device_info_get_max_slm_size(&pdevice->info)),
       .maxComputeWorkGroupCount                 = { 65535, 65535, 65535 },
       .maxComputeWorkGroupInvocations           = max_workgroup_size,
       .maxComputeWorkGroupSize = {
@@ -1460,10 +1466,10 @@ get_properties(const struct anv_physical_device *pdevice,
       props->maxGeometryCount = (1u << 24) - 1;
       props->maxInstanceCount = (1u << 24) - 1;
       props->maxPrimitiveCount = (1u << 29) - 1;
-      props->maxPerStageDescriptorAccelerationStructures = UINT16_MAX;
-      props->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = UINT16_MAX;
-      props->maxDescriptorSetAccelerationStructures = UINT16_MAX;
-      props->maxDescriptorSetUpdateAfterBindAccelerationStructures = UINT16_MAX;
+      props->maxPerStageDescriptorAccelerationStructures = desc_limits.max_resources;
+      props->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = desc_limits.max_resources;
+      props->maxDescriptorSetAccelerationStructures = desc_limits.max_resources;
+      props->maxDescriptorSetUpdateAfterBindAccelerationStructures = desc_limits.max_resources;
       props->minAccelerationStructureScratchOffsetAlignment = 64;
    }
 
@@ -1562,6 +1568,16 @@ get_properties(const struct anv_physical_device *pdevice,
    {
       props->allowCommandBufferQueryCopies = false;
    }
+
+   /* VK_KHR_pipeline_binary */
+   {
+      const bool has_disk_cache = pdevice->vk.disk_cache != NULL;
+      props->pipelineBinaryInternalCache = has_disk_cache;
+      props->pipelineBinaryInternalCacheControl = has_disk_cache;
+      props->pipelineBinaryPrefersInternalCache = has_disk_cache;
+      props->pipelineBinaryPrecompiledInternalCache = has_disk_cache;
+      props->pipelineBinaryCompressedData = false;
+    }
 
    /* VK_KHR_push_descriptor */
    {
@@ -1873,7 +1889,7 @@ get_properties(const struct anv_physical_device *pdevice,
 
       /* NumPrim + Primitive Data List */
       const uint32_t max_indices_memory =
-         ALIGN(sizeof(uint32_t) +
+         align(sizeof(uint32_t) +
                sizeof(uint32_t) * props->maxMeshOutputVertices, 32);
 
       props->maxMeshOutputMemorySize = MIN2(max_urb_size - max_indices_memory, 32768);

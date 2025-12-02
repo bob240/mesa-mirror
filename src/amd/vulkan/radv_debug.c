@@ -151,7 +151,7 @@ radv_init_adress_binding_report(struct radv_device *device)
       return false;
 
    simple_mtx_init(&device->addr_binding_tracker->mtx, mtx_plain);
-   util_dynarray_init(&device->addr_binding_tracker->reports, NULL);
+   device->addr_binding_tracker->reports = UTIL_DYNARRAY_INIT;
 
    VkDebugUtilsMessengerCreateInfoEXT create_info = {
       .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT,
@@ -227,7 +227,7 @@ static void
 radv_dump_trace(const struct radv_device *device, struct ac_cmdbuf *cs, FILE *f)
 {
    fprintf(f, "Trace ID: %x\n", device->trace_data->primary_id);
-   device->ws->cs_dump(cs, f, (const int *)&device->trace_data->primary_id, 2, RADV_CS_DUMP_TYPE_IBS);
+   device->ws->cs_dump(cs, f, (const int *)&device->trace_data->primary_id, 2, RADV_CS_DUMP_TYPE_MAIN_IBS);
 }
 
 static void
@@ -1047,7 +1047,7 @@ radv_check_gpu_hangs(struct radv_queue *queue, const struct radv_winsys_submit_i
          break;
       case RADV_DEVICE_FAULT_CHUNK_GPU_INFO:
          radv_dump_device_name(device, f);
-         ac_print_gpu_info(&pdev->info, f);
+         ac_print_gpu_info(f, &pdev->info, pdev->local_fd);
          break;
       case RADV_DEVICE_FAULT_CHUNK_DMESG:
          radv_dump_dmesg(f);

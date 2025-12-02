@@ -27,7 +27,7 @@ struct poly_tess_point {
 };
 static_assert(sizeof(struct poly_tess_point) == 8);
 
-struct poly_tess_args {
+struct poly_tess_params {
    /* Heap to allocate tessellator outputs in */
    DEVICE(struct poly_heap) heap;
 
@@ -58,11 +58,6 @@ struct poly_tess_args {
     * statistics, if active. Zero if inactive. Incremented by tessellator.
     */
    DEVICE(uint32_t) statistic;
-
-   /* When geom+tess used together, the buffer containing TES outputs (executed
-    * as a hardware compute shader).
-    */
-   uint64_t tes_buffer;
 
    /* Bitfield of TCS per-vertex outputs */
    uint64_t tcs_per_vertex_outputs;
@@ -105,4 +100,4 @@ struct poly_tess_args {
     */
    uint32_t ccw;
 } PACKED;
-static_assert(sizeof(struct poly_tess_args) == 36 * 4);
+static_assert(sizeof(struct poly_tess_params) == 34 * 4);

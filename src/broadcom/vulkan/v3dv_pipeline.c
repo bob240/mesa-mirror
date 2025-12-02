@@ -205,6 +205,8 @@ v3dv_pipeline_get_nir_options(const struct v3d_device_info *devinfo)
       .lower_ufind_msb = true,
       .has_fsub = true,
       .has_isub = true,
+      .has_imul24 = true,
+      .has_umul24 = true,
       .has_uclz = true,
       .vertex_id_zero_based = false, /* FIXME: to set this to true, the intrinsic
                                       * needs to be supported */
@@ -292,6 +294,7 @@ preprocess_nir(nir_shader *nir)
    const struct nir_lower_sysvals_to_varyings_options sysvals_to_varyings = {
       .frag_coord = true,
       .point_coord = true,
+      .layer_id = true,
    };
    NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals_to_varyings);
 
@@ -315,7 +318,7 @@ preprocess_nir(nir_shader *nir)
    }
 
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
-            nir_shader_get_entrypoint(nir), true, false);
+            nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
    NIR_PASS(_, nir, nir_lower_system_values);
 
@@ -347,9 +350,10 @@ preprocess_nir(nir_shader *nir)
    /* Lower a bunch of stuff */
    NIR_PASS(_, nir, nir_lower_var_copies);
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs, nir_var_shader_in, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_shader_in, UINT32_MAX);
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs,
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_function_temp, 2);
 
    NIR_PASS(_, nir, nir_lower_array_deref_of_vec,
@@ -933,11 +937,8 @@ lower_fs_io(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, false);
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_out, NULL);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                               MESA_SHADER_FRAGMENT);
-
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               MESA_SHADER_FRAGMENT);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4, 0);
@@ -948,11 +949,8 @@ lower_gs_io(struct nir_shader *nir)
 {
    NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, false);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                               MESA_SHADER_GEOMETRY);
-
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               MESA_SHADER_GEOMETRY);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 }
 
 static void
@@ -960,11 +958,8 @@ lower_vs_io(struct nir_shader *nir)
 {
    NIR_PASS(_, nir, nir_lower_io_array_vars_to_elements_no_indirects, false);
 
-   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                               MESA_SHADER_VERTEX);
-
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               MESA_SHADER_VERTEX);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 
    /* FIXME: if we call nir_lower_io, we get a crash later. Likely because it
     * overlaps with v3d_nir_lower_io. Need further research though.
@@ -1394,6 +1389,7 @@ pipeline_populate_v3d_vs_key(struct v3d_vs_key *key,
          &vi_info->pVertexAttributeDescriptions[i];
       assert(desc->location < MAX_VERTEX_ATTRIBS);
       if (desc->format == VK_FORMAT_B8G8R8A8_UNORM ||
+          desc->format == VK_FORMAT_A2R10G10B10_UINT_PACK32 ||
           desc->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
          key->va_swap_rb_mask |= 1 << (VERT_ATTRIB_GENERIC0 + desc->location);
       }
@@ -2096,6 +2092,7 @@ pipeline_populate_graphics_key(struct v3dv_pipeline *pipeline,
          &vi_info->pVertexAttributeDescriptions[i];
       assert(desc->location < MAX_VERTEX_ATTRIBS);
       if (desc->format == VK_FORMAT_B8G8R8A8_UNORM ||
+          desc->format == VK_FORMAT_A2R10G10B10_UINT_PACK32 ||
           desc->format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) {
          key->va_swap_rb_mask |= 1 << (VERT_ATTRIB_GENERIC0 + desc->location);
       }

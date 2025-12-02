@@ -882,6 +882,9 @@ emit_alu(struct ir3_context *ctx, nir_alu_instr *alu)
    case nir_op_imul24:
       dst = ir3_MUL_S24_rpt(b, dst_sz, src[0], 0, src[1], 0);
       break;
+   case nir_op_umul24:
+      dst = ir3_MUL_U24_rpt(b, dst_sz, src[0], 0, src[1], 0);
+      break;
    case nir_op_ineg:
       dst = ir3_ABSNEG_S_rpt(b, dst_sz, src[0], IR3_REG_SNEG);
       break;
@@ -4187,7 +4190,7 @@ read_phi_src(struct ir3_context *ctx, struct ir3_block *blk,
 
    nir_foreach_phi_src (nsrc, nphi) {
       if (blk->nblock == nsrc->pred) {
-         if (nsrc->src.ssa->parent_instr->type == nir_instr_type_undef) {
+         if (nir_src_is_undef(nsrc->src)) {
             /* Create an ir3 undef */
             return NULL;
          } else {
@@ -4296,7 +4299,7 @@ emit_instr(struct ir3_context *ctx, nir_instr *instr)
       emit_phi(ctx, nir_instr_as_phi(instr));
       break;
    case nir_instr_type_call:
-   case nir_instr_type_parallel_copy:
+   case nir_instr_type_cmat_call:
       ir3_context_error(ctx, "Unhandled NIR instruction type: %d\n",
                         instr->type);
       break;
@@ -4395,7 +4398,7 @@ get_branch_condition(struct ir3_context *ctx, nir_src *src, unsigned comp,
 {
    struct ir3_instruction *condition = ir3_get_src(ctx, src)[comp];
 
-   if (src->ssa->parent_instr->type == nir_instr_type_alu) {
+   if (nir_def_is_alu(src->ssa)) {
       nir_alu_instr *nir_cond = nir_def_as_alu(src->ssa);
 
       if (nir_cond->op == nir_op_inot) {
@@ -4418,7 +4421,7 @@ fold_conditional_branch(struct ir3_context *ctx, struct nir_src *nir_cond)
    if (!ctx->compiler->has_branch_and_or)
       return NULL;
 
-   if (nir_cond->ssa->parent_instr->type != nir_instr_type_alu)
+   if (!nir_def_is_alu(nir_cond->ssa))
       return NULL;
 
    nir_alu_instr *alu_cond = nir_def_as_alu(nir_cond->ssa);
@@ -4466,9 +4469,9 @@ instr_can_be_predicated(nir_instr *instr)
    case nir_instr_type_load_const:
    case nir_instr_type_undef:
    case nir_instr_type_phi:
-   case nir_instr_type_parallel_copy:
       return true;
    case nir_instr_type_call:
+   case nir_instr_type_cmat_call:
    case nir_instr_type_jump:
       return false;
    case nir_instr_type_intrinsic: {
@@ -4484,6 +4487,7 @@ instr_can_be_predicated(nir_instr *instr)
       case nir_intrinsic_ballot:
       case nir_intrinsic_elect:
       case nir_intrinsic_elect_any_ir3:
+      case nir_intrinsic_read_getlast_ir3:
       case nir_intrinsic_read_invocation_cond_ir3:
       case nir_intrinsic_demote:
       case nir_intrinsic_demote_if:
@@ -5942,8 +5946,8 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
    }
 
    IR3_PASS(ir, ir3_remove_noop_subreg_moves);
-   IR3_PASS(ir, ir3_merge_rpt, so);
    IR3_PASS(ir, ir3_postsched, so);
+   IR3_PASS(ir, ir3_merge_rpt, so);
 
    IR3_PASS(ir, ir3_legalize_relative);
    IR3_PASS(ir, ir3_lower_subgroups);
@@ -6025,7 +6029,7 @@ ir3_compile_shader_nir(struct ir3_compiler *compiler,
       ir3_instr_move_before(unlock, end);
    }
 
-   so->pvtmem_size = ALIGN(so->pvtmem_size, compiler->pvtmem_per_fiber_align);
+   so->pvtmem_size = align(so->pvtmem_size, compiler->pvtmem_per_fiber_align);
 
    /* Note that max_bary counts inputs that are not bary.f'd for FS: */
    if (so->type == MESA_SHADER_FRAGMENT)

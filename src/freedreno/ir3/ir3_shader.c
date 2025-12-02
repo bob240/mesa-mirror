@@ -37,7 +37,7 @@ ir3_const_ensure_imm_size(struct ir3_shader_variant *v, unsigned size)
    /* Immediates are uploaded in units of vec4 so make sure our buffer is large
     * enough.
     */
-   size = ALIGN(size, 4);
+   size = align(size, 4);
 
    /* Pre-a7xx, the immediates that get lowered to const registers are
     * emitted as part of the const state so the total size of immediates
@@ -710,13 +710,8 @@ ir3_shader_passthrough_tcs(struct ir3_shader *vs, unsigned patch_vertices)
        */
       tcs->info.internal = false;
 
-      nir_assign_io_var_locations(tcs, nir_var_shader_in,
-                                  &tcs->num_inputs,
-                                  tcs->info.stage);
-
-      nir_assign_io_var_locations(tcs, nir_var_shader_out,
-                                  &tcs->num_outputs,
-                                  tcs->info.stage);
+      nir_assign_io_var_locations(tcs, nir_var_shader_in);
+      nir_assign_io_var_locations(tcs, nir_var_shader_out);
 
       NIR_PASS(_, tcs, nir_lower_system_values);
 
@@ -1095,9 +1090,22 @@ print_raw(FILE *out, const BITSET_WORD *data, size_t size) {
    fprintf(out, "raw 0x%X%X\n", data[0], data[1]);
 }
 
-void
-ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out)
+static void
+pre_instr_cb(void *d, unsigned n, void *instr)
 {
+   struct ir3_disasm_options *options = d;
+
+   if (options->print_raw) {
+      uint32_t *dwords = instr;
+      fprintf(options->out, "%3d[%08x_%08x] ", n, dwords[1], dwords[0]);
+   }
+}
+
+void
+ir3_shader_disasm_options(struct ir3_shader_variant *so, uint32_t *bin,
+                          struct ir3_disasm_options *options)
+{
+   FILE *out = options->out;
    struct ir3 *ir = so->ir;
    struct ir3_register *reg;
    const char *type = ir3_shader_stage(so);
@@ -1146,6 +1154,8 @@ ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out)
                      .show_errors = true,
                      .branch_labels = true,
                      .no_match_cb = print_raw,
+                     .pre_instr_cb = pre_instr_cb,
+                     .cbdata = options,
                   });
 
    fprintf(out, "; %s: outputs:", type);
@@ -1246,6 +1256,17 @@ ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out)
    }
 
    fprintf(out, "\n");
+}
+
+void
+ir3_shader_disasm(struct ir3_shader_variant *so, uint32_t *bin, FILE *out)
+{
+   struct ir3_disasm_options options = {
+      .out = out,
+      .print_raw = false,
+   };
+
+   ir3_shader_disasm_options(so, bin, &options);
 }
 
 uint64_t

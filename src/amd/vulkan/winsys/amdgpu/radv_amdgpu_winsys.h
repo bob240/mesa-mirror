@@ -31,10 +31,10 @@ struct radv_amdgpu_winsys {
 
    bool debug_all_bos;
    bool debug_log_bos;
+   bool dump_ibs;
    FILE *bo_history_logfile;
    bool chain_ib;
    bool zero_all_vram_allocs;
-   bool reserve_vmid;
    uint64_t perftest;
 
    alignas(8) uint64_t allocated_vram;

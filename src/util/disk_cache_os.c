@@ -927,7 +927,7 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
    }
 
    if (path == NULL) {
-      char *xdg_cache_home = secure_getenv("XDG_CACHE_HOME");
+      const char *xdg_cache_home = os_get_option_secure("XDG_CACHE_HOME");
 
       if (xdg_cache_home) {
          path = concatenate_and_mkdir(mem_ctx, xdg_cache_home, cache_dir_name,
@@ -938,7 +938,7 @@ disk_cache_generate_cache_dir(void *mem_ctx, const char *gpu_name,
    }
 
    if (!path) {
-      char *home = getenv("HOME");
+      const char *home = os_get_option("HOME");
 
       if (home) {
          path = concatenate_and_mkdir(mem_ctx, home, ".cache", mkdir);
@@ -1021,9 +1021,9 @@ disk_cache_enabled()
 #endif
    char *envvar_name = "MESA_SHADER_CACHE_DISABLE";
 #if !DETECT_OS_ANDROID
-   if (!getenv(envvar_name)) {
+   if (!os_get_option(envvar_name)) {
       envvar_name = "MESA_GLSL_CACHE_DISABLE";
-      if (getenv(envvar_name))
+      if (os_get_option(envvar_name))
          fprintf(stderr,
                  "*** MESA_GLSL_CACHE_DISABLE is deprecated; "
                  "use MESA_SHADER_CACHE_DISABLE instead ***\n");

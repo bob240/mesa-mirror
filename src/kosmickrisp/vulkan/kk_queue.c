@@ -73,6 +73,11 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
                               signal->signal_value);
    }
 
+   /* Ensure any changes to residency are propagated before we submit any work.
+    * All resources should have been allocated before submission. Otherwise,
+    * users are playing with fire. */
+   kk_device_make_resources_resident(dev);
+
    /* Steal the last fence to chain with the next submission */
    if (util_dynarray_num_elements(&encoder->main.fences, mtl_fence *) > 0)
       queue->wait_fence = util_dynarray_pop(&encoder->main.fences, mtl_fence *);

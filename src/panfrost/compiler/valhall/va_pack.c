@@ -280,6 +280,14 @@ va_pack_widen(const bi_instr *I, enum bi_swizzle swz, enum va_size size)
          return VA_SWIZZLES_8_BIT_B2222;
       case BI_SWIZZLE_B3333:
          return VA_SWIZZLES_8_BIT_B3333;
+      case BI_SWIZZLE_B0011:
+         return VA_SWIZZLES_8_BIT_B0011;
+      case BI_SWIZZLE_B2301:
+         return VA_SWIZZLES_8_BIT_B2301;
+      case BI_SWIZZLE_B1032:
+         return VA_SWIZZLES_8_BIT_B1032;
+      case BI_SWIZZLE_B2233:
+         return VA_SWIZZLES_8_BIT_B2233;
       default:
          invalid_instruction(I, "8-bit widen");
       }
@@ -891,14 +899,14 @@ va_pack_instr(const bi_instr *I, unsigned arch)
       hex |= va_pack_load(I, false);
       break;
 
-   case BI_OPCODE_LD_BUFFER_I8:
-   case BI_OPCODE_LD_BUFFER_I16:
-   case BI_OPCODE_LD_BUFFER_I24:
-   case BI_OPCODE_LD_BUFFER_I32:
-   case BI_OPCODE_LD_BUFFER_I48:
-   case BI_OPCODE_LD_BUFFER_I64:
-   case BI_OPCODE_LD_BUFFER_I96:
-   case BI_OPCODE_LD_BUFFER_I128:
+   case BI_OPCODE_LD_PKA_I8:
+   case BI_OPCODE_LD_PKA_I16:
+   case BI_OPCODE_LD_PKA_I24:
+   case BI_OPCODE_LD_PKA_I32:
+   case BI_OPCODE_LD_PKA_I48:
+   case BI_OPCODE_LD_PKA_I64:
+   case BI_OPCODE_LD_PKA_I96:
+   case BI_OPCODE_LD_PKA_I128:
       hex |= va_pack_load(I, true);
       break;
 
@@ -973,6 +981,15 @@ va_pack_instr(const bi_instr *I, unsigned arch)
       if (I->atom_opc == BI_ATOM_OPC_ACMPXCHG)
          hex |= (1 << 26); /* .compare */
 
+      break;
+
+   case BI_OPCODE_LD_CVT:
+      hex |= (uint64_t)va_pack_src(I, 0);
+      hex |= va_pack_byte_offset(I);
+
+      /* Conversion descriptor */
+      hex |= (uint64_t)va_pack_src(I, 2) << 16;
+      hex |= va_pack_memory_access(I) << 37;
       break;
 
    case BI_OPCODE_ST_CVT:

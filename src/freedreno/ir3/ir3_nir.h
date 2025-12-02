@@ -51,7 +51,6 @@ uint8_t ir3_nir_vectorize_filter(const nir_instr *instr, const void *data);
 /*
  * 64b related lowering:
  */
-bool ir3_nir_lower_64b_intrinsics(nir_shader *shader);
 bool ir3_nir_lower_64b_undef(nir_shader *shader);
 bool ir3_nir_lower_64b_global(nir_shader *shader);
 bool ir3_nir_lower_64b_regs(nir_shader *shader);
@@ -63,9 +62,12 @@ nir_mem_access_size_align ir3_mem_access_size_align(
 
 bool ir3_nir_opt_branch_and_or_not(nir_shader *nir);
 bool ir3_nir_opt_triops_bitwise(nir_shader *nir);
+
+struct ir3_optimize_options {
+   nir_opt_uub_options opt_uub_options;
+};
 bool ir3_optimize_loop(struct ir3_compiler *compiler,
-                       const struct ir3_shader_nir_options *options,
-                       nir_shader *s);
+                       struct ir3_optimize_options *options, nir_shader *s);
 void ir3_nir_lower_io_vars_to_temporaries(nir_shader *s);
 void ir3_finalize_nir(struct ir3_compiler *compiler,
                       const struct ir3_shader_nir_options *options,
@@ -150,7 +152,7 @@ bool ir3_get_driver_param_info(const nir_shader *shader,
 static inline nir_intrinsic_instr *
 ir3_bindless_resource(nir_src src)
 {
-   if (src.ssa->parent_instr->type != nir_instr_type_intrinsic)
+   if (!nir_src_is_intrinsic(src))
       return NULL;
 
    nir_intrinsic_instr *intrin = nir_def_as_intrinsic(src.ssa);

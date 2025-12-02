@@ -296,7 +296,10 @@ AluInstr::do_print(std::ostream& os) const
 
       if (m_dest) {
          if (has_alu_flag(alu_write) || m_dest->has_flag(Register::addr_or_idx)) {
-            os << " " << *m_dest;
+            if (unlikely(m_dest->sel() == g_registers_unused))
+               os << " ()" << "." << swzchar[dest_chan()];
+            else
+               os << " " << *m_dest;
          } else {
             os << " __"
                << "." << swzchar[m_dest->chan()];
@@ -534,6 +537,14 @@ bool AluInstr::do_replace_source(PRegister old_src, PVirtualValue new_src)
    return process;
 }
 
+void
+AluInstr::override_or_clear_dest(PRegister dummy_reg)
+{
+   m_alu_flags.reset(alu_write);
+   m_fallback_chan = m_dest->chan();
+   m_dest = m_src.size() < 3 ? nullptr : dummy_reg;
+}
+
 bool AluInstr::replace_src(int i, PVirtualValue new_src, uint32_t to_set,
                            SourceMod to_clear)
 {
@@ -664,7 +675,7 @@ uint8_t AluInstr::allowed_src_chan_mask() const
 }
 
 bool
-AluInstr::replace_dest(PRegister new_dest, AluInstr *move_instr)
+AluInstr::replace_dest(PRegister new_dest, UNUSED AluInstr *move_instr)
 {
    if (m_dest->equal_to(*new_dest))
       return false;
@@ -750,7 +761,9 @@ AluInstr::check_readport_validation(PRegister old_src, PVirtualValue new_src) co
    bool success = true;
    AluReadportReservation rpr_sum;
 
-   unsigned nsrc = alu_ops.at(m_opcode).nsrc;
+   unsigned nsrc = !has_alu_flag(alu_is_lds) ? alu_ops.at(m_opcode).nsrc
+                                             : lds_ops.at(m_lds_opcode).nsrc;
+
    assert(nsrc * m_alu_slots == m_src.size());
 
    for (int s = 0; s < m_alu_slots && success; ++s) {
@@ -1344,8 +1357,10 @@ AluInstr::from_string(istream& is, ValueFactory& value_factory, AluGroup *group,
       if (op_descr.alu_opcode != op0_nop && op_descr.alu_opcode != op0_group_barrier) {
          if (dest)
             retval = new AluInstr(op_descr.alu_opcode, dest, sources, flags, slots);
-         else
+         else if (op_descr.nsrc < 3)
             retval = new AluInstr(op_descr.alu_opcode, chan, sources, flags);
+         else
+            retval = new AluInstr(op_descr.alu_opcode, value_factory.dummy_dest(chan), sources, flags, 1);
       } else {
          retval = new AluInstr(op_descr.alu_opcode, 0);
          for (auto f : flags)
@@ -2205,25 +2220,30 @@ emit_alu_op2_64bit(const nir_alu_instr& alu, EAluOp opcode, Shader& shader)
    for (unsigned k = 0; k < alu.def.num_components; ++k) {
       int i = 0;
       for (; i < num_emit0; ++i) {
-         auto dest = i < 2 ? value_factory.dest(alu.def, i, pin_chan)
-                           : value_factory.dummy_dest(i);
-
-         ir = new AluInstr(opcode,
-                           dest,
-                           tmp[2 * k + 1][0],
-                           tmp[2 * k + 1][1],
-                           i < 2 ? AluInstr::write : AluInstr::empty);
+         if (i < 2) {
+            ir = new AluInstr(opcode,
+                              value_factory.dest(alu.def, i, pin_chan),
+                              tmp[2 * k + 1][0],
+                              tmp[2 * k + 1][1],
+                              AluInstr::write);
+         } else {
+            ir = new AluInstr(opcode,
+                              i,
+                              {tmp[2 * k + 1][0], tmp[2 * k + 1][1]},
+                              AluInstr::empty);
+         }
          group->add_instruction(ir);
       }
 
-      auto dest =
-         i == 1 ? value_factory.dest(alu.def, i, pin_chan) : value_factory.dummy_dest(i);
+      if (i == 1)
+         ir = new AluInstr(opcode,
+                           value_factory.dest(alu.def, i, pin_chan),
+                           tmp[2 * k][0],
+                           tmp[2 * k][1],
+                           AluInstr::write);
+      else
+         ir = new AluInstr(opcode, i, {tmp[2 * k][0], tmp[2 * k][1]}, AluInstr::empty);
 
-      ir = new AluInstr(opcode,
-                        dest,
-                        tmp[2 * k][0],
-                        tmp[2 * k][1],
-                        i == 1 ? AluInstr::write : AluInstr::empty);
       group->add_instruction(ir);
    }
 
@@ -2273,18 +2293,26 @@ emit_alu_op1_64bit_trans(const nir_alu_instr& alu, EAluOp opcode, Shader& shader
    auto& value_factory = shader.value_factory();
    auto group = new AluGroup();
    AluInstr *ir = nullptr;
-   for (unsigned i = 0; i < 3; ++i) {
+   for (unsigned i = 0; i < 2; ++i) {
       ir = new AluInstr(opcode,
-                        i < 2 ? value_factory.dest(alu.def, i, pin_chan)
-                              : value_factory.dummy_dest(i),
+                        value_factory.dest(alu.def, i, pin_chan),
                         value_factory.src64(alu.src[0], 0, 1),
                         value_factory.src64(alu.src[0], 0, 0),
-                        i < 2 ? AluInstr::write : AluInstr::empty);
-
+                        AluInstr::write);
       if (opcode == op1_sqrt_64)
          ir->set_source_mod(0, AluInstr::mod_abs);
       group->add_instruction(ir);
    }
+
+   ir = new AluInstr(opcode,
+                     2,
+                     {value_factory.src64(alu.src[0], 0, 1),
+                      value_factory.src64(alu.src[0], 0, 0)},
+                     AluInstr::empty);
+   if (opcode == op1_sqrt_64)
+      ir->set_source_mod(0, AluInstr::mod_abs);
+   group->add_instruction(ir);
+
    shader.emit_instruction(group);
    return true;
 }

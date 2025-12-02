@@ -921,6 +921,7 @@ typedef struct bi_block {
    /* Scalar liveness indexed by SSA index */
    BITSET_WORD *ssa_live_in;
    BITSET_WORD *ssa_live_out;
+   uint32_t ssa_max_live;
 
    /* If true, uses clauses; if false, uses instructions */
    bool scheduled;
@@ -939,6 +940,33 @@ typedef struct bi_block {
 
    /* Flags available for pass-internal use */
    uint8_t pass_flags;
+
+   /*
+    * this node's immediate dominator in the dominance tree - set to NULL for
+    * the start block and any unreachable blocks.
+    */
+   struct bi_block *imm_dom;
+
+   /* This node's children in the dominance tree */
+   unsigned num_dom_children;
+   struct bi_block **dom_children;
+
+   /*
+    * This is the backing storage for "dom_children" if the array is small
+    * enough to fit in it, so that we don't have to ralloc the array.
+    */
+   struct bi_block *_dom_children_storage[3];
+
+   /* Set of nir_blocks on the dominance frontier of this block */
+   struct set dom_frontier;
+
+   /*
+    * These two indices have the property that dom_{pre,post}_index for each
+    * child of this block in the dominance tree will always be between
+    * dom_pre_index and dom_post_index for this block, which makes testing if
+    * a given block is dominated by another block an O(1) operation.
+    */
+   uint32_t dom_pre_index, dom_post_index;
 } bi_block;
 
 static inline unsigned
@@ -1102,6 +1130,9 @@ typedef struct {
 
    /* alignment needed for registers during register allocation */
    uint8_t *reg_alignment;
+
+   /* Computed after RA */
+   uint64_t spill_cost;
 } bi_context;
 
 static inline enum bi_round
@@ -1376,6 +1407,9 @@ bool bi_side_effects(const bi_instr *I);
 bool bi_reconverge_branches(bi_block *block);
 
 bool bi_can_replace_with_csel(bi_instr *I);
+
+void bi_calc_dominance(bi_context *ctx);
+bool bi_block_dominates(bi_block *parent, bi_block *child);
 
 void bi_print_instr(const bi_instr *I, FILE *fp);
 void bi_print_slots(bi_registers *regs, FILE *fp);
@@ -1734,6 +1768,9 @@ bi_record_use(bi_instr **uses, BITSET_WORD *multiple, bi_instr *I, unsigned s)
 /* NIR passes */
 
 bool bi_lower_divergent_indirects(nir_shader *shader, unsigned lanes);
+
+void bi_find_loop_blocks(const bi_context *ctx, bi_block *header,
+                         BITSET_WORD *out);
 
 #ifdef __cplusplus
 } /* extern C */

@@ -38,7 +38,6 @@ panvk_tracepoints = custom_target(
 libpanvk_files = files(
   'panvk_buffer.c',
   'panvk_cmd_pool.c',
-  'panvk_device.c',
   'panvk_device_memory.c',
   'panvk_host_copy.c',
   'panvk_image.c',
@@ -46,6 +45,7 @@ libpanvk_files = files(
   'panvk_mempool.c',
   'panvk_physical_device.c',
   'panvk_priv_bo.c',
+  'panvk_sparse.c',
   'panvk_utrace.c',
   'panvk_wsi.c',
 )
@@ -241,12 +241,13 @@ icd_file_name = libname_prefix + 'vulkan_panfrost.' + libname_suffix
 panfrost_icd = custom_target(
   'panfrost_icd',
   input : [vk_icd_gen, vk_api_xml],
-  output : 'panfrost_icd.@0@.json'.format(host_machine.cpu()),
+  output : 'panfrost_icd.' + vulkan_manifest_suffix,
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
     '--sizeof-pointer', sizeof_pointer,
-    '--lib-path', vulkan_icd_lib_path / icd_file_name,
+    '--icd-lib-path', vulkan_icd_lib_path,
+    '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
   ],
   build_by_default : true,
@@ -264,7 +265,8 @@ _dev_icd = custom_target(
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
     '--sizeof-pointer', sizeof_pointer,
-    '--lib-path', meson.current_build_dir() / icd_file_name,
+    '--icd-lib-path', meson.current_build_dir(),
+    '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
   ],
   build_by_default : true,

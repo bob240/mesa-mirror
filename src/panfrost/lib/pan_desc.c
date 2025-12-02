@@ -371,7 +371,8 @@ GENX(pan_emit_afbc_zs_attachment)(const struct pan_fb_info *fb,
 
 #if PAN_ARCH >= 6
       cfg.header_row_stride =
-         pan_afbc_stride_blocks(pref.image->props.modifier, hdr_row_stride);
+         pan_afbc_stride_blocks(pref.image->props.format,
+                                pref.image->props.modifier, hdr_row_stride);
 #else
       cfg.body_size = 0x1000;
       cfg.chunk_size = 9;
@@ -487,6 +488,11 @@ pan_cbuf_bytes_per_pixel(const struct pan_fb_info *fb)
          rt_size = pan_bytes_per_pixel_tib(rt->format) * rt->nr_samples;
 
       sum += rt_size;
+   }
+
+   if (fb->pls_enabled) {
+      /* need at least 16 bytes per pixel for pixel local storage */
+      sum = MAX2(sum, 16);
    }
 
    return sum;
@@ -638,7 +644,7 @@ static bool pan_force_clean_write_on(const struct pan_image *img, unsigned tile_
 static struct MALI_RT_CLEAR
 rt_clear(const struct pan_fb_color_attachment *rt)
 {
-   if (!rt->clear)
+   if (!rt || !rt->clear)
       return (struct MALI_RT_CLEAR){0};
 
    return (struct MALI_RT_CLEAR){
@@ -727,7 +733,8 @@ GENX(pan_emit_afbc_color_attachment)(const struct pan_fb_info *fb,
 
 #if PAN_ARCH >= 6
       cfg.row_stride =
-         pan_afbc_stride_blocks(image->props.modifier, hdr_row_stride);
+         pan_afbc_stride_blocks(image->props.format,
+                                image->props.modifier, hdr_row_stride);
 #else
       const struct pan_image_plane *plane = image->planes[pref.plane_idx];
       const struct pan_image_slice_layout *slayout =
@@ -925,10 +932,8 @@ pan_emit_rt(const struct pan_fb_info *fb, unsigned layer_idx, unsigned idx,
          cfg.clear = rt_clear(&fb->rts[idx]);
          cfg.dithering_enable = true;
          cfg.internal_format = MALI_COLOR_BUFFER_INTERNAL_FORMAT_R8G8B8A8;
-         cfg.internal_buffer_offset = cbuf_offset;
 #if PAN_ARCH >= 7
          cfg.writeback_block_format = MALI_BLOCK_FORMAT_TILED_U_INTERLEAVED;
-         cfg.dithering_enable = true;
 #endif
       }
 
@@ -1119,7 +1124,10 @@ GENX(pan_emit_fbd)(const struct pan_fb_info *fb, unsigned layer_idx,
        * This can be used to read SYSTEM_VALUE_SAMPLE_MASK_IN from the
        * fragment shader, even when performing single-sampled rendering.
        */
-      if (!fb->force_samples) {
+      if (fb->pls_enabled) {
+         cfg.sample_count = 4;
+         cfg.sample_pattern = pan_sample_pattern(1);
+      } else if (!fb->force_samples) {
          cfg.sample_count = fb->nr_samples;
          cfg.sample_pattern = pan_sample_pattern(fb->nr_samples);
       } else if (fb->force_samples == 1) {

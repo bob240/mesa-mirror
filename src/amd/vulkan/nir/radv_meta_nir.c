@@ -351,7 +351,7 @@ radv_meta_nir_build_blit2d_vertex_shader(struct radv_device *device)
 }
 
 nir_def *
-radv_meta_nir_build_blit2d_texel_fetch(struct nir_builder *b, struct radv_device *device, nir_def *tex_pos, bool is_3d,
+radv_meta_nir_build_blit2d_texel_fetch(nir_builder *b, uint32_t binding, nir_def *tex_pos, bool is_3d,
                                        bool is_multisampled)
 {
    enum glsl_sampler_dim dim = is_3d             ? GLSL_SAMPLER_DIM_3D
@@ -360,7 +360,7 @@ radv_meta_nir_build_blit2d_texel_fetch(struct nir_builder *b, struct radv_device
    const struct glsl_type *sampler_type = glsl_sampler_type(dim, false, false, GLSL_TYPE_UINT);
    nir_variable *sampler = nir_variable_create(b->shader, nir_var_uniform, sampler_type, "s_tex");
    sampler->data.descriptor_set = 0;
-   sampler->data.binding = 0;
+   sampler->data.binding = binding;
 
    nir_def *tex_pos_3d = NULL;
    nir_def *sample_idx = NULL;
@@ -387,7 +387,7 @@ radv_meta_nir_build_blit2d_texel_fetch(struct nir_builder *b, struct radv_device
 }
 
 nir_def *
-radv_meta_nir_build_blit2d_buffer_fetch(struct nir_builder *b, struct radv_device *device, nir_def *tex_pos, bool is_3d,
+radv_meta_nir_build_blit2d_buffer_fetch(nir_builder *b, uint32_t binding, nir_def *tex_pos, bool is_3d,
                                         bool is_multisampled)
 {
    const struct glsl_type *sampler_type = glsl_sampler_type(GLSL_SAMPLER_DIM_BUF, false, false, GLSL_TYPE_UINT);
@@ -424,7 +424,7 @@ radv_meta_nir_build_blit2d_copy_fragment_shader(struct radv_device *device,
    nir_def *pos_int = nir_f2i32(&b, nir_load_var(&b, tex_pos_in));
    nir_def *tex_pos = nir_trim_vector(&b, pos_int, 2);
 
-   nir_def *color = txf_func(&b, device, tex_pos, is_3d, is_multisampled);
+   nir_def *color = txf_func(&b, 0, tex_pos, is_3d, is_multisampled);
    nir_store_var(&b, color_out, color, 0xf);
 
    b.shader->info.fs.uses_sample_shading = is_multisampled;
@@ -450,7 +450,7 @@ radv_meta_nir_build_blit2d_copy_fragment_shader_depth(struct radv_device *device
    nir_def *pos_int = nir_f2i32(&b, nir_load_var(&b, tex_pos_in));
    nir_def *tex_pos = nir_trim_vector(&b, pos_int, 2);
 
-   nir_def *color = txf_func(&b, device, tex_pos, is_3d, is_multisampled);
+   nir_def *color = txf_func(&b, 0, tex_pos, is_3d, is_multisampled);
    nir_store_var(&b, color_out, color, 0x1);
 
    b.shader->info.fs.uses_sample_shading = is_multisampled;
@@ -476,11 +476,44 @@ radv_meta_nir_build_blit2d_copy_fragment_shader_stencil(struct radv_device *devi
    nir_def *pos_int = nir_f2i32(&b, nir_load_var(&b, tex_pos_in));
    nir_def *tex_pos = nir_trim_vector(&b, pos_int, 2);
 
-   nir_def *color = txf_func(&b, device, tex_pos, is_3d, is_multisampled);
+   nir_def *color = txf_func(&b, 0, tex_pos, is_3d, is_multisampled);
    nir_store_var(&b, color_out, color, 0x1);
 
    b.shader->info.fs.uses_sample_shading = is_multisampled;
 
+   return b.shader;
+}
+
+nir_shader *
+radv_meta_nir_build_blit2d_copy_fragment_shader_depth_stencil(struct radv_device *device,
+                                                              radv_meta_nir_texel_fetch_build_func txf_func,
+                                                              const char *name, bool is_3d, bool is_multisampled)
+{
+   const struct glsl_type *vec4 = glsl_vec4_type();
+   const struct glsl_type *vec2 = glsl_vector_type(GLSL_TYPE_FLOAT, 2);
+   nir_builder b = radv_meta_nir_init_shader(device, MESA_SHADER_FRAGMENT, "%s", name);
+
+   nir_variable *tex_pos_in = nir_variable_create(b.shader, nir_var_shader_in, vec2, "v_tex_pos");
+   tex_pos_in->data.location = VARYING_SLOT_VAR0;
+
+   nir_def *pos_int = nir_f2i32(&b, nir_load_var(&b, tex_pos_in));
+   nir_def *tex_pos = nir_trim_vector(&b, pos_int, 2);
+
+   /* Depth */
+   nir_variable *depth_out = nir_variable_create(b.shader, nir_var_shader_out, vec4, "f_depth");
+   depth_out->data.location = FRAG_RESULT_DEPTH;
+
+   nir_def *depth = txf_func(&b, 0, tex_pos, is_3d, is_multisampled);
+   nir_store_var(&b, depth_out, depth, 0x1);
+
+   /* Stencil */
+   nir_variable *stencil_out = nir_variable_create(b.shader, nir_var_shader_out, vec4, "f_stencil");
+   stencil_out->data.location = FRAG_RESULT_STENCIL;
+
+   nir_def *stencil = txf_func(&b, 1, tex_pos, is_3d, is_multisampled);
+   nir_store_var(&b, stencil_out, stencil, 0x1);
+
+   b.shader->info.fs.uses_sample_shading = is_multisampled;
    return b.shader;
 }
 
@@ -942,7 +975,7 @@ radv_meta_nir_build_clear_dcc_comp_to_single_shader(struct radv_device *dev, boo
 }
 
 nir_shader *
-radv_meta_nir_build_copy_vrs_htile_shader(struct radv_device *device, struct radeon_surf *surf)
+radv_meta_nir_build_copy_vrs_htile_shader(struct radv_device *device, const struct radeon_surf *surf)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    nir_builder b = radv_meta_nir_init_shader(device, MESA_SHADER_COMPUTE, "meta_copy_vrs_htile");
@@ -1024,7 +1057,7 @@ radv_meta_nir_build_copy_vrs_htile_shader(struct radv_device *device, struct rad
 }
 
 nir_shader *
-radv_meta_nir_build_dcc_retile_compute_shader(struct radv_device *dev, struct radeon_surf *surf)
+radv_meta_nir_build_dcc_retile_compute_shader(struct radv_device *dev, const struct radeon_surf *surf)
 {
    const struct radv_physical_device *pdev = radv_device_physical(dev);
    enum glsl_sampler_dim dim = GLSL_SAMPLER_DIM_BUF;

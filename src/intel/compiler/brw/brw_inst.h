@@ -50,6 +50,7 @@ enum ENUM_PACKED brw_inst_kind {
    BRW_KIND_LOAD_PAYLOAD,
    BRW_KIND_URB,
    BRW_KIND_FB_WRITE,
+   BRW_KIND_SCRATCH,
 };
 
 brw_inst_kind brw_inst_kind_for_opcode(enum opcode opcode);
@@ -82,6 +83,7 @@ struct brw_inst : brw_exec_node {
    KIND_HELPERS(as_load_payload, brw_load_payload_inst, BRW_KIND_LOAD_PAYLOAD);
    KIND_HELPERS(as_urb, brw_urb_inst, BRW_KIND_URB);
    KIND_HELPERS(as_fb_write, brw_fb_write_inst, BRW_KIND_FB_WRITE);
+   KIND_HELPERS(as_scratch, brw_scratch_inst, BRW_KIND_SCRATCH);
 
 #undef KIND_HELPERS
 
@@ -257,9 +259,10 @@ struct brw_send_inst : brw_inst {
          bool is_volatile:1;
 
          /**
-          * Use extended bindless surface offset (26bits instead of 20bits)
+          * The surface used for this message is bindless and therefore should
+          * go into the address register.
           */
-         bool ex_bso:1;
+         bool bindless_surface:1;
 
          /**
           * Serialize the message (Gfx12.x only)
@@ -357,6 +360,7 @@ struct brw_load_payload_inst : brw_inst {
 };
 
 struct brw_urb_inst : brw_inst {
+   /** Global offset in bytes on Xe2 or OWords on older hardware */
    uint32_t offset;
    uint8_t components;
 };
@@ -366,6 +370,18 @@ struct brw_fb_write_inst : brw_inst {
    uint8_t target;
    bool null_rt;
    bool last_rt;
+};
+
+struct brw_scratch_inst : brw_inst {
+   /** Offset in scratch space for the load or store. */
+   unsigned offset;
+
+   /**
+    * Should a LSC transpose message be used for the fill?
+    *
+    * Currently this must be false for spills.
+    */
+   bool use_transpose;
 };
 
 /**
@@ -526,7 +542,7 @@ brw_flag_mask(const brw_inst *inst, unsigned width)
    assert(util_is_power_of_two_nonzero(width));
    const unsigned start = (inst->flag_subreg * 16 + inst->group) &
                           ~(width - 1);
-   const unsigned end = start + ALIGN(inst->exec_size, width);
+   const unsigned end = start + align(inst->exec_size, width);
    return ((1 << DIV_ROUND_UP(end, 8)) - 1) & ~((1 << (start / 8)) - 1);
 }
 

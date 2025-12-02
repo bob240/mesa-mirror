@@ -669,11 +669,13 @@ anv_get_image_format_features2(const struct anv_physical_device *physical_device
                   VK_FORMAT_FEATURE_2_BLIT_SRC_BIT |
                   VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                   VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
-                  VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+                  VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+                  VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
       } else if (vk_tiling == VK_IMAGE_TILING_LINEAR) {
          /* Images used for transfers */
          flags |= VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT |
-                  VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT;
+                  VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+                  VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
       }
       return flags;
    }
@@ -681,9 +683,21 @@ anv_get_image_format_features2(const struct anv_physical_device *physical_device
    const VkImageAspectFlags aspects = vk_format_aspects(vk_format);
 
    if (aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
-      if (vk_tiling == VK_IMAGE_TILING_LINEAR ||
-          vk_tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+      if (vk_tiling == VK_IMAGE_TILING_LINEAR)
          return 0;
+
+      if (vk_tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+         if (aspects != VK_IMAGE_ASPECT_DEPTH_BIT)
+            return 0;
+
+         if (isl_mod_info->tiling != ISL_TILING_Y0 &&
+             isl_mod_info->tiling != ISL_TILING_4)
+            return 0;
+
+         if (devinfo->ver <= 12 &&
+             isl_drm_modifier_has_aux(isl_mod_info->modifier))
+            return 0;
+      }
 
       flags |= VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
                VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
@@ -753,6 +767,8 @@ anv_get_image_format_features2(const struct anv_physical_device *physical_device
        * compressed format to an uncompressed one.
        *
        * We handle modifier tilings further down in this function.
+       *
+       * TODO: check if we could enable HOST copies in that non emulated case.
        */
       if (vk_tiling == VK_IMAGE_TILING_LINEAR &&
           isl_format_get_layout(plane_format.isl_format)->txc == ISL_TXC_ASTC)
@@ -1716,9 +1732,6 @@ anv_get_image_format_properties(
        * non-mipmapped single-sample) 2D images.
        */
       if (info->type != VK_IMAGE_TYPE_2D && isl_mod_info->modifier != DRM_FORMAT_MOD_LINEAR) {
-         vk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                   "non-linear VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT "
-                   "requires VK_IMAGE_TYPE_2D");
          goto unsupported;
       }
 
@@ -1952,13 +1965,8 @@ anv_get_image_format_properties(
          /* This memory handle has no restrictions on driverUUID nor deviceUUID,
           * and therefore requires explicit memory layout.
           */
-         if (!tiling_has_explicit_layout) {
-            vk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                      "VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT "
-                      "requires VK_IMAGE_TILING_LINEAR or "
-                      "VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT");
+         if (!tiling_has_explicit_layout)
             goto unsupported;
-         }
 
          /* With an explicit memory layout, we don't care which type of fd
           * the image belongs too. Both OPAQUE_FD and DMA_BUF are
@@ -1971,13 +1979,8 @@ anv_get_image_format_properties(
          /* This memory handle has no restrictions on driverUUID nor deviceUUID,
           * and therefore requires explicit memory layout.
           */
-         if (!tiling_has_explicit_layout) {
-            vk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                      "VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT "
-                      "requires VK_IMAGE_TILING_LINEAR or "
-                      "VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT");
+         if (!tiling_has_explicit_layout)
             goto unsupported;
-         }
 
          if (external_props)
             external_props->externalMemoryProperties = userptr_props;
@@ -2006,9 +2009,6 @@ anv_get_image_format_properties(
           *    vkGetPhysicalDeviceImageFormatProperties2 returns
           *    VK_ERROR_FORMAT_NOT_SUPPORTED.
           */
-         vk_errorf(physical_device, VK_ERROR_FORMAT_NOT_SUPPORTED,
-                   "unsupported VkExternalMemoryTypeFlagBits 0x%x",
-                   external_info->handleType);
          goto unsupported;
       }
    }
@@ -2101,7 +2101,7 @@ void anv_GetPhysicalDeviceSparseImageFormatProperties2(
 
    if (physical_device->sparse_type == ANV_SPARSE_TYPE_NOT_SUPPORTED) {
       if (INTEL_DEBUG(DEBUG_SPARSE))
-         fprintf(stderr, "=== [%s:%d] [%s]\n", __FILE__, __LINE__, __func__);
+         mesa_logi("=== [%s:%d] [%s]\n", __FILE__, __LINE__, __func__);
       return;
    }
 
@@ -2148,7 +2148,7 @@ void anv_GetPhysicalDeviceSparseImageFormatProperties2(
 
       isl_surf_usage_flags_t isl_usage =
          anv_image_choose_isl_surf_usage(physical_device,
-                                         pFormatInfo->format,
+                                         pFormatInfo->format, NULL,
                                          vk_create_flags, pFormatInfo->usage,
                                          0, aspect,
                                          VK_IMAGE_COMPRESSION_DEFAULT_EXT);
@@ -2245,7 +2245,7 @@ void anv_GetPhysicalDeviceExternalBufferProperties(
          pExternalBufferProperties->externalMemoryProperties = android_buffer_props;
          return;
       }
-      FALLTHROUGH; /* If ahw not supported */
+      FALLTHROUGH; /* If ahb not supported */
    default:
       goto unsupported;
    }

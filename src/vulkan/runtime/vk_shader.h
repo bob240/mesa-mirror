@@ -47,6 +47,8 @@ struct vk_physical_device;
 struct vk_pipeline;
 struct vk_pipeline_robustness_state;
 
+bool vk_validate_shader_binaries(void);
+
 int vk_shader_cmp_graphics_stages(mesa_shader_stage a, mesa_shader_stage b);
 int vk_shader_cmp_rt_stages(mesa_shader_stage a, mesa_shader_stage b);
 
@@ -98,18 +100,6 @@ struct vk_shader_compile_info {
 
 struct vk_shader_ops;
 
-#ifdef __GNUC__
-#pragma GCC diagnostic push
-#pragma GCC diagnostic error "-Wpadded"
-#endif
-struct vk_shader_pipeline_cache_key {
-   mesa_shader_stage stage;
-   blake3_hash blake3;
-};
-#ifdef __GNUC__
-#pragma GCC diagnostic pop
-#endif
-
 struct vk_shader {
    struct vk_object_base base;
 
@@ -131,7 +121,7 @@ struct vk_shader {
    /* Used for the generic VkPipeline implementation */
    struct {
       struct vk_pipeline_cache_object cache_obj;
-      struct vk_shader_pipeline_cache_key cache_key;
+      blake3_hash cache_key;
    } pipeline;
 };
 
@@ -203,6 +193,14 @@ void *vk_shader_multizalloc(struct vk_device *device,
 void vk_shader_free(struct vk_device *device,
                     const VkAllocationCallbacks *alloc,
                     struct vk_shader *shader);
+
+VkResult vk_compile_shaders(struct vk_device *device,
+                            uint32_t shader_count,
+                            struct vk_shader_compile_info *infos,
+                            const struct vk_graphics_pipeline_state *state,
+                            const struct vk_features *enabled_features,
+                            const VkAllocationCallbacks* pAllocator,
+                            struct vk_shader **shaders_out);
 
 static inline void
 vk_shader_destroy(struct vk_device *device,
@@ -331,7 +329,8 @@ struct vk_device_shader_ops {
    /** Sets scratch size & ray query count for RT pipelines */
    void (*cmd_set_rt_state)(struct vk_command_buffer *cmd_buffer,
                             VkDeviceSize scratch_size,
-                            uint32_t ray_queries);
+                            uint32_t ray_queries,
+                            const uint8_t *dynamic_descriptor_offsets);
 
    /** Sets stack size for RT pipelines */
    void (*cmd_set_stack_size)(struct vk_command_buffer *cmd_buffer,

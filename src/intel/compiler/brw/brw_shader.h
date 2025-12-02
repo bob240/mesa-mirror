@@ -191,8 +191,8 @@ public:
 
    bool source_depth_to_render_target;
 
-   brw_reg pixel_x;
-   brw_reg pixel_y;
+   brw_reg uw_pixel_x;
+   brw_reg uw_pixel_y;
    brw_reg pixel_z;
    brw_reg wpos_w;
    brw_reg pixel_w;
@@ -250,6 +250,13 @@ void brw_print_instruction(const brw_shader &s, const brw_inst *inst,
                            const brw_def_analysis *defs = nullptr);
 
 void brw_print_swsb(FILE *f, const struct intel_device_info *devinfo, const tgl_swsb swsb);
+
+static inline bool
+brw_can_coherent_fb_fetch(const struct intel_device_info *devinfo)
+{
+   /* Not functional after Gfx20 */
+   return devinfo->ver >= 9 && devinfo->ver < 20;
+}
 
 /**
  * Return the flag register used in fragment shaders to keep track of live
@@ -328,6 +335,7 @@ bool brw_lower_constant_loads(brw_shader &s);
 bool brw_lower_csel(brw_shader &s);
 bool brw_lower_derivatives(brw_shader &s);
 bool brw_lower_dpas(brw_shader &s);
+bool brw_lower_fill_and_spill(brw_shader &s);
 bool brw_lower_find_live_channel(brw_shader &s);
 bool brw_lower_indirect_mov(brw_shader &s);
 bool brw_lower_integer_multiplication(brw_shader &s);
@@ -347,6 +355,8 @@ bool brw_lower_sub_sat(brw_shader &s);
 bool brw_lower_subgroup_ops(brw_shader &s);
 bool brw_lower_uniform_pull_constant_loads(brw_shader &s);
 void brw_lower_vgrfs_to_fixed_grfs(brw_shader &s);
+brw_reg brw_lower_vgrf_to_fixed_grf(const struct intel_device_info *devinfo,
+                                    const brw_inst *inst, const brw_reg &reg);
 
 bool brw_opt_address_reg_load(brw_shader &s);
 bool brw_opt_algebraic(brw_shader &s);
@@ -361,6 +371,7 @@ bool brw_opt_copy_propagation_defs(brw_shader &s);
 bool brw_opt_cse_defs(brw_shader &s);
 bool brw_opt_dead_code_eliminate(brw_shader &s);
 bool brw_opt_eliminate_find_live_channel(brw_shader &s);
+bool brw_opt_fill_and_spill(brw_shader &s);
 bool brw_opt_register_coalesce(brw_shader &s);
 bool brw_opt_remove_extra_rounding_modes(brw_shader &s);
 bool brw_opt_remove_redundant_halts(brw_shader &s);
@@ -402,4 +413,3 @@ brw_inst *brw_clone_inst(brw_shader &s, const brw_inst *inst);
  */
 brw_inst *brw_transform_inst(brw_shader &s, brw_inst *inst, enum opcode new_opcode,
                              unsigned new_num_srcs = UINT_MAX);
-

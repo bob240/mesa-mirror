@@ -193,12 +193,15 @@ enum tu_stage {
     * wait for pending WFIs to complete and therefore need a CP_WAIT_FOR_ME.
     * As a source stage, it is for things needing no waits. 
     */
-   TU_STAGE_CP,
+   TU_STAGE_BV_CP,
+
+   /* This is for operations executed on BV. */
+   TU_STAGE_BV,
 
    /* This is for most operations, which WFI will wait to finish and will not
     * start until any pending WFIs are finished.
     */
-   TU_STAGE_GPU,
+   TU_STAGE_BR,
 
    /* This is only used as a destination stage and is for things needing no
     * waits on the GPU (e.g. host operations).
@@ -223,6 +226,7 @@ enum tu_cmd_flush_bits {
     */
    TU_CMD_FLAG_BLIT_CACHE_CLEAN = 1 << 11,
    TU_CMD_FLAG_RTU_INVALIDATE = 1 << 12,
+   TU_CMD_FLAG_WAIT_FOR_BR = 1 << 13,
 
    TU_CMD_FLAG_ALL_CLEAN =
       TU_CMD_FLAG_CCU_CLEAN_DEPTH |
@@ -268,6 +272,7 @@ struct tu_cache_state {
    BITMASK_ENUM(tu_cmd_flush_bits) pending_flush_bits;
    /* Pending flushes */
    BITMASK_ENUM(tu_cmd_flush_bits) flush_bits;
+   BITMASK_ENUM(tu_cmd_flush_bits) bv_flush_bits;
 };
 
 struct tu_vs_params {
@@ -293,6 +298,7 @@ struct tu_render_pass_state
    bool xfb_used;
    bool has_tess;
    bool has_prim_generated_query_in_rp;
+   bool has_vtx_stats_query_in_rp;
    bool has_zpass_done_sample_count_write_in_rp;
    bool disable_gmem;
    bool sysmem_single_prim_mode;
@@ -339,6 +345,7 @@ struct tu_render_pass_state
    uint32_t lrz_write_disabled_at_draw;
 
    const char *gmem_disable_reason;
+   const char *cb_disable_reason;
 };
 
 /* These are the states of the suspend/resume state machine. In addition to
@@ -578,6 +585,8 @@ struct tu_cmd_state
    uint32_t prim_counters_running;
 
    bool prim_generated_query_running_before_rp;
+   bool vtx_stats_query_running_before_rp;
+   bool xfb_query_running_before_rp;
 
    bool occlusion_query_may_be_running;
 
@@ -601,6 +610,29 @@ struct tu_cmd_state
 
    uint32_t total_renderpasses;
    uint32_t total_dispatches;
+
+   unsigned tile_render_pass_count;
+   bool renderpass_cb_disabled;
+};
+
+struct tu_vis_stream_patchpoint {
+   unsigned render_pass_idx;
+   uint32_t *data;
+   uint64_t iova;
+   uint32_t offset;
+};
+
+enum tu_cb_control_type {
+   TU_CB_CONTROL_TYPE_PATCHPOINT,
+   TU_CB_CONTROL_TYPE_BARRIER,
+   TU_CB_CONTROL_TYPE_CB_ENABLED,
+};
+
+struct tu_cb_control_point {
+   enum tu_cb_control_type type;
+   uint32_t *patchpoint;
+   uint32_t patch_value;
+   uint32_t original_value;
 };
 
 struct tu_cmd_buffer
@@ -617,6 +649,13 @@ struct tu_cmd_buffer
 
    void *patchpoints_ctx;
    struct util_dynarray fdm_bin_patchpoints;
+
+   struct tu_vis_stream_patchpoint vis_stream_count_patchpoint;
+   struct util_dynarray vis_stream_patchpoints;
+   struct util_dynarray vis_stream_bos;
+   struct util_dynarray vis_stream_cs_bos;
+
+   struct util_dynarray cb_control_points;
 
    VkCommandBufferUsageFlags usage_flags;
 
@@ -686,7 +725,9 @@ struct tu_cmd_buffer
 
    uint32_t vsc_draw_strm_pitch;
    uint32_t vsc_prim_strm_pitch;
-   uint64_t vsc_draw_strm_va, vsc_draw_strm_size_va, vsc_prim_strm_va;
+   uint32_t vsc_draw_strm_offset, vsc_draw_strm_size_offset;
+   uint32_t vsc_prim_strm_offset, vsc_state_offset;
+   uint64_t vsc_size;
    bool vsc_initialized;
 
    bool prev_fsr_is_null;
@@ -832,6 +873,10 @@ struct tu_fdm_bin_patchpoint {
    tu_fdm_bin_apply_t apply;
 };
 
+struct tu_vis_stream_patchpoint_cs {
+   struct tu_suballoc_bo cs_bo;
+   struct tu_suballoc_bo fence_bo;
+};
 
 void
 tu_barrier(struct tu_cmd_buffer *cmd,
@@ -889,5 +934,10 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
    _tu_create_fdm_bin_patchpoint(cmd, cs, size, flags, apply, &state, sizeof(state))
 
 VkResult tu_init_bin_preamble(struct tu_device *device);
+
+void
+tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
+                             struct tu_cs *cs,
+                             bool force_disable_cb);
 
 #endif /* TU_CMD_BUFFER_H */

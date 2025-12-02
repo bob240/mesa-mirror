@@ -56,23 +56,27 @@ class stats_buffer_manager : public IUnknown
    HRESULT
    AttachPipeResourceAsSampleExtension( struct pipe_resource *pPipeRes, ID3D12CommandQueue *pSyncObjectQueue, IMFSample *pSample );
 
-   static HRESULT Create( struct vl_screen *pVlScreen,
+   static HRESULT Create( void *logId,
+                          struct vl_screen *pVlScreen,
                           struct pipe_context *pPipeContext,
                           REFGUID guidExtension,
                           uint32_t width,
                           uint16_t height,
                           enum pipe_format buffer_format,
-                          unsigned pool_size,
+                          unsigned initial_pool_size,
+                          unsigned max_pool_size,
                           stats_buffer_manager **ppInstance );
 
  private:
-   stats_buffer_manager( struct vl_screen *m_pVlScreen,
+   stats_buffer_manager( void *logId,
+                         struct vl_screen *m_pVlScreen,
                          pipe_context *pPipeContext,
                          REFGUID guidExtension,
                          uint32_t width,
                          uint16_t height,
                          enum pipe_format buffer_format,
-                         unsigned pool_size,
+                         unsigned initial_pool_size,
+                         unsigned max_pool_size,
                          HRESULT &hr );
 
    ~stats_buffer_manager();
@@ -80,6 +84,7 @@ class stats_buffer_manager : public IUnknown
    STDMETHOD( OnSampleAvailable )( __in IMFAsyncResult *pAsyncResult );
    METHODASYNCCALLBACKEX( OnSampleAvailable, stats_buffer_manager, 0, MFASYNC_CALLBACK_QUEUE_MULTITHREADED );
 
+   const void *m_logId = {};
    std::mutex m_lock;
    GUID m_resourceGUID {};
    ULONG m_refCount = 0;
@@ -90,8 +95,8 @@ class stats_buffer_manager : public IUnknown
 
    struct stats_buffer_manager_pool_entry
    {
-      struct pipe_resource *buffer;
-      bool used;
+      struct pipe_resource *buffer {};
+      bool used {};
    };
 
    std::vector<struct stats_buffer_manager_pool_entry> m_pool;

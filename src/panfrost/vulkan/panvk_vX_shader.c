@@ -141,10 +141,7 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, void *data)
       break;
 
    case nir_intrinsic_load_printf_buffer_address:
-      if (b->shader->info.stage == MESA_SHADER_COMPUTE)
-         val = load_sysval(b, compute, bit_size, printf_buffer_address);
-      else
-         val = load_sysval(b, graphics, bit_size, printf_buffer_address);
+      val = load_sysval(b, common, bit_size, printf_buffer_address);
       break;
 
    case nir_intrinsic_load_input_attachment_target_pan: {
@@ -398,17 +395,18 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_opt_vectorize_io_vars, nir_var_shader_out);
 
-   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir),
-            true, true);
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+            nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
 #if PAN_ARCH < 9
    /* This needs to be done just after the io_to_temporaries pass, because we
-    * rely on in/out temporaries to collect the final layer_id value. */
+    * rely on out temporaries to collect the final layer_id value.
+    */
    NIR_PASS(_, nir, lower_layer_writes);
 #endif
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs,
-            nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+   NIR_PASS(_, nir, nir_split_var_copies);
 
    NIR_PASS(_, nir, nir_opt_copy_prop_vars);
    NIR_PASS(_, nir, nir_opt_combine_stores, nir_var_all);
@@ -451,9 +449,12 @@ panvk_preprocess_nir(struct vk_physical_device *vk_pdev,
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_lower_wpos_center);
 
+   pan_shader_optimize(nir, pdev->kmod.props.gpu_id);
+
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
 
+   assert(pdev->kmod.props.shader_present != 0);
    uint64_t core_max_id = util_last_bit(pdev->kmod.props.shader_present) - 1;
    NIR_PASS(_, nir, nir_inline_sysval, nir_intrinsic_load_core_max_id_arm,
             core_max_id);
@@ -583,10 +584,7 @@ collect_push_constant(struct nir_builder *b, nir_intrinsic_instr *intr,
 
       /* Flag the push_uniforms sysval as needed if we have an indirect offset.
        */
-      if (b->shader->info.stage == MESA_SHADER_COMPUTE)
-         shader_use_sysval(shader, compute, push_uniforms);
-      else
-         shader_use_sysval(shader, graphics, push_uniforms);
+      shader_use_sysval(shader, common, push_uniforms);
    } else {
       offset = base + nir_src_as_uint(intr->src[0]);
       size = (intr->def.bit_size / 8) * intr->def.num_components;
@@ -637,9 +635,7 @@ move_push_constant(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
        * .base=SYSVALS_PUSH_CONST_BASE, and we're supposed to force a base of
        * zero in this pass. */
       unsigned push_const_buf_offset = shader_remapped_sysval_offset(
-         shader, b->shader->info.stage == MESA_SHADER_COMPUTE
-                    ? sysval_offset(compute, push_uniforms)
-                    : sysval_offset(graphics, push_uniforms));
+         shader, sysval_offset(common, push_uniforms));
       nir_def *push_const_buf = nir_load_push_constant(
          b, 1, 64, nir_imm_int(b, push_const_buf_offset));
       unsigned push_const_offset = is_sysval ?
@@ -670,7 +666,7 @@ lower_load_push_consts(nir_shader *nir, struct panvk_shader_variant *shader)
    bool progress = false;
    do {
       progress = false;
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
@@ -769,7 +765,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
                 uint32_t set_layout_count,
                 struct vk_descriptor_set_layout *const *set_layouts,
                 const struct vk_pipeline_robustness_state *rs,
-                uint32_t *noperspective_varyings,
+                const uint32_t *noperspective_varyings,
                 const struct vk_graphics_pipeline_state *state,
                 const struct pan_compile_inputs *compile_input,
                 struct panvk_shader_variant *shader)
@@ -794,7 +790,7 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
       /* Pull output writes out of the loop and give them constant offsets for
        * pan_lower_store_components */
       NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
-               nir_shader_get_entrypoint(nir), true, false);
+               nir_shader_get_entrypoint(nir), nir_var_shader_out);
    }
 #endif
 
@@ -802,21 +798,18 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
     * number of varying loads, as this number is required during descriptor
     * lowering for v9+. */
    if (stage == MESA_SHADER_FRAGMENT) {
-      nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                                  stage);
+      nir_assign_io_var_locations(nir, nir_var_shader_in);
 #if PAN_ARCH >= 9
       shader->desc_info.max_varying_loads = nir->num_inputs;
 #endif
    }
 
-#if PAN_ARCH >= 10
    const struct lower_ycbcr_state ycbcr_state = {
       .set_layout_count = set_layout_count,
       .set_layouts = set_layouts,
    };
    NIR_PASS(_, nir, nir_vk_lower_ycbcr_tex, lookup_ycbcr_conversion,
             &ycbcr_state);
-#endif
 
    panvk_per_arch(nir_lower_descriptors)(nir, dev, rs, set_layout_count,
                                          set_layouts, state, shader);
@@ -899,12 +892,10 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
       }
    } else if (stage != MESA_SHADER_FRAGMENT) {
       /* Input varyings in fragment shader have been lowered early. */
-      nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs,
-                                  stage);
+      nir_assign_io_var_locations(nir, nir_var_shader_in);
    }
 
-   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs,
-                               stage);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
 
    /* Needed to turn shader_temp into function_temp since the backend only
     * handles the latter for now.
@@ -913,28 +904,21 @@ panvk_lower_nir(struct panvk_device *dev, nir_shader *nir,
 
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
    if (PANVK_DEBUG(NIR)) {
-      fprintf(stderr, "translated nir:\n");
-      nir_print_shader(nir, stderr);
+      mesa_logi("translated nir:");
+      nir_log_shaderi(nir);
    }
 
    pan_shader_preprocess(nir, compile_input->gpu_id);
 
+   /* Postprocess can add copies back in and lower_io can't handle them */
+   NIR_PASS(_, nir, nir_lower_var_copies);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size, nir_lower_io_use_interpolated_input_intrinsics);
 
-   if (nir->info.stage == MESA_SHADER_VERTEX)
-      NIR_PASS(_, nir, pan_nir_lower_noperspective_vs);
-   if (nir->info.stage == MESA_SHADER_FRAGMENT)
-      NIR_PASS(_, nir, pan_nir_lower_noperspective_fs);
-
-   /* nir_lower[_explicit]_io is lazy and emits mul+add chains even for
-    * offsets it could figure out are constant.  Do some constant folding
-    * before bifrost_nir_lower_store_component below.
-    */
-   NIR_PASS(_, nir, nir_opt_constant_folding);
-
-   pan_shader_lower_texture(nir, compile_input->gpu_id);
    pan_shader_postprocess(nir, compile_input->gpu_id);
+   pan_shader_lower_texture_late(nir, compile_input->gpu_id);
 
    if (stage == MESA_SHADER_VERTEX)
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, panvk_lower_load_vs_input,
@@ -975,8 +959,7 @@ panvk_compile_nir(struct panvk_device *dev, nir_shader *nir,
    const bool dump_asm =
       shader_flags & VK_SHADER_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_MESA;
 
-   struct util_dynarray binary;
-   util_dynarray_init(&binary, NULL);
+   struct util_dynarray binary = UTIL_DYNARRAY_INIT;
    pan_shader_compile(nir, compile_input, &binary, &shader->info);
 
    /* Propagate potential additional FAU values into the panvk info struct. */
@@ -1305,7 +1288,7 @@ static VkResult
 panvk_compile_shader(struct panvk_device *dev,
                      struct vk_shader_compile_info *info,
                      const struct vk_graphics_pipeline_state *state,
-                     uint32_t *noperspective_varyings,
+                     const uint32_t *noperspective_varyings,
                      const VkAllocationCallbacks *pAllocator,
                      struct vk_shader **shader_out)
 {
@@ -1337,6 +1320,7 @@ panvk_compile_shader(struct panvk_device *dev,
       .gpu_variant = phys_dev->kmod.props.gpu_variant,
       .view_mask = (state && state->rp) ? state->rp->view_mask : 0,
       .robust2_modes = robust2_modes,
+      .robust_descriptors = dev->vk.enabled_features.nullDescriptor,
    };
 
    if (info->stage == MESA_SHADER_FRAGMENT && state != NULL &&

@@ -5,7 +5,7 @@
 
 #include "compiler/nir/nir_builder.h"
 #include "pipe/p_defines.h"
-#include "poly/nir/poly_nir_lower_gs.h"
+#include "poly/nir/poly_nir.h"
 #include "util/bitset.h"
 #include "util/u_dynarray.h"
 #include "agx_abi.h"
@@ -180,13 +180,10 @@ lower_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
    case nir_intrinsic_get_ssbo_size:
       return load_sysval_indirect(b, 1, 32, stage_table(b), &s->ssbo_size,
                                   intr->src[0].ssa);
-   case nir_intrinsic_load_input_assembly_buffer_poly:
-      return load_sysval_root(b, 1, 64, &u->input_assembly);
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+      return load_sysval_root(b, 1, 64, &u->vertex_params);
    case nir_intrinsic_load_geometry_param_buffer_poly:
       return load_sysval_root(b, 1, 64, &u->geometry_params);
-   case nir_intrinsic_load_vs_output_buffer_poly:
-      return nir_load_global_constant(
-         b, 1, 64, load_sysval_root(b, 1, 64, &u->vertex_output_buffer_ptr));
    case nir_intrinsic_load_vs_outputs_poly:
       return load_sysval_root(b, 1, 64, &u->vertex_outputs);
    case nir_intrinsic_load_tess_param_buffer_poly:
@@ -415,9 +412,9 @@ lay_out_uniforms(struct agx_compiled_shader *shader, struct state *state)
       bool sw = state->hw_stage == MESA_SHADER_COMPUTE;
       if (sw) {
          shader->push[shader->push_range_count++] = (struct agx_push_range){
-            .uniform = AGX_ABI_VUNI_INPUT_ASSEMBLY(count),
+            .uniform = AGX_ABI_VUNI_VERTEX_PARAMS(count),
             .table = AGX_SYSVAL_TABLE_ROOT,
-            .offset = (uintptr_t)&u->input_assembly,
+            .offset = (uintptr_t)&u->vertex_params,
             .length = 4,
          };
       }

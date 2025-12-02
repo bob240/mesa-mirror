@@ -332,7 +332,7 @@ ubwc_possible(struct tu_device *device,
               bool use_z24uint_s8uint)
 {
    /* TODO: enable for a702 */
-   if (info->a6xx.is_a702)
+   if (info->props.is_a702)
       return false;
 
    /* UBWC isn't possible with sparse residency, because unbound blocks may
@@ -355,10 +355,10 @@ ubwc_possible(struct tu_device *device,
     * all 1's prior to a740.  Disable UBWC for snorm.
     */
    if (vk_format_is_snorm(format) &&
-       !info->a7xx.ubwc_unorm_snorm_int_compatible)
+       !info->props.ubwc_unorm_snorm_int_compatible)
       return false;
 
-   if (!info->a6xx.has_8bpp_ubwc &&
+   if (!info->props.has_8bpp_ubwc &&
        vk_format_get_blocksizebits(format) == 8 &&
        vk_format_get_plane_count(format) == 1)
       return false;
@@ -382,7 +382,7 @@ ubwc_possible(struct tu_device *device,
     * and we can't change the descriptor so we can't do this.
     */
    if (((usage | stencil_usage) & VK_IMAGE_USAGE_STORAGE_BIT) &&
-       !info->a7xx.supports_uav_ubwc) {
+       !info->props.supports_uav_ubwc) {
       return false;
    }
 
@@ -391,7 +391,7 @@ ubwc_possible(struct tu_device *device,
     * ordinary draw calls writing read/depth. WSL blob seem to use ubwc
     * sometimes for depth/stencil.
     */
-   if (info->a6xx.broken_ds_ubwc_quirk &&
+   if (info->props.broken_ds_ubwc_quirk &&
        vk_format_is_depth_or_stencil(format))
       return false;
 
@@ -416,7 +416,7 @@ ubwc_possible(struct tu_device *device,
        (stencil_usage & (VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT)))
       return false;
 
-   if (!info->a6xx.has_z24uint_s8uint &&
+   if (!info->props.has_z24uint_s8uint &&
        (format == VK_FORMAT_D24_UNORM_S8_UINT ||
         format == VK_FORMAT_X8_D24_UNORM_PACK32) &&
        samples > VK_SAMPLE_COUNT_1_BIT) {
@@ -470,6 +470,20 @@ format_list_has_swaps(const VkImageFormatListCreateInfo *fmt_list)
          vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
 
       if (tu6_format_texture(format, TILE6_LINEAR, false).swap)
+         return true;
+   }
+   return false;
+}
+
+static bool
+format_list_has_uncompressed_format(
+   const VkImageFormatListCreateInfo *fmt_list)
+{
+   if (!fmt_list || !fmt_list->viewFormatCount)
+      return true;
+
+   for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
+      if (!vk_format_is_compressed(fmt_list->pViewFormats[i]))
          return true;
    }
    return false;
@@ -564,6 +578,7 @@ tu_image_update_layout(struct tu_device *device, struct tu_image *image,
          .is_mutable = image->is_mutable,
          .sparse = image->vk.create_flags &
             VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
+         .force_disable_linear_fallback = image->force_disable_linear_fallback,
       };
 
       if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
@@ -590,23 +605,33 @@ tu_image_update_layout(struct tu_device *device, struct tu_image *image,
       image->total_size = MAX2(image->total_size, layout->size);
    }
 
+   image->max_tile_w_constraint_fdm = ~0;
+   image->max_tile_h_constraint_fdm = ~0;
+
    const struct util_format_description *desc = util_format_description(image->layout[0].format);
    if (util_format_has_depth(desc) && device->use_lrz) {
       /* If FDM offset is enabled, then the LRZ image will be shifted over. We
        * have to overallocate it, but we have no idea how large the tiles it's
-       * used with will be. Try to calculate the worst-case width and height.
+       * used with will be. Try to calculate a maximum size of tile that would
+       * still let us do LRZ fast clears that we'll use to inform tiling setup
+       * later once we know the rest of the images.  We'll fall back to
+       * allocating for the device's maximum tile size if we can't ensure
+       * LRZ fast clears.
        */
-      uint32_t extra_width = 0, extra_height = 0;
+      struct fdl_lrz_fdm_extra_size extra_size = { 0, 0 };
       if (image->vk.create_flags &
           VK_IMAGE_CREATE_FRAGMENT_DENSITY_MAP_OFFSET_BIT_EXT) {
-         extra_width =
-            device->physical_device->info->tile_max_w;
-         extra_height =
-            device->physical_device->info->tile_max_h;
+         extra_size = fdl6_lrz_get_max_fdm_extra_size<CHIP>(
+            device->physical_device->info, image->layout[0].width0,
+            image->layout[0].height0, image->vk.samples,
+            image->vk.array_layers);
+
+         image->max_tile_w_constraint_fdm = extra_size.extra_width;
+         image->max_tile_h_constraint_fdm = extra_size.extra_height;
       }
 
       fdl6_lrz_layout_init<CHIP>(&image->lrz_layout, &image->layout[0],
-                                 extra_width, extra_height,
+                                 extra_size.extra_width, extra_size.extra_height,
                                  device->physical_device->info,
                                  image->total_size, image->vk.array_layers);
 
@@ -717,7 +742,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
       if (!tu6_mutable_format_list_ubwc_compatible(device->physical_device->info,
                                                    fmt_list)) {
-         bool mutable_ubwc_fc = device->physical_device->info->a7xx.ubwc_all_formats_compatible;
+         bool mutable_ubwc_fc = device->physical_device->info->props.ubwc_all_formats_compatible;
 
          /* NV12 uses a special compression scheme for the Y channel which
           * doesn't support reinterpretation. We have to fall back to linear
@@ -769,6 +794,23 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
             image->is_mutable = true;
             if (!format_list_ubwc_possible(device, fmt_list, pCreateInfo))
                image->ubwc_enabled = false;
+         }
+
+         /* If the threshold of the linear mipmap fallback for compressed
+          * format is reached at a different mipmap level than the
+          * size-compatible non-compressed formats the image can be viewed as,
+          * then we have to disable the fallback. Otherwise, for some levels,
+          * texels would be read from the wrong locations due to the tiling
+          * mismatch.
+          * NOTE: Prop driver falls back to LINEAR in this case.
+          */
+         if (!device->physical_device->info->props
+                 .supports_linear_mipmap_threshold_in_blocks &&
+             vk_format_is_compressed(image->vk.format) &&
+             pCreateInfo->usage &
+                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT &&
+             format_list_has_uncompressed_format(fmt_list)) {
+            image->force_disable_linear_fallback = true;
          }
       }
    }

@@ -106,7 +106,7 @@ brw_compile_tes(const struct brw_compiler *compiler,
    }
 
    brw_nir_apply_key(nir, compiler, &key->base, dispatch_width);
-   brw_nir_lower_tes_inputs(nir, &input_vue_map);
+   brw_nir_lower_tes_inputs(nir, devinfo, &input_vue_map);
    brw_nir_lower_vue_outputs(nir);
    NIR_PASS(_, nir, intel_nir_lower_patch_vertices_tes);
    brw_postprocess_nir(nir, compiler, dispatch_width, params->base.archiver,
@@ -133,7 +133,7 @@ brw_compile_tes(const struct brw_compiler *compiler,
       BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_PRIMITIVE_ID);
 
    /* URB entry sizes are stored as a multiple of 64 bytes. */
-   prog_data->base.urb_entry_size = ALIGN(output_size_bytes, 64) / 64;
+   prog_data->base.urb_entry_size = align(output_size_bytes, 64) / 64;
 
    prog_data->base.urb_read_length = 0;
 

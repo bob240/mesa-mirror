@@ -84,7 +84,7 @@ panfrost_batch_init(struct panfrost_context *ctx,
 
    batch->seqnum = ++ctx->batches.seqnum;
 
-   util_dynarray_init(&batch->bos, NULL);
+   batch->bos = UTIL_DYNARRAY_INIT;
 
    batch->minx = batch->miny = ~0;
    batch->maxx = batch->maxy = 0;
@@ -495,6 +495,7 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
    fb->nr_samples = util_framebuffer_get_num_samples(&batch->key);
    fb->force_samples = (batch->line_smoothing == U_TRISTATE_YES) ? 16 : 0;
    fb->rt_count = batch->key.nr_cbufs;
+   fb->pls_enabled = batch->key.pls_enabled;
    fb->sprite_coord_origin = (batch->sprite_coord_origin == U_TRISTATE_YES);
    fb->first_provoking_vertex =
       (batch->first_provoking_vertex == U_TRISTATE_YES);

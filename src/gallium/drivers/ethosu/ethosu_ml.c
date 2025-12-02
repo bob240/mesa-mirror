@@ -69,7 +69,7 @@ ethosu_allocate_feature_map(struct ethosu_subgraph *subgraph, struct ethosu_feat
    if (tensor->layout == ETHOSU_LAYOUT_NHWC) {
       size = tensor->shape.width * tensor->shape.height * tensor->shape.depth;
    } else if (tensor->layout == ETHOSU_LAYOUT_NHCWB16) {
-      size = tensor->shape.width * tensor->shape.height * ALIGN(tensor->shape.depth, 16);
+      size = tensor->shape.width * tensor->shape.height * align(tensor->shape.depth, 16);
    } else {
       assert(0 && "Unsupported layout");
       size = 0; // This should never happen
@@ -204,8 +204,8 @@ ethosu_ml_subgraph_create(struct pipe_context *pcontext,
    subgraph = calloc(1, sizeof(*subgraph));
    subgraph->base.context = pcontext;
 
-   util_dynarray_init(&subgraph->tensors, NULL);
-   util_dynarray_init(&subgraph->operations, NULL);
+   subgraph->tensors = UTIL_DYNARRAY_INIT;
+   subgraph->operations = UTIL_DYNARRAY_INIT;
 
    ethosu_lower_graph(subgraph, poperations, count);
 

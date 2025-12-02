@@ -19,6 +19,7 @@
 #include "vk_shader_module.h"
 
 #include "panvk_instance.h"
+#include "panvk_buffer.h"
 #include "panvk_cmd_draw.h"
 #include "panvk_descriptor_set_layout.h"
 #include "panvk_physical_device.h"
@@ -28,7 +29,6 @@
 #include "pan_props.h"
 #include "util/pan_ir.h"
 
-#define ARM_VENDOR_ID        0x13b5
 /* We reserve one ubo for push constant, one for sysvals and one per-set for the
  * descriptor metadata  */
 #define RESERVED_UBO_COUNT                   6
@@ -86,12 +86,13 @@ panvk_per_arch(get_physical_device_extensions)(
       .KHR_maintenance9 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
+      .KHR_pipeline_binary = true,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
-      .KHR_sampler_ycbcr_conversion = PAN_ARCH >= 10,
+      .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_clock = true,
       .KHR_shader_draw_parameters = true,
@@ -132,6 +133,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clip_enable = true,
       .EXT_depth_clip_control = true,
+      .EXT_device_memory_report = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
 #endif
@@ -148,7 +150,7 @@ panvk_per_arch(get_physical_device_extensions)(
       .EXT_host_query_reset = true,
       .EXT_image_2d_view_of_3d = true,
       /* EXT_image_drm_format_modifier depends on KHR_sampler_ycbcr_conversion */
-      .EXT_image_drm_format_modifier = PAN_ARCH >= 10,
+      .EXT_image_drm_format_modifier = true,
       .EXT_image_robustness = true,
       .EXT_index_type_uint8 = true,
       .EXT_line_rasterization = true,
@@ -240,6 +242,8 @@ panvk_per_arch(get_physical_device_features)(
    const struct panvk_instance *instance,
    const struct panvk_physical_device *device, struct vk_features *features)
 {
+   bool has_sparse = PAN_ARCH >= 10;
+
    *features = (struct vk_features){
       /* Vulkan 1.0 */
       .robustBufferAccess = true,
@@ -291,15 +295,15 @@ panvk_per_arch(get_physical_device_features)(
       .shaderInt16 = true,
       .shaderResourceResidency = false,
       .shaderResourceMinLod = false,
-      .sparseBinding = PAN_ARCH >= 10,
-      .sparseResidencyBuffer = PAN_ARCH >= 10,
-      .sparseResidencyImage2D = false,
-      .sparseResidencyImage3D = false,
+      .sparseBinding = has_sparse,
+      .sparseResidencyBuffer = has_sparse,
+      .sparseResidencyImage2D = has_sparse,
+      .sparseResidencyImage3D = false, /* https://gitlab.freedesktop.org/panfrost/mesa/-/issues/242 */
       .sparseResidency2Samples = false,
       .sparseResidency4Samples = false,
       .sparseResidency8Samples = false,
       .sparseResidency16Samples = false,
-      .sparseResidencyAliased = false,
+      .sparseResidencyAliased = false, /* https://gitlab.freedesktop.org/panfrost/mesa/-/issues/237 */
       .variableMultisampleRate = false,
       .inheritedQueries = false,
 
@@ -314,7 +318,7 @@ panvk_per_arch(get_physical_device_features)(
       .variablePointersStorageBuffer = true,
       .variablePointers = true,
       .protectedMemory = false,
-      .samplerYcbcrConversion = PAN_ARCH >= 10,
+      .samplerYcbcrConversion = true,
       .shaderDrawParameters = true,
 
       /* Vulkan 1.2 */
@@ -477,6 +481,9 @@ panvk_per_arch(get_physical_device_features)(
        */
       .customBorderColorWithoutFormat = PAN_ARCH != 7,
 
+      /* VK_KHR_pipeline_binary */
+      .pipelineBinaries = true,
+
       /* VK_KHR_pipeline_executable_properties */
       .pipelineExecutableInfo = true,
 
@@ -535,6 +542,9 @@ panvk_per_arch(get_physical_device_features)(
       .presentWait2 = true,
 #endif
 
+      /* VK_EXT_device_memory_report */
+      .deviceMemoryReport = true,
+
       /* VK_ARM_shader_core_builtins */
       .shaderCoreBuiltins = PAN_ARCH >= 9,
    };
@@ -577,6 +587,8 @@ panvk_per_arch(get_physical_device_properties)(
 
    uint64_t os_page_size = 4096;
    os_get_page_size(&os_page_size);
+
+   const bool has_disk_cache = device->vk.disk_cache != NULL;
 
    /* Ensure that the max threads count per workgroup is valid for Bifrost */
    assert(PAN_ARCH > 8 || device->kmod.props.max_threads_per_wg <= 1024);
@@ -624,11 +636,12 @@ panvk_per_arch(get_physical_device_properties)(
       .maxImageDimension3D = PAN_ARCH <= 10 ? (1 << 9) : (1 << 14),
       .maxImageDimensionCube = PAN_ARCH <= 10 ? (1 << 14) - 1 : (1 << 16),
       .maxImageArrayLayers = (1 << 16),
-      /* Currently limited by the 1D texture size, which is 2^16.
-       * TODO: If we expose buffer views as 2D textures, we can increase the
-       * limit.
-       */
-      .maxTexelBufferElements = (1 << 16),
+      /* Currently Bifrost is limited by the 1D texture size, which is 2^16,
+         while pre-v11 is limited to 2^27 elements of 16 byte formats due to
+         size fields of 32 bits. */
+      .maxTexelBufferElements = PAN_ARCH >= 11  ? PANVK_MAX_BUFFER_SIZE
+                                : PAN_ARCH >= 9 ? (1 << 27)
+                                                : (1 << 16),
       /* Each uniform entry is 16-byte and the number of entries is encoded in a
        * 12-bit field, with the minus(1) modifier, which gives 2^20.
        */
@@ -796,7 +809,7 @@ panvk_per_arch(get_physical_device_properties)(
       /* Vulkan 1.0 sparse properties */
       .sparseResidencyNonResidentStrict = false,
       .sparseResidencyAlignedMipSize = false,
-      .sparseResidencyStandard2DBlockShape = false,
+      .sparseResidencyStandard2DBlockShape = true,
       .sparseResidencyStandard2DMultisampleBlockShape = false,
       .sparseResidencyStandard3DBlockShape = false,
 
@@ -954,9 +967,9 @@ panvk_per_arch(get_physical_device_properties)(
       .integerDotProductAccumulatingSaturating64BitMixedSignednessAccelerated = false,
       .storageTexelBufferOffsetAlignmentBytes = 64,
       .storageTexelBufferOffsetSingleTexelAlignment = false,
-      .uniformTexelBufferOffsetAlignmentBytes = 64,
-      .uniformTexelBufferOffsetSingleTexelAlignment = false,
-      .maxBufferSize = 1 << 30,
+      .uniformTexelBufferOffsetAlignmentBytes = PAN_ARCH >= 9 ? 4 : 64,
+      .uniformTexelBufferOffsetSingleTexelAlignment = PAN_ARCH >= 9,
+      .maxBufferSize = PANVK_MAX_BUFFER_SIZE,
 
       /* Vulkan 1.4 properties */
       .lineSubPixelPrecisionBits = 8,
@@ -985,6 +998,13 @@ panvk_per_arch(get_physical_device_properties)(
       .defaultRobustnessImages =
          VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_EXT,
       .identicalMemoryTypeRequirements = true,
+
+      /* VK_KHR_pipeline_binary */
+      .pipelineBinaryInternalCache = has_disk_cache,
+      .pipelineBinaryInternalCacheControl = has_disk_cache,
+      .pipelineBinaryPrefersInternalCache = has_disk_cache,
+      .pipelineBinaryPrecompiledInternalCache = has_disk_cache,
+      .pipelineBinaryCompressedData = false,
 
       /* VK_EXT_robustness2 */
       .robustStorageBufferAccessSizeAlignment = 1,

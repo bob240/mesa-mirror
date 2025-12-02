@@ -35,8 +35,10 @@
 #include "panfrost/util/pan_lower_framebuffer.h"
 
 void bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id);
+void bifrost_optimize_nir(nir_shader *nir, unsigned gpu_id);
 void bifrost_postprocess_nir(nir_shader *nir, unsigned gpu_id);
 void bifrost_lower_texture_nir(nir_shader *nir, unsigned gpu_id);
+void bifrost_lower_texture_late_nir(nir_shader *nir, unsigned gpu_id);
 void midgard_preprocess_nir(nir_shader *nir, unsigned gpu_id);
 void midgard_postprocess_nir(nir_shader *nir, unsigned gpu_id);
 void midgard_lower_texture_nir(nir_shader *nir, unsigned gpu_id);
@@ -55,6 +57,13 @@ pan_shader_preprocess(nir_shader *nir, unsigned gpu_id)
       bifrost_preprocess_nir(nir, gpu_id);
    else
       midgard_preprocess_nir(nir, gpu_id);
+}
+
+static inline void
+pan_shader_optimize(nir_shader *nir, unsigned gpu_id)
+{
+   assert(pan_arch(gpu_id) >= 6);
+   bifrost_optimize_nir(nir, gpu_id);
 }
 
 static inline void
@@ -84,12 +93,12 @@ pan_shader_lower_texture_early(nir_shader *nir, unsigned gpu_id)
 }
 
 static inline void
-pan_shader_lower_texture(nir_shader *nir, unsigned gpu_id)
+pan_shader_lower_texture_late(nir_shader *nir, unsigned gpu_id)
 {
+   /* This must be called after any lowering of resource indices
+    * (panfrost_nir_lower_res_indices / panvk_per_arch(nir_lower_descriptors)) */
    if (pan_arch(gpu_id) >= 6)
-      bifrost_lower_texture_nir(nir, gpu_id);
-   else
-      midgard_lower_texture_nir(nir, gpu_id);
+      bifrost_lower_texture_late_nir(nir, gpu_id);
 }
 
 static inline void

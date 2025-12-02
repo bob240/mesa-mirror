@@ -166,7 +166,8 @@ brw_generator::generate_send(brw_send_inst *inst,
                              struct brw_reg desc,
                              struct brw_reg ex_desc,
                              struct brw_reg payload,
-                             struct brw_reg payload2)
+                             struct brw_reg payload2,
+                             bool ex_bso)
 {
    const bool gather = inst->opcode == SHADER_OPCODE_SEND_GATHER;
    if (gather) {
@@ -192,7 +193,7 @@ brw_generator::generate_send(brw_send_inst *inst,
       brw_send_indirect_split_message(p, inst->sfid, dst, payload, payload2,
                                       desc, ex_desc,
                                       inst->ex_desc_imm ? inst->offset : 0,
-                                      inst->ex_mlen, inst->ex_bso,
+                                      inst->ex_mlen, ex_bso,
                                       inst->eot, gather);
       if (inst->check_tdr)
          brw_eu_inst_set_opcode(p->isa, brw_last_inst,
@@ -298,13 +299,20 @@ brw_generator::generate_mov_indirect(brw_inst *inst,
          brw_eu_inst_set_no_dd_check(devinfo, insn, use_dep_ctrl);
 
       if (brw_type_size_bytes(reg.type) > 4 &&
-          (intel_device_info_is_9lp(devinfo) || !devinfo->has_64bit_int)) {
+          (devinfo->ver != 9 || intel_device_info_is_9lp(devinfo))) {
          /* From the Cherryview PRM Vol 7. "Register Region Restrictions":
           *
           *   "When source or destination datatype is 64b or operation is
           *    integer DWord multiply, indirect addressing must not be used."
           *
-          * We may also not support Q/UQ types.
+          * Later platforms either don't support Q/UQ types or have a
+          * restriction in "Register Region Restrictions" similar to
+          *
+          *   "Vx1 and VxH indirect addressing for Float, Half-Float, Double-Float and
+          *    Quad-Word data must not be used."
+          *
+          * Which means effectively all platforms except non-LP Gfx9 will
+          * need to lower this MOV.
           *
           * To work around both of these, we do two integer MOVs instead
           * of one 64-bit MOV.  Because no double value should ever cross
@@ -1159,14 +1167,18 @@ brw_generator::generate_code(const brw_shader &s,
 
       case SHADER_OPCODE_SEND:
          generate_send(inst->as_send(), dst, src[SEND_SRC_DESC], src[SEND_SRC_EX_DESC],
-                       src[SEND_SRC_PAYLOAD1], src[SEND_SRC_PAYLOAD2]);
+                       src[SEND_SRC_PAYLOAD1], src[SEND_SRC_PAYLOAD2],
+                       inst->as_send()->bindless_surface &&
+                       compiler->extended_bindless_surface_offset);
          send_count++;
          break;
 
       case SHADER_OPCODE_SEND_GATHER:
          generate_send(inst->as_send(), dst,
                        src[SEND_GATHER_SRC_DESC], src[SEND_GATHER_SRC_EX_DESC],
-                       src[SEND_GATHER_SRC_SCALAR], brw_null_reg());
+                       src[SEND_GATHER_SRC_SCALAR], brw_null_reg(),
+                       inst->as_send()->bindless_surface &&
+                       compiler->extended_bindless_surface_offset);
          send_count++;
          break;
 
@@ -1411,8 +1423,32 @@ brw_generator::generate_code(const brw_shader &s,
 
          brw_eu_inst *last = &p->store[last_insn_offset / 16];
 
-         if (inst->conditional_mod)
-            brw_eu_inst_set_cond_modifier(p->devinfo, last, inst->conditional_mod);
+         if (inst->conditional_mod) {
+            if (inst->opcode != BRW_OPCODE_BFN) {
+               brw_eu_inst_set_cond_modifier(p->devinfo, last, inst->conditional_mod);
+            } else {
+               unsigned cc;
+
+               switch (inst->conditional_mod) {
+               case BRW_CONDITIONAL_NONE:
+                  cc = 0;
+                  break;
+               case BRW_CONDITIONAL_Z:
+                  cc = 1;
+                  break;
+               case BRW_CONDITIONAL_G:
+                  cc = 2;
+                  break;
+               case BRW_CONDITIONAL_L:
+                  cc = 3;
+                  break;
+               default:
+                  UNREACHABLE("Invalid cmod for BFN.");
+               }
+
+               brw_eu_inst_set_boolean_func_cond_modifier(p->devinfo, last, cc);
+            }
+         }
       }
 
       /* When enabled, insert sync NOP after every instruction and make sure

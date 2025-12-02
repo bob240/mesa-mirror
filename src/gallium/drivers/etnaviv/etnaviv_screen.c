@@ -505,6 +505,17 @@ gpu_supports_vertex_format(struct etna_screen *screen, enum pipe_format format)
    if (util_format_is_pure_integer(format))
       return VIV_FEATURE(screen, ETNA_FEATURE_HALTI2);
 
+   /* ARB_vertex_type_2_10_10_10_rev */
+   if (format == PIPE_FORMAT_R10G10B10A2_UNORM ||
+       format == PIPE_FORMAT_B10G10R10A2_UNORM ||
+       format == PIPE_FORMAT_R10G10B10A2_SNORM ||
+       format == PIPE_FORMAT_B10G10R10A2_SNORM ||
+       format == PIPE_FORMAT_R10G10B10A2_USCALED ||
+       format == PIPE_FORMAT_B10G10R10A2_USCALED ||
+       format == PIPE_FORMAT_R10G10B10A2_SSCALED ||
+       format == PIPE_FORMAT_B10G10R10A2_SSCALED)
+      return VIV_FEATURE(screen, ETNA_FEATURE_HALTI2);
+
    return true;
 }
 
@@ -1075,7 +1086,7 @@ etna_screen_create(struct etna_device *dev, struct etna_gpu *gpu,
    etna_init_shader_caps(screen);
    etna_init_screen_caps(screen);
 
-   util_dynarray_init(&screen->supported_pm_queries, NULL);
+   screen->supported_pm_queries = UTIL_DYNARRAY_INIT;
    slab_create_parent(&screen->transfer_pool, sizeof(struct etna_transfer), 16);
 
    if (screen->drm_version >= ETNA_DRM_VERSION_PERFMON)

@@ -215,7 +215,8 @@ iris_init_shader_caps(struct iris_screen *screen)
 
       /* Lie about these to avoid st/mesa's GLSL IR lowering of indirects,
        * which we don't want.  Our compiler backend will check brw_compiler's
-       * options and call nir_lower_indirect_derefs appropriately anyway.
+       * options and call nir_lower_indirect_derefs_to_if_else_trees
+       * appropriately anyway.
        */
       caps->indirect_temp_addr = true;
       caps->indirect_const_addr = true;
@@ -617,7 +618,7 @@ iris_init_identifier_bo(struct iris_screen *screen)
 
    screen->workaround_address = (struct iris_address) {
       .bo = screen->workaround_bo,
-      .offset = ALIGN(
+      .offset = align(
          intel_debug_write_identifiers(bo_map, 4096, "Iris"), 32),
    };
 
@@ -751,6 +752,8 @@ iris_screen_create(int fd, const struct pipe_screen_config *config)
       driQueryOptionb(config->options, "intel_te_distribution");
    screen->driconf.generated_indirect_threshold =
       driQueryOptioni(config->options, "generated_indirect_threshold");
+   screen->driconf.disable_threaded_context =
+      driQueryOptionb(config->options, "intel_disable_threaded_context");
 
    screen->precompile = debug_get_bool_option("shader_precompile", true);
 

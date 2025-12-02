@@ -2890,7 +2890,7 @@ agx_optimize_loop_nir(nir_shader *nir)
    do {
       progress = false;
 
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
@@ -3118,7 +3118,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
    /* Before optimizing bounds checks, we need to clean up and index defs so
     * optimize_bounds does the right thing.
     */
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
 
    nir_foreach_function_impl(impl, nir) {
@@ -3132,7 +3132,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
    NIR_PASS(_, nir, agx_nir_fuse_selects);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_combine_barriers, NULL, NULL);
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_opt_cse);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, NULL, NULL);
@@ -3152,7 +3152,7 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
     * can't deal with dead phis.
     */
    do {
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       progress = false;
    } while (progress);
@@ -3164,38 +3164,23 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
  * conformant not to, but every app gets this wrong.
  */
 static bool
-gather_texcoords(nir_builder *b, nir_instr *instr, void *data)
+gather_texcoords(nir_builder *b, nir_tex_instr *tex, void *data)
 {
-   uint64_t *mask = data;
-
-   if (instr->type != nir_instr_type_tex)
+   nir_def *coord = nir_get_tex_src(tex, nir_tex_src_coord);
+   if (!coord)
       return false;
 
-   nir_tex_instr *tex = nir_instr_as_tex(instr);
+   nir_scalar x = nir_scalar_resolved(coord, 0);
+   nir_scalar y = nir_scalar_resolved(coord, 1);
+   nir_intrinsic_instr *intr = nir_scalar_as_intrinsic(x);
 
-   int coord_idx = nir_tex_instr_src_index(tex, nir_tex_src_coord);
-   if (coord_idx < 0)
-      return false;
+   if (x.def == y.def && intr &&
+       intr->intrinsic == nir_intrinsic_load_interpolated_input) {
 
-   nir_src src = tex->src[coord_idx].src;
-   nir_scalar x = nir_scalar_resolved(src.ssa, 0);
-   nir_scalar y = nir_scalar_resolved(src.ssa, 1);
+      uint64_t *mask = data;
+      *mask |= BITFIELD64_BIT(nir_intrinsic_io_semantics(intr).location);
+   }
 
-   if (x.def != y.def)
-      return false;
-
-   nir_instr *parent = x.def->parent_instr;
-
-   if (parent->type != nir_instr_type_intrinsic)
-      return false;
-
-   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(parent);
-
-   if (intr->intrinsic != nir_intrinsic_load_interpolated_input)
-      return false;
-
-   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
-   *mask |= BITFIELD64_BIT(sem.location);
    return false;
 }
 
@@ -3209,7 +3194,7 @@ agx_gather_texcoords(nir_shader *nir)
    assert(nir->info.stage == MESA_SHADER_FRAGMENT);
 
    uint64_t mask = 0;
-   nir_shader_instructions_pass(nir, gather_texcoords, nir_metadata_all, &mask);
+   nir_shader_tex_pass(nir, gather_texcoords, nir_metadata_all, &mask);
    return mask;
 }
 
@@ -3465,7 +3450,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
     */
    if (ctx->any_scratch) {
       assert(!ctx->is_preamble && "preambles don't use scratch");
-      ctx->scratch_size_B = ALIGN(nir->scratch_size, 16);
+      ctx->scratch_size_B = align(nir->scratch_size, 16);
    }
 
    /* Stop the main shader or preamble shader after the exit block. For real
@@ -3524,7 +3509,7 @@ agx_compile_function_nir(nir_shader *nir, nir_function_impl *impl,
 
    if (ctx->scratch_size_B > 0) {
       /* Apple always allocate 40 more bytes in the entrypoint and align to 4. */
-      uint64_t stack_size = ALIGN(DIV_ROUND_UP(ctx->scratch_size_B, 4) + 10, 4);
+      uint64_t stack_size = align(DIV_ROUND_UP(ctx->scratch_size_B, 4) + 10, 4);
 
       assert(stack_size < INT16_MAX);
 
@@ -3704,7 +3689,8 @@ agx_preprocess_nir(nir_shader *nir)
    /* Lower large arrays to scratch and small arrays to csel */
    NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 256,
             glsl_get_natural_size_align_bytes, glsl_get_word_size_align_bytes);
-   NIR_PASS(_, nir, nir_lower_indirect_derefs, nir_var_function_temp, ~0);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_function_temp, ~0);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -3787,8 +3773,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    agx_compiler_debug = agx_get_compiler_debug();
    struct agx_shader_info *info = &out->info;
 
-   struct util_dynarray binary;
-   util_dynarray_init(&binary, NULL);
+   struct util_dynarray binary = UTIL_DYNARRAY_INIT;
 
    memset(out, 0, sizeof *out);
 
@@ -3821,7 +3806,8 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
       NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 256,
                glsl_get_natural_size_align_bytes,
                glsl_get_natural_size_align_bytes);
-      NIR_PASS(_, nir, nir_lower_indirect_derefs, nir_var_function_temp, ~0);
+      NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+               nir_var_function_temp, ~0);
    }
 
    /* Cleanup 8-bit math before lowering */

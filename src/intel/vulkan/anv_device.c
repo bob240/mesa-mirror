@@ -355,6 +355,15 @@ VkResult anv_CreateDevice(
                                                 true);
       override_initial_entrypoints = false;
    }
+
+   if (physical_device->info.ver < 12 &&
+       physical_device->instance->vk.app_info.app_name &&
+       !strcmp(physical_device->instance->vk.app_info.app_name, "GeeXLab")) {
+      vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                                &anv_furmark_device_entrypoints,
+                                                true);
+      override_initial_entrypoints = false;
+   }
 #if DETECT_OS_ANDROID
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
                                              &anv_android_device_entrypoints,
@@ -972,6 +981,8 @@ VkResult anv_CreateDevice(
    if (device->info->ver > 9)
       BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_PMA_FIX);
 
+   BITSET_CLEAR(device->gfx_dirty_state, ANV_GFX_STATE_WA_14024997852);
+
    device->queue_count = 0;
    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
       const VkDeviceQueueCreateInfo *queueCreateInfo =
@@ -1574,7 +1585,7 @@ VkResult anv_AllocateMemory(
       alloc_flags |= ANV_BO_ALLOC_DYNAMIC_VISIBLE_POOL;
 
    if (mem->vk.ahardware_buffer) {
-      result = anv_import_ahw_memory(_device, mem);
+      result = anv_import_ahb_memory(_device, mem);
       if (result != VK_SUCCESS)
          goto fail;
 
@@ -1608,7 +1619,9 @@ VkResult anv_AllocateMemory(
           * heap and then PAT entry in the later vm_bind stage.
           */
          assert(device->info->ver >= 20);
-         alloc_flags |= ANV_BO_ALLOC_SCANOUT;
+         assert(image);
+         if (vk_format_is_color(image->vk.format))
+            alloc_flags |= ANV_BO_ALLOC_SCANOUT;
       }
 
       result = anv_device_import_bo(device, fd_info->fd, alloc_flags,

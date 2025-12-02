@@ -51,9 +51,15 @@ struct tu_image
 
    struct fdl_lrz_layout lrz_layout;
 
+   /* Maximum width/height of tiles for use with this image, or ~0 if no constraints. */
+   uint32_t max_tile_w_constraint_fdm;
+   uint32_t max_tile_h_constraint_fdm;
+
    bool ubwc_enabled;
    bool force_linear_tile;
    bool is_mutable;
+   /* Force to either use tiled layout or linear for all mip layers. */
+   bool force_disable_linear_fallback;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)
 

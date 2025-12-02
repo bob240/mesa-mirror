@@ -89,13 +89,6 @@ struct wsi_surface_supported_counters {
 #define VK_STRUCTURE_TYPE_WSI_SURFACE_SUPPORTED_COUNTERS_MESA_cast \
    struct wsi_surface_supported_counters
 
-
-/* Mesa-specific dynamic rendering flag to indicate that legacy RPs don't use
- * input attachments with concurrent writes (aka. feedback loops).
- */
-#define VK_RENDERING_INPUT_ATTACHMENT_NO_CONCURRENT_WRITES_BIT_MESA 0x80000000
-
-
 /**
  * Pseudo-extension struct that may be chained into VkRenderingAttachmentInfo
  * to indicate an initial layout for the attachment.  This is only allowed if
@@ -152,6 +145,7 @@ static const VkPipelineCreateFlagBits2
 
 #define VK_SHADER_CREATE_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_MESA 0x1000
 #define VK_SHADER_CREATE_UNALIGNED_DISPATCH_BIT_MESA               0x2000
+#define VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_MESA                 0x4000
 
 #ifdef __cplusplus
 }

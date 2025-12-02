@@ -126,6 +126,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_timeline_semaphore = true,
 #ifdef HK_USE_WSI_PLATFORM
       .KHR_swapchain = true,
+      .KHR_swapchain_maintenance1 = true,
       .KHR_swapchain_mutable_format = true,
 #endif
       .KHR_synchronization2 = true,
@@ -543,7 +544,7 @@ hk_get_device_features(
       .imageSlicedViewOf3D = false,
 
 #ifdef HK_USE_WSI_PLATFORM
-      /* VK_EXT_swapchain_maintenance1 */
+      /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 #endif
 
@@ -936,7 +937,8 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* VK_KHR_maintenance9 */
       .image2DViewOf3DSparse = false,
-      .defaultVertexAttributeValue = VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR,
+      .defaultVertexAttributeValue =
+         VK_DEFAULT_VERTEX_ATTRIBUTE_VALUE_ZERO_ZERO_ZERO_ONE_KHR,
 
       /* VK_EXT_map_memory_placed */
       .minPlacedMemoryMapAlignment = os_page_size,
@@ -1243,7 +1245,7 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
 
    hk_physical_device_init_pipeline_cache(pdev);
 
-   const char *hk_sysmem = getenv("HK_SYSMEM");
+   const char *hk_sysmem = os_get_option("HK_SYSMEM");
    if (hk_sysmem) {
       uint64_t sysmem = strtoll(hk_sysmem, NULL, 10);
       if (sysmem != LLONG_MIN && sysmem != LLONG_MAX) {

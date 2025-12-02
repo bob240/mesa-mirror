@@ -111,6 +111,7 @@ static const struct vk_instance_extension_table instance_extensions = {
 #ifdef V3DV_USE_WSI_PLATFORM
    .KHR_get_surface_capabilities2       = true,
    .KHR_surface                         = true,
+   .KHR_surface_maintenance1            = true,
    .KHR_surface_protected_capabilities  = true,
    .EXT_surface_maintenance1            = true,
    .EXT_swapchain_colorspace            = true,
@@ -190,6 +191,7 @@ get_device_extensions(const struct v3dv_physical_device *device,
       .KHR_workgroup_memory_explicit_layout = true,
 #ifdef V3DV_USE_WSI_PLATFORM
       .KHR_swapchain                        = true,
+      .KHR_swapchain_maintenance1           = true,
       .KHR_swapchain_mutable_format         = true,
       .KHR_incremental_present              = true,
       .KHR_present_id2                      = true,
@@ -508,7 +510,7 @@ get_features(const struct v3dv_physical_device *physical_device,
       .maintenance5 = true,
 
 #ifdef V3DV_USE_WSI_PLATFORM
-      /* VK_EXT_swapchain_maintenance1 */
+      /* VK_KHR_swapchain_maintenance1 */
       .swapchainMaintenance1 = true,
 
       /* VK_KHR_present_id2 */
@@ -586,7 +588,7 @@ v3dv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    instance->pipeline_cache_enabled = true;
    instance->default_pipeline_cache_enabled = true;
    instance->meta_cache_enabled = true;
-   const char *pipeline_cache_str = getenv("V3DV_ENABLE_PIPELINE_CACHE");
+   const char *pipeline_cache_str = os_get_option("V3DV_ENABLE_PIPELINE_CACHE");
    if (pipeline_cache_str != NULL) {
       if (strncmp(pipeline_cache_str, "full", 4) == 0) {
          /* nothing to do, just to filter correct values */
@@ -1582,9 +1584,7 @@ enumerate_devices(struct vk_instance *vk_instance)
          break;
    }
 
-   assert(primary_fd >= 0);
-
-   if (render_fd < 0)
+   if (render_fd < 0 || primary_fd < 0)
       result = VK_ERROR_INCOMPATIBLE_DRIVER;
    else
       result = create_physical_device(instance, primary_fd, render_fd, display_fd);

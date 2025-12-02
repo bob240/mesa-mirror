@@ -106,7 +106,7 @@ hk_create_cmd_buffer(struct vk_command_pool *vk_pool,
       return result;
    }
 
-   util_dynarray_init(&cmd->large_bos, NULL);
+   cmd->large_bos = UTIL_DYNARRAY_INIT;
 
    cmd->vk.dynamic_graphics_state.vi = &cmd->state.gfx._dynamic_vi;
    cmd->vk.dynamic_graphics_state.ms.sample_locations =
@@ -144,7 +144,6 @@ hk_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
    cmd->current_cs.pre_gfx = NULL;
 
    assert(!cmd->in_meta);
-   cmd->geom_indirect = 0;
    cmd->geom_index_buffer = 0;
    cmd->geom_index_count = 0;
    cmd->geom_instance_count = 0;
@@ -723,8 +722,8 @@ hk_upload_usc_words(struct hk_cmd_buffer *cmd, struct hk_shader *s,
 
       if (linked->sw_indexing) {
          agx_usc_uniform(
-            &b, AGX_ABI_VUNI_INPUT_ASSEMBLY(count), 4,
-            root_ptr + hk_root_descriptor_offset(draw.input_assembly));
+            &b, AGX_ABI_VUNI_VERTEX_PARAMS(count), 4,
+            root_ptr + hk_root_descriptor_offset(draw.vertex_params));
       }
 
       root_unif = AGX_ABI_VUNI_COUNT_VK(count);
@@ -831,8 +830,8 @@ hk_cs_init_graphics(struct hk_cmd_buffer *cmd, struct hk_cs *cs)
    agx_ppp_fini(&map, &ppp);
    cs->current = map;
 
-   util_dynarray_init(&cs->scissor, NULL);
-   util_dynarray_init(&cs->depth_bias, NULL);
+   cs->scissor = UTIL_DYNARRAY_INIT;
+   cs->depth_bias = UTIL_DYNARRAY_INIT;
 
    /* All graphics state must be reemited in each control stream */
    hk_cmd_buffer_dirty_all(cmd);

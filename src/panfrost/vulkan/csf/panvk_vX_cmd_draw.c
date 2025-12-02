@@ -71,6 +71,7 @@ generate_fn_set_fbds_provoking_vertex(struct panvk_device *dev,
       .nr_registers = csif_info->cs_reg_count,
       .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
       .reg_perm = provoking_vertex_fn_reg_perm_cb,
+      .ls_sb_slot = SB_ID(LS),
    };
    cs_builder_init(&b, &conf, fn_mem);
 
@@ -137,7 +138,7 @@ calc_fn_set_fbds_provoking_vertex_idx(struct panvk_cmd_buffer *cmdbuf)
 VkResult
 panvk_per_arch(device_draw_context_init)(struct panvk_device *dev)
 {
-   dev->draw_ctx = vk_alloc(&dev->vk.alloc,
+   dev->draw_ctx = vk_zalloc(&dev->vk.alloc,
             sizeof(struct panvk_device_draw_context),
             _Alignof(struct panvk_device_draw_context),
             VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -929,7 +930,7 @@ cs_render_desc_ringbuf_reserve(struct cs_builder *b, uint32_t size)
    assert(size <= RENDER_DESC_RINGBUF_SIZE);
 
    /* Make sure the allocation is 64-byte aligned. */
-   assert(ALIGN_POT(size, 64) == size);
+   assert(util_is_aligned(size, 64));
 
    struct cs_index ringbuf_sync = cs_scratch_reg64(b, 0);
    struct cs_index sz_reg = cs_scratch_reg32(b, 2);
@@ -2044,8 +2045,16 @@ prepare_dcd(struct panvk_cmd_buffer *cmdbuf,
 
             cfg.pixel_kill_operation = (enum mali_pixel_kill)earlyzs->kill;
             cfg.zs_update_operation = (enum mali_pixel_kill)earlyzs->update;
-            cfg.evaluate_per_sample = fs->info.fs.sample_shading &&
-                                      (dyns->ms.rasterization_samples > 1);
+
+            /* Use per-sample shading if required by API. Also use it when a
+             * blend shader is used with multisampling, as this is handled by a
+             * single ST_TILE in the blend shader with the current sample ID,
+             * requiring per-sample shading.
+             */
+            cfg.evaluate_per_sample =
+               (fs->info.fs.sample_shading ||
+                cmdbuf->state.gfx.cb.info.needs_shader) &&
+               (dyns->ms.rasterization_samples > 1);
 
             cfg.shader_modifies_coverage = fs->info.fs.writes_coverage ||
                                            fs->info.fs.can_discard ||
@@ -2144,15 +2153,10 @@ set_tiler_idvs_flags(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
    bool writes_point_size =
       vs->info.vs.writes_point_size &&
       ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-   bool multiview = cmdbuf->state.gfx.render.view_mask;
    bool writes_layer = vs->info.outputs_written & VARYING_BIT_LAYER;
-
-   /* Multiview shaders depend on the FIFO format for indexing per-view
-    * output writes. We don't currently patch these offsets in the no_psiz
-    * variant, so we still need the extended format even though the shader
-    * does not write point size. */
-   bool extended_fifo = writes_point_size || writes_layer ||
-                        (vs->info.vs.writes_point_size && multiview);
+   bool extended_fifo = writes_point_size || vs->info.vs.needs_extended_fifo;
+   bool writes_prim_id = vs->info.outputs_written & VARYING_BIT_PRIMITIVE_ID;
+   bool fs_reads_prim_id = fs ? fs->info.fs.reads_primitive_id : false;
 
    bool dirty = gfx_state_dirty(cmdbuf, VS) || fs_user_dirty(cmdbuf) ||
                 dyn_gfx_state_dirty(cmdbuf, IA_PRIMITIVE_RESTART_ENABLE) ||
@@ -2163,8 +2167,8 @@ set_tiler_idvs_flags(struct cs_builder *b, struct panvk_cmd_buffer *cmdbuf,
    if (dirty) {
       pan_pack(&tiler_idvs_flags, PRIMITIVE_FLAGS, cfg) {
          cfg.draw_mode = translate_prim_topology(ia->primitive_topology);
-         cfg.primitive_index_enable =
-            fs ? fs->info.fs.reads_primitive_id : false;
+         cfg.primitive_index_enable = fs_reads_prim_id;
+         cfg.primitive_index_override = writes_prim_id && fs_reads_prim_id;
 
 #if PAN_ARCH < 13
          cfg.point_size_array_format = writes_point_size
@@ -2970,22 +2974,12 @@ flush_tiling(struct panvk_cmd_buffer *cmdbuf)
 
    cs_move64_to(b, add_val, 1);
 
-   cs_match(b, iter_sb, cmp_scratch) {
-#define CASE(x)                                                                \
-   cs_case(b, SB_ITER(x)) {                                                    \
-      cs_heap_operation(b, MALI_CS_HEAP_OPERATION_VERTEX_TILER_COMPLETED,      \
-                        cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));      \
-      panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,        \
-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,       \
-                             cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC))); \
-   }
-
-      CASE(0)
-      CASE(1)
-      CASE(2)
-      CASE(3)
-      CASE(4)
-#undef CASE
+   cs_match_iter_sb(b, x, iter_sb, cmp_scratch) {
+      cs_heap_operation(b, MALI_CS_HEAP_OPERATION_VERTEX_TILER_COMPLETED,
+                        cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
+      panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_VERTEX_TILER, true,
+                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
+                             cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC)));
    }
 #endif
 
@@ -3279,66 +3273,6 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
                 offsetof(struct panvk_cs_subqueue_context, syncobjs));
    cs_add64(b, sync_addr, sync_addr,
             PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64));
-
-   if (td_count == 1) {
-      cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);
-      cs_finish_fragment(b, true, completed_top, completed_bottom,
-                         cs_defer_indirect());
-   } else if (td_count > 1) {
-      cs_while(b, MALI_CS_CONDITION_GREATER, tiler_count) {
-         cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);
-         cs_finish_fragment(b, false, completed_top, completed_bottom,
-                            cs_defer_indirect());
-         cs_update_frag_ctx(b)
-            cs_add64(b, cur_tiler, cur_tiler, pan_size(TILER_CONTEXT));
-         cs_add32(b, tiler_count, tiler_count, -1);
-      }
-      cs_frag_end(b, cs_defer_indirect());
-   }
-
-   if (free_render_descs) {
-      cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG, release_sz,
-                    ringbuf_sync_addr, cs_defer_indirect());
-   }
-
-   if (has_oq_chain) {
-      struct cs_index flush_id = oq_chain_lo;
-      cs_move32_to(b, flush_id, 0);
-
-      /* FLUSH_CACHE2 is part of the deferred group so we need to
-       * temporarily set DEFERRED_FLUSH here to use the right scoreboard in
-       * indirect mode */
-      cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_DEFERRED,
-                         SB_ID(DEFERRED_FLUSH));
-      cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
-                      MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,
-                      cs_defer_indirect());
-      cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_DEFERRED,
-                         SB_ID(DEFERRED_SYNC));
-
-      cs_load64_to(b, oq_chain, cs_subqueue_ctx_reg(b),
-                   offsetof(struct panvk_cs_subqueue_context, render.oq_chain));
-
-      /* For WAR dependency on subqueue_context.render.oq_chain. */
-      cs_flush_loads(b);
-
-      /* We use oq_syncobj as a placeholder to reset the oq_chain. */
-      cs_move64_to(b, oq_syncobj, 0);
-      cs_store64(b, oq_syncobj, cs_subqueue_ctx_reg(b),
-                 offsetof(struct panvk_cs_subqueue_context, render.oq_chain));
-
-      cs_single_link_list_for_each_from(b, oq_chain,
-                                        struct panvk_cs_occlusion_query, node) {
-         cs_load64_to(b, oq_syncobj, oq_chain,
-                      offsetof(struct panvk_cs_occlusion_query, syncobj));
-         cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, add_val_lo, oq_syncobj,
-                       cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));
-      }
-   }
-
-   panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
-                          MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,
-                          cs_defer_indirect());
 #else
    struct cs_index iter_sb = cs_scratch_reg32(b, 2);
    struct cs_index cmp_scratch = cs_scratch_reg32(b, 3);
@@ -3348,69 +3282,78 @@ issue_fragment_jobs(struct panvk_cmd_buffer *cmdbuf)
               offsetof(struct panvk_cs_subqueue_context, syncobjs));
    cs_add64(b, sync_addr, sync_addr,
             PANVK_SUBQUEUE_FRAGMENT * sizeof(struct panvk_cs_sync64));
-
-   cs_match(b, iter_sb, cmp_scratch) {
-#define CASE(x)                                                                \
-   cs_case(b, SB_ITER(x)) {                                                    \
-      const struct cs_async_op async =                                         \
-         cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC));                      \
-      if (td_count == 1) {                                                     \
-         cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);            \
-         cs_finish_fragment(b, true, completed_top, completed_bottom, async);  \
-      } else if (td_count > 1) {                                               \
-         cs_while(b, MALI_CS_CONDITION_GREATER, tiler_count) {                 \
-            cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);         \
-            cs_finish_fragment(b, false, completed_top, completed_bottom,      \
-                               async);                                         \
-            cs_update_frag_ctx(b)                                              \
-               cs_add64(b, cur_tiler, cur_tiler, pan_size(TILER_CONTEXT));     \
-            cs_add32(b, tiler_count, tiler_count, -1);                         \
-         }                                                                     \
-         cs_frag_end(b, async);                                                \
-      }                                                                        \
-      if (free_render_descs) {                                                 \
-         cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG, release_sz,            \
-                       ringbuf_sync_addr, async);                              \
-      }                                                                        \
-      if (has_oq_chain) {                                                      \
-         struct cs_index flush_id = oq_chain_lo;                               \
-         cs_move32_to(b, flush_id, 0);                                         \
-         cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN,                          \
-                         MALI_CS_FLUSH_MODE_CLEAN,                             \
-                         MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id,              \
-                         cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_FLUSH)));    \
-         cs_load64_to(                                                         \
-            b, oq_chain, cs_subqueue_ctx_reg(b),                               \
-            offsetof(struct panvk_cs_subqueue_context, render.oq_chain));      \
-         /* For WAR dependency on subqueue_context.render.oq_chain. */         \
-         cs_flush_loads(b);                                                    \
-         /* We use oq_syncobj as a placeholder to reset the oq_chain. */       \
-         cs_move64_to(b, oq_syncobj, 0);                                       \
-         cs_store64(                                                           \
-            b, oq_syncobj, cs_subqueue_ctx_reg(b),                             \
-            offsetof(struct panvk_cs_subqueue_context, render.oq_chain));      \
-         cs_single_link_list_for_each_from(                                    \
-            b, oq_chain, struct panvk_cs_occlusion_query, node) {              \
-            cs_load64_to(b, oq_syncobj, oq_chain,                              \
-                         offsetof(struct panvk_cs_occlusion_query, syncobj));  \
-            cs_sync32_set(                                                     \
-               b, true, MALI_CS_SYNC_SCOPE_CSG, add_val_lo, oq_syncobj,        \
-               cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));       \
-         }                                                                     \
-      }                                                                        \
-      panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,            \
-                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr,       \
-                             async);                                           \
-   }
-
-      CASE(0)
-      CASE(1)
-      CASE(2)
-      CASE(3)
-      CASE(4)
-#undef CASE
-   }
 #endif
+
+#if PAN_ARCH >= 11
+   {
+      const struct cs_async_op async = cs_defer_indirect();
+#else
+   cs_match_iter_sb(b, x, iter_sb, cmp_scratch) {
+      const struct cs_async_op async =
+         cs_defer(SB_WAIT_ITER(x), SB_ID(DEFERRED_SYNC));
+#endif
+
+      if (td_count == 1) {
+         cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);
+         cs_finish_fragment(b, true, completed_top, completed_bottom, async);
+      } else if (td_count > 1) {
+         cs_while(b, MALI_CS_CONDITION_GREATER, tiler_count) {
+            cs_load_to(b, completed, cur_tiler, BITFIELD_MASK(4), 40);
+            cs_finish_fragment(b, false, completed_top, completed_bottom,
+                               async);
+            cs_update_frag_ctx(b)
+               cs_add64(b, cur_tiler, cur_tiler, pan_size(TILER_CONTEXT));
+            cs_add32(b, tiler_count, tiler_count, -1);
+         }
+         cs_frag_end(b, async);
+      }
+
+      if (free_render_descs) {
+         cs_sync32_add(b, true, MALI_CS_SYNC_SCOPE_CSG, release_sz,
+                       ringbuf_sync_addr, async);
+      }
+
+      if (has_oq_chain) {
+         struct cs_index flush_id = oq_chain_lo;
+         cs_move32_to(b, flush_id, 0);
+
+#if PAN_ARCH >= 11
+         /* FLUSH_CACHE2 is part of the deferred group so we need to
+          * temporarily set DEFERRED_FLUSH here to use the right scoreboard in
+          * indirect mode */
+         cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_DEFERRED,
+                            SB_ID(DEFERRED_FLUSH));
+#endif
+         cs_flush_caches(b, MALI_CS_FLUSH_MODE_CLEAN, MALI_CS_FLUSH_MODE_CLEAN,
+                         MALI_CS_OTHER_FLUSH_MODE_NONE, flush_id, async);
+#if PAN_ARCH >= 11
+         cs_set_state_imm32(b, MALI_CS_SET_STATE_TYPE_SB_SEL_DEFERRED,
+                            SB_ID(DEFERRED_SYNC));
+#endif
+
+         cs_load64_to(b, oq_chain, cs_subqueue_ctx_reg(b),
+                      offsetof(struct panvk_cs_subqueue_context, render.oq_chain));
+
+         /* For WAR dependency on subqueue_context.render.oq_chain. */
+         cs_flush_loads(b);
+
+         /* We use oq_syncobj as a placeholder to reset the oq_chain. */
+         cs_move64_to(b, oq_syncobj, 0);
+         cs_store64(b, oq_syncobj, cs_subqueue_ctx_reg(b),
+                    offsetof(struct panvk_cs_subqueue_context, render.oq_chain));
+
+         cs_single_link_list_for_each_from(b, oq_chain,
+                                           struct panvk_cs_occlusion_query, node) {
+            cs_load64_to(b, oq_syncobj, oq_chain,
+                         offsetof(struct panvk_cs_occlusion_query, syncobj));
+            cs_sync32_set(b, true, MALI_CS_SYNC_SCOPE_CSG, add_val_lo, oq_syncobj,
+                          cs_defer(SB_MASK(DEFERRED_FLUSH), SB_ID(DEFERRED_SYNC)));
+         }
+      }
+
+      panvk_instr_sync64_add(cmdbuf, PANVK_SUBQUEUE_FRAGMENT, true,
+                             MALI_CS_SYNC_SCOPE_CSG, add_val, sync_addr, async);
+   }
 
    /* Update the ring buffer position. */
    if (free_render_descs) {

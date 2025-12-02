@@ -17,7 +17,7 @@ bool si_alu_to_scalar_packed_math_filter(const nir_instr *instr, const void *dat
       nir_alu_instr *alu = nir_instr_as_alu(instr);
 
       if (alu->def.bit_size == 16 && alu->def.num_components == 2 &&
-          aco_nir_op_supports_packed_math_16bit(alu)) {
+          ac_nir_op_supports_packed_math_16bit(alu)) {
          /* ACO requires that all but the first bit of swizzle must be equal. */
          for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
             if ((alu->src[i].swizzle[0] >> 1) != (alu->src[i].swizzle[1] >> 1))
@@ -39,7 +39,7 @@ static uint8_t si_vectorize_callback(const nir_instr *instr, const void *data)
    if (alu->def.bit_size != 16)
       return 1;
 
-   return aco_nir_op_supports_packed_math_16bit(alu) ? 2 : 1;
+   return ac_nir_op_supports_packed_math_16bit(alu) ? 2 : 1;
 }
 
 void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool has_array_temps)
@@ -65,7 +65,7 @@ void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool has_arr
 
       NIR_PASS(lower_alu_to_scalar, nir, nir_opt_loop);
       /* (Constant) copy propagation is needed for txf with offsets. */
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
       /* nir_opt_if_optimize_phi_true_false is disabled on LLVM14 (#6976) */
@@ -99,13 +99,7 @@ void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool has_arr
                                (nir->options->lower_flrp32 ? 32 : 0) |
                                (nir->options->lower_flrp64 ? 64 : 0);
          assert(lower_flrp);
-         bool lower_flrp_progress = false;
-
-         NIR_PASS(lower_flrp_progress, nir, nir_lower_flrp, lower_flrp, false /* always_precise */);
-         if (lower_flrp_progress) {
-            NIR_PASS(progress, nir, nir_opt_constant_folding);
-            progress = true;
-         }
+         NIR_PASS(progress, nir, nir_lower_flrp, lower_flrp, false /* always_precise */);
 
          /* Nothing should rematerialize any flrps, so we only
           * need to do this lowering once.
@@ -142,15 +136,7 @@ void si_nir_late_opts(nir_shader *nir)
       more_late_algebraic = false;
       NIR_PASS(more_late_algebraic, nir, nir_opt_algebraic_late);
       NIR_PASS(_, nir, nir_opt_constant_folding);
-
-      /* We should run this after constant folding for stages that support indirect
-       * inputs/outputs.
-       */
-      if (nir->options->support_indirect_inputs & BITFIELD_BIT(nir->info.stage) ||
-          nir->options->support_indirect_outputs & BITFIELD_BIT(nir->info.stage))
-         NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_in | nir_var_shader_out);
-
-      NIR_PASS(_, nir, nir_copy_prop);
+      NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_dce);
       NIR_PASS(_, nir, nir_opt_cse);
    }
@@ -375,6 +361,22 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
       }
    }
 
+   if (nir->info.stage == MESA_SHADER_MESH && !sscreen->info.mesh_fast_launch_2) {
+      nir_lower_compute_system_values_options options = {
+         /* Mesh shaders run as NGG which can implement local_invocation_index from
+          * the wave ID in merged_wave_info, but they don't have local_invocation_ids
+          * in FAST_LAUNCH=1 mode (the default on GFX10.3, deprecated on GFX11).
+          */
+         .lower_cs_local_id_to_index = true,
+         /* Mesh shaders only have a 1D "vertex index" which we use
+          * as "workgroup index" to emulate the 3D workgroup ID.
+          */
+         .lower_workgroup_id_to_index = true,
+         .shortcut_1d_workgroup_id = true,
+      };
+      NIR_PASS(_, nir, nir_lower_compute_system_values, &options);
+   }
+
    si_nir_opts(sscreen, nir, true);
    /* Run late optimizations to fuse ffma and eliminate 16-bit conversions. */
    si_nir_late_opts(nir);
@@ -387,7 +389,8 @@ static void si_lower_nir(struct si_screen *sscreen, struct nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_fp16_casts, nir_lower_fp16_split_fp64);
 }
 
-void si_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir)
+void si_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir,
+                     bool optimize)
 {
    struct si_screen *sscreen = (struct si_screen *)screen;
 

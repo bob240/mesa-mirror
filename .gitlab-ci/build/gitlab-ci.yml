@@ -13,7 +13,7 @@ make-git-archive:
     # Compactify the .git directory
     - git gc --aggressive
     # Download & cache the perfetto subproject as well.
-    - rm -rf subprojects/perfetto ; mkdir -p subprojects/perfetto && curl --fail https://android.googlesource.com/platform/external/perfetto/+archive/$(grep 'revision =' subprojects/perfetto.wrap | cut -d ' ' -f3).tar.gz | tar zxf - -C subprojects/perfetto
+    - rm -rf subprojects/perfetto ; mkdir -p subprojects/perfetto && curl --fail --location https://github.com/google/perfetto/archive/$(grep 'revision =' subprojects/perfetto.wrap | cut -d ' ' -f3).tar.gz | tar zxf - --strip-components=1 -C subprojects/perfetto
     # compress the current folder
     - tar -cvzf ../$CI_PROJECT_NAME.tar.gz .
 
@@ -44,6 +44,7 @@ debian-x86_64:
       -D spirv-to-dxil=true
       -D tools=drm-shim
       -D valgrind=disabled
+      -D perfetto=true
     S3_ARTIFACT_NAME: mesa-x86_64-default-${BUILDTYPE}
     RUN_MESON_TESTS: "false"  # debian-build-x86_64 already runs these
   artifacts:
@@ -361,6 +362,7 @@ debian-android:
       -D android-libbacktrace=disabled
       -D mesa-clc=system
       -D precomp-compiler=system
+      -D perfetto=true
     GALLIUM_ST: >
       -D gallium-va=disabled
       -D gallium-rusticl=false
@@ -390,7 +392,7 @@ debian-android:
     - git clean -dxf .
     # aarch64 build:
     - export CROSS=aarch64-linux-android
-    - export GALLIUM_DRIVERS=etnaviv,freedreno,lima,panfrost,vc4,v3d
+    - export GALLIUM_DRIVERS=etnaviv,freedreno,lima,panfrost,vc4,v3d,zink
     - export VULKAN_DRIVERS=freedreno,broadcom,panfrost,virtio
     - export S3_ARTIFACT_NAME=mesa-arm64-android-${BUILDTYPE}
     - !reference [.meson-build-for-tests, script]
@@ -493,6 +495,7 @@ debian-arm64:
       -D imagination-srv=true
       -D freedreno-kmds=msm,virtio
       -D teflon=true
+      -D perfetto=true
     GALLIUM_ST:
       -D gallium-rusticl=true
     RUN_MESON_TESTS: "false"  # run by debian-arm64-build-testing
@@ -713,6 +716,7 @@ debian-vulkan:
     VULKAN_DRIVERS: amd,asahi,broadcom,freedreno,intel,intel_hasvk,panfrost,virtio,imagination,microsoft-experimental,nouveau,kosmickrisp
     EXTRA_OPTION: >
       -D vulkan-layers=device-select,overlay
+      -D tools=drm-shim
       -D build-radv-tests=true
       -D build-aco-tests=true
       -D intel-rt=disabled
@@ -750,6 +754,22 @@ debian-x86_32:
       -D platforms=
       -D mesa-clc=enabled
       -D install-mesa-clc=true
+
+# In case of issues with this job, contact @frankbinns
+debian-riscv64:
+  extends:
+    - .meson-cross
+    - .use-debian/riscv64_build
+    - .meson-build-only
+  tags:
+    - $FDO_RUNNER_JOB_PRIORITY_TAG_X86_64_KVM
+  variables:
+    BUILDTYPE: debug
+    CROSS: riscv64
+    GALLIUM_DRIVERS: "llvmpipe,zink"
+    VULKAN_DRIVERS: "swrast"
+    # See https://gitlab.freedesktop.org/mesa/mesa/-/issues/14123
+    MESON_TEST_ARGS: "--no-suite mesa:llvmpipe"
 
 # While s390 is dead, s390x is very much alive, and one of the last major
 # big-endian platforms, so it provides useful coverage.

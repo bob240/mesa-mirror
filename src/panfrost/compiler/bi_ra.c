@@ -1119,6 +1119,71 @@ bi_out_of_ssa(bi_context *ctx)
    return first_reg;
 }
 
+static bool
+op_is_load_store(enum bi_opcode op)
+{
+   switch (op) {
+   case BI_OPCODE_STORE_I8:
+   case BI_OPCODE_STORE_I16:
+   case BI_OPCODE_STORE_I24:
+   case BI_OPCODE_STORE_I32:
+   case BI_OPCODE_STORE_I48:
+   case BI_OPCODE_STORE_I64:
+   case BI_OPCODE_STORE_I96:
+   case BI_OPCODE_STORE_I128:
+      return true;
+   case BI_OPCODE_LOAD_I8:
+   case BI_OPCODE_LOAD_I16:
+   case BI_OPCODE_LOAD_I24:
+   case BI_OPCODE_LOAD_I32:
+   case BI_OPCODE_LOAD_I48:
+   case BI_OPCODE_LOAD_I64:
+   case BI_OPCODE_LOAD_I96:
+   case BI_OPCODE_LOAD_I128:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static uint64_t
+compute_spill_cost(bi_context *ctx)
+{
+   void *mctx = ralloc_context(NULL);
+
+   /* Required for finding blocks belonging to loops. */
+   bi_calc_dominance(ctx);
+
+   /* The cost of a spill/fill is just 10*block_depth for now. */
+
+   uint32_t *block_depth = rzalloc_array(mctx, uint32_t, ctx->num_blocks);
+   BITSET_WORD *loop_block = BITSET_RZALLOC(mctx, ctx->num_blocks);
+
+   bi_foreach_block(ctx, block) {
+      if (!block->loop_header)
+         continue;
+
+      bi_find_loop_blocks(ctx, block, loop_block);
+
+      for (uint32_t b = 0; b < ctx->num_blocks; ++b) {
+         if (BITSET_SET(loop_block, b))
+            block_depth[b] += 1;
+      }
+   }
+
+   uint64_t cost = 0;
+   bi_foreach_block(ctx, block) {
+      bi_foreach_instr_in_block(block, I) {
+         if (op_is_load_store(I->op) && I->seg == BI_SEG_TL)
+            cost += 10 * (block_depth[block->index] + 1);
+      }
+   }
+
+   ralloc_free(mctx);
+
+   return cost;
+}
+
 void
 bi_register_allocate(bi_context *ctx)
 {
@@ -1213,6 +1278,8 @@ bi_register_allocate(bi_context *ctx)
          bi_coalesce_tied(ctx);
       }
    }
+
+   ctx->spill_cost = compute_spill_cost(ctx);
 
    assert(success);
    assert(l != NULL);

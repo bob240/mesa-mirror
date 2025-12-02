@@ -125,17 +125,17 @@ zink_context_destroy(struct pipe_context *pctx)
    if (util_queue_is_initialized(&screen->flush_queue))
       util_queue_finish(&screen->flush_queue);
    if (ctx->bs && !screen->device_lost) {
-      simple_mtx_lock(&screen->queue_lock);
+      simple_mtx_lock(screen->queue_lock);
       VkResult result = VKSCR(QueueWaitIdle)(screen->queue);
-      simple_mtx_unlock(&screen->queue_lock);
+      simple_mtx_unlock(screen->queue_lock);
 
       if (result != VK_SUCCESS)
          mesa_loge("ZINK: vkQueueWaitIdle failed (%s)", vk_Result_to_str(result));
 
       if (screen->queue_sparse && screen->queue_sparse != screen->queue) {
-         simple_mtx_lock(&screen->queue_lock);
+         simple_mtx_lock(screen->queue_lock);
          VkResult result = VKSCR(QueueWaitIdle)(screen->queue_sparse);
-         simple_mtx_unlock(&screen->queue_lock);
+         simple_mtx_unlock(screen->queue_lock);
 
          if (result != VK_SUCCESS)
             mesa_loge("ZINK: vkQueueWaitIdle failed (%s)", vk_Result_to_str(result));
@@ -1362,11 +1362,11 @@ update_img_bind_count(struct zink_context *ctx, struct zink_resource *res, bool 
    assert(!res->obj->is_buffer);
    if (decrement) {
       assert(res->bind_count[is_compute]);
-      if (!--res->bind_count[is_compute])
+      if (p_atomic_dec_zero(&res->bind_count[is_compute]))
          _mesa_set_remove_key(ctx->need_barriers[is_compute], res);
       check_resource_for_batch_ref(ctx, res);
    } else
-      res->bind_count[is_compute]++;
+      p_atomic_inc(&res->bind_count[is_compute]);
 }
 
 ALWAYS_INLINE static void
@@ -1375,12 +1375,18 @@ update_buf_bind_count(struct zink_context *ctx, struct zink_resource *res, bool 
    assert(res->obj->is_buffer);
    if (decrement) {
       assert(res->bind_count[is_compute]);
-      --res->bind_count[is_compute];
+      /* these are 16bit counters:
+         - the gfx count is 0-65535, increments of 1
+         - the compute count is 65536-UINT32_MAX, increments of (1<<16)
+       */
+      unsigned incr = is_compute ? 1 << 16 : 1;
+      /* avoid extra atomics from checking all_binds in the next line by directly subtracting the 16bit increment */
+      unsigned all_binds = p_atomic_add_return(&res->all_binds, -incr);
       /* if hit while blitting, this will be triggered again after blitting */
-      if (res->deleted && !res->all_binds && !ctx->blitting)
+      if (res->deleted && !all_binds && !ctx->blitting)
          resource_release(ctx, res);
    } else
-      res->bind_count[is_compute]++;
+      p_atomic_inc(&res->bind_count[is_compute]);
 }
 
 ALWAYS_INLINE static void
@@ -1397,7 +1403,7 @@ zink_resource_release(struct pipe_context *pctx, struct pipe_resource *pres)
 {
    struct zink_resource *res = zink_resource(pres);
 
-   if (res->all_binds)
+   if (p_atomic_read_relaxed(&res->all_binds))
       res->deleted = true;
    else
       resource_release(zink_context(pctx), res);
@@ -5759,8 +5765,8 @@ zink_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
             mesa_loge("ZINK: failed to allocate ctx->di.bindless[%d].img_infos!",i);
             goto fail;
          }
-         util_dynarray_init(&ctx->di.bindless[i].updates, NULL);
-         util_dynarray_init(&ctx->di.bindless[i].resident, NULL);
+         ctx->di.bindless[i].updates = UTIL_DYNARRAY_INIT;
+         ctx->di.bindless[i].resident = UTIL_DYNARRAY_INIT;
       }
    }
 

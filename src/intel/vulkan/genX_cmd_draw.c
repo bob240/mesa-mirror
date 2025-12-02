@@ -985,8 +985,9 @@ cmd_buffer_flush_gfx_state(struct anv_cmd_buffer *cmd_buffer)
 #if GFX_VER >= 20
    if (cmd_buffer->state.gfx.dirty & ANV_CMD_DIRTY_INDIRECT_DATA_STRIDE) {
       anv_batch_emit(&cmd_buffer->batch, GENX(STATE_BYTE_STRIDE), sb_stride) {
-         sb_stride.ByteStride = cmd_buffer->state.gfx.indirect_data_stride;
-         sb_stride.ByteStrideEnable = !cmd_buffer->state.gfx.indirect_data_stride_aligned;
+         sb_stride.ByteStride = cmd_buffer->state.gfx.indirect_data_stride >> 2;
+         sb_stride.ByteStrideEnable =
+            cmd_buffer->state.gfx.indirect_data_stride_aligned == U_TRISTATE_NO;
       }
    }
 #endif
@@ -1656,6 +1657,7 @@ void genX(CmdDrawIndirectByteCountEXT)(
    mi_store(&b, mi_reg32(GFX7_3DPRIM_VERTEX_COUNT), count);
 
    mi_store(&b, mi_reg32(GFX7_3DPRIM_START_VERTEX), mi_imm(firstVertex));
+   assert(((uint64_t)instanceCount * gfx->instance_multiplier <= UINT32_MAX));
    mi_store(&b, mi_reg32(GFX7_3DPRIM_INSTANCE_COUNT),
             mi_imm(instanceCount * gfx->instance_multiplier));
    mi_store(&b, mi_reg32(GFX7_3DPRIM_START_INSTANCE), mi_imm(firstInstance));
@@ -1893,7 +1895,7 @@ cmd_buffer_set_indirect_stride(struct anv_cmd_buffer *cmd_buffer,
       UNREACHABLE("unhandled cmd type");
    }
 
-   bool aligned = stride == data_stride;
+   enum u_tristate aligned = u_tristate_make(stride == data_stride);
 
 #if GFX_VER >= 20
    /* The stride can change as long as it matches the default command stride
@@ -1907,7 +1909,7 @@ cmd_buffer_set_indirect_stride(struct anv_cmd_buffer *cmd_buffer,
       gfx_state->indirect_data_stride = stride;
       gfx_state->indirect_data_stride_aligned = aligned;
       gfx_state->dirty |= ANV_CMD_DIRTY_INDIRECT_DATA_STRIDE;
-   } else if (!gfx_state->indirect_data_stride_aligned &&
+   } else if (gfx_state->indirect_data_stride_aligned == U_TRISTATE_NO &&
               gfx_state->indirect_data_stride != stride) {
       gfx_state->indirect_data_stride = stride;
       gfx_state->indirect_data_stride_aligned = aligned;

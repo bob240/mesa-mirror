@@ -148,8 +148,8 @@ print_def(nir_def *def, print_state *state)
            def->bit_size, sizes[def->num_components],
            padding, "", state->def_prefix, def->index);
 
-   if (def->parent_instr->has_debug_info) {
-      nir_instr_debug_info *debug_info = nir_instr_get_debug_info(def->parent_instr);
+   if (nir_def_instr(def)->has_debug_info) {
+      nir_instr_debug_info *debug_info = nir_instr_get_debug_info(nir_def_instr(def));
       if (debug_info->variable_name)
          fprintf(fp, ".%s", debug_info->variable_name);
    }
@@ -407,7 +407,7 @@ print_src(const nir_src *src, print_state *state, nir_alu_type src_type)
 {
    FILE *fp = state->fp;
    fprintf(fp, "%s%u", state->def_prefix, src->ssa->index);
-   nir_instr *instr = src->ssa->parent_instr;
+   nir_instr *instr = nir_def_instr(src->ssa);
 
    if (instr->has_debug_info) {
       nir_instr_debug_info *debug_info = nir_instr_get_debug_info(instr);
@@ -752,6 +752,12 @@ get_variable_mode_str(nir_variable_mode mode, bool want_local_global_mode)
       return "push_const";
    case nir_var_mem_constant:
       return "constant";
+   case nir_var_mem_pixel_local_in:
+      return "pixel_local_in";
+   case nir_var_mem_pixel_local_out:
+      return "pixel_local_out";
+   case nir_var_mem_pixel_local_inout:
+      return "pixel_local";
    case nir_var_image:
       return "image";
    case nir_var_shader_temp:
@@ -1054,6 +1060,11 @@ print_deref_link(const nir_deref_instr *instr, bool whole_chain, print_state *st
    case nir_deref_type_struct:
       fprintf(fp, "%s%s", is_parent_pointer ? "->" : ".",
               glsl_get_struct_elem_name(parent->type, instr->strct.index));
+      if (whole_chain &&
+          parent->type->fields.structure[instr->strct.index].pixel_local_storage) {
+         fprintf(fp, " (%s)",
+                 util_format_short_name(parent->type->fields.structure[instr->strct.index].image_format));
+      }
       break;
 
    case nir_deref_type_array:
@@ -1131,6 +1142,12 @@ print_deref_instr(nir_deref_instr *instr, print_state *state)
       fprintf(fp, "  (ptr_stride=%u, align_mul=%u, align_offset=%u)",
               instr->cast.ptr_stride,
               instr->cast.align_mul, instr->cast.align_offset);
+   }
+
+   if (instr->deref_type == nir_deref_type_array ||
+       instr->deref_type == nir_deref_type_ptr_as_array) {
+      if (instr->arr.in_bounds)
+         fprintf(fp, "  (in bounds)");
    }
 
    if (instr->deref_type != nir_deref_type_var &&
@@ -1467,6 +1484,11 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
             mode = nir_var_shader_out;
             break;
 
+         case nir_intrinsic_load_pixel_local:
+         case nir_intrinsic_store_pixel_local:
+            mode = nir_var_mem_pixel_local_inout;
+            break;
+
          default:
             break;
          }
@@ -1523,6 +1545,9 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
             }
             fprintf(fp, ")");
          }
+
+         if (io.no_validate)
+            fprintf(fp, " no_validate");
 
          break;
       }
@@ -2042,6 +2067,42 @@ print_call_instr(nir_call_instr *instr, print_state *state)
    }
 }
 
+static const char *
+get_cmat_call_op_str(nir_cmat_call_op op)
+{
+   switch (op) {
+   case nir_cmat_call_op_reduce:
+      return "cmat_call_reduce";
+   case nir_cmat_call_op_reduce_finish:
+      return "cmat_call_reduce_finish";
+   case nir_cmat_call_op_reduce_2x2:
+      return "cmat_call_reduce_2x2";
+   case nir_cmat_call_op_per_element_op:
+      return "cmat_call_per_element";
+   }
+   UNREACHABLE("Unknown cmat call op");
+}
+
+static void
+print_cmat_call_instr(nir_cmat_call_instr *instr, print_state *state)
+{
+   FILE *fp = state->fp;
+
+   print_no_dest_padding(state);
+
+   fprintf(fp, "%s %s ", get_cmat_call_op_str(instr->op), instr->callee->name);
+
+   for (unsigned i = 0; i < instr->num_params; i++) {
+      if (i != 0)
+         fprintf(fp, ", ");
+
+      if (instr->callee->params[i].name)
+         fprintf(fp, "%s ", instr->callee->params[i].name);
+
+      print_src(&instr->params[i], state, nir_type_invalid);
+   }
+}
+
 static void
 print_jump_instr(nir_jump_instr *instr, print_state *state)
 {
@@ -2112,28 +2173,6 @@ print_phi_instr(nir_phi_instr *instr, print_state *state)
 }
 
 static void
-print_parallel_copy_instr(nir_parallel_copy_instr *instr, print_state *state)
-{
-   FILE *fp = state->fp;
-   nir_foreach_parallel_copy_entry(entry, instr) {
-      if (&entry->node != exec_list_get_head(&instr->entries))
-         fprintf(fp, "; ");
-
-      if (entry->dest_is_reg) {
-         fprintf(fp, "*");
-         print_src(&entry->dest.reg, state, nir_type_invalid);
-      } else {
-         print_def(&entry->dest.def, state);
-      }
-      fprintf(fp, " = ");
-
-      if (entry->src_is_reg)
-         fprintf(fp, "*");
-      print_src(&entry->src, state, nir_type_invalid);
-   }
-}
-
-static void
 print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
 {
    FILE *fp = state->fp;
@@ -2181,6 +2220,10 @@ print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
       print_call_instr(nir_instr_as_call(instr), state);
       break;
 
+   case nir_instr_type_cmat_call:
+      print_cmat_call_instr(nir_instr_as_cmat_call(instr), state);
+      break;
+
    case nir_instr_type_intrinsic:
       print_intrinsic_instr(nir_instr_as_intrinsic(instr), state);
       break;
@@ -2205,10 +2248,6 @@ print_instr(const nir_instr *instr, print_state *state, unsigned tabs)
       print_phi_instr(nir_instr_as_phi(instr), state);
       break;
 
-   case nir_instr_type_parallel_copy:
-      print_parallel_copy_instr(nir_instr_as_parallel_copy(instr), state);
-      break;
-
    default:
       UNREACHABLE("Invalid instruction type");
       break;
@@ -2229,7 +2268,6 @@ block_has_instruction_with_dest(nir_block *block)
       case nir_instr_type_tex:
       case nir_instr_type_undef:
       case nir_instr_type_phi:
-      case nir_instr_type_parallel_copy:
          return true;
 
       case nir_instr_type_intrinsic: {
@@ -2244,6 +2282,7 @@ block_has_instruction_with_dest(nir_block *block)
 
       case nir_instr_type_jump:
       case nir_instr_type_call:
+      case nir_instr_type_cmat_call:
          /* Doesn't define a new value. */
          break;
       }
@@ -2917,6 +2956,8 @@ _nir_print_shader_annotated(nir_shader *shader, FILE *fp,
       fprintf(fp, "scratch: %u\n", shader->scratch_size);
    if (shader->constant_data_size)
       fprintf(fp, "constants: %u\n", shader->constant_data_size);
+   if (shader->printf_info_count)
+      fprintf(fp, "printfs: %u\n", shader->printf_info_count);
 
    if (NIR_DEBUG(PRINT_STRUCT_DECLS)) {
       nir_foreach_variable_in_shader(var, shader) {

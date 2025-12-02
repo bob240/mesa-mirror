@@ -145,6 +145,7 @@ struct zink_device {
    VkPhysicalDevice pdev;
    VkDevice dev;
    struct zink_device_info *info;
+   simple_mtx_t queue_lock;
 };
 
 static simple_mtx_t device_lock = SIMPLE_MTX_INITIALIZER;
@@ -303,7 +304,7 @@ disk_cache_init(struct zink_screen *screen)
    struct mesa_blake3 ctx;
    _mesa_blake3_init(&ctx);
 
-#ifdef HAVE_DL_ITERATE_PHDR
+#ifdef HAVE_BUILD_ID
    /* Hash in the zink driver build. */
    const struct build_id_note *note =
        build_id_find_nhdr_for_addr(disk_cache_init);
@@ -972,6 +973,7 @@ zink_init_screen_caps(struct zink_screen *screen)
    caps->cube_map_array = screen->info.feats.features.imageCubeArray;
 
    caps->texture_buffer_objects = true;
+   caps->buffer_sampler_view_rgba_only = true;
    caps->primitive_restart = true;
 
    caps->bindless_texture =
@@ -1523,13 +1525,19 @@ zink_destroy_screen(struct pipe_screen *pscreen)
    struct zink_screen *screen = zink_screen(pscreen);
 
    if (!screen->device_lost && screen->queue) {
+      // Multiple screens can share a queue, so we need to lock queue_lock even
+      // in the screen destructor
+      simple_mtx_lock(screen->queue_lock);
       VkResult result = VKSCR(QueueWaitIdle)(screen->queue);
+      simple_mtx_unlock(screen->queue_lock);
 
       if (result != VK_SUCCESS)
          mesa_loge("ZINK: vkQueueWaitIdle failed (%s)", vk_Result_to_str(result));
 
       if (screen->queue_sparse && screen->queue_sparse != screen->queue) {
+         simple_mtx_lock(screen->queue_lock);
          result = VKSCR(QueueWaitIdle)(screen->queue_sparse);
+         simple_mtx_unlock(screen->queue_lock);
 
          if (result != VK_SUCCESS)
             mesa_loge("ZINK: vkQueueWaitIdle failed (%s)", vk_Result_to_str(result));
@@ -1831,7 +1839,6 @@ update_queue_props(struct zink_screen *screen)
 static void
 init_queue(struct zink_screen *screen)
 {
-   simple_mtx_init(&screen->queue_lock, mtx_plain);
    VKSCR(GetDeviceQueue)(screen->dev, screen->gfx_queue, 0, &screen->queue);
    if (screen->sparse_queue != screen->gfx_queue)
       VKSCR(GetDeviceQueue)(screen->dev, screen->sparse_queue, 0, &screen->queue_sparse);
@@ -2731,7 +2738,7 @@ hack_it_up:
    return 1;
 }
 
-static VkDevice
+static struct zink_device*
 get_device(struct zink_screen *screen, VkDeviceCreateInfo *dci)
 {
    VkDevice dev = VK_NULL_HANDLE;
@@ -2747,7 +2754,7 @@ get_device(struct zink_screen *screen, VkDeviceCreateInfo *dci)
          continue;
       zdev->refcount++;
       simple_mtx_unlock(&device_lock);
-      return zdev->dev;
+      return zdev;
    }
 
    VkResult result = VKSCR(CreateDevice)(screen->pdev, dci, NULL, &dev);
@@ -2758,12 +2765,13 @@ get_device(struct zink_screen *screen, VkDeviceCreateInfo *dci)
    zdev->refcount = 1;
    zdev->pdev = screen->pdev;
    zdev->dev = dev;
+   simple_mtx_init(&zdev->queue_lock, mtx_plain);
    _mesa_set_add(&device_table, zdev);
    simple_mtx_unlock(&device_lock);
-   return dev;
+   return zdev;
 }
 
-static VkDevice
+static struct zink_device*
 zink_create_logical_device(struct zink_screen *screen)
 {
    VkDeviceQueueCreateInfo qci[2] = {0};
@@ -3318,7 +3326,7 @@ zink_cl_cts_version(struct pipe_screen *pscreen)
 static struct zink_screen *
 zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev_major, int64_t dev_minor, uint64_t adapter_luid)
 {
-   if (getenv("ZINK_USE_LAVAPIPE")) {
+   if (os_get_option("ZINK_USE_LAVAPIPE")) {
       mesa_loge("ZINK_USE_LAVAPIPE is obsolete. Use LIBGL_ALWAYS_SOFTWARE\n");
       return NULL;
    }
@@ -3521,9 +3529,11 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    init_driver_workarounds(screen);
    disable_features(screen);
 
-   screen->dev = zink_create_logical_device(screen);
-   if (!screen->dev)
+   struct zink_device *zdev = zink_create_logical_device(screen);
+   if (!zdev->dev)
       goto fail;
+   screen->dev = zdev->dev;
+   screen->queue_lock = &zdev->queue_lock;
 
    vk_device_uncompacted_dispatch_table_load(&screen->vk.device,
                                              screen->vk_GetDeviceProcAddr,
@@ -3769,7 +3779,9 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    zink_tracing = screen->instance_info->have_EXT_debug_utils &&
                   (u_trace_is_enabled(U_TRACE_TYPE_PERFETTO) || u_trace_is_enabled(U_TRACE_TYPE_MARKERS));
 
+   simple_mtx_lock(screen->queue_lock);
    screen->frame_marker_emitted = zink_screen_debug_marker_begin(screen, "frame");
+   simple_mtx_unlock(screen->queue_lock);
 
    return screen;
 
@@ -3865,6 +3877,8 @@ void VKAPI_PTR zink_stub_function_not_loaded()
 bool
 zink_screen_debug_marker_begin(struct zink_screen *screen, const char *fmt, ...)
 {
+   simple_mtx_assert_locked(screen->queue_lock);
+
    if (!zink_tracing)
       return false;
 
@@ -3890,6 +3904,8 @@ zink_screen_debug_marker_begin(struct zink_screen *screen, const char *fmt, ...)
 void
 zink_screen_debug_marker_end(struct zink_screen *screen, bool emitted)
 {
+   simple_mtx_assert_locked(screen->queue_lock);
+
    if (emitted)
       VKSCR(QueueEndDebugUtilsLabelEXT)(screen->queue);
 }

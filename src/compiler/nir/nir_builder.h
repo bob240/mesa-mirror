@@ -40,6 +40,9 @@ typedef struct nir_builder {
    /* Whether new ALU instructions will be marked "exact" */
    bool exact;
 
+   /* Whether new ALU instruction will be constanst-folded if possible. */
+   bool constant_fold_alu;
+
    /* Float_controls2 bits. See nir_alu_instr for details. */
    uint32_t fp_fast_math;
 
@@ -1024,7 +1027,7 @@ static inline nir_def *
 nir_iadd_imm_nuw(nir_builder *b, nir_def *x, uint64_t y)
 {
    nir_def *d = nir_iadd_imm(b, x, y);
-   if (d != x && d->parent_instr->type == nir_instr_type_alu)
+   if (d != x && nir_def_is_alu(d))
       nir_def_as_alu(d)->no_unsigned_wrap = true;
    return d;
 }
@@ -1033,7 +1036,8 @@ static inline nir_def *
 nir_iadd_nuw(nir_builder *b, nir_def *x, nir_def *y)
 {
    nir_def *d = nir_iadd(b, x, y);
-   nir_def_as_alu(d)->no_unsigned_wrap = true;
+   if (nir_def_is_alu(d))
+      nir_def_as_alu(d)->no_unsigned_wrap = true;
    return d;
 }
 
@@ -1108,6 +1112,24 @@ static inline nir_def *
 nir_imul_imm(nir_builder *build, nir_def *x, uint64_t y)
 {
    return _nir_mul_imm(build, x, y, false);
+}
+
+static inline nir_def *
+nir_imul_imm_nuw(nir_builder *build, nir_def *x, uint64_t y)
+{
+   nir_def *d = nir_imul_imm(build, x, y);
+   if (d != x && nir_def_is_alu(d))
+      nir_def_as_alu(d)->no_unsigned_wrap = true;
+   return d;
+}
+
+static inline nir_def *
+nir_imul_nuw(nir_builder *build, nir_def *x, nir_def *y)
+{
+   nir_def *d = nir_imul(build, x, y);
+   if (nir_def_is_alu(d))
+      nir_def_as_alu(d)->no_unsigned_wrap = true;
+   return d;
 }
 
 static inline nir_def *
@@ -1623,9 +1645,9 @@ nir_resize_vector(nir_builder *b, nir_def *src, unsigned num_components)
       return nir_trim_vector(b, src, num_components);
 }
 
-/* Shift channels to the left or right. Fill undefined components with .x.
+/* Shift channels to the left or right. Fill undefined components with undef.
  * Examples:
- *    channel_shift =  1, new_num_components = 4: .xyzw -> .xxyz
+ *    channel_shift =  1, new_num_components = 4: .xyzw -> ._xyz
  *    channel_shift = -1, new_num_components = 3: .xyzw -> .yzw
  */
 static inline nir_def *
@@ -1635,15 +1657,18 @@ nir_shift_channels(nir_builder *b, nir_def *def, int channel_shift,
    if (channel_shift == 0)
       return nir_resize_vector(b, def, new_num_components);
 
-   assert(abs(channel_shift) < NIR_MAX_VEC_COMPONENTS);
-   unsigned swizzle[NIR_MAX_VEC_COMPONENTS] = {0};
+   nir_def *chan[NIR_MAX_VEC_COMPONENTS];
 
-   for (int i = 1; i < def->num_components; i++) {
-      if (i + channel_shift >= 0)
-         swizzle[i + channel_shift] = i;
+   for (int i = 0; i < (int)new_num_components; i++) {
+      int src_index = i - channel_shift;
+
+      if (src_index >= 0 && src_index < def->num_components)
+         chan[i] = nir_channel(b, def, src_index);
+      else
+         chan[i] = nir_undef(b, 1, def->bit_size);
    }
 
-   return nir_swizzle(b, def, swizzle, new_num_components);
+   return nir_vec(b, chan, new_num_components);
 }
 
 nir_def *

@@ -53,6 +53,7 @@
 #include "pvr_macros.h"
 #include "pvr_pass.h"
 #include "pvr_pds.h"
+#include "pvr_physical_device.h"
 #include "pvr_pipeline.h"
 #include "pvr_query.h"
 #include "pvr_tex_state.h"
@@ -237,10 +238,10 @@ static VkResult pvr_cmd_buffer_create(struct pvr_device *device,
 
    cmd_buffer->device = device;
 
-   util_dynarray_init(&cmd_buffer->depth_bias_array, NULL);
-   util_dynarray_init(&cmd_buffer->scissor_array, NULL);
-   util_dynarray_init(&cmd_buffer->deferred_csb_commands, NULL);
-   util_dynarray_init(&cmd_buffer->deferred_clears, NULL);
+   cmd_buffer->depth_bias_array = UTIL_DYNARRAY_INIT;
+   cmd_buffer->scissor_array = UTIL_DYNARRAY_INIT;
+   cmd_buffer->deferred_csb_commands = UTIL_DYNARRAY_INIT;
+   cmd_buffer->deferred_clears = UTIL_DYNARRAY_INIT;
 
    list_inithead(&cmd_buffer->sub_cmds);
    list_inithead(&cmd_buffer->bo_list);
@@ -324,7 +325,7 @@ pvr_cmd_buffer_upload_tables(struct pvr_device *device,
                              struct pvr_sub_cmd_gfx *const sub_cmd)
 {
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    VkResult result;
 
    assert(!sub_cmd->depth_bias_bo && !sub_cmd->scissor_bo);
@@ -398,7 +399,7 @@ pvr_cmd_buffer_upload_general(struct pvr_cmd_buffer *const cmd_buffer,
 {
    struct pvr_device *const device = cmd_buffer->device;
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    struct pvr_suballoc_bo *suballoc_bo;
    VkResult result;
 
@@ -427,7 +428,7 @@ pvr_cmd_buffer_upload_usc(struct pvr_cmd_buffer *const cmd_buffer,
 {
    struct pvr_device *const device = cmd_buffer->device;
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    struct pvr_suballoc_bo *suballoc_bo;
    VkResult result;
 
@@ -2681,7 +2682,7 @@ VkResult pvr_cmd_buffer_start_sub_cmd(struct pvr_cmd_buffer *cmd_buffer,
                       &sub_cmd->gfx.control_stream);
       }
 
-      util_dynarray_init(&sub_cmd->gfx.sec_query_indices, NULL);
+      sub_cmd->gfx.sec_query_indices = UTIL_DYNARRAY_INIT;
       break;
 
    case PVR_SUB_CMD_TYPE_QUERY:
@@ -2715,7 +2716,7 @@ VkResult pvr_cmd_buffer_alloc_mem(struct pvr_cmd_buffer *cmd_buffer,
                                   struct pvr_suballoc_bo **const pvr_bo_out)
 {
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&cmd_buffer->device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&cmd_buffer->device->pdevice->dev_info);
    struct pvr_suballoc_bo *suballoc_bo;
    struct pvr_suballocator *allocator;
    VkResult result;
@@ -3424,9 +3425,9 @@ static void pvr_emit_clear_words(struct pvr_cmd_buffer *const cmd_buffer,
    }
 
    if (pvr_is_large_clear_required(cmd_buffer))
-      vdm_state = device->static_clear_state.large_clear_vdm_words;
+      vdm_state = device->static_clear_state->large_clear_vdm_words;
    else
-      vdm_state = device->static_clear_state.vdm_words;
+      vdm_state = device->static_clear_state->vdm_words;
 
    memcpy(stream, vdm_state, PVR_DW_TO_BYTES(vdm_state_size_in_dw));
 
@@ -3441,8 +3442,8 @@ static VkResult pvr_cs_write_load_op_for_view(struct pvr_cmd_buffer *cmd_buffer,
 {
    const struct pvr_device *device = cmd_buffer->device;
    struct pvr_static_clear_ppp_template template =
-      device->static_clear_state.ppp_templates[VK_IMAGE_ASPECT_COLOR_BIT];
-   uint32_t pds_state[PVR_STATIC_CLEAR_PDS_STATE_COUNT];
+      device->static_clear_state->ppp_templates[VK_IMAGE_ASPECT_COLOR_BIT];
+   uint32_t pds_state[PVR_PDS_STATE_LENGTH];
    struct pvr_pds_upload shareds_update_program;
    struct pvr_suballoc_bo *pvr_bo;
    VkResult result;
@@ -3664,7 +3665,7 @@ VkResult pvr_BeginCommandBuffer(VkCommandBuffer commandBuffer,
       state->dirty.isp_userpass = true;
    }
 
-   util_dynarray_init(&state->query_indices, NULL);
+   state->query_indices = UTIL_DYNARRAY_INIT;
 
    memset(state->barriers_needed,
           0xFF,
@@ -7850,8 +7851,8 @@ static void pvr_insert_transparent_obj(struct pvr_cmd_buffer *const cmd_buffer,
     * in parallel so writing the template in place could cause problems.
     */
    struct pvr_static_clear_ppp_template clear =
-      device->static_clear_state.ppp_templates[VK_IMAGE_ASPECT_COLOR_BIT];
-   uint32_t pds_state[PVR_STATIC_CLEAR_PDS_STATE_COUNT] = { 0 };
+      device->static_clear_state->ppp_templates[VK_IMAGE_ASPECT_COLOR_BIT];
+   uint32_t pds_state[PVR_PDS_STATE_LENGTH] = { 0 };
    struct pvr_csb *csb = &sub_cmd->control_stream;
    struct pvr_suballoc_bo *ppp_bo;
 

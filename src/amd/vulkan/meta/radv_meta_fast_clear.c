@@ -281,7 +281,7 @@ radv_process_color_image_layer(struct radv_cmd_buffer *cmd_buffer, struct radv_i
 
    const VkRenderingInfo rendering_info = {
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-      .flags = VK_RENDERING_INPUT_ATTACHMENT_NO_CONCURRENT_WRITES_BIT_MESA,
+      .flags = VK_RENDERING_LOCAL_READ_CONCURRENT_ACCESS_CONTROL_BIT_KHR,
       .renderArea = {.offset = {0, 0}, .extent = {width, height}},
       .layerCount = 1,
       .colorAttachmentCount = 1,
@@ -301,7 +301,11 @@ radv_process_color_image_layer(struct radv_cmd_buffer *cmd_buffer, struct radv_i
       cmd_buffer->state.flush_bits |= radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                                                             VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 0, image, range);
 
-   radv_CmdEndRendering(radv_cmd_buffer_to_handle(cmd_buffer));
+   const VkRenderingEndInfoKHR end_info = {
+      .sType = VK_STRUCTURE_TYPE_RENDERING_END_INFO_KHR,
+   };
+
+   radv_CmdEndRendering2KHR(radv_cmd_buffer_to_handle(cmd_buffer), &end_info);
 
    radv_image_view_finish(&iview);
 }

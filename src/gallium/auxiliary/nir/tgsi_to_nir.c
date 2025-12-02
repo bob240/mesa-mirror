@@ -2410,12 +2410,12 @@ ttn_optimize_nir(nir_shader *nir)
 
       NIR_PASS(progress, nir, nir_lower_alu);
       NIR_PASS(progress, nir, nir_lower_pack);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
       if (nir_opt_loop(nir)) {
          progress = true;
-         NIR_PASS(progress, nir, nir_copy_prop);
+         NIR_PASS(progress, nir, nir_opt_copy_prop);
          NIR_PASS(progress, nir, nir_opt_dce);
       }
       NIR_PASS(progress, nir, nir_opt_if, nir_opt_if_optimize_phi_true_false);
@@ -2440,16 +2440,8 @@ ttn_optimize_nir(nir_shader *nir)
             (nir->options->lower_flrp64 ? 64 : 0);
 
          if (lower_flrp) {
-            bool lower_flrp_progress = false;
-
-            NIR_PASS(lower_flrp_progress, nir, nir_lower_flrp,
-                     lower_flrp,
-                     false /* always_precise */);
-            if (lower_flrp_progress) {
-               NIR_PASS(progress, nir,
-                        nir_opt_constant_folding);
-               progress = true;
-            }
+            NIR_PASS(progress, nir, nir_lower_flrp,
+                     lower_flrp, false /* always_precise */);
          }
 
          /* Nothing should rematerialize any flrps, so we only need to do this
@@ -2572,7 +2564,7 @@ ttn_finalize_nir(struct ttn_compile *c, struct pipe_screen *screen)
       NIR_PASS(_, nir, nir_lower_samplers);
 
    if (screen->finalize_nir) {
-      screen->finalize_nir(screen, nir);
+      screen->finalize_nir(screen, nir, true);
    } else {
       ttn_optimize_nir(nir);
    }

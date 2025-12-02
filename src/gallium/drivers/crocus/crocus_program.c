@@ -1022,6 +1022,13 @@ crocus_setup_binding_table(const struct intel_device_info *devinfo,
 
          case nir_intrinsic_load_output:
             if (devinfo->ver >= 6) {
+               /* We're using a BTI as the load_output offset here which
+                * breaks newer NIR assumptions.
+                */
+               nir_io_semantics io_sem = nir_intrinsic_io_semantics(intrin);
+               io_sem.no_validate = true;
+               nir_intrinsic_set_io_semantics(intrin, io_sem);
+
                rewrite_src_with_bti(&b, bt, instr, &intrin->src[0],
                                     CROCUS_SURFACE_GROUP_RENDER_TARGET_READ);
             }
@@ -1040,6 +1047,8 @@ crocus_setup_binding_table(const struct intel_device_info *devinfo,
          }
       }
    }
+
+   nir_validate_shader(nir, "after crocus_setup_binding_table");
 }
 
 static void
@@ -1172,7 +1181,7 @@ crocus_compile_vs(struct crocus_context *ice,
       /* Check if variables were found. */
       if (nir_lower_clip_vs(nir, (1 << key->nr_userclip_plane_consts) - 1,
                             true, false, NULL)) {
-         nir_lower_io_vars_to_temporaries(nir, impl, true, false);
+         nir_lower_io_vars_to_temporaries(nir, impl, nir_var_shader_out);
          nir_lower_global_vars_to_local(nir);
          nir_lower_vars_to_ssa(nir);
          nir_shader_gather_info(nir, impl);
@@ -1180,7 +1189,7 @@ crocus_compile_vs(struct crocus_context *ice,
    }
 
    if (key->clamp_pointsize)
-      nir_lower_point_size(nir, 1.0, 255.0);
+      nir_lower_point_size(nir, 1.0, 255.0, nir_type_invalid);
 
    prog_data->use_alt_mode = nir->info.use_legacy_math_rules;
 
@@ -1532,14 +1541,14 @@ crocus_compile_tes(struct crocus_context *ice,
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_lower_clip_vs(nir, (1 << key->nr_userclip_plane_consts) - 1, true,
                         false, NULL);
-      nir_lower_io_vars_to_temporaries(nir, impl, true, false);
+      nir_lower_io_vars_to_temporaries(nir, impl, nir_var_shader_out);
       nir_lower_global_vars_to_local(nir);
       nir_lower_vars_to_ssa(nir);
       nir_shader_gather_info(nir, impl);
    }
 
    if (key->clamp_pointsize)
-      nir_lower_point_size(nir, 1.0, 255.0);
+      nir_lower_point_size(nir, 1.0, 255.0, nir_type_invalid);
 
    crocus_setup_uniforms(devinfo, mem_ctx, nir, prog_data, &system_values,
                          &num_system_values, &num_cbufs);
@@ -1675,14 +1684,14 @@ crocus_compile_gs(struct crocus_context *ice,
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_lower_clip_gs(nir, (1 << key->nr_userclip_plane_consts) - 1, false,
                         NULL);
-      nir_lower_io_vars_to_temporaries(nir, impl, true, false);
+      nir_lower_io_vars_to_temporaries(nir, impl, nir_var_shader_out);
       nir_lower_global_vars_to_local(nir);
       nir_lower_vars_to_ssa(nir);
       nir_shader_gather_info(nir, impl);
    }
 
    if (key->clamp_pointsize)
-      nir_lower_point_size(nir, 1.0, 255.0);
+      nir_lower_point_size(nir, 1.0, 255.0, nir_type_invalid);
 
    crocus_setup_uniforms(devinfo, mem_ctx, nir, prog_data, &system_values,
                          &num_system_values, &num_cbufs);

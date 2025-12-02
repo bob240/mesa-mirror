@@ -619,7 +619,7 @@ fn opt_nir(nir: &mut NirShader, dev: &Device, has_explicit_types: bool) {
     while {
         let mut progress = false;
 
-        progress |= nir_pass!(nir, nir_copy_prop);
+        progress |= nir_pass!(nir, nir_opt_copy_prop);
         progress |= nir_pass!(nir, nir_opt_copy_prop_vars);
         progress |= nir_pass!(nir, nir_opt_dead_write_vars);
 
@@ -706,7 +706,6 @@ fn compile_nir_to_args(
     nir.set_fp_rounding_mode_rtne();
 
     nir_pass!(nir, nir_scale_fdiv);
-    nir.set_workgroup_size_variable_if_zero();
     nir.structurize();
     nir_pass!(
         nir,
@@ -717,7 +716,7 @@ fn compile_nir_to_args(
     while {
         let mut progress = false;
         nir_pass!(nir, nir_split_var_copies);
-        progress |= nir_pass!(nir, nir_copy_prop);
+        progress |= nir_pass!(nir, nir_opt_copy_prop);
         progress |= nir_pass!(nir, nir_opt_copy_prop_vars);
         progress |= nir_pass!(nir, nir_opt_dead_write_vars);
         progress |= nir_pass!(nir, nir_opt_deref);
@@ -1440,6 +1439,15 @@ impl Kernel {
         grid: &mut [usize],
         block: &mut [usize],
     ) {
+        // We have to use the required workgroup size if specified.
+        if self.work_group_size() != [0; 3] {
+            for i in 0..work_dim {
+                block[i] = self.work_group_size()[i];
+                grid[i] /= block[i];
+            }
+            return;
+        }
+
         let mut threads = self.max_threads_per_block(d);
         let dim_threads = d.max_block_sizes();
         let subgroups = self.preferred_simd_size(d);
@@ -1469,7 +1477,13 @@ impl Kernel {
         }
     }
 
-    fn optimize_local_size(&self, d: &Device, grid: &mut [usize; 3], block: &mut [u32; 3]) {
+    fn optimize_local_size(
+        &self,
+        d: &Device,
+        work_dim: u32,
+        grid: &mut [usize; 3],
+        block: &mut [u32; 3],
+    ) {
         if !block.contains(&0) {
             for i in 0..3 {
                 // we already made sure everything is fine
@@ -1483,10 +1497,10 @@ impl Kernel {
             usize_block[i] = block[i] as usize;
         }
 
-        self.suggest_local_size(d, 3, grid, &mut usize_block);
+        self.suggest_local_size(d, work_dim as usize, grid, &mut usize_block);
 
         for i in 0..3 {
-            block[i] = usize_block[i] as u32;
+            block[i] = 1.max(usize_block[i] as u32);
         }
     }
 
@@ -1501,7 +1515,8 @@ impl Kernel {
         offsets: &[usize],
     ) -> CLResult<EventSig> {
         // Clone all the data we need to execute this kernel
-        let kernel_info = Arc::clone(&self.kernel_info);
+        let work_group_size_hint = self.kernel_info.work_group_size_hint;
+        let args = self.kernel_info.args.clone();
         let arg_values = self.values.clone();
         let nir_kernel_builds = Arc::clone(&self.builds[q.device]);
         let mut bdas = self.bdas.clone();
@@ -1539,7 +1554,7 @@ impl Kernel {
 
         let api_grid = grid;
 
-        self.optimize_local_size(q.device, &mut grid, &mut block);
+        self.optimize_local_size(q.device, work_dim, &mut grid, &mut block);
 
         Ok(Box::new(move |cl_ctx, ctx| {
             let hw_max_grid = ctx.dev.max_grid_size();
@@ -1548,8 +1563,7 @@ impl Kernel {
                 && grid[0] <= hw_max_grid[0]
                 && grid[1] <= hw_max_grid[1]
                 && grid[2] <= hw_max_grid[2]
-                && (kernel_info.work_group_size_hint == [0; 3]
-                    || block == kernel_info.work_group_size_hint)
+                && (work_group_size_hint == [0; 3] || block == work_group_size_hint)
             {
                 NirKernelVariant::Optimized
             } else {
@@ -1603,7 +1617,7 @@ impl Kernel {
 
             for arg in &nir_kernel_build.compiled_args {
                 let is_opaque = if let CompiledKernelArgType::APIArg(idx) = arg.kind {
-                    kernel_info.args[idx].kind.is_opaque()
+                    args[idx].kind.is_opaque()
                 } else {
                     false
                 };
@@ -1614,7 +1628,7 @@ impl Kernel {
 
                 match arg.kind {
                     CompiledKernelArgType::APIArg(idx) => {
-                        let api_arg = &kernel_info.args[idx];
+                        let api_arg = &args[idx];
                         let Some(value) = &arg_values[idx] else {
                             continue;
                         };

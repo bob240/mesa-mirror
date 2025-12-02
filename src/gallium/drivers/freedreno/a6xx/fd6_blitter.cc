@@ -279,19 +279,19 @@ emit_blit_fini(struct fd_context *ctx, fd_cs &cs)
 
    fd6_event_write<CHIP>(ctx, cs, FD_LABEL);
 
-   if (info->a6xx.magic.RB_DBG_ECO_CNTL != info->a6xx.magic.RB_DBG_ECO_CNTL_blit) {
+   if (info->magic.RB_DBG_ECO_CNTL != info->magic.RB_DBG_ECO_CNTL_blit) {
       fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
       fd_pkt4(cs, 1)
-         .add(A6XX_RB_DBG_ECO_CNTL(.dword = info->a6xx.magic.RB_DBG_ECO_CNTL_blit));
+         .add(A6XX_RB_DBG_ECO_CNTL(.dword = info->magic.RB_DBG_ECO_CNTL_blit));
    }
 
    fd_pkt7(cs, CP_BLIT, 1)
       .add(CP_BLIT_0(.op = BLIT_OP_SCALE));
 
-   if (info->a6xx.magic.RB_DBG_ECO_CNTL != info->a6xx.magic.RB_DBG_ECO_CNTL_blit) {
+   if (info->magic.RB_DBG_ECO_CNTL != info->magic.RB_DBG_ECO_CNTL_blit) {
       fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
       fd_pkt4(cs, 1)
-         .add(A6XX_RB_DBG_ECO_CNTL(.dword = info->a6xx.magic.RB_DBG_ECO_CNTL));
+         .add(A6XX_RB_DBG_ECO_CNTL(.dword = info->magic.RB_DBG_ECO_CNTL));
    }
 }
 
@@ -867,6 +867,9 @@ convert_color(enum pipe_format format, union pipe_color_union *pcolor)
    for (unsigned i = 0; i < 4; i++) {
       unsigned channel = desc->swizzle[i];
 
+      if (channel >= 4) /* PIPE_SWIZZLE_0/_1 */
+         continue;
+
       if (desc->channel[channel].normalized)
          continue;
 
@@ -1414,7 +1417,7 @@ handle_zs_blit(struct fd_context *ctx,
       /* non-UBWC Z24_UNORM_S8_UINT_AS_R8G8B8A8 is broken on a630, fall back to
        * 8888_unorm.
        */
-      if (!ctx->screen->info->a6xx.has_z24uint_s8uint) {
+      if (!ctx->screen->info->props.has_z24uint_s8uint) {
          if (!src->layout.ubwc && !dst->layout.ubwc) {
             blit.src.format = PIPE_FORMAT_RGBA8888_UINT;
             blit.dst.format = PIPE_FORMAT_RGBA8888_UINT;
@@ -1560,12 +1563,5 @@ fd6_tile_mode_for_format(enum pipe_format pfmt)
 unsigned
 fd6_tile_mode(const struct pipe_resource *tmpl)
 {
-   /* if the mipmap level 0 is still too small to be tiled, then don't
-    * bother pretending:
-    */
-   if ((tmpl->width0 < FDL_MIN_UBWC_WIDTH) &&
-         !util_format_is_depth_or_stencil(tmpl->format))
-      return TILE6_LINEAR;
-
    return fd6_tile_mode_for_format(tmpl->format);
 }

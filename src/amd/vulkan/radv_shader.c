@@ -164,30 +164,19 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
 {
    bool progress;
 
+   NIR_PASS(_, shader, nir_lower_alu_width, vectorize_vec2_16bit, NULL);
+
    struct set *skip = _mesa_pointer_set_create(NULL);
    do {
       progress = false;
 
       NIR_LOOP_PASS(progress, skip, shader, nir_split_array_vars, nir_var_function_temp);
       NIR_LOOP_PASS(progress, skip, shader, nir_shrink_vec_array_vars, nir_var_function_temp | nir_var_mem_shared);
-
-      if (!shader->info.var_copies_lowered) {
-         /* Only run this pass if nir_lower_var_copies was not called
-          * yet. That would lower away any copy_deref instructions and we
-          * don't want to introduce any more.
-          */
-         NIR_LOOP_PASS(progress, skip, shader, nir_opt_find_array_copies);
-      }
-
-      NIR_LOOP_PASS(progress, skip, shader, nir_opt_memcpy);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_copy_prop_vars);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_dead_write_vars);
-      NIR_LOOP_PASS(_, skip, shader, nir_lower_vars_to_ssa);
 
-      NIR_LOOP_PASS(_, skip, shader, nir_lower_alu_width, vectorize_vec2_16bit, NULL);
       NIR_LOOP_PASS(_, skip, shader, nir_lower_phis_to_scalar, ac_nir_lower_phis_to_scalar_cb, NULL);
-
-      NIR_LOOP_PASS(progress, skip, shader, nir_copy_prop);
+      NIR_LOOP_PASS(progress, skip, shader, nir_opt_copy_prop);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_remove_phis);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_dce);
       NIR_LOOP_PASS(progress, skip, shader, nir_opt_dead_cf);
@@ -195,7 +184,7 @@ radv_optimize_nir(struct nir_shader *shader, bool optimize_conservatively)
       NIR_LOOP_PASS_NOT_IDEMPOTENT(opt_loop_progress, skip, shader, nir_opt_loop);
       if (opt_loop_progress) {
          progress = true;
-         NIR_LOOP_PASS(progress, skip, shader, nir_copy_prop);
+         NIR_LOOP_PASS(progress, skip, shader, nir_opt_copy_prop);
          NIR_LOOP_PASS(progress, skip, shader, nir_opt_remove_phis);
          NIR_LOOP_PASS(progress, skip, shader, nir_opt_dce);
       }
@@ -240,7 +229,7 @@ radv_optimize_nir_algebraic_early(nir_shader *nir)
    bool more_algebraic = true;
    while (more_algebraic) {
       more_algebraic = false;
-      NIR_PASS(_, nir, nir_copy_prop);
+      NIR_PASS(_, nir, nir_opt_copy_prop);
       NIR_PASS(_, nir, nir_opt_dce);
       NIR_PASS(_, nir, nir_opt_constant_folding);
       NIR_PASS(_, nir, nir_opt_cse);
@@ -276,7 +265,7 @@ radv_optimize_nir_algebraic_late(nir_shader *nir)
       more_late_algebraic = false;
       NIR_LOOP_PASS_NOT_IDEMPOTENT(more_late_algebraic, skip, nir, nir_opt_algebraic_late);
       NIR_LOOP_PASS(_, skip, nir, nir_opt_constant_folding);
-      NIR_LOOP_PASS(_, skip, nir, nir_copy_prop);
+      NIR_LOOP_PASS(_, skip, nir, nir_opt_copy_prop);
       NIR_LOOP_PASS(_, skip, nir, nir_opt_dce);
       NIR_LOOP_PASS(_, skip, nir, nir_opt_cse);
    }
@@ -366,6 +355,10 @@ radv_shader_choose_subgroup_size(struct radv_device *device, nir_shader *nir,
       .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO,
       .requiredSubgroupSize = stage_key->subgroup_required_size * 32,
    };
+
+   /* Do not allow for the SPIR-V 1.6 varying subgroup size rules. */
+   if (pdev->cache_key.no_implicit_varying_subgroup_size)
+      spirv_version = 0x10000;
 
    vk_set_subgroup_size(&device->vk, nir, spirv_version, rss_info.requiredSubgroupSize ? &rss_info : NULL,
                         stage_key->subgroup_allow_varying, stage_key->subgroup_require_full);
@@ -541,12 +534,12 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
       NIR_PASS(progress, nir, nir_inline_functions);
       if (progress) {
          NIR_PASS(_, nir, nir_opt_copy_prop_vars);
-         NIR_PASS(_, nir, nir_copy_prop);
+         NIR_PASS(_, nir, nir_opt_copy_prop);
       }
       NIR_PASS(_, nir, nir_opt_deref);
 
-      /* Pick off the single entrypoint that we want */
-      nir_remove_non_entrypoints(nir);
+      /* Pick off the single entrypoint that we want - leave cmat call functions */
+      nir_remove_non_cmat_call_entrypoints(nir);
 
       /* Make sure we lower constant initializers on output variables so that
        * nir_remove_dead_variables below sees the corresponding stores
@@ -567,7 +560,19 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
          NIR_PASS(_, nir, nir_opt_dce);
          NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp | nir_var_shader_temp, NULL);
       }
-      NIR_PASS(_, nir, radv_nir_lower_cooperative_matrix, pdev->info.gfx_level, nir->info.max_subgroup_size);
+
+      NIR_PASS(progress, nir, radv_nir_lower_cooperative_matrix, pdev->info.gfx_level, nir->info.max_subgroup_size);
+      if (progress) {
+         NIR_PASS(_, nir, nir_opt_dce);
+         NIR_PASS(progress, nir, nir_inline_functions);
+         nir_remove_non_entrypoints(nir); /* remove the late inlined functions */
+         if (progress) {
+            NIR_PASS(_, nir, nir_opt_copy_prop_vars);
+            NIR_PASS(_, nir, nir_opt_copy_prop);
+         }
+         NIR_PASS(_, nir, nir_opt_deref);
+         NIR_PASS(_, nir, nir_opt_dce);
+      }
 
       /* Split member structs.  We do this before lower_io_to_temporaries so that
        * it doesn't lower system values to temporaries by accident.
@@ -673,13 +678,12 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
 
    NIR_PASS(_, nir, nir_lower_image, &image_options);
 
-   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
-
    if (nir->info.stage == MESA_SHADER_VERTEX || nir->info.stage == MESA_SHADER_GEOMETRY ||
        nir->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir), true, true);
+      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir),
+               nir_var_shader_in | nir_var_shader_out);
    } else if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
-      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir), true, false);
+      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir), nir_var_shader_out);
    }
 
    NIR_PASS(_, nir, nir_split_var_copies);
@@ -721,8 +725,17 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
    };
    NIR_PASS(_, nir, nir_opt_access, &opt_access_options);
 
-   if (!stage->key.optimisations_disabled)
+   if (!stage->key.optimisations_disabled) {
+      /* Only run this pass once before nir_lower_var_copies is called,
+      * so that we don't introduce any new copy_deref instructions later.
+      */
+      NIR_PASS(_, nir, nir_opt_find_array_copies);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
       radv_optimize_nir(nir, false);
+
+      NIR_PASS(_, nir, nir_opt_memcpy);
+   }
 
    /* We call nir_lower_var_copies() after the first radv_optimize_nir()
     * to remove any copies introduced by nir_opt_find_array_copies().
@@ -733,12 +746,8 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
 
    unsigned lower_flrp = (nir->options->lower_flrp16 ? 16 : 0) | (nir->options->lower_flrp32 ? 32 : 0) |
                          (nir->options->lower_flrp64 ? 64 : 0);
-   if (lower_flrp != 0) {
-      progress = false;
+   if (lower_flrp != 0)
       NIR_PASS(progress, nir, nir_lower_flrp, lower_flrp, false /* always precise */);
-      if (progress)
-         NIR_PASS(_, nir, nir_opt_constant_folding);
-   }
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
 
@@ -760,7 +769,7 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
 
       if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
          const unsigned chunk_size = 16; /* max single store size */
-         const unsigned shared_size = ALIGN(nir->info.shared_size, chunk_size);
+         const unsigned shared_size = align(nir->info.shared_size, chunk_size);
          NIR_PASS(_, nir, nir_zero_initialize_shared_memory, shared_size, chunk_size);
       }
    }
@@ -786,7 +795,11 @@ radv_shader_spirv_to_nir(struct radv_device *device, const struct radv_shader_st
     * bloat the instruction count of the loop and cause it to be
     * considered too large for unrolling.
     */
-   if (ac_nir_lower_indirect_derefs(nir, pdev->info.gfx_level) && !stage->key.optimisations_disabled &&
+   bool indirect_derefs_lowered = false;
+   NIR_PASS(indirect_derefs_lowered, nir, ac_nir_lower_indirect_derefs, pdev->info.gfx_level);
+   NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+
+   if (indirect_derefs_lowered && !stage->key.optimisations_disabled &&
        nir->info.stage != MESA_SHADER_COMPUTE) {
       /* Optimize the lowered code before the linking optimizations. */
       radv_optimize_nir(nir, false);
@@ -945,7 +958,7 @@ radv_lower_ngg(struct radv_device *device, struct radv_shader_stage *ngg_stage,
                &ngg_stage->info.ngg_lds_scratch_size);
    } else if (nir->info.stage == MESA_SHADER_MESH) {
       /* ACO aligns the workgroup size to the wave size. */
-      unsigned hw_workgroup_size = ALIGN(info->workgroup_size, info->wave_size);
+      unsigned hw_workgroup_size = align(info->workgroup_size, info->wave_size);
 
       bool scratch_ring = false;
       NIR_PASS(_, nir, ac_nir_lower_ngg_mesh, &pdev->info, options.export_clipdist_mask, options.vs_output_param_offset,
@@ -1253,6 +1266,9 @@ get_hole(struct radv_shader_arena *arena, struct list_head *head)
 void
 radv_free_shader_memory(struct radv_device *device, union radv_shader_arena_block *alloc)
 {
+   if (!alloc)
+      return;
+
    mtx_lock(&device->shader_arena_mutex);
 
    union radv_shader_arena_block *hole_prev = get_hole(alloc->arena, alloc->list.prev);
@@ -1625,60 +1641,59 @@ radv_precompute_registers_hw_vs(struct radv_device *device, struct radv_shader_b
    }
 }
 
-static void
-radv_precompute_registers_hw_gs(struct radv_device *device, struct radv_shader_binary *binary)
+void
+radv_precompute_registers_hw_gs(struct radv_device *device, struct radv_shader_info *es_info, struct radv_shader_info *gs_info)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   struct radv_shader_info *info = &binary->info;
 
-   info->regs.gs.vgt_esgs_ring_itemsize = info->gs_ring_info.esgs_itemsize;
+   gs_info->regs.gs.vgt_esgs_ring_itemsize = es_info ? es_info->esgs_itemsize / 4 : gs_info->legacy_gs_info.esgs_itemsize /4;
 
-   info->regs.gs.vgt_gs_max_prims_per_subgroup =
-      S_028A94_MAX_PRIMS_PER_SUBGROUP(info->gs_ring_info.gs_inst_prims_in_subgroup);
+   gs_info->regs.gs.vgt_gs_max_prims_per_subgroup =
+      S_028A94_MAX_PRIMS_PER_SUBGROUP(gs_info->legacy_gs_info.gs_inst_prims_in_subgroup);
 
-   info->regs.vgt_gs_onchip_cntl = S_028A44_ES_VERTS_PER_SUBGRP(info->gs_ring_info.es_verts_per_subgroup) |
-                                   S_028A44_GS_PRIMS_PER_SUBGRP(info->gs_ring_info.gs_prims_per_subgroup) |
-                                   S_028A44_GS_INST_PRIMS_IN_SUBGRP(info->gs_ring_info.gs_inst_prims_in_subgroup);
+   gs_info->regs.vgt_gs_onchip_cntl = S_028A44_ES_VERTS_PER_SUBGRP(gs_info->legacy_gs_info.es_verts_per_subgroup) |
+                                   S_028A44_GS_PRIMS_PER_SUBGRP(gs_info->legacy_gs_info.gs_prims_per_subgroup) |
+                                   S_028A44_GS_INST_PRIMS_IN_SUBGRP(gs_info->legacy_gs_info.gs_inst_prims_in_subgroup);
 
-   const uint32_t gs_max_out_vertices = info->gs.vertices_out;
-   const uint8_t max_stream = info->gs.num_components_per_stream[3]   ? 3
-                              : info->gs.num_components_per_stream[2] ? 2
-                              : info->gs.num_components_per_stream[1] ? 1
+   const uint32_t gs_max_out_vertices = gs_info->gs.vertices_out;
+   const uint8_t max_stream = gs_info->gs.num_components_per_stream[3]   ? 3
+                              : gs_info->gs.num_components_per_stream[2] ? 2
+                              : gs_info->gs.num_components_per_stream[1] ? 1
                                                                       : 0;
-   const uint8_t *num_components = info->gs.num_components_per_stream;
+   const uint8_t *num_components = gs_info->gs.num_components_per_stream;
 
    uint32_t offset = num_components[0] * gs_max_out_vertices;
-   info->regs.gs.vgt_gsvs_ring_offset[0] = offset;
+   gs_info->regs.gs.vgt_gsvs_ring_offset[0] = offset;
 
    if (max_stream >= 1)
       offset += num_components[1] * gs_max_out_vertices;
-   info->regs.gs.vgt_gsvs_ring_offset[1] = offset;
+   gs_info->regs.gs.vgt_gsvs_ring_offset[1] = offset;
 
    if (max_stream >= 2)
       offset += num_components[2] * gs_max_out_vertices;
-   info->regs.gs.vgt_gsvs_ring_offset[2] = offset;
+   gs_info->regs.gs.vgt_gsvs_ring_offset[2] = offset;
 
    if (max_stream >= 3)
       offset += num_components[3] * gs_max_out_vertices;
-   info->regs.gs.vgt_gsvs_ring_itemsize = offset;
+   gs_info->regs.gs.vgt_gsvs_ring_itemsize = offset;
 
    for (uint32_t i = 0; i < 4; i++)
-      info->regs.gs.vgt_gs_vert_itemsize[i] = (max_stream >= i) ? num_components[i] : 0;
+      gs_info->regs.gs.vgt_gs_vert_itemsize[i] = (max_stream >= i) ? num_components[i] : 0;
 
-   const uint32_t gs_num_invocations = info->gs.invocations;
-   info->regs.gs.vgt_gs_instance_cnt =
+   const uint32_t gs_num_invocations = gs_info->gs.invocations;
+   gs_info->regs.gs.vgt_gs_instance_cnt =
       S_028B90_CNT(MIN2(gs_num_invocations, 127)) | S_028B90_ENABLE(gs_num_invocations > 0);
 
-   info->regs.spi_shader_pgm_rsrc3_gs =
+   gs_info->regs.spi_shader_pgm_rsrc3_gs =
       ac_apply_cu_en(S_00B21C_CU_EN(0xffff) | S_00B21C_WAVE_LIMIT(0x3F), C_00B21C_CU_EN, 0, &pdev->info);
 
    if (pdev->info.gfx_level >= GFX10) {
-      info->regs.spi_shader_pgm_rsrc4_gs =
+      gs_info->regs.spi_shader_pgm_rsrc4_gs =
          ac_apply_cu_en(S_00B204_CU_EN_GFX10(0xffff) | S_00B204_SPI_SHADER_LATE_ALLOC_GS_GFX10(0), C_00B204_CU_EN_GFX10,
                         16, &pdev->info);
    }
 
-   info->regs.vgt_gs_max_vert_out = info->gs.vertices_out;
+   gs_info->regs.vgt_gs_max_vert_out = gs_info->gs.vertices_out;
 }
 
 void
@@ -1809,18 +1824,18 @@ radv_precompute_registers_hw_ms(struct radv_device *device, struct radv_shader_b
 
    info->regs.vgt_gs_max_vert_out = pdev->info.mesh_fast_launch_2 ? info->ngg_info.max_out_verts : info->workgroup_size;
 
-   info->regs.ms.spi_shader_gs_meshlet_dim = S_00B2B0_MESHLET_NUM_THREAD_X(info->cs.block_size[0] - 1) |
-                                             S_00B2B0_MESHLET_NUM_THREAD_Y(info->cs.block_size[1] - 1) |
-                                             S_00B2B0_MESHLET_NUM_THREAD_Z(info->cs.block_size[2] - 1) |
-                                             S_00B2B0_MESHLET_THREADGROUP_SIZE(info->workgroup_size - 1);
+   info->regs.ngg.ms.spi_shader_gs_meshlet_dim = S_00B2B0_MESHLET_NUM_THREAD_X(info->cs.block_size[0] - 1) |
+                                                 S_00B2B0_MESHLET_NUM_THREAD_Y(info->cs.block_size[1] - 1) |
+                                                 S_00B2B0_MESHLET_NUM_THREAD_Z(info->cs.block_size[2] - 1) |
+                                                 S_00B2B0_MESHLET_THREADGROUP_SIZE(info->workgroup_size - 1);
 
-   info->regs.ms.spi_shader_gs_meshlet_exp_alloc =
+   info->regs.ngg.ms.spi_shader_gs_meshlet_exp_alloc =
       S_00B2B4_MAX_EXP_VERTS(info->ngg_info.max_out_verts) | S_00B2B4_MAX_EXP_PRIMS(info->ngg_info.prim_amp_factor);
 
    if (pdev->info.gfx_level >= GFX12) {
       const bool derivative_group_quads = info->cs.derivative_group == DERIVATIVE_GROUP_QUADS;
 
-      info->regs.ms.spi_shader_gs_meshlet_ctrl =
+      info->regs.ngg.ms.spi_shader_gs_meshlet_ctrl =
          S_00B2B8_INTERLEAVE_BITS_X(derivative_group_quads) | S_00B2B8_INTERLEAVE_BITS_Y(derivative_group_quads);
    }
 }
@@ -2028,7 +2043,7 @@ radv_precompute_registers(struct radv_device *device, struct radv_shader_binary 
       if (info->is_ngg) {
          radv_precompute_registers_hw_ngg(device, &binary->config, &binary->info);
       } else {
-         radv_precompute_registers_hw_gs(device, binary);
+         radv_precompute_registers_hw_gs(device, NULL, &binary->info);
       }
       break;
    case MESA_SHADER_MESH:
@@ -2458,7 +2473,7 @@ radv_shader_combine_cfg_vs_gs(const struct radv_device *device, const struct rad
       if (gs->info.is_ngg) {
          lds_size = gs->info.ngg_info.lds_size;
       } else {
-         lds_size = gs->info.gs_ring_info.lds_size;
+         lds_size = gs->info.legacy_gs_info.lds_size;
       }
 
       rsrc2 |= S_00B22C_LDS_SIZE(ac_shader_encode_lds_size(lds_size, pdev->info.gfx_level, MESA_SHADER_VERTEX));
@@ -2860,6 +2875,11 @@ radv_shader_create_uncached(struct radv_device *device, const struct radv_shader
       }
    }
 
+   if (radv_device_physical(device)->info.family_overridden) {
+      *out_shader = shader;
+      return VK_SUCCESS;
+   }
+
    if (replay_block) {
       shader->alloc = radv_replay_shader_arena_block(device, replay_block, shader);
       if (!shader->alloc) {
@@ -2961,6 +2981,9 @@ radv_shader_part_create(struct radv_device *device, struct radv_shader_part_bina
    shader_part->spi_shader_col_format = binary->info.spi_shader_col_format;
    shader_part->cb_shader_mask = binary->info.cb_shader_mask;
    shader_part->spi_shader_z_format = binary->info.spi_shader_z_format;
+
+   if (radv_device_physical(device)->info.family_overridden)
+      return shader_part;
 
    /* Allocate memory and upload. */
    shader_part->alloc = radv_alloc_shader_memory(device, shader_part->code_size, false, NULL);
@@ -3562,8 +3585,7 @@ radv_shader_part_destroy(struct radv_device *device, struct radv_shader_part *sh
       radv_shader_wait_for_upload(device, shader_part->upload_seq);
    }
 
-   if (shader_part->alloc)
-      radv_free_shader_memory(device, shader_part->alloc);
+   radv_free_shader_memory(device, shader_part->alloc);
    free(shader_part->disasm_string);
    free(shader_part);
 }

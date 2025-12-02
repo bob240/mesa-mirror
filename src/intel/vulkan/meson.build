@@ -25,6 +25,7 @@ anv_entrypoints = custom_target(
     '--device-prefix', 'gfx20',
     '--device-prefix', 'gfx30',
     '--device-prefix', 'anv_doom64',
+    '--device-prefix', 'anv_furmark',
     '--device-prefix', 'anv_hitman3',
     '--device-prefix', 'anv_android',
     '--device-prefix', 'anv_rmv',
@@ -50,12 +51,13 @@ icd_file_name = libname_prefix + 'vulkan_intel.' + libname_suffix
 intel_icd = custom_target(
   'intel_icd',
   input : [vk_icd_gen, vk_api_xml],
-  output : 'intel_icd.@0@.json'.format(host_machine.cpu()),
+  output : 'intel_icd.' + vulkan_manifest_suffix,
   command : [
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
     '--sizeof-pointer', sizeof_pointer,
-    '--lib-path', vulkan_icd_lib_path / icd_file_name,
+    '--icd-lib-path', vulkan_icd_lib_path,
+    '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
   ],
   build_by_default : true,
@@ -73,7 +75,8 @@ _dev_icd = custom_target(
     prog_python, '@INPUT0@',
     '--api-version', '1.4', '--xml', '@INPUT1@',
     '--sizeof-pointer', sizeof_pointer,
-    '--lib-path', meson.current_build_dir() / icd_file_name,
+    '--icd-lib-path', meson.current_build_dir(),
+    '--icd-filename', icd_file_name,
     '--out', '@OUTPUT@',
   ],
   build_by_default : true,
@@ -138,6 +141,7 @@ libanv_files = files(
   'i915/anv_queue.h',
   'layers/anv_android_layer.c',
   'layers/anv_doom64.c',
+  'layers/anv_furmark.c',
   'layers/anv_hitman3.c',
   'layers/anv_rmv_layer.c',
   'xe/anv_batch_chain.c',
@@ -174,6 +178,7 @@ libanv_files = files(
   'anv_nir.h',
   'anv_nir_apply_pipeline_layout.c',
   'anv_nir_compute_push_layout.c',
+  'anv_nir_lower_driver_values.c',
   'anv_nir_lower_multiview.c',
   'anv_nir_lower_ubo_loads.c',
   'anv_nir_lower_resource_intel.c',
@@ -252,6 +257,9 @@ libanv_common = static_library(
   dependencies : anv_deps
 )
 
+idep_libvulkan_intel_decoder = (with_mesa_ndebug ?
+  idep_intel_decoder_stub_brw : idep_intel_decoder_brw)
+
 libvulkan_intel = shared_library(
   'vulkan_intel',
   [files('anv_gem.c'), anv_entrypoints[0], bvh_spv],
@@ -267,7 +275,7 @@ libvulkan_intel = shared_library(
     idep_nir, idep_genxml, idep_vulkan_util, idep_vulkan_wsi,
     idep_vulkan_runtime, idep_mesautil, idep_xmlconfig,
     idep_intel_driver_ds, idep_intel_dev, idep_intel_blorp,
-    idep_intel_compiler_brw, idep_intel_decoder_brw,
+    idep_intel_compiler_brw, idep_libvulkan_intel_decoder
   ],
   c_args : anv_flags,
   gnu_symbol_visibility : 'hidden',
@@ -305,7 +313,7 @@ if with_tests
       dep_thread, dep_dl, dep_m, anv_deps,
       idep_nir, idep_vulkan_util, idep_vulkan_wsi, idep_vulkan_runtime,
       idep_mesautil, idep_intel_dev, idep_intel_blorp,
-      idep_intel_compiler_brw, idep_intel_decoder_brw,
+      idep_intel_compiler_brw, idep_libvulkan_intel_decoder,
     ],
     c_args : anv_flags,
     gnu_symbol_visibility : 'hidden',

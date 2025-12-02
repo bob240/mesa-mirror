@@ -210,12 +210,12 @@ agx_resource_from_handle(struct pipe_screen *pscreen,
 
    if (rsc->layout.tiling == AIL_TILING_LINEAR) {
       rsc->layout.linear_stride_B = whandle->stride;
-   } else if (whandle->stride != ail_get_wsi_stride_B(&rsc->layout, 0)) {
+      rsc->layout.level_offsets_B[0] = whandle->offset;
+   } else if (whandle->stride != ail_get_wsi_stride_B(&rsc->layout, 0) ||
+              whandle->offset != 0) {
       FREE(rsc);
       return NULL;
    }
-
-   assert(whandle->offset == 0);
 
    ail_make_miptree(&rsc->layout);
 
@@ -301,7 +301,8 @@ agx_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
                        enum pipe_resource_param param, unsigned usage,
                        uint64_t *value)
 {
-   struct agx_resource *rsrc = (struct agx_resource *)prsc;
+   struct agx_resource *rsrc =
+      (struct agx_resource *)util_resource_at_index(prsc, plane);
 
    switch (param) {
    case PIPE_RESOURCE_PARAM_STRIDE:
@@ -1206,13 +1207,6 @@ agx_flush_resource(struct pipe_context *pctx, struct pipe_resource *pres)
    }
 }
 
-static bool
-is_aligned(unsigned x, unsigned pot_alignment)
-{
-   assert(util_is_power_of_two_nonzero(pot_alignment));
-   return (x & (pot_alignment - 1)) == 0;
-}
-
 static unsigned
 build_timestamp_offset(struct agx_batch *batch, unsigned offset)
 {
@@ -1284,7 +1278,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
          /* Main stride in pages */
          assert((zres->layout.depth_px == 1 ||
-                 is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
+                 util_is_aligned(zres->layout.layer_stride_B, AIL_PAGESIZE)) &&
                 "Page aligned Z layers");
 
          unsigned stride_pages = zres->layout.layer_stride_B / AIL_PAGESIZE;
@@ -1292,13 +1286,13 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
          if (zres->layout.compressed) {
             c->depth.comp_base =
-               agx_map_texture_gpu(zres, 0) + zres->layout.metadata_offset_B +
+               agx_map_gpu(zres) + zres->layout.metadata_offset_B +
                (first_layer * zres->layout.compression_layer_stride_B) +
                zres->layout.level_offsets_compressed_B[level];
 
             /* Meta stride in cache lines */
-            assert(is_aligned(zres->layout.compression_layer_stride_B,
-                              AIL_CACHELINE) &&
+            assert(util_is_aligned(zres->layout.compression_layer_stride_B,
+                                   AIL_CACHELINE) &&
                    "Cacheline aligned Z meta layers");
             unsigned stride_lines =
                zres->layout.compression_layer_stride_B / AIL_CACHELINE;
@@ -1322,20 +1316,20 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
 
          /* Main stride in pages */
          assert((sres->layout.depth_px == 1 ||
-                 is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
+                 util_is_aligned(sres->layout.layer_stride_B, AIL_PAGESIZE)) &&
                 "Page aligned S layers");
          unsigned stride_pages = sres->layout.layer_stride_B / AIL_PAGESIZE;
          c->stencil.stride = ((stride_pages - 1) << 14) | 1;
 
          if (sres->layout.compressed) {
             c->stencil.comp_base =
-               agx_map_texture_gpu(sres, 0) + sres->layout.metadata_offset_B +
+               agx_map_gpu(sres) + sres->layout.metadata_offset_B +
                (first_layer * sres->layout.compression_layer_stride_B) +
                sres->layout.level_offsets_compressed_B[level];
 
             /* Meta stride in cache lines */
-            assert(is_aligned(sres->layout.compression_layer_stride_B,
-                              AIL_CACHELINE) &&
+            assert(util_is_aligned(sres->layout.compression_layer_stride_B,
+                                   AIL_CACHELINE) &&
                    "Cacheline aligned S meta layers");
             unsigned stride_lines =
                sres->layout.compression_layer_stride_B / AIL_CACHELINE;

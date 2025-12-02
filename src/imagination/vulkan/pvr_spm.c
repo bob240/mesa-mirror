@@ -40,6 +40,7 @@
 #include "pvr_macros.h"
 #include "pvr_pass.h"
 #include "pvr_pds.h"
+#include "pvr_physical_device.h"
 #include "pvr_spm.h"
 #include "pvr_tex_state.h"
 #include "pvr_types.h"
@@ -124,7 +125,7 @@ pvr_spm_scratch_buffer_alloc(struct pvr_device *device,
                              struct pvr_spm_scratch_buffer **const buffer_out)
 {
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    struct pvr_spm_scratch_buffer *scratch_buffer;
    struct pvr_bo *bo;
    VkResult result;

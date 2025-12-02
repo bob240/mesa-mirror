@@ -285,8 +285,6 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
    if (!screen->caps.nir_atomics_as_deref)
       NIR_PASS(_, nir, gl_nir_lower_atomics, shader_program, true);
 
-   NIR_PASS(_, nir, nir_opt_intrinsics);
-
    /* Lower 64-bit ops. */
    if (nir->options->lower_int64_options ||
        nir->options->lower_doubles_options) {
@@ -362,6 +360,8 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
       NIR_PASS(_, nir, nir_lower_atomics_to_ssbo, align_offset_state);
    }
 
+   NIR_PASS(_, nir, nir_opt_intrinsics);
+
    st_set_prog_affected_state_flags(prog);
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
@@ -370,7 +370,7 @@ st_glsl_to_nir_post_opts(struct st_context *st, struct gl_program *prog,
       st_finalize_nir(st, prog, shader_program, nir, true, false);
 
       if (screen->finalize_nir)
-         screen->finalize_nir(screen, nir);
+         screen->finalize_nir(screen, nir, false);
    }
 
    if (st->ctx->_Shader->Flags & GLSL_DUMP) {
@@ -539,7 +539,7 @@ st_link_glsl_to_nir(struct gl_context *ctx,
             (nir_variable_mode)0;
 
          if (mode)
-            nir_lower_indirect_derefs(nir, mode, UINT32_MAX);
+            nir_lower_indirect_derefs_to_if_else_trees(nir, mode, UINT32_MAX);
       }
 
       /* This needs to run after the initial pass of nir_lower_vars_to_ssa, so

@@ -39,6 +39,7 @@
 #include "lp_bld_coro.h"
 #include "lp_bld_printf.h"
 #include "lp_bld_intr.h"
+#include "lp_bld_tgsi.h"
 
 #include "util/u_cpu_detect.h"
 #include "util/u_math.h"
@@ -217,6 +218,7 @@ struct lp_build_nir_soa_context
    LLVMValueRef ssbo_ptr;
 
    LLVMValueRef shared_ptr;
+   LLVMValueRef shared_size;
    LLVMValueRef payload_ptr;
    LLVMValueRef scratch_ptr;
    unsigned scratch_size;
@@ -361,7 +363,7 @@ group_op_mask_vec(struct lp_build_nir_soa_context *bld)
 {
    if (bld->shader->info.fs.require_full_quads)
       return mask_vec_with_helpers(bld);
-   
+
    return mask_vec(bld);
 }
 
@@ -1316,11 +1318,27 @@ mem_access_base_pointer(struct lp_build_nir_soa_context *bld,
          ptr = LLVMBuildPtrToInt(gallivm->builder, ptr, bld->int64_bld.elem_type, "");
          ptr = LLVMBuildAdd(gallivm->builder, ptr, lp_build_const_int64(gallivm, 12), "");
          ptr = LLVMBuildIntToPtr(gallivm->builder, ptr, LLVMPointerType(LLVMInt32TypeInContext(gallivm->context), 0), "");
+         if (bounds)
+            *bounds = NULL;
       }
-      else
+      else {
          ptr = bld->shared_ptr;
-      if (bounds)
-         *bounds = NULL;
+         if (bounds) {
+            /*
+             * For shared mem, use essentially the same logic as for SSBOs,
+             * and clamp against the declared size.
+             * Note this is probably overkill - unsure of vulkan semantics,
+             * but d3d would allow for instance to just clamp offsets,
+             * since OOB writes cause shared mem to become undefined, and OOB
+             * reads have undefined results, unlike for SSBOs there's no
+             * need to ignore writes and return 0 for reads.
+             * Bounds is in units of bit_size (not bytes).
+             */
+            uint32_t shift_val = bit_size_to_shift_size(bit_size);
+            *bounds = LLVMBuildAShr(gallivm->builder, bld->shared_size,
+                                    lp_build_const_int32(gallivm, shift_val), "");
+         }
+      }
    }
 
    /* Cast it to the pointer type of the access this instruction is doing. */
@@ -2892,7 +2910,7 @@ get_instr_src_vec(struct lp_build_nir_soa_context *bld, nir_instr *instr, uint32
    struct gallivm_state *gallivm = bld->base.gallivm;
    LLVMBuilderRef builder = gallivm->builder;
 
-   nir_src *src = NULL; 
+   nir_src *src = NULL;
    switch (instr->type) {
    case nir_instr_type_alu: {
       nir_alu_instr *alu = nir_instr_as_alu(instr);
@@ -2968,8 +2986,10 @@ assign_ssa_dest(struct lp_build_nir_soa_context *bld, const nir_def *ssa,
    struct gallivm_state *gallivm = bld->base.gallivm;
    LLVMBuilderRef builder = gallivm->builder;
 
-   if (gallivm->di_builder && ssa->parent_instr->has_debug_info) {
-      nir_instr_debug_info *debug_info = nir_instr_get_debug_info(ssa->parent_instr);
+   if (gallivm->di_builder && nir_def_instr(ssa)->has_debug_info) {
+      /* Cast away the constness */
+      nir_instr_debug_info *debug_info =
+         nir_instr_get_debug_info((void *) nir_def_instr(ssa));
 
       /* Use "ssa_%u" because GDB cannot handle "%%%u" */
       char name[16];
@@ -3163,7 +3183,7 @@ do_int_divide(struct lp_build_nir_soa_context *bld,
 
 static LLVMValueRef
 do_int_mod(struct lp_build_nir_soa_context *bld,
-           bool is_unsigned, unsigned src_bit_size,
+           bool is_unsigned, bool use_src2_sign, unsigned src_bit_size,
            LLVMValueRef src, LLVMValueRef src2)
 {
    struct gallivm_state *gallivm = bld->base.gallivm;
@@ -3180,8 +3200,18 @@ do_int_mod(struct lp_build_nir_soa_context *bld,
       divisor = get_signed_divisor(gallivm, int_bld, mask_bld,
                                    src_bit_size, src, divisor);
    }
-   LLVMValueRef result = lp_build_mod(int_bld, src, divisor);
-   return LLVMBuildOr(builder, div_mask, result, "");
+   LLVMValueRef rem = lp_build_mod(int_bld, src, divisor);
+   rem = LLVMBuildOr(builder, div_mask, rem, "");
+
+   if (use_src2_sign) {
+      LLVMValueRef add_src2 = LLVMBuildICmp(builder, LLVMIntNE, rem, int_bld->zero, "");
+      LLVMValueRef signs_different = LLVMBuildXor(builder, LLVMBuildICmp(builder, LLVMIntSLT, src, int_bld->zero, ""),
+                                                  LLVMBuildICmp(builder, LLVMIntSLT, src2, int_bld->zero, ""), "");
+      add_src2 = LLVMBuildAnd(builder, add_src2, signs_different, "");
+      rem = LLVMBuildSelect(builder, add_src2, LLVMBuildAdd(builder, rem, src2, ""), rem, "");
+   }
+
+   return rem;
 }
 
 static LLVMValueRef
@@ -3493,7 +3523,7 @@ do_alu_action(struct lp_build_nir_soa_context *bld,
       break;
    case nir_op_imod:
    case nir_op_irem:
-      result = do_int_mod(bld, false, src_bit_size[0], src[0], src[1]);
+      result = do_int_mod(bld, false, instr->op == nir_op_imod, src_bit_size[0], src[0], src[1]);
       break;
    case nir_op_ishl: {
       if (src_bit_size[0] == 64)
@@ -3592,7 +3622,7 @@ do_alu_action(struct lp_build_nir_soa_context *bld,
       result = lp_build_min(uint_bld, src[0], src[1]);
       break;
    case nir_op_umod:
-      result = do_int_mod(bld, true, src_bit_size[0], src[0], src[1]);
+      result = do_int_mod(bld, true, false, src_bit_size[0], src[0], src[1]);
       break;
    case nir_op_umul_high: {
       LLVMValueRef hi_bits;
@@ -4249,7 +4279,7 @@ img_params_init_resource(struct lp_build_nir_soa_context *bld, struct lp_img_par
          params->image_index = nir_src_as_int(*src);
       else
          params->image_index_offset = get_src(bld, src, 0);
-   
+
       return;
    }
 
@@ -4264,7 +4294,7 @@ sampler_size_params_init_resource(struct lp_build_nir_soa_context *bld, struct l
          params->texture_unit = nir_src_as_int(*src);
       else
          params->texture_unit_offset = get_src(bld, src, 0);
-   
+
       return;
    }
 
@@ -4569,7 +4599,7 @@ visit_shared_load(struct lp_build_nir_soa_context *bld,
    bool offset_is_uniform = !lp_nir_instr_src_divergent(&instr->instr, 0);
    emit_load_mem(bld, instr->def.num_components,
                  instr->def.bit_size, true,
-                 offset_is_uniform, false, true, NULL, offset, result);
+                 offset_is_uniform, false, false, NULL, offset, result);
 }
 
 static void
@@ -4582,7 +4612,7 @@ visit_shared_store(struct lp_build_nir_soa_context *bld,
    int writemask = nir_intrinsic_write_mask(instr);
    int nc = nir_src_num_components(instr->src[0]);
    int bitsize = nir_src_bit_size(instr->src[0]);
-   emit_store_mem(bld, writemask, nc, bitsize, false, true, NULL, offset, val);
+   emit_store_mem(bld, writemask, nc, bitsize, false, false, NULL, offset, val);
 }
 
 static void
@@ -4597,7 +4627,7 @@ visit_shared_atomic(struct lp_build_nir_soa_context *bld,
    if (instr->intrinsic == nir_intrinsic_shared_atomic_swap)
       val2 = get_src(bld, &instr->src[2], 0);
 
-   emit_atomic_mem(bld, nir_intrinsic_atomic_op(instr), bitsize, false, true,
+   emit_atomic_mem(bld, nir_intrinsic_atomic_op(instr), bitsize, false, false,
                    NULL, offset, val, val2, &result[0]);
 }
 
@@ -6008,6 +6038,7 @@ void lp_build_nir_soa_func(struct gallivm_state *gallivm,
    bld.thread_data_ptr = params->thread_data_ptr;
    bld.image = params->image;
    bld.shared_ptr = params->shared_ptr;
+   bld.shared_size = params->shared_size;
    bld.payload_ptr = params->payload_ptr;
    bld.coro = params->coro;
    bld.num_inputs = params->num_inputs;
@@ -6042,7 +6073,7 @@ void lp_build_nir_soa_func(struct gallivm_state *gallivm,
 
    bld.shader = shader;
 
-   bld.scratch_size = ALIGN(shader->scratch_size, 8);
+   bld.scratch_size = align(shader->scratch_size, 8);
    if (params->scratch_ptr)
       bld.scratch_ptr = params->scratch_ptr;
    else if (shader->scratch_size) {
@@ -6179,7 +6210,7 @@ lp_build_nir_soa_prepasses(struct nir_shader *nir)
    do {
       progress = false;
       NIR_PASS(progress, nir, nir_lower_alu_to_scalar, NULL, NULL);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
    } while (progress);
 

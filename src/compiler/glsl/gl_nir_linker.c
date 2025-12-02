@@ -76,7 +76,7 @@ gl_nir_opts(nir_shader *nir)
 
       NIR_PASS(_, nir, nir_lower_alu);
       NIR_PASS(_, nir, nir_lower_pack);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
 
@@ -84,7 +84,7 @@ gl_nir_opts(nir_shader *nir)
       NIR_PASS(opt_loop_progress, nir, nir_opt_loop);
       if (opt_loop_progress) {
          progress = true;
-         NIR_PASS(progress, nir, nir_copy_prop);
+         NIR_PASS(progress, nir, nir_opt_copy_prop);
          NIR_PASS(progress, nir, nir_opt_dce);
       }
       NIR_PASS(progress, nir, nir_opt_if, 0);
@@ -101,8 +101,6 @@ gl_nir_opts(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_phi_precision);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_io_add_const_offset_to_base,
-               nir_var_shader_in | nir_var_shader_out);
 
       if (!nir->info.flrp_lowered) {
          unsigned lower_flrp =
@@ -111,16 +109,8 @@ gl_nir_opts(nir_shader *nir)
             (nir->options->lower_flrp64 ? 64 : 0);
 
          if (lower_flrp) {
-            bool lower_flrp_progress = false;
-
-            NIR_PASS(lower_flrp_progress, nir, nir_lower_flrp,
-                     lower_flrp,
-                     false /* always_precise */);
-            if (lower_flrp_progress) {
-               NIR_PASS(progress, nir,
-                        nir_opt_constant_folding);
-               progress = true;
-            }
+            NIR_PASS(progress, nir, nir_lower_flrp,
+                     lower_flrp, false /* always_precise */);
          }
 
          /* Nothing should rematerialize any flrps, so we only need to do this
@@ -1454,9 +1444,7 @@ prelink_lowering(const struct pipe_screen *screen,
        * - shader_info::clip_distance_array_size
        * - shader_info::cull_distance_array_size
        */
-      if (!(nir->options->io_options &
-            nir_io_separate_clip_cull_distance_arrays))
-         NIR_PASS(_, nir, nir_lower_clip_cull_distance_array_vars);
+      NIR_PASS(_, nir, nir_lower_clip_cull_distance_array_vars);
    }
 
    return true;

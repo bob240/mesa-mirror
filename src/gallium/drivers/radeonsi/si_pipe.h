@@ -257,7 +257,6 @@ enum
    DBG_MONOLITHIC_SHADERS,
    DBG_NO_OPT_VARIANT,
 
-   DBG_USE_ACO,
    DBG_USE_LLVM,
 };
 
@@ -1251,8 +1250,10 @@ struct si_context {
    bool bindless_descriptors_dirty;
    bool graphics_internal_bindings_pointer_dirty;
    bool compute_internal_bindings_pointer_dirty;
+   bool task_internal_bindings_pointer_dirty;
    bool graphics_bindless_pointer_dirty;
    bool compute_bindless_pointer_dirty;
+   bool task_bindless_pointer_dirty;
    bool gs_attribute_ring_pointer_dirty;
 
    /* Allocated bindless handles */
@@ -1361,6 +1362,18 @@ struct si_context {
    struct si_ds_queue ds_queue;
    uint32_t *last_timestamp_cmd;
    unsigned int last_timestamp_cmd_cdw;
+
+   /* For mesh shader */
+   struct si_resource *task_wait_buf;
+   uint32_t task_wait_count;
+   uint32_t last_task_wait_count;
+   bool task_state_init_emitted;
+   struct si_resource *task_ring;
+   struct si_resource *task_scratch_buffer;
+   unsigned max_seen_task_scratch_bytes_per_wave;
+   uint32_t task_tmpring_size;
+   struct si_pm4_state *task_preamble_state;
+   struct si_resource *mesh_scratch_ring;
 };
 
 /* si_barrier.c */
@@ -1485,6 +1498,10 @@ void si_gfx_clear_render_target(struct pipe_context *ctx, struct pipe_surface *d
 void si_init_clear_functions(struct si_context *sctx);
 
 /* si_compute.c */
+bool si_setup_compute_scratch_buffer(struct si_screen *screen,
+                                     struct si_shader *shader,
+                                     struct si_resource **scratch_buffer,
+                                     unsigned max_scratch_bytes_per_wave);
 void si_destroy_compute(struct si_compute *program);
 
 /* si_compute_blit.c */
@@ -1620,6 +1637,8 @@ uint64_t si_begin_counter(struct si_screen *sscreen, unsigned type);
 unsigned si_end_counter(struct si_screen *sscreen, unsigned type, uint64_t begin);
 
 /* si_compute.c */
+void *si_create_compute_state_for_nir(struct pipe_context *ctx, nir_shader *nir,
+                                      enum mesa_shader_stage stage);
 void si_init_compute_functions(struct si_context *sctx);
 
 /* si_pipe.c */
@@ -1636,10 +1655,6 @@ void si_init_perfcounters(struct si_screen *screen);
 void si_destroy_perfcounters(struct si_screen *screen);
 void si_inhibit_clockgating(struct si_context *sctx, struct radeon_cmdbuf *cs, bool inhibit);
 void si_pc_emit_shaders(struct radeon_cmdbuf *cs, unsigned shaders);
-void si_pc_emit_spm_start(struct radeon_cmdbuf *cs);
-void si_pc_emit_spm_stop(struct radeon_cmdbuf *cs, bool never_stop_sq_perf_counters,
-                         bool never_send_perfcounter_stop);
-void si_pc_emit_spm_reset(struct radeon_cmdbuf *cs);
 void si_emit_spm_setup(struct si_context *sctx, struct radeon_cmdbuf *cs);
 bool si_spm_init(struct si_context *sctx);
 void si_spm_finish(struct si_context *sctx);
@@ -1653,7 +1668,7 @@ void si_resume_queries(struct si_context *sctx);
 /* si_shaderlib_nir.c */
 
 void *si_create_shader_state(struct si_context *sctx, struct nir_shader *nir);
-void *si_create_dcc_retile_cs(struct si_context *sctx, struct radeon_surf *surf);
+void *si_create_dcc_retile_cs(struct si_context *sctx, const struct radeon_surf *surf);
 void *gfx9_create_clear_dcc_msaa_cs(struct si_context *sctx, struct si_texture *tex);
 void *si_create_passthrough_tcs(struct si_context *sctx);
 void *si_clear_image_dcc_single_shader(struct si_context *sctx, bool is_msaa, unsigned wg_dim);
@@ -1744,6 +1759,9 @@ si_sqtt_describe_barrier_end(struct si_context* sctx, struct radeon_cmdbuf *rcs,
 bool si_init_sqtt(struct si_context *sctx);
 void si_destroy_sqtt(struct si_context *sctx);
 void si_handle_sqtt(struct si_context *sctx, struct radeon_cmdbuf *rcs);
+
+/* si_mesh_shader.c */
+void si_init_task_mesh_shader_functions(struct si_context *sctx);
 
 /*
  * common helpers
@@ -2277,14 +2295,6 @@ static inline bool si_is_buffer_idle(struct si_context *sctx, struct si_resource
 static inline bool si_vs_uses_vbos(struct si_shader_selector *sel)
 {
    return !sel || !sel->info.base.vs.blit_sgprs_amd;
-}
-
-static inline bool si_is_line_stipple_enabled(struct si_context *sctx)
-{
-   struct si_state_rasterizer *rs = sctx->queued.named.rasterizer;
-
-   return rs->line_stipple_enable && sctx->current_rast_prim != MESA_PRIM_POINTS &&
-          (rs->polygon_mode_is_lines || util_prim_is_lines(sctx->current_rast_prim));
 }
 
 static ALWAYS_INLINE void

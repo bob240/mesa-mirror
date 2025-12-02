@@ -602,7 +602,7 @@ dxil_nir_lower_shared_to_var(nir_shader *nir)
       NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_algebraic);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_dce);
    } while (progress);
@@ -732,7 +732,7 @@ cast_phi(nir_builder *b, nir_phi_instr *phi, unsigned new_bit_size)
       assert(num_components == 0 || num_components == src->src.ssa->num_components);
       num_components = src->src.ssa->num_components;
 
-      b->cursor = nir_after_instr_and_phis(src->src.ssa->parent_instr);
+      b->cursor = nir_after_instr_and_phis(nir_def_instr(src->src.ssa));
 
       nir_def *cast = nir_u2uN(b, src->src.ssa, new_bit_size);
 

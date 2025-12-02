@@ -87,6 +87,11 @@ CMFD3DManager::Shutdown( bool bReleaseDeviceManager )
       m_spQPMapStatsBufferPool.Reset();
    }
 
+   if( m_spReconstructedPictureBufferPool )
+   {
+      m_spReconstructedPictureBufferPool.Reset();
+   }
+
    if( m_spDeviceManager != nullptr )
    {
       if( m_hDevice != NULL )
@@ -159,12 +164,22 @@ CMFD3DManager::xReopenDeviceManager( bool bNewDevice )
       ComPtr<IDXGIDevice> spDXGIDevice;
       ComPtr<IDXGIAdapter> spDXGIAdapter;
       ComPtr<IUnknown> spAdapter;
+      ComPtr<ID3D11DeviceContext> spImmediaContext;
+      ComPtr<ID3D11Multithread> spMultithread;
       CHECKHR_GOTO( m_spDeviceManager->GetVideoService( m_hDevice, IID_ID3D11Device, &m_spDevice11 ), done );
       CHECKHR_GOTO( m_spDevice11.As( &spDXGIDevice ), done );
       CHECKHR_GOTO( spDXGIDevice->GetAdapter( &spDXGIAdapter ), done );
       CHECKHR_GOTO( spDXGIAdapter.As( &spAdapter ), done );
       // Create a D3D12 device off of the same adapter this 11 device is on
       CHECKHR_GOTO( CreateD3D12DeviceWithMinimumSupportedFeatureLevel( spAdapter.Get(), m_spDevice ), done );
+
+      // check if the D3D11 device is multithread protected and issue warning
+      m_spDevice11->GetImmediateContext( &spImmediaContext );
+      CHECKHR_GOTO( spImmediaContext.As( &spMultithread ), done );
+      if( !spMultithread->GetMultithreadProtected() )
+      {
+         MFE_WARNING( "[dx12 hmft 0x%p] D3D11 device was created without multithread protected\n", m_logId );
+      }
    }
    // Create a staging queue for MF to signal on input texture GPU completion
    CHECKHR_GOTO( m_spDevice->CreateCommandQueue( &commandQueueDesc, IID_PPV_ARGS( &m_spStagingQueue ) ), done );
@@ -327,8 +342,6 @@ CMFD3DManager::xOnSetD3DManager( ULONG_PTR ulParam )
    HRESULT hr = S_OK;
    Shutdown();
 
-   d3d12_interop_device_info1 screen_interop_info = {};
-
    if( ulParam == 0 )
    {
       return hr;
@@ -349,17 +362,18 @@ CMFD3DManager::xOnSetD3DManager( ULONG_PTR ulParam )
                    MF_E_DXGI_DEVICE_NOT_INITIALIZED,
                    done );
 
-   if( ( m_pVlScreen->pscreen->interop_query_device_info( m_pVlScreen->pscreen,
-                                                          sizeof( d3d12_interop_device_info1 ),
-                                                          &screen_interop_info ) != 0 ) &&
-       ( screen_interop_info.set_context_queue_priority_manager != NULL ) )
+   m_pVlScreen->pscreen->interop_query_device_info( m_pVlScreen->pscreen,
+                                                    sizeof( d3d12_interop_device_info1 ),
+                                                    &m_ScreenInteropInfo );
+   assert( m_ScreenInteropInfo.set_context_queue_priority_manager != NULL );
+
    {
       CHECKBOOL_GOTO( thrd_success == mtx_init( &m_ContextPriorityMgr.m_lock, mtx_plain ), MF_E_DXGI_DEVICE_NOT_INITIALIZED, done );
 
       m_ContextPriorityMgr.base.register_work_queue = MFTRegisterWorkQueue;
       m_ContextPriorityMgr.base.unregister_work_queue = MFTUnregisterWorkQueue;
 
-      CHECKBOOL_GOTO( screen_interop_info.set_context_queue_priority_manager( m_pPipeContext, &m_ContextPriorityMgr.base ) == 0,
+      CHECKBOOL_GOTO( m_ScreenInteropInfo.set_context_queue_priority_manager( m_pPipeContext, &m_ContextPriorityMgr.base ) == 0,
                       MF_E_DXGI_DEVICE_NOT_INITIALIZED,
                       done );
 

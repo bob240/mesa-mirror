@@ -75,10 +75,10 @@ instr_can_rewrite(const nir_instr *instr)
       }
    }
    case nir_instr_type_call:
+   case nir_instr_type_cmat_call:
    case nir_instr_type_jump:
    case nir_instr_type_undef:
       return false;
-   case nir_instr_type_parallel_copy:
    default:
       UNREACHABLE("Invalid instruction type");
    }
@@ -359,7 +359,7 @@ nir_srcs_equal(nir_src src1, nir_src src2)
 static nir_alu_instr *
 get_neg_instr(nir_src s, nir_alu_type base_type)
 {
-   nir_alu_instr *alu = nir_src_as_alu_instr(s);
+   nir_alu_instr *alu = nir_src_as_alu(s);
 
    return alu != NULL && (alu->op == (base_type == nir_type_float ? nir_op_fneg : nir_op_ineg))
              ? alu
@@ -757,7 +757,6 @@ nir_instrs_equal(const nir_instr *instr1, const nir_instr *instr2)
    case nir_instr_type_call:
    case nir_instr_type_jump:
    case nir_instr_type_undef:
-   case nir_instr_type_parallel_copy:
    default:
       UNREACHABLE("Invalid instruction type");
    }

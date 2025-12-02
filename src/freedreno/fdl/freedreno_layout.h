@@ -109,6 +109,8 @@ struct fdl_image_params {
     * standard sparse tiling.
     */
    bool sparse;
+
+   bool force_disable_linear_fallback;
 };
 
 /**
@@ -157,6 +159,11 @@ struct fdl_layout {
     * use fdl_cpp_shift() to sanity check you aren't hitting that case.
     */
    uint8_t cpp_shift;
+
+   /* In texels the threshold for linear fallback can be different between
+    * compressed and uncompressed formats.
+    */
+   uint32_t linear_fallback_threshold_texels;
 
    uint32_t width0, height0, depth0;
    uint32_t mip_levels;
@@ -234,8 +241,21 @@ fdl_ubwc_offset(const struct fdl_layout *layout, unsigned level, unsigned layer)
    return slice->offset + layer * layout->ubwc_layer_size;
 }
 
-/* Minimum layout width to enable UBWC. */
-#define FDL_MIN_UBWC_WIDTH 16
+/* Minimum layout width to enable tiling/UBWC, and width below which
+ * mipmaps can use LINEAR layout even if previous mipmaps are tiled.
+ * Can be in texel or blocks, depending on HW support.
+ */
+#define FDL_LINEAR_FALLBACK_THRESHOLD 16
+
+static inline uint32_t
+fdl_linear_fallback_threshold_texels(struct fdl_layout *layout,
+                                     const struct fd_dev_info *info)
+{
+   return info->props.supports_linear_mipmap_threshold_in_blocks
+             ? FDL_LINEAR_FALLBACK_THRESHOLD *
+                  util_format_get_blockwidth(layout->format)
+             : FDL_LINEAR_FALLBACK_THRESHOLD;
+}
 
 static inline bool
 fdl_level_linear(const struct fdl_layout *layout, int level)
@@ -244,7 +264,7 @@ fdl_level_linear(const struct fdl_layout *layout, int level)
       return false;
 
    unsigned w = u_minify(layout->width0, level);
-   if (w < FDL_MIN_UBWC_WIDTH)
+   if (w < layout->linear_fallback_threshold_texels)
       return true;
 
    return false;

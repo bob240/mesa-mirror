@@ -396,6 +396,8 @@ struct D3D12EncodeConfiguration
          D3D12_VIDEO_ENCODER_FRAME_INPUT_MOTION_UNIT_PRECISION MotionUnitPrecision;
          D3D12_VIDEO_ENCODER_PICTURE_CONTROL_CODEC_DATA1 PictureControlConfiguration;
          D3D12_FEATURE_DATA_VIDEO_ENCODER_RESOLVE_INPUT_PARAM_LAYOUT capInputLayoutMotionVectors;
+         std::vector<struct d3d12_resource *> pMotionVectorMapsGalliumResources;
+         std::vector<struct d3d12_resource *> pMotionVectorMapsMetadataGalliumResources;
       } MapInfo;
    } m_MoveRectsDesc = {};
    std::vector<RECT> m_DirtyRectsArray;
@@ -565,6 +567,7 @@ struct d3d12_video_encoder
    struct d3d12_screen *   m_pD3D12Screen = nullptr;
    UINT max_quality_levels = 1;
    UINT max_num_ltr_frames = 0;
+   UINT screen_max_slices_per_frame = 0;
 
    union pipe_enc_cap_sliced_notifications supports_sliced_fences = {};
 
@@ -725,7 +728,7 @@ d3d12_video_encoder_build_pre_encode_codec_headers(struct d3d12_video_encoder *p
                                                    bool &postEncodeHeadersNeeded,
                                                    uint64_t &preEncodeGeneratedHeadersByteSize,
                                                    std::vector<uint64_t> &pWrittenCodecUnitsSizes);
-void
+bool
 d3d12_video_encoder_extract_encode_metadata(
    struct d3d12_video_encoder *                               pD3D12Dec,
    void                                                       *feedback,

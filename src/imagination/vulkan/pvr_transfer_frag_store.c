@@ -29,10 +29,12 @@
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_bo.h"
 #include "pvr_common.h"
+#include "pvr_csb.h"
 #include "pvr_device.h"
 #include "pvr_device_info.h"
 #include "pvr_job_transfer.h"
 #include "pvr_pds.h"
+#include "pvr_physical_device.h"
 #include "pvr_transfer_frag_store.h"
 #include "pvr_types.h"
 #include "pvr_usc.h"
@@ -186,7 +188,7 @@ static VkResult pvr_transfer_frag_store_entry_data_compile(
       offsetof(struct pvr_combined_image_sampler_descriptor, sampler) / 4;
 
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
 
    struct pvr_tq_frag_sh_reg_layout *sh_reg_layout = &entry_data->sh_reg_layout;
    uint32_t next_free_sh_reg = 0;

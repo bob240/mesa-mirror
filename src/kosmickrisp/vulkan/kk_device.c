@@ -138,6 +138,31 @@ kk_sampler_heap_remove(struct kk_device *dev, struct kk_rc_sampler *rc)
    simple_mtx_unlock(&h->lock);
 }
 
+static void
+kk_parse_device_environment_options(struct kk_device *dev)
+{
+   dev->gpu_capture_enabled =
+      debug_get_bool_option("MESA_KK_GPU_CAPTURE", false);
+   if (dev->gpu_capture_enabled) {
+      const char *capture_directory =
+         debug_get_option("MESA_KK_GPU_CAPTURE_DIRECTORY", NULL);
+      mtl_start_gpu_capture(dev->mtl_handle, capture_directory);
+   }
+
+   const char *list = debug_get_option("MESA_KK_DISABLE_WORKAROUNDS", "");
+   const char *all_workarounds = "all";
+   const size_t all_len = strlen(all_workarounds);
+   for (unsigned n; n = strcspn(list, ","), *list; list += MAX2(1, n)) {
+      if (n == all_len && !strncmp(list, all_workarounds, n)) {
+         dev->disabled_workarounds = UINT64_MAX;
+         break;
+      }
+
+      int index = atoi(list);
+      dev->disabled_workarounds |= BITFIELD64_BIT(index);
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_CreateDevice(VkPhysicalDevice physicalDevice,
                 const VkDeviceCreateInfo *pCreateInfo,
@@ -180,10 +205,10 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_buffer_ops = &kk_cmd_buffer_ops;
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
 
-   /* Buffer to use as null descriptor */
-   result = kk_alloc_bo(dev, &dev->vk.base, sizeof(uint64_t) * 8, 8u,
-                        &dev->null_descriptor);
-   if (result != VK_SUCCESS)
+   /* We need to initialize the device residency set before any bo is created. */
+   simple_mtx_init(&dev->residency_set.mutex, mtx_plain);
+   dev->residency_set.handle = mtl_new_residency_set(dev->mtl_handle);
+   if (dev->residency_set.handle == NULL)
       goto fail_init;
 
    result =
@@ -208,13 +233,9 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (result != VK_SUCCESS)
       goto fail_sampler_heap;
 
-   simple_mtx_init(&dev->user_heap_cache.mutex, mtx_plain);
-   util_dynarray_init(&dev->user_heap_cache.handles, NULL);
+   kk_parse_device_environment_options(dev);
 
    *pDevice = kk_device_to_handle(dev);
-
-   dev->gpu_capture_enabled = kk_get_environment_boolean(KK_ENABLE_GPU_CAPTURE);
-   mtl_start_gpu_capture(dev->mtl_handle);
 
    return VK_SUCCESS;
 
@@ -227,7 +248,8 @@ fail_meta:
 fail_mem_cache:
    kk_queue_finish(dev, &dev->queue);
 fail_vab_memory:
-   kk_destroy_bo(dev, dev->null_descriptor);
+   mtl_release(dev->residency_set.handle);
+   simple_mtx_destroy(&dev->residency_set.mutex);
 fail_init:
    vk_device_finish(&dev->vk);
 fail_alloc:
@@ -243,22 +265,24 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (!dev)
       return;
 
+   /* End capture before we start releasing resources. Otherwise, Metal capture
+    * may run into issues. */
+   if (dev->gpu_capture_enabled) {
+      mtl_stop_gpu_capture();
+   }
+
    /* Meta first since it may destroy Vulkan objects */
    kk_device_finish_meta(dev);
-
-   util_dynarray_fini(&dev->user_heap_cache.handles);
-   simple_mtx_destroy(&dev->user_heap_cache.mutex);
    kk_device_finish_lib(dev);
    kk_query_table_finish(dev, &dev->occlusion_queries);
    kk_destroy_sampler_heap(dev, &dev->samplers);
 
-   kk_queue_finish(dev, &dev->queue);
-   kk_destroy_bo(dev, dev->null_descriptor);
-   vk_device_finish(&dev->vk);
+   /* Release the residency set last once all BOs are released. */
+   mtl_release(dev->residency_set.handle);
+   simple_mtx_destroy(&dev->residency_set.mutex);
 
-   if (dev->gpu_capture_enabled) {
-      mtl_stop_gpu_capture();
-   }
+   kk_queue_finish(dev, &dev->queue);
+   vk_device_finish(&dev->vk);
 
    vk_free(&dev->vk.alloc, dev);
 }
@@ -330,19 +354,26 @@ kk_GetDeviceProcAddr(VkDevice _device, const char *pName)
 }
 
 void
-kk_device_add_user_heap(struct kk_device *dev, mtl_heap *heap)
+kk_device_add_heap_to_residency_set(struct kk_device *dev, mtl_heap *heap)
 {
-   simple_mtx_lock(&dev->user_heap_cache.mutex);
-   util_dynarray_append(&dev->user_heap_cache.handles, heap);
-   dev->user_heap_cache.hash += 1u;
-   simple_mtx_unlock(&dev->user_heap_cache.mutex);
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_add_allocation(dev->residency_set.handle, heap);
+   simple_mtx_unlock(&dev->residency_set.mutex);
 }
 
 void
-kk_device_remove_user_heap(struct kk_device *dev, mtl_heap *heap)
+kk_device_remove_heap_from_residency_set(struct kk_device *dev, mtl_heap *heap)
 {
-   simple_mtx_lock(&dev->user_heap_cache.mutex);
-   util_dynarray_delete_unordered(&dev->user_heap_cache.handles, mtl_heap *,
-                                  heap);
-   simple_mtx_unlock(&dev->user_heap_cache.mutex);
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_remove_allocation(dev->residency_set.handle, heap);
+   simple_mtx_unlock(&dev->residency_set.mutex);
+}
+
+void
+kk_device_make_resources_resident(struct kk_device *dev)
+{
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_commit(dev->residency_set.handle);
+   mtl_residency_set_request_residency(dev->residency_set.handle);
+   simple_mtx_unlock(&dev->residency_set.mutex);
 }

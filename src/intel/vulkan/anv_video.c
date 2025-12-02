@@ -588,7 +588,7 @@ get_vp9_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
       size = 32;
       break;
    case ANV_VID_MEM_VP9_SEGMENT_ID:
-      size = width_in_ctb * height_in_ctb;
+      size = (uint64_t)width_in_ctb * height_in_ctb;
       break;
    case ANV_VID_MEM_VP9_HVD_LINE_ROW_STORE:
    case ANV_VID_MEM_VP9_HVD_TILE_ROW_STORE:
@@ -596,7 +596,7 @@ get_vp9_video_mem_size(struct anv_video_session *vid, uint32_t mem_idx)
       break;
    case ANV_VID_MEM_VP9_MV_1:
    case ANV_VID_MEM_VP9_MV_2:
-      size = (width_in_ctb * height_in_ctb * 9);
+      size = ((uint64_t)width_in_ctb * height_in_ctb * 9);
       break;
    default:
       UNREACHABLE("unknown memory");
@@ -1319,26 +1319,13 @@ anv_update_vp9_tables(struct anv_cmd_buffer *cmd,
 
 void
 anv_calculate_qmul(const struct VkVideoDecodeVP9PictureInfoKHR *vp9_pic,
+                   uint32_t qyac,
                    uint32_t seg_id,
                    int16_t *ptr)
 {
    const StdVideoDecodeVP9PictureInfo *std_pic = vp9_pic->pStdPictureInfo;
-   const StdVideoVP9Segmentation *segmentation = std_pic->pSegmentation;
 
    uint32_t bpp_index = std_pic->pColorConfig->BitDepth > 8 ? 1 : 0;
-
-   uint32_t qyac;
-
-   if (std_pic->flags.segmentation_enabled && segmentation->FeatureEnabled[seg_id]) {
-      if (segmentation->flags.segmentation_abs_or_delta_update) {
-         /* FIXME. which lvl needs to be picked */
-         qyac = segmentation->FeatureData[seg_id][0] & 0xff;
-      } else {
-         qyac = (std_pic->base_q_idx + segmentation->FeatureData[seg_id][0]) & 0xff;
-      }
-   } else {
-      qyac = std_pic->base_q_idx & 0xff;
-   }
 
    uint32_t qydc = (qyac + std_pic->delta_q_y_dc) & 0xff;
    uint32_t quvdc = (qyac + std_pic->delta_q_uv_dc) & 0xff;
@@ -1396,7 +1383,7 @@ anv_video_get_image_mv_size(struct anv_device *device,
                  profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR) {
          unsigned w_mb = DIV_ROUND_UP(image->vk.extent.width, 32);
          unsigned h_mb = DIV_ROUND_UP(image->vk.extent.height, 32);
-         size = ALIGN(w_mb * h_mb, 2) << 6;
+         size = align(w_mb * h_mb, 2) << 6;
       } else if (profile_list->pProfiles[i].videoCodecOperation == VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR) {
          unsigned w_ctb = DIV_ROUND_UP(image->vk.extent.width, ANV_MAX_VP9_CTB_SIZE);
          unsigned h_ctb = DIV_ROUND_UP(image->vk.extent.height, ANV_MAX_VP9_CTB_SIZE);

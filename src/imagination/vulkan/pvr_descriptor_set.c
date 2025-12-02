@@ -33,10 +33,13 @@
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_bo.h"
 #include "pvr_buffer.h"
+#include "pvr_csb.h"
 #include "pvr_debug.h"
 #include "pvr_device.h"
 #include "pvr_entrypoints.h"
 #include "pvr_image.h"
+#include "pvr_physical_device.h"
+#include "pvr_sampler.h"
 #include "pvr_types.h"
 #include "util/compiler.h"
 #include "util/list.h"
@@ -256,7 +259,7 @@ VkResult pvr_CreateDescriptorPool(VkDevice _device,
 {
    VK_FROM_HANDLE(pvr_device, device, _device);
    const uint32_t cache_line_size =
-      rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+      pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
    struct pvr_descriptor_pool *pool;
    uint64_t bo_size = 0;
    VkResult result;
@@ -397,6 +400,23 @@ write_sampler(const struct pvr_descriptor_set *set,
               const struct pvr_descriptor_set_layout_binding *binding,
               uint32_t elem);
 
+static void
+write_immutable_samplers(struct pvr_descriptor_set_layout *layout,
+                         struct pvr_descriptor_set *set)
+{
+   for (unsigned u = 0; u < layout->binding_count; ++u) {
+      const struct pvr_descriptor_set_layout_binding *binding =
+         &layout->bindings[u];
+
+      if (binding->type == VK_DESCRIPTOR_TYPE_SAMPLER &&
+          binding->immutable_samplers) {
+         for (uint32_t j = 0; j < binding->descriptor_count; j++) {
+            write_sampler(set, NULL, binding, j);
+         }
+      }
+   }
+}
+
 static VkResult
 pvr_descriptor_set_create(struct pvr_device *device,
                           struct pvr_descriptor_pool *pool,
@@ -434,17 +454,7 @@ pvr_descriptor_set_create(struct pvr_device *device,
    list_addtail(&set->link, &pool->desc_sets);
 
    /* Setup immutable samplers. */
-   for (unsigned u = 0; u < layout->binding_count; ++u) {
-      const struct pvr_descriptor_set_layout_binding *binding =
-         &layout->bindings[u];
-
-      if (binding->type == VK_DESCRIPTOR_TYPE_SAMPLER &&
-          binding->immutable_samplers) {
-         for (uint32_t j = 0; j < binding->descriptor_count; j++) {
-            write_sampler(set, NULL, binding, j);
-         }
-      }
-   }
+   write_immutable_samplers(layout, set);
 
    *descriptor_set_out = set;
 

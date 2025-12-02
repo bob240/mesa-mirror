@@ -1,6 +1,17 @@
 include:
   - local: 'src/freedreno/ci/gitlab-ci-inc.yml'
 
+a200-gl:
+  extends:
+    - .ci-tron-arm32-test-gl
+    - .a200
+    - .lumag-freedreno-manual-rules
+  timeout: 180m
+  parallel: 2
+  variables:
+    CI_TRON_TIMEOUT__OVERALL__MINUTES: 180
+    DEQP_SUITE: freedreno-a200
+
 a306-gl:
   extends:
     - .lava-arm64-test-gl
@@ -137,7 +148,7 @@ a618-gles-asan:
   extends:
     - .lava-arm64-test-asan-gl
     - .lava-sc7180-trogdor-kingoftown:arm64
-    - .collabora-turnip-manual-rules
+    - .collabora-freedreno-manual-rules
   variables:
     DEQP_SUITE: freedreno-a618-gles-asan
     FLAKES_CHANNEL: "#freedreno-ci"
@@ -252,11 +263,11 @@ a660-gl-cl:
     - .lava-arm64-test-gl
     - .lava-sm8350-hdk:arm64
     - .test-piglit
-    - .collabora-freedreno-manual-rules
+    - .collabora-freedreno-rules
   rules:
-    - !reference [.collabora-freedreno-manual-rules, rules]
-    - !reference [.rusticl-manual-rules, rules]
-  parallel: 3
+    - !reference [.collabora-freedreno-rules, rules]
+    - !reference [.rusticl-rules, rules]
+  parallel: 2
   variables:
     DEQP_SUITE: freedreno-a660
     HWCI_START_WESTON: 1
@@ -266,11 +277,10 @@ a660-vk:
     - .lava-arm64-test-vk
     - .collabora-turnip-rules
     - .lava-sm8350-hdk:arm64
-  parallel: 3
+  parallel: 5
   variables:
     DEQP_SUITE: freedreno-a660-vk
     FLAKES_CHANNEL: "#freedreno-ci"
-    DEQP_FRACTION: 6
 
 a660-vk-full:
   extends:

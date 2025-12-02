@@ -116,17 +116,12 @@ static_assert(sizeof(struct poly_heap) == 4 * 4);
 
 #ifdef __OPENCL_VERSION__
 static inline uint
-_poly_heap_alloc_offs(global struct poly_heap *heap, uint size_B, bool atomic)
+poly_heap_alloc_offs(global struct poly_heap *heap, uint size_B)
 {
    size_B = align(size_B, 16);
 
-   uint offs;
-   if (atomic) {
-      offs = atomic_fetch_add((volatile atomic_uint *)(&heap->bottom), size_B);
-   } else {
-      offs = heap->bottom;
-      heap->bottom = offs + size_B;
-   }
+   uint offs =
+      atomic_fetch_add((volatile atomic_uint *)(&heap->bottom), size_B);
 
    /* Use printf+abort because assert is stripped from release builds. */
    if (heap->bottom >= heap->size) {
@@ -140,22 +135,10 @@ _poly_heap_alloc_offs(global struct poly_heap *heap, uint size_B, bool atomic)
    return offs;
 }
 
-static inline uint
-poly_heap_alloc_nonatomic_offs(global struct poly_heap *heap, uint size_B)
-{
-   return _poly_heap_alloc_offs(heap, size_B, false);
-}
-
-static inline uint
-poly_heap_alloc_atomic_offs(global struct poly_heap *heap, uint size_B)
-{
-   return _poly_heap_alloc_offs(heap, size_B, true);
-}
-
 static inline global void *
-poly_heap_alloc_nonatomic(global struct poly_heap *heap, uint size_B)
+poly_heap_alloc(global struct poly_heap *heap, uint size_B)
 {
-   return heap->base + poly_heap_alloc_nonatomic_offs(heap, size_B);
+   return heap->base + poly_heap_alloc_offs(heap, size_B);
 }
 
 uint64_t nir_load_ro_sink_address_poly(void);
@@ -171,9 +154,19 @@ poly_index_buffer(uint64_t index_buffer, uint size_el, uint offset_el,
 }
 #endif
 
-struct poly_ia_state {
+/** Parameters that feed a vertex (or tessellation evaluation) shader.
+ *
+ * From the perspective of libpoly, vertex and tessellation evaluation shaders
+ * are identical.  One just fets fed by the hardware's input assmebly (which
+ * may be emulated by the driver) and the other gets fed from the tessellator.
+ * However, from the perspective of a geometry dispatch, they are identical.
+ */
+struct poly_vertex_params {
    /* Index buffer if present. */
    uint64_t index_buffer;
+
+   /* Size of an index in the index buffer, in bytes */
+   uint32_t index_size_B;
 
    /* Size of the bound index buffer for bounds checking */
    uint32_t index_buffer_range_el;
@@ -182,8 +175,47 @@ struct poly_ia_state {
     * setup kernel for indirect. This is used for VS->GS and VS->TCS indexing.
     */
    uint32_t verts_per_instance;
+
+   /* Within an indirect VS draw, the grids used to dispatch the VS written
+    * out by the GS indirect setup kernel or the CPU for a direct draw. This is
+    * the "indirect local" format: first 3 is in threads, second 3 is in grid
+    * blocks. This lets us use nontrivial workgroups with indirect draws without
+    * needing any predication.
+    */
+   uint32_t grid[6];
+
+   uint32_t _pad;
+
+   /* Output buffer for vertex data */
+   uint64_t output_buffer;
+
+   /* Mask of outputs present in the output buffer */
+   uint64_t outputs;
 } PACKED;
-static_assert(sizeof(struct poly_ia_state) == 4 * 4);
+static_assert(sizeof(struct poly_vertex_params) == 16 * 4);
+
+static inline void
+poly_vertex_params_init(struct poly_vertex_params *p,
+                        uint64_t outputs, const uint32_t wg_size[3])
+{
+   *p = (struct poly_vertex_params) {
+      .outputs = outputs,
+      .grid = {
+         0, 0, 1, /* x/y are set by poly_vertex_params_set_draw() */
+         wg_size[0], wg_size[1], wg_size[2],
+      },
+   };
+}
+
+static inline void
+poly_vertex_params_set_draw(struct poly_vertex_params *p,
+                            uint32_t vertex_count, uint32_t instance_count)
+{
+   /* Invoke VS as (vertices, instances) */
+   p->verts_per_instance = vertex_count;
+   p->grid[0] = vertex_count;
+   p->grid[1] = instance_count;
+}
 
 static inline uint
 poly_index_buffer_range_el(uint size_el, uint offset_el)
@@ -191,10 +223,27 @@ poly_index_buffer_range_el(uint size_el, uint offset_el)
    return offset_el < size_el ? (size_el - offset_el) : 0;
 }
 
-struct poly_geometry_params {
-   /* Address of associated indirect draw buffer */
-   DEVICE(uint) indirect_desc;
+/* This must match VkDraw[Indexed]IndirectCommand
+ *
+ * The vertex/index_count and first_vertex/index fields line up, as does
+ * instance_count.  The only ones that don't are vertexOffset and
+ * firstInstance but we always set those to zero.
+ */
+struct poly_indirect_draw {
+   union {
+      uint32_t vertex_count;
+      uint32_t index_count;
+   };
+   uint32_t instance_count;
+   union {
+      uint32_t first_vertex;
+      uint32_t first_index;
+   };
+   uint32_t zeros[2];
+};
+static_assert(sizeof(struct poly_indirect_draw) == 5 * 4);
 
+struct poly_geometry_params {
    /* Address of count buffer. For an indirect draw, this will be written by the
     * indirect setup kernel.
     */
@@ -220,13 +269,6 @@ struct poly_geometry_params {
     */
    DEVICE(uchar) xfb_base[POLY_MAX_SO_BUFFERS];
 
-   /* Address and present mask for the input to the geometry shader. These will
-    * reflect the vertex shader for VS->GS or instead the tessellation
-    * evaluation shader for TES->GS.
-    */
-   uint64_t input_buffer;
-   uint64_t input_mask;
-
    /* Location-indexed mask of flat outputs, used for lowering GL edge flags. */
    uint64_t flat_outputs;
 
@@ -237,14 +279,16 @@ struct poly_geometry_params {
     */
    uint32_t xfb_verts[POLY_MAX_VERTEX_STREAMS];
 
-   /* Within an indirect GS draw, the grids used to dispatch the VS/GS written
+   /* Within an indirect GS draw, the grids used to dispatch the GS written
     * out by the GS indirect setup kernel or the CPU for a direct draw. This is
     * the "indirect local" format: first 3 is in threads, second 3 is in grid
     * blocks. This lets us use nontrivial workgroups with indirect draws without
     * needing any predication.
     */
-   uint32_t vs_grid[6];
-   uint32_t gs_grid[6];
+   uint32_t grid[6];
+
+   /* Indirect draw command */
+   struct poly_indirect_draw draw;
 
    /* Number of input primitives across all instances, calculated by the CPU for
     * a direct draw or the GS indirect setup kernel for an indirect draw.
@@ -268,7 +312,43 @@ struct poly_geometry_params {
     */
    uint32_t input_topology;
 } PACKED;
-static_assert(sizeof(struct poly_geometry_params) == 86 * 4);
+static_assert(sizeof(struct poly_geometry_params) == 79 * 4);
+
+static inline void
+poly_geometry_params_init(struct poly_geometry_params *p,
+                          enum mesa_prim prim, const uint32_t wg_size[3])
+{
+   *p = (struct poly_geometry_params) {
+      .input_topology = prim,
+      .grid = {
+         0, 0, 1, /* x/y are set by poly_geometry_params_set_draw() */
+         wg_size[0], wg_size[1], wg_size[2],
+      },
+   };
+}
+
+static inline void
+poly_geometry_params_set_draw(struct poly_geometry_params *p,
+                              enum mesa_prim prim,
+                              enum poly_gs_shape shape, uint32_t max_indices,
+                              uint32_t vertex_count, uint32_t instance_count)
+{
+   /* Calculate number of primitives input into the GS */
+   const uint32_t prim_per_instance =
+      u_decomposed_prims_for_vertices(prim, vertex_count);
+
+   /* Invoke GS as (primitives, instances) */
+   p->grid[0] = prim_per_instance;
+   p->grid[1] = instance_count;
+
+   p->input_primitives = prim_per_instance * instance_count;
+   p->primitives_log2 = util_logbase2_ceil(prim_per_instance);
+
+   p->draw.index_count = poly_gs_rast_vertices(
+      shape, max_indices, prim_per_instance, instance_count);
+   p->draw.instance_count = poly_gs_rast_instances(
+      shape, max_indices, prim_per_instance, instance_count);
+}
 
 /* TCS shared memory layout:
  *
@@ -515,8 +595,7 @@ poly_increment_ia(global uint32_t *ia_vertices, global uint32_t *ia_primitives,
 
 static inline void
 poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
-                       global uintptr_t *vertex_buffer /* output */,
-                       global struct poly_ia_state *ia /* output */,
+                       global struct poly_vertex_params *vp /* output */,
                        global struct poly_geometry_params *p /* output */,
                        global struct poly_heap *heap,
                        uint64_t vs_outputs /* Vertex (TES) output mask */,
@@ -530,20 +609,9 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
    uint vertex_count = draw[0];
    uint instance_count = draw[1];
 
-   ia->verts_per_instance = vertex_count;
-
-   /* Calculate number of primitives input into the GS */
-   uint prim_per_instance = u_decomposed_prims_for_vertices(prim, vertex_count);
-   p->input_primitives = prim_per_instance * instance_count;
-
-   /* Invoke VS as (vertices, instances); GS as (primitives, instances) */
-   p->vs_grid[0] = vertex_count;
-   p->vs_grid[1] = instance_count;
-
-   p->gs_grid[0] = prim_per_instance;
-   p->gs_grid[1] = instance_count;
-
-   p->primitives_log2 = util_logbase2_ceil(prim_per_instance);
+   poly_vertex_params_set_draw(vp, vertex_count, instance_count);
+   poly_geometry_params_set_draw(p, prim, shape, max_indices,
+                                 vertex_count, instance_count);
 
    /* If indexing is enabled, the third word is the offset into the index buffer
     * in elements. Apply that offset now that we have it. For a hardware
@@ -551,10 +619,10 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
     * assembly we need to do it ourselves.
     */
    if (index_size_B) {
-      ia->index_buffer = poly_index_buffer(index_buffer, index_buffer_range_el,
+      vp->index_buffer = poly_index_buffer(index_buffer, index_buffer_range_el,
                                            draw[2], index_size_B);
 
-      ia->index_buffer_range_el =
+      vp->index_buffer_range_el =
          poly_index_buffer_range_el(index_buffer_range_el, draw[2]);
    }
 
@@ -563,32 +631,19 @@ poly_gs_setup_indirect(uint64_t index_buffer, constant uint *draw,
       poly_tcs_in_size(vertex_count * instance_count, vs_outputs);
 
    if (is_prefix_summing) {
-      p->count_buffer = poly_heap_alloc_nonatomic(
+      p->count_buffer = poly_heap_alloc(
          heap, p->input_primitives * p->count_buffer_stride);
    }
 
-   p->input_buffer =
-      (uintptr_t)poly_heap_alloc_nonatomic(heap, vertex_buffer_size);
-   *vertex_buffer = p->input_buffer;
+   vp->output_buffer = (uintptr_t)poly_heap_alloc(heap, vertex_buffer_size);
 
-   p->input_mask = vs_outputs;
-
-   /* Allocate the index buffer and write the draw consuming it */
-   global VkDrawIndexedIndirectCommand *cmd = (global void *)p->indirect_desc;
-
-   *cmd = (VkDrawIndexedIndirectCommand){
-      .indexCount = poly_gs_rast_vertices(shape, max_indices, prim_per_instance,
-                                          instance_count),
-      .instanceCount = poly_gs_rast_instances(
-         shape, max_indices, prim_per_instance, instance_count),
-   };
+   vp->outputs = vs_outputs;
 
    if (shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
-      cmd->firstIndex =
-         poly_heap_alloc_nonatomic_offs(heap, cmd->indexCount * 4) / 4;
-
-      p->output_index_buffer =
-         (global uint *)(heap->base + (cmd->firstIndex * 4));
+      const uint32_t index_offset =
+         poly_heap_alloc_offs(heap, p->draw.index_count * 4);
+      p->draw.first_index = index_offset / 4;
+      p->output_index_buffer = (global uint *)(heap->base + index_offset);
    }
 }
 

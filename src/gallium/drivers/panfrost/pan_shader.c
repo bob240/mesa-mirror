@@ -139,13 +139,13 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
    if (mesa_shader_stage_is_compute(s->info.stage)) {
       pan_shader_preprocess(s, panfrost_device_gpu_id(dev));
       pan_shader_lower_texture_early(s, panfrost_device_gpu_id(dev));
-      pan_shader_lower_texture(s, panfrost_device_gpu_id(dev));
       pan_shader_postprocess(s, panfrost_device_gpu_id(dev));
    }
 
    struct pan_compile_inputs inputs = {
       .gpu_id = panfrost_device_gpu_id(dev),
       .gpu_variant = dev->kmod.props.gpu_variant,
+      .get_conv_desc = screen->vtbl.get_conv_desc,
    };
 
    /* Lower this early so the backends don't have to worry about it */
@@ -159,14 +159,13 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
          pan_get_fixed_varying_mask(s->info.outputs_written);
 
       if (s->info.has_transform_feedback_varyings) {
-         NIR_PASS(_, s, nir_io_add_const_offset_to_base,
-                  nir_var_shader_in | nir_var_shader_out);
+         NIR_PASS(_, s, nir_opt_constant_folding);
          NIR_PASS(_, s, nir_io_add_intrinsic_xfb_info);
          NIR_PASS(_, s, pan_lower_xfb);
       }
    }
 
-   util_dynarray_init(&out->binary, NULL);
+   out->binary = UTIL_DYNARRAY_INIT;
 
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       if (key->fs.nr_cbufs_for_fragcolor) {
@@ -226,9 +225,14 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
 
    /* Lower resource indices */
    NIR_PASS(_, s, panfrost_nir_lower_res_indices, &inputs);
+   pan_shader_lower_texture_late(s, inputs.gpu_id);
 
-   if (dev->arch >= 9)
+   if (dev->arch >= 9) {
       inputs.valhall.use_ld_var_buf = panfrost_use_ld_var_buf(s);
+      /* Always enable this for GL, it avoids crashes when using unbound
+       * resources. */
+      inputs.robust_descriptors = true;
+   }
 
    screen->vtbl.compile_shader(s, &inputs, &out->binary, &out->info);
 
@@ -498,6 +502,42 @@ panfrost_create_shader_state(struct pipe_context *pctx,
    so->stream_output = cso->stream_output;
    so->nir = nir;
 
+   /* PLS lowering is not taken care of by glsl_to_nir(), so do it here. */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+       nir->info.fs.accesses_pixel_local_storage) {
+      /* Try to optimize the case where inout PLS vars are never
+       * read/written to. Needs to be called before
+       * nir_lower_io_vars_to_temporaries() because the copy_derefs
+       * inserted there prevent us from detecting PLS usage.
+       */
+      NIR_PASS(_, nir, nir_downgrade_pls_vars);
+
+      /* Lower PLS vars to temporaries before we lower IOs. */
+      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+               nir_shader_get_entrypoint(nir), nir_var_any_pixel_local);
+
+      /* We need to lower all the copy_deref's introduced by lower_io_to-
+       * _temporaries before calling nir_lower_io.
+       */
+      NIR_PASS(_, nir, nir_split_var_copies);
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+
+      /* Lower all PLS IOs. */
+      NIR_PASS(_, nir, nir_lower_io, nir_var_any_pixel_local, glsl_type_size,
+               0);
+
+      /* Lower and remove dead derefs and variables to clean up the IR. */
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
+      NIR_PASS(_, nir, nir_opt_dce);
+      NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+
+      /* Re-run gather_info() to get the latest accesses_pixel_local_storage
+       * state.
+       */
+      nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+   }
+
    /* gl_FragColor needs to be lowered before lowering I/O, do that now */
    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
        nir->info.outputs_written & BITFIELD_BIT(FRAG_RESULT_COLOR)) {
@@ -515,18 +555,6 @@ panfrost_create_shader_state(struct pipe_context *pctx,
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size, nir_lower_io_use_interpolated_input_intrinsics);
 
-   if (dev->arch >= 6 && nir->info.stage == MESA_SHADER_VERTEX)
-      NIR_PASS(_, nir, pan_nir_lower_noperspective_vs);
-   if (dev->arch >= 6 && nir->info.stage == MESA_SHADER_FRAGMENT)
-      NIR_PASS(_, nir, pan_nir_lower_noperspective_fs);
-
-   /* nir_lower[_explicit]_io is lazy and emits mul+add chains even for
-    * offsets it could figure out are constant.  Do some constant folding
-    * before bifrost_nir_lower_store_component below.
-    */
-   NIR_PASS(_, nir, nir_opt_constant_folding);
-
-   pan_shader_lower_texture(nir, panfrost_device_gpu_id(dev));
    pan_shader_postprocess(nir, panfrost_device_gpu_id(dev));
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT)

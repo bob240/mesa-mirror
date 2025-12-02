@@ -266,6 +266,10 @@ StringFromCodecAPI( const GUID *Api )
    {
       return "CODECAPI_AVEncVideoSatdMapBlockSize";
    }
+   else if( *Api == CODECAPI_AVEncVideoReconstructedPictureOutputMode )
+   {
+      return "CODECAPI_AVEncVideoReconstructedPictureOutputMode";
+   }
    else if( *Api == CODECAPI_AVEncVideoRateControlFramePreAnalysis )
    {
       return "CODECAPI_AVEncVideoRateControlFramePreAnalysis";
@@ -274,7 +278,7 @@ StringFromCodecAPI( const GUID *Api )
    {
       return "CODECAPI_AVEncVideoRateControlFramePreAnalysisExternalReconDownscale";
    }
-   else if (*Api == CODECAPI_AVEncSliceGenerationMode)
+   else if( *Api == CODECAPI_AVEncSliceGenerationMode )
    {
       return "CODECAPI_AVEncSliceGenerationMode";
    }
@@ -348,7 +352,7 @@ CDX12EncHMFT::IsSupported( const GUID *Api )
        *Api == CODECAPI_AVEncVideoMaxNumRefFrame || *Api == CODECAPI_AVEncVideoMeanAbsoluteDifference ||
        *Api == CODECAPI_AVEncVideoMaxQP || *Api == CODECAPI_AVScenarioInfo || *Api == CODECAPI_AVEncVideoROIEnabled ||
        *Api == CODECAPI_AVEncVideoLTRBufferControl || *Api == CODECAPI_AVEncVideoMarkLTRFrame ||
-       *Api == CODECAPI_AVEncVideoUseLTRFrame  || *Api == CODECAPI_AVEncSliceGenerationMode)
+       *Api == CODECAPI_AVEncVideoUseLTRFrame || *Api == CODECAPI_AVEncSliceGenerationMode )
    {
       hr = S_OK;
       return hr;
@@ -438,6 +442,15 @@ CDX12EncHMFT::IsSupported( const GUID *Api )
    if( m_EncoderCapabilities.m_TwoPassSupport.bits.supports_1pass_recon_writing_skip )
    {
       if( *Api == CODECAPI_AVEncVideoRateControlFramePreAnalysisExternalReconDownscale )
+      {
+         hr = S_OK;
+         return hr;
+      }
+   }
+
+   if( m_EncoderCapabilities.m_bHWSupportReadableReconstructedPicture )
+   {
+      if( *Api == CODECAPI_AVEncVideoReconstructedPictureOutputMode )
       {
          hr = S_OK;
          return hr;
@@ -906,6 +919,11 @@ CDX12EncHMFT::GetValue( const GUID *Api, VARIANT *Value )
       Value->vt = VT_UI4;
       Value->ulVal = m_bVideoEnableFramePsnrYuv;
    }
+   else if( *Api == CODECAPI_AVEncVideoReconstructedPictureOutputMode )
+   {
+      Value->vt = VT_UI4;
+      Value->ulVal = (UINT32) m_VideoReconstructedPictureMode;
+   }
    else if( *Api == CODECAPI_AVEncVideoEnableSpatialAdaptiveQuantization )
    {
       Value->vt = VT_UI4;
@@ -943,7 +961,7 @@ CDX12EncHMFT::GetValue( const GUID *Api, VARIANT *Value )
       Value->vt = VT_BOOL;
       Value->boolVal = m_bRateControlFramePreAnalysisExternalReconDownscale ? VARIANT_TRUE : VARIANT_FALSE;
    }
-   else if (*Api == CODECAPI_AVEncSliceGenerationMode)
+   else if( *Api == CODECAPI_AVEncSliceGenerationMode )
    {
       Value->vt = VT_UI4;
       Value->ulVal = m_uiSliceGenerationMode;
@@ -1179,6 +1197,15 @@ CDX12EncHMFT::SetValue( const GUID *Api, VARIANT *Value )
              ( m_eScenarioInfo == eAVScenarioInfo_LiveStreaming ) )
          {
             m_bLowLatency = TRUE;
+         }
+
+         // Enforce disabling read only shared resource output mode when low latency is disabled
+         if( ( m_bLowLatency == FALSE ) && ( m_VideoReconstructedPictureMode == RECON_PIC_OUTPUT_MODE_READ_ONLY_SHARED_RESOURCE ) )
+         {
+            m_VideoReconstructedPictureMode = RECON_PIC_OUTPUT_MODE_DISABLED;
+            debug_printf( "[dx12 hmft 0x%p] Disabling RECON_PIC_OUTPUT_MODE_READ_ONLY_SHARED_RESOURCE as low latency is disabled. "
+                          "Please use to RECON_PIC_OUTPUT_MODE_BLIT_COPY for LowLatency Mode disabled scenarios.\n",
+                          this );
          }
       }
    }
@@ -1661,6 +1688,39 @@ CDX12EncHMFT::SetValue( const GUID *Api, VARIANT *Value )
       }
       m_bVideoEnableFramePsnrYuv = Value->ulVal ? TRUE : FALSE;
    }
+   else if( *Api == CODECAPI_AVEncVideoReconstructedPictureOutputMode )
+   {
+      debug_printf( "[dx12 hmft 0x%p] SET CODECAPI_AVEncVideoReconstructedPictureOutputMode - %u\n", this, Value->ulVal );
+      if( Value->vt != VT_UI4 )
+      {
+         CHECKHR_GOTO( E_INVALIDARG, done );
+      }
+
+      if( Value->ulVal > RECON_PIC_OUTPUT_MODE_READ_ONLY_SHARED_RESOURCE )
+      {
+         MFE_ERROR(
+            "[dx12 hmft 0x%p] Invalid value %u for CODECAPI_AVEncVideoReconstructedPictureOutputMode. Valid values are 0-2.",
+            this,
+            Value->ulVal );
+         CHECKHR_GOTO( E_INVALIDARG, done );
+      }
+
+      if( !m_EncoderCapabilities.m_bHWSupportReadableReconstructedPicture && Value->ulVal != RECON_PIC_OUTPUT_MODE_DISABLED )
+      {
+         MFE_ERROR( "[dx12 hmft 0x%p] User tried to enable CODECAPI_AVEncVideoReconstructedPictureOutputMode, but this encoder "
+                    "does NOT support this feature.",
+                    this );
+         CHECKHR_GOTO( E_INVALIDARG, done );
+      }
+
+      if( Value->ulVal == RECON_PIC_OUTPUT_MODE_READ_ONLY_SHARED_RESOURCE && !m_bLowLatency )
+      {
+         MFE_ERROR( "[dx12 hmft 0x%p] RECON_PIC_OUTPUT_MODE_READ_ONLY_SHARED_RESOURCE requires low latency mode to be enabled.",
+                    this );
+         CHECKHR_GOTO( E_INVALIDARG, done );
+      }
+      m_VideoReconstructedPictureMode = (RECON_PIC_OUTPUT_MODE) Value->ulVal;
+   }
    else if( *Api == CODECAPI_AVEncVideoEnableSpatialAdaptiveQuantization )
    {
       debug_printf( "[dx12 hmft 0x%p] SET CODECAPI_AVEncVideoEnableSpatialAdaptiveQuantization - %u\n", this, Value->ulVal );
@@ -1818,21 +1878,23 @@ CDX12EncHMFT::SetValue( const GUID *Api, VARIANT *Value )
       }
       m_bRateControlFramePreAnalysisExternalReconDownscale = Value->boolVal == VARIANT_TRUE ? TRUE : FALSE;
    }
-   else if (*Api == CODECAPI_AVEncSliceGenerationMode)
+   else if( *Api == CODECAPI_AVEncSliceGenerationMode )
    {
-      if (Value->vt != VT_UI4)
+      if( Value->vt != VT_UI4 )
       {
-         CHECKHR_GOTO(E_INVALIDARG, done);
+         CHECKHR_GOTO( E_INVALIDARG, done );
       }
 
-      if ((Value->ulVal > 0) && (!m_EncoderCapabilities.m_HWSupportSlicedFences.bits.supported))
+      if( ( Value->ulVal > 0 ) && ( !m_EncoderCapabilities.m_HWSupportSlicedFences.bits.supported ) )
       {
-         MFE_ERROR("[dx12 hmft 0x%p] User tried to set CODECAPI_AVEncSliceGenerationMode: %d, but this encoder does NOT support sliced fence generation.",
-                   this, Value->ulVal);
-         CHECKHR_GOTO(E_INVALIDARG, done);
+         MFE_ERROR( "[dx12 hmft 0x%p] User tried to set CODECAPI_AVEncSliceGenerationMode: %d, but this encoder does NOT support "
+                    "sliced fence generation.",
+                    this,
+                    Value->ulVal );
+         CHECKHR_GOTO( E_INVALIDARG, done );
       }
 
-      debug_printf("[dx12 hmft 0x%p] SET CODECAPI_AVEncSliceGenerationMode - %u\n", this, Value->ulVal);
+      debug_printf( "[dx12 hmft 0x%p] SET CODECAPI_AVEncSliceGenerationMode - %u\n", this, Value->ulVal );
       m_uiSliceGenerationMode = Value->ulVal;
       m_bSliceGenerationModeSet = TRUE;
    }

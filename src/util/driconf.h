@@ -367,6 +367,9 @@
    DRI_CONF_OPT_B(intel_sampler_route_to_lsc, def, \
                   "Intel specific toggle to enable sampler route to LSC")
 
+#define DRI_CONF_INTEL_DISABLE_THREADED_CONTEXT(def) \
+   DRI_CONF_OPT_B(intel_disable_threaded_context, def, "Disable threaded context")
+
 #define DRI_CONF_VK_REQUIRE_ETC2(def) \
   DRI_CONF_OPT_B(vk_require_etc2, def, \
                  "Implement emulated ETC2 on HW that does not support it")
@@ -449,6 +452,10 @@
    DRI_CONF_OPT_B(vk_wsi_force_swapchain_to_current_extent, def, \
                   "Force VkSwapchainCreateInfoKHR::imageExtent to be VkSurfaceCapabilities2KHR::currentExtent")
 
+#define DRI_CONF_VK_WSI_DISABLE_UNORDERED_SUBMITS(def) \
+   DRI_CONF_OPT_B(vk_wsi_disable_unordered_submits, def, \
+                  "Disable unordered WSI submits to workaround application synchronization bugs")
+
 #define DRI_CONF_VK_X11_OVERRIDE_MIN_IMAGE_COUNT(def) \
    DRI_CONF_OPT_I(vk_x11_override_min_image_count, def, 0, 999, \
                   "Override the VkSurfaceCapabilitiesKHR::minImageCount (0 = no override)")
@@ -519,6 +526,10 @@
 #define DRI_CONF_ALLOW_MULTISAMPLED_COPYTEXIMAGE(def) \
    DRI_CONF_OPT_B(allow_multisampled_copyteximage, def, \
                   "Allow CopyTexSubImage and other to copy sampled framebuffer")
+
+#define DRI_CONF_VERTEX_PROGRAM_DEFAULT_OUT(def) \
+   DRI_CONF_OPT_B(vertex_program_default_out, def, \
+                  "Initialize outputs of vertex program to a default value vec4(0, 0, 0, 1)")
 
 #define DRI_CONF_CUSTOM_BORDER_COLORS_WITHOUT_FORMAT(def) \
    DRI_CONF_OPT_B(custom_border_colors_without_format, def, \
@@ -639,6 +650,10 @@
    DRI_CONF_OPT_B(tu_ignore_frag_depth_direction, def, \
                   "Ignore direction specified for gl_FragDepth output")
 
+#define DRI_CONF_TU_ENABLE_SOFTFLOAT32(def) \
+   DRI_CONF_OPT_B(tu_enable_softfloat32, def, \
+                  "Enable softfloat emulation for float32 denormals")
+
 /**
  * \brief Honeykrisp specific configuration options
  */
@@ -708,11 +723,11 @@
 
 #define DRI_CONF_RADV_DISABLE_DCC(def) \
    DRI_CONF_OPT_B(radv_disable_dcc, def, \
-                  "Disable DCC for color images")
+                  "Disable DCC for color images on GFX8-GFX11.5")
 
 #define DRI_CONF_RADV_DISABLE_DCC_MIPS(def) \
    DRI_CONF_OPT_B(radv_disable_dcc_mips, def, \
-                  "Disable DCC for color images with mips")
+                  "Disable DCC for color images with mips on GFX8-GFX11.5")
 
 #define DRI_CONF_RADV_DISABLE_DCC_STORES(def) \
    DRI_CONF_OPT_B(radv_disable_dcc_stores, def, \
@@ -763,6 +778,10 @@
    DRI_CONF_OPT_B(radv_wait_for_vm_map_updates, def, \
                   "Wait for VM MAP updates at allocation time to mitigate use-before-alloc")
 
+#define DRI_CONF_RADV_NO_IMPLICIT_VARYING_SUBGROUP_SIZE(def) \
+   DRI_CONF_OPT_B(radv_no_implicit_varying_subgroup_size, def, \
+                  "Do not assume VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE for SPIR-V 1.6.")
+
 /**
  * Overrides for forcing re-compilation of pipelines when RADV_BUILD_ID_OVERRIDE is enabled.
  * These need to be bumped every time a compiler bugfix is backported (up to 8 shader
@@ -804,6 +823,10 @@
    DRI_CONF_OPT_S_NODEF(radv_gfx12_hiz_wa, \
                         "Choose the specific HiZ workaround to apply on GFX12 (RDNA4). " \
                         "Accepted values are: disabled, partial or full")
+
+#define DRI_CONF_RADV_HIDE_REBAR_ON_DGPU(def) \
+   DRI_CONF_OPT_B(radv_hide_rebar_on_dgpu, def, \
+                  "Hide resizable bar on dGPUs by exposing a fake carveout of 256MiB.")
 
 /**
  * \brief ANV specific configuration options

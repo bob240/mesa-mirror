@@ -1043,7 +1043,7 @@ _mesa_initialize_context(struct gl_context *ctx,
    simple_mtx_lock(&ctx->Shared->Mutex);
    list_addtail(&ctx->SharedLink, &ctx->Shared->Contexts);
    simple_mtx_unlock(&ctx->Shared->Mutex);
-   util_dynarray_init(&ctx->ReleaseResources, NULL);
+   ctx->ReleaseResources = UTIL_DYNARRAY_INIT;
 
    return GL_TRUE;
 
@@ -1415,7 +1415,7 @@ handle_first_current(struct gl_context *ctx)
     * first time each context is made current we'll print some useful
     * information.
     */
-   if (getenv("MESA_INFO")) {
+   if (os_get_option("MESA_INFO")) {
       _mesa_print_info(ctx);
    }
 }

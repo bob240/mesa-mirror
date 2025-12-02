@@ -362,6 +362,7 @@ v3d_init_screen_caps(struct v3d_screen *screen)
         caps->supported_prim_modes_with_restart = screen->prim_types;
 
         caps->texture_buffer_objects = true;
+        caps->buffer_sampler_view_rgba_only = true;
 
         caps->texture_buffer_offset_alignment = V3D_TMU_TEXEL_ALIGN;
 
@@ -608,6 +609,8 @@ v3d_screen_get_compiler_options(struct pipe_screen *pscreen,
                 .lower_ufind_msb = true,
                 .has_fsub = true,
                 .has_isub = true,
+                .has_imul24 = true,
+                .has_umul24 = true,
                 .has_uclz = true,
                 .divergence_analysis_options =
                        nir_divergence_multiple_workgroup_per_compute_subgroup,

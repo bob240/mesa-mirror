@@ -83,9 +83,7 @@ struct brw_nir_compiler_opts {
 static inline bool
 brw_nir_ubo_surface_index_is_pushable(nir_src src)
 {
-   nir_intrinsic_instr *intrin =
-      src.ssa->parent_instr->type == nir_instr_type_intrinsic ?
-      nir_def_as_intrinsic(src.ssa) : NULL;
+   nir_intrinsic_instr *intrin = nir_src_as_intrinsic(src);
 
    if (intrin && intrin->intrinsic == nir_intrinsic_resource_intel) {
       return (nir_intrinsic_resource_access_intel(intrin) &
@@ -104,7 +102,7 @@ brw_nir_ubo_surface_index_get_push_block(nir_src src)
    if (!brw_nir_ubo_surface_index_is_pushable(src))
       return UINT32_MAX;
 
-   assert(src.ssa->parent_instr->type == nir_instr_type_intrinsic);
+   assert(nir_src_is_intrinsic(src));
 
    nir_intrinsic_instr *intrin = nir_def_as_intrinsic(src.ssa);
    assert(intrin->intrinsic == nir_intrinsic_resource_intel);
@@ -126,7 +124,7 @@ brw_nir_ubo_surface_index_get_bti(nir_src src)
    if (nir_src_is_const(src))
       return nir_src_as_uint(src);
 
-   assert(src.ssa->parent_instr->type == nir_instr_type_intrinsic);
+   assert(nir_src_is_intrinsic(src));
 
    nir_intrinsic_instr *intrin = nir_def_as_intrinsic(src.ssa);
    if (!intrin || intrin->intrinsic != nir_intrinsic_resource_intel)
@@ -188,11 +186,16 @@ void brw_nir_lower_fs_barycentrics(nir_shader *shader);
 void brw_nir_lower_vs_inputs(nir_shader *nir);
 void brw_nir_lower_vue_inputs(nir_shader *nir,
                               const struct intel_vue_map *vue_map);
-void brw_nir_lower_tes_inputs(nir_shader *nir, const struct intel_vue_map *vue);
+void brw_nir_lower_tes_inputs(nir_shader *nir,
+                              const struct intel_device_info *devinfo,
+                              const struct intel_vue_map *vue);
 void brw_nir_lower_fs_inputs(nir_shader *nir,
                              const struct intel_device_info *devinfo,
                              const struct brw_wm_prog_key *key);
 void brw_nir_lower_vue_outputs(nir_shader *nir);
+void brw_nir_lower_tcs_inputs(nir_shader *nir,
+                              const struct intel_device_info *devinfo,
+                              const struct intel_vue_map *vue);
 void brw_nir_lower_tcs_outputs(nir_shader *nir,
                                const struct intel_device_info *devinfo,
                                const struct intel_vue_map *vue,
@@ -352,9 +355,6 @@ brw_nir_no_indirect_mask(const struct brw_compiler *compiler,
 }
 
 bool brw_nir_uses_inline_data(nir_shader *shader);
-
-nir_shader *
-brw_nir_from_spirv(void *mem_ctx, const uint32_t *spirv, size_t spirv_size);
 
 nir_variable *
 brw_nir_find_complete_variable_with_location(nir_shader *shader,

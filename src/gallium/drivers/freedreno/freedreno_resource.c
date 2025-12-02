@@ -1186,6 +1186,7 @@ fd_resource_resize(struct pipe_resource *prsc, uint32_t sz)
 void
 fd_resource_layout_init(struct pipe_resource *prsc)
 {
+   const struct fd_dev_info *info = fd_screen(prsc->screen)->info;
    struct fd_resource *rsc = fd_resource(prsc);
    struct fdl_layout *layout = &rsc->layout;
 
@@ -1198,6 +1199,9 @@ fd_resource_layout_init(struct pipe_resource *prsc)
    layout->cpp = util_format_get_blocksize(prsc->format);
    layout->cpp *= fd_resource_nr_samples(prsc);
    layout->cpp_shift = ffs(util_next_power_of_two(layout->cpp)) - 1;
+
+   layout->linear_fallback_threshold_texels =
+      fdl_linear_fallback_threshold_texels(layout, info);
 }
 
 static struct fd_resource *
@@ -1295,7 +1299,7 @@ get_best_layout(struct fd_screen *screen,
       return FD_LAYOUT_LINEAR;
    }
 
-   bool ubwc_ok = is_a6xx(screen) && !screen->info->a6xx.is_a702;
+   bool ubwc_ok = is_a6xx(screen) && !screen->info->props.is_a702;
    if (FD_DBG(NOUBWC))
       ubwc_ok = false;
 
@@ -1372,7 +1376,7 @@ fd_resource_allocate_and_resolve(struct pipe_screen *pscreen,
       rsc->b.is_shared = true;
 
    enum fd_layout_type layout =
-      get_best_layout(screen, tmpl, modifiers, count);
+      get_best_layout(screen, prsc, modifiers, count);
    if (layout == FD_LAYOUT_ERROR) {
       free(prsc);
       return NULL;
@@ -1508,8 +1512,11 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
    rsc->b.is_shared = true;
 
    struct fd_bo *bo = fd_screen_bo_from_handle(pscreen, handle);
-   if (!bo)
+   if (!bo) {
+      if (FD_DBG(LAYOUT))
+         mesa_loge("handle import failed for: %" PRSC_FMT, PRSC_ARGS(tmpl));
       goto fail;
+   }
 
    fd_resource_set_bo(rsc, bo);
 
@@ -1518,11 +1525,17 @@ fd_resource_from_handle(struct pipe_screen *pscreen,
    if (tmpl->target == PIPE_BUFFER) {
       fdl_layout_buffer(&rsc->layout, tmpl->width0);
    } else if (!screen->layout_resource_for_handle(rsc, handle)) {
+      if (FD_DBG(LAYOUT))
+         mesa_loge("layout failed for: %" PRSC_FMT, PRSC_ARGS(tmpl));
       goto fail;
    }
 
-   if (rsc->layout.pitch0 != handle->stride)
+   if (rsc->layout.pitch0 != handle->stride) {
+      if (FD_DBG(LAYOUT))
+         mesa_loge("invalid pitch (%u vs %u) for: %" PRSC_FMT, rsc->layout.pitch0,
+                   handle->stride, PRSC_ARGS(tmpl));
       goto fail;
+   }
 
    if (screen->ro) {
       rsc->scanout =
@@ -1686,7 +1699,6 @@ fd_resource_from_memobj(struct pipe_screen *pscreen,
                         const struct pipe_resource *tmpl,
                         struct pipe_memory_object *pmemobj, uint64_t offset)
 {
-   struct fd_screen *screen = fd_screen(pscreen);
    struct fd_memory_object *memobj = fd_memory_object(pmemobj);
    struct pipe_resource *prsc;
    struct fd_resource *rsc;
@@ -1705,8 +1717,6 @@ fd_resource_from_memobj(struct pipe_screen *pscreen,
       modifiers = metadata.modifier;
    } else if (tmpl->bind & PIPE_BIND_LINEAR) {
       modifiers = DRM_FORMAT_MOD_LINEAR;
-   } else if (is_a6xx(screen) && tmpl->width0 >= FDL_MIN_UBWC_WIDTH) {
-      modifiers = DRM_FORMAT_MOD_QCOM_COMPRESSED;
    }
 
    /* Allocate new pipe resource. */

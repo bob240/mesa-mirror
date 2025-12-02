@@ -3373,13 +3373,13 @@ Converter::runOptLoop()
    bool progress;
    do {
       progress = false;
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_loop);
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
       NIR_PASS(progress, nir, nir_lower_64bit_phis);
@@ -3418,7 +3418,7 @@ Converter::run()
 
       if (lowered) {
          nir_function_impl *impl = nir_shader_get_entrypoint(nir);
-         NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, impl, true, false);
+         NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, impl, nir_var_shader_out);
          NIR_PASS(_, nir, nir_lower_global_vars_to_local);
          NIR_PASS(_, nir, nv50_nir_lower_load_user_clip_plane, info);
       } else {

@@ -105,6 +105,7 @@ struct radeon_enc_pic {
    bool use_rc_per_pic_ex;
    bool av1_tile_splitting_legacy_flag;
    bool has_dependent_slice_instructions;
+   bool av1_unidir_rc_available;
 
    struct {
       union {
@@ -123,15 +124,7 @@ struct radeon_enc_pic {
    struct radeon_enc_dpb_buffer *dpb_bufs[RENCODE_MAX_NUM_RECONSTRUCTED_PICTURES];
 
    struct {
-      struct {
-         struct {
-            uint32_t enable_error_resilient_mode:1;
-            uint32_t force_integer_mv:1;
-            uint32_t disable_screen_content_tools:1;
-            uint32_t is_obu_frame:1;
-         };
-         uint32_t *copy_start;
-      };
+      uint32_t *copy_start;
       rvcn_enc_av1_spec_misc_t av1_spec_misc;
       rvcn_enc_av1_cdf_default_table_t av1_cdf_default_table;
    };
@@ -172,7 +165,6 @@ struct radeon_encoder {
    struct pipe_video_codec base;
 
    void (*begin)(struct radeon_encoder *enc);
-   void (*before_encode)(struct radeon_encoder *enc);
    void (*encode)(struct radeon_encoder *enc);
    void (*destroy)(struct radeon_encoder *enc);
    void (*session_info)(struct radeon_encoder *enc);
@@ -255,13 +247,13 @@ struct radeon_encoder {
    bool need_feedback;
    bool need_rate_control;
    bool need_rc_per_pic;
-   bool need_spec_misc;
    unsigned dpb_size;
    unsigned dpb_slots;
    unsigned roi_size;
    unsigned metadata_size;
 
    bool error;
+   bool first_frame;
 
    enum {
       DPB_LEGACY = 0,

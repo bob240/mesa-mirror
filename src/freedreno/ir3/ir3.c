@@ -380,6 +380,7 @@ ir3_collect_info(struct ir3_shader_variant *v)
    info->sizedwords = info->size / 4;
 
    info->early_preamble = v->early_preamble;
+   info->loops = v->loops;
 
    bool in_preamble = false;
    bool has_eq = false;
@@ -643,13 +644,18 @@ struct ir3_block *
 ir3_block_create(struct ir3 *shader)
 {
    struct ir3_block *block = ir3_alloc(shader, sizeof(*block));
-#if MESA_DEBUG
-   block->serialno = ++shader->block_count;
-#endif
    block->shader = shader;
    list_inithead(&block->node);
    list_inithead(&block->instr_list);
    return block;
+}
+
+uint32_t
+block_id(struct ir3_block *block)
+{
+   if (block->nblock)
+      return block->nblock->index;
+   return (uint32_t)(unsigned long)block;
 }
 
 struct ir3_instruction *
@@ -895,7 +901,6 @@ instr_create(struct ir3_block *block, opc_t opc, int ndst, int nsrc)
    instr->srcs_max = nsrc;
 #endif
 
-   list_inithead(&instr->rpt_node);
    return instr;
 }
 
@@ -974,7 +979,8 @@ ir3_instr_clone(struct ir3_instruction *instr)
    new_instr->dsts = dsts;
    new_instr->srcs = srcs;
    new_instr->uses = NULL;
-   list_inithead(&new_instr->rpt_node);
+   new_instr->rpt_prev = NULL;
+   new_instr->rpt_next = NULL;
 
    insert_instr(ir3_before_terminator(instr->block), new_instr);
 
@@ -1019,7 +1025,14 @@ void
 ir3_instr_remove(struct ir3_instruction *instr)
 {
    list_delinit(&instr->node);
-   list_delinit(&instr->rpt_node);
+
+   if (instr->rpt_prev) {
+      instr->rpt_prev->rpt_next = instr->rpt_next;
+   }
+
+   if (instr->rpt_next) {
+      instr->rpt_next->rpt_prev = instr->rpt_prev;
+   }
 }
 
 void
@@ -1028,28 +1041,25 @@ ir3_instr_create_rpt(struct ir3_instruction **instrs, unsigned n)
    assert(n > 0 && !ir3_instr_is_rpt(instrs[0]));
 
    for (unsigned i = 1; i < n; ++i) {
-      assert(!ir3_instr_is_rpt(instrs[i]));
-      assert(instrs[i]->serialno > instrs[i - 1]->serialno);
+      struct ir3_instruction *instr = instrs[i];
+      struct ir3_instruction *prev = instrs[i - 1];
+      assert(!ir3_instr_is_rpt(instr));
 
-      list_addtail(&instrs[i]->rpt_node, &instrs[0]->rpt_node);
+      prev->rpt_next = instr;
+      instr->rpt_prev = prev;
    }
 }
 
 bool
 ir3_instr_is_rpt(const struct ir3_instruction *instr)
 {
-   return !list_is_empty(&instr->rpt_node);
+   return instr->rpt_prev || instr->rpt_next;
 }
 
 bool
 ir3_instr_is_first_rpt(const struct ir3_instruction *instr)
 {
-   if (!ir3_instr_is_rpt(instr))
-      return false;
-
-   struct ir3_instruction *prev_rpt =
-      list_entry(instr->rpt_node.prev, struct ir3_instruction, rpt_node);
-   return prev_rpt->serialno > instr->serialno;
+   return instr->rpt_next && !instr->rpt_prev;
 }
 
 struct ir3_instruction *
@@ -1057,9 +1067,7 @@ ir3_instr_prev_rpt(const struct ir3_instruction *instr)
 {
    assert(ir3_instr_is_rpt(instr));
 
-   if (ir3_instr_is_first_rpt(instr))
-      return NULL;
-   return list_entry(instr->rpt_node.prev, struct ir3_instruction, rpt_node);
+   return instr->rpt_prev;
 }
 
 struct ir3_instruction *
@@ -1080,7 +1088,14 @@ ir3_instr_rpt_length(const struct ir3_instruction *instr)
 {
    assert(ir3_instr_is_first_rpt(instr));
 
-   return list_length(&instr->rpt_node) + 1;
+   unsigned length = 1;
+
+   while (instr->rpt_next) {
+      length++;
+      instr = instr->rpt_next;
+   }
+
+   return length;
 }
 
 struct ir3_register *

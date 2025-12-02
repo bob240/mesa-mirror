@@ -358,6 +358,9 @@ index("struct glsl_cmat_description", "src_cmat_desc")
 # coordinates in compute.
 index("bool", "explicit_coord")
 
+index("bool", "src_is_reg")
+index("bool", "dst_is_reg")
+
 # The index of the format string used by a printf. (u_printf_info element of the shader)
 index("unsigned", "fmt_idx")
 # for NV coop matrix - num of matrix in load 1/2/4
@@ -388,6 +391,9 @@ intrinsic("load_deref", dest_comp=0, src_comp=[-1],
 intrinsic("store_deref", src_comp=[-1, 0], indices=[WRITE_MASK, ACCESS])
 intrinsic("copy_deref", src_comp=[-1, -1], indices=[DST_ACCESS, SRC_ACCESS])
 intrinsic("memcpy_deref", src_comp=[-1, -1, 1], indices=[DST_ACCESS, SRC_ACCESS])
+
+# Sources: [src, reg_dst], Definition: dst
+intrinsic("parallel_copy", dest_comp=0, src_comp=[-1, -1], indices=[SRC_IS_REG, DST_IS_REG])
 
 # Returns an opaque handle representing a register indexed by BASE. The
 # logically def-use list of a register is given by the use list of this handle.
@@ -445,6 +451,9 @@ intrinsic("get_ssbo_size", src_comp=[-1], dest_comp=1, bit_sizes=[32],
           indices=[ACCESS], flags=[CAN_ELIMINATE, CAN_REORDER])
 intrinsic("get_ubo_size", src_comp=[-1], dest_comp=1,
           flags=[CAN_ELIMINATE, CAN_REORDER])
+
+intrinsic("ssbo_descriptor_amd", src_comp=[-1], dest_comp=4, bit_sizes=[32],
+          indices=[ACCESS], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Intrinsics which provide a run-time mode-check.  Unlike the compile-time
 # mode checks, a pointer can only have exactly one mode at runtime.
@@ -614,7 +623,7 @@ intrinsic("write_invocation_amd", src_comp=[0, 0, 1], dest_comp=0, bit_sizes=src
 # src = [ mask, addition ]
 intrinsic("mbcnt_amd", src_comp=[1, 1], dest_comp=1, bit_sizes=[32], flags=[CAN_REORDER, CAN_ELIMINATE])
 # Compiled to v_permlane16_b32. src = [ value, lanesel_lo, lanesel_hi ]
-intrinsic("lane_permute_16_amd", src_comp=[1, 1, 1], dest_comp=1, bit_sizes=[32], flags=[CAN_ELIMINATE])
+intrinsic("lane_permute_16_amd", src_comp=[1, 1, 1], dest_comp=1, bit_sizes=src0, flags=[CAN_ELIMINATE])
 # subgroup shuffle up/down with cluster size 16.
 # base in [-15, -1]: DPP_ROW_SR
 # base in [  1, 15]: DPP_ROW_SL, otherwise invalid.
@@ -1245,6 +1254,8 @@ load("ssbo", [-1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET, OFFSET_SHIFT], [CAN_ELIM
 load("ssbo_address", [1, 1], [], [CAN_ELIMINATE, CAN_REORDER])
 # src[] = { offset }.
 load("output", [1], [BASE, RANGE, COMPONENT, DEST_TYPE, IO_SEMANTICS], flags=[CAN_ELIMINATE])
+# src[] = { offset }.
+load("pixel_local", [1], [BASE, RANGE, COMPONENT, DEST_TYPE, FORMAT, IO_SEMANTICS], flags=[CAN_ELIMINATE])
 # src[] = { vertex, offset }.
 load("per_vertex_output", [1, 1], [BASE, RANGE, COMPONENT, DEST_TYPE, IO_SEMANTICS], [CAN_ELIMINATE])
 # src[] = { view_index, offset }.
@@ -1294,6 +1305,8 @@ def store(name, srcs, indices=[], flags=[]):
 
 # src[] = { value, offset }.
 store("output", [1], [BASE, RANGE, WRITE_MASK, COMPONENT, SRC_TYPE, IO_SEMANTICS, IO_XFB, IO_XFB2])
+# src[] = { value, offset }.
+store("pixel_local", [1], [BASE, RANGE, WRITE_MASK, COMPONENT, FORMAT, SRC_TYPE, IO_SEMANTICS])
 # src[] = { value, vertex, offset }.
 store("per_vertex_output", [1, 1], [BASE, RANGE, WRITE_MASK, COMPONENT, SRC_TYPE, IO_SEMANTICS])
 # src[] = { value, view_index, offset }.
@@ -1418,20 +1431,26 @@ system_value("ro_sink_address_poly", 1, bit_sizes=[64])
 # mesa_prim for the input topology (in a geometry shader)
 system_value("input_topology_poly", 1)
 
-# Pointer to the buffer passing outputs VS->TCS, VS->GS, or TES->GS linkage.
-system_value("vs_output_buffer_poly", 1, bit_sizes=[64])
+# Size of an index in the index buffer in bytes, or zero for no indexing.
+# This is modeled as a sysval so it can be constant folded by drivers based
+# on a shader key if desired.
+system_value("index_size_poly", 1, bit_sizes=[32])
 
 # Mask of VS->TCS, VS->GS, or TES->GS outputs. This is modelled as a sysval
 # so it can be dynamic with shader objects or constant folded with monolithic.
 system_value("vs_outputs_poly", 1, bit_sizes=[64])
 
-# Address of state for poly input assembly lowering for geometry/tessellation
-system_value("input_assembly_buffer_poly", 1, bit_sizes=[64])
+# Address of poly_vertex_param for vertex and tessellation evaluation
+# shaders.  In tessellation control shaders, this is the poly_vertex_param
+# for the vertex shader.  In geometry shaders, this is the poly_vertex_param
+# For whichever of vertex or tessellation evaluation shader preceeded the
+# geometry shader.
+system_value("vertex_param_buffer_poly", 1, bit_sizes=[64])
 
-# Address of the parameter buffer for poly geometry shaders
+# Address of poly_geometry_param for geometry shaders
 system_value("geometry_param_buffer_poly", 1, bit_sizes=[64])
 
-# Address of the parameter buffer for poly tessellation shaders
+# Address of poly_tess_param for tessellation shaders
 system_value("tess_param_buffer_poly", 1, bit_sizes=[64])
 
 # Address of the pipeline statistic query result indexed by BASE
@@ -1655,6 +1674,22 @@ load("converted_output_pan", [1, 1, 1], indices=[ACCESS, DEST_TYPE, IO_SEMANTICS
 # target must be in the [0..7] range when io_semantics.location is FRAG_RESULT_DATA0
 # and is ignored otherwise
 load("readonly_output_pan", [1, 1, 1], indices=[ACCESS, DEST_TYPE, IO_SEMANTICS], flags=[CAN_ELIMINATE])
+
+# Load converted memory given an address and a conversion descriptor
+# src[] = { address, conversion }
+load("converted_mem_pan", [1, 1], indices=[DEST_TYPE, IO_SEMANTICS], flags=[CAN_ELIMINATE])
+
+# Store a value to memory with conversion given an address and a conversion descriptor
+# src[] = { value, address, conversion }
+store("converted_mem_pan", [1, 1], indices=[IO_SEMANTICS])
+
+# Load the address of a texel buffer index
+# src[] = { resource_handle, index }
+intrinsic("load_texel_buf_index_address_pan", [1, 1], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[64])
+
+# Load conversion descriptor for a texel buffer
+# src[] = { resource_handle }
+intrinsic("load_texel_buf_conv_pan", [1], dest_comp=1, flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
 
 # Load input attachment target
 # src[] = { input_attachment_index }
@@ -2394,11 +2429,9 @@ image("store_raw_intel", src_comp=[1, 0])
 # Maximum number of polygons processed in the fragment shader
 system_value("max_polygon_intel", 1, bit_sizes=[32])
 
-# Read the attribute thread payload at a given offset
+# Read the attribute thread payload at a given byte offset
 # src[] = { offset }
-intrinsic("read_attribute_payload_intel", dest_comp=1, bit_sizes=[32],
-          src_comp=[1],
-          flags=[CAN_ELIMINATE, CAN_REORDER])
+load("attribute_payload_intel", [1], flags=[CAN_ELIMINATE, CAN_REORDER])
 
 # Populate the per-primitive payload at an offset
 # src[] = { value, offset }
@@ -2430,7 +2463,7 @@ intrinsic("resource_intel", dest_comp=1, bit_sizes=[32],
 # OpSubgroupBlockReadINTEL and OpSubgroupBlockWriteINTEL from SPV_INTEL_subgroups.
 intrinsic("load_deref_block_intel", dest_comp=0, src_comp=[-1],
           indices=[ACCESS], flags=[CAN_ELIMINATE])
-intrinsic("store_deref_block_intel", src_comp=[-1, 0], indices=[WRITE_MASK, ACCESS])
+intrinsic("store_deref_block_intel", src_comp=[-1, 0], indices=[ACCESS])
 
 # Special load_ssbo intrinsic with an additional BASE value for Xe2+ offsets
 # src[] = { buffer_index, offset }.
@@ -2438,7 +2471,7 @@ load("ssbo_intel", [-1, 1], [ACCESS, BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMIN
 
 # Special store_ssbo intrinsic with an additional BASE value for Xe2+ offsets
 # src[] = { value, buffer_index, offset }
-store("ssbo_intel", [-1, 1], [WRITE_MASK, ACCESS, BASE, ALIGN_MUL, ALIGN_OFFSET])
+store("ssbo_intel", [-1, 1], [ACCESS, BASE, ALIGN_MUL, ALIGN_OFFSET])
 
 # src[] = { address }.
 load("global_block_intel", [1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
@@ -2450,13 +2483,13 @@ load("ssbo_block_intel", [-1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMIN
 load("shared_block_intel", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
 
 # src[] = { value, address }.
-store("global_block_intel", [1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
+store("global_block_intel", [1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 
 # src[] = { value, block_index, offset }
-store("ssbo_block_intel", [-1, 1], [WRITE_MASK, ACCESS, ALIGN_MUL, ALIGN_OFFSET])
+store("ssbo_block_intel", [-1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET])
 
 # src[] = { value, offset }.
-store("shared_block_intel", [1], [BASE, WRITE_MASK, ALIGN_MUL, ALIGN_OFFSET])
+store("shared_block_intel", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET])
 
 # src[] = { address }.
 load("global_constant_uniform_block_intel", [1],
@@ -2476,6 +2509,47 @@ load("ssbo_uniform_block_intel", [-1, 1], [ACCESS, ALIGN_MUL, ALIGN_OFFSET, BASE
 # Similar to load_global_const_block_intel but for shared memory
 # src[] = { offset }.
 load("shared_uniform_block_intel", [1], [BASE, ALIGN_MUL, ALIGN_OFFSET], [CAN_ELIMINATE])
+
+# Legacy pre-Xe2 URB read.  This takes a URB handle and a 128-bit (vec4)
+# aligned offset.  The hardware can implicitly add a constant offset ("base")
+# to the total offset (which is also in 128-bit units).  Certain stages can
+# use access flags to specify that inputs will never be written to and that
+# loads can be reordered freely.
+#
+# src[] = { urb_handle, offset }.
+load("urb_vec4_intel", [1, 1], [BASE, ACCESS], [CAN_ELIMINATE])
+
+# Newer Xe2+ URB read.  This takes a byte offset into the URB memory
+# (which is the handle plus any offset).  The hardware can implicitly
+# add a constant offset ("base") to the total offset (which is also in
+# bytes).  Certain stages can use access flags to specify that inputs
+# will never be written to and that loads can be reordered freely.
+#
+# src[] = { address }.
+load("urb_lsc_intel", [1], [BASE, ACCESS], [CAN_ELIMINATE])
+
+# Legacy pre-Xe2 URB write.  This takes a URB handle, a 128-bit (vec4)
+# aligned offset and a writemask (which can be non-constant).
+#
+# src[] = { value, urb_handle, 128-bit offset, write_mask }.
+store("urb_vec4_intel", [1, 1, 1], [BASE])
+
+# Newer Xe2+ URB write.  This takes a byte offset into the URB memory
+# (which is the handle plus any offset).  The hardware can implicitly
+# add a constant offset ("base") to the total offset.
+#
+# src[] = { value, address }.
+store("urb_lsc_intel", [1], [BASE])
+
+# Return a handle for a shader's input or output URB memory.
+system_value("urb_input_handle_intel", 1)
+system_value("urb_output_handle_intel", 1)
+
+# TCS and GS have separate handles for each Input Control Point (ICP)
+# so we also take a vertex index corresponding to which one to access.
+#
+# src[] = { vertex }
+load("urb_input_handle_indexed_intel", [1], [], [CAN_ELIMINATE, CAN_REORDER])
 
 # Inline register delivery (available on Gfx12.5+ for CS/Mesh/Task stages)
 intrinsic("load_inline_data_intel", [], dest_comp=0,
@@ -2643,7 +2717,10 @@ intrinsic("ssa_bar_nv", src_comp=[1])
 intrinsic("cmat_muladd_nv", src_comp=[-1, -1, -1], dest_comp=0, bit_sizes=src2,
           indices=[FLAGS], flags=[CAN_ELIMINATE])
 
-intrinsic("cmat_load_shared_nv", src_comp=[1], dest_comp=0, indices=[NUM_MATRICES, MATRIX_LAYOUT, BASE])
+intrinsic("cmat_load_shared_nv", src_comp=[1], dest_comp=0, indices=[NUM_MATRICES, MATRIX_LAYOUT, BASE], flags=[CAN_ELIMINATE])
+
+# Moves a 8x8 16bit matrix with transposition within a subgroup
+intrinsic("cmat_mov_transpose_nv", src_comp=[2], dest_comp=2, bit_sizes=[16], flags=[CAN_ELIMINATE, CAN_REORDER, SUBGROUP])
 
 # NVIDIA-specific system values
 system_value("warps_per_sm_nv", 1, bit_sizes=[32])
@@ -2807,7 +2884,7 @@ intrinsic("is_null_descriptor", src_comp=[-1], dest_comp=1, flags=[CAN_ELIMINATE
 # given binding
 load("buffer_ptr_kk", [], [BINDING], [CAN_ELIMINATE, CAN_REORDER])
 # Opaque texture<T> handle, with DEST_TYPE representing T
-load("texture_handle_kk", [1], [DEST_TYPE, IMAGE_DIM, IMAGE_ARRAY, FLAGS], [CAN_ELIMINATE])
+load("texture_handle_kk", [1], [DEST_TYPE, IMAGE_DIM, IMAGE_ARRAY, ACCESS, FLAGS], [CAN_ELIMINATE])
 # Same as above but for depth<T> textures, T is always float
 load("depth_texture_kk", [1], [IMAGE_DIM, IMAGE_ARRAY], [CAN_ELIMINATE])
 # Load a bindless sampler handle mapping a binding table sampler.

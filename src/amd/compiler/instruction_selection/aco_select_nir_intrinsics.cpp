@@ -1314,7 +1314,8 @@ visit_store_output(isel_context* ctx, nir_intrinsic_instr* instr)
    if (ls_need_output || ps_need_output) {
       bool stored_to_temps = store_output_to_temps(ctx, instr);
       if (!stored_to_temps) {
-         isel_err(instr->src[1].ssa->parent_instr, "Unimplemented output offset instruction");
+         isel_err(nir_def_instr(instr->src[1].ssa),
+                  "Unimplemented output offset instruction");
          abort();
       }
    } else {
@@ -1459,7 +1460,8 @@ visit_load_fs_input(isel_context* ctx, nir_intrinsic_instr* instr)
    nir_src offset = *nir_get_io_offset_src(instr);
 
    if (!nir_src_is_const(offset) || nir_src_as_uint(offset))
-      isel_err(offset.ssa->parent_instr, "Unimplemented non-zero nir_intrinsic_load_input offset");
+      isel_err(nir_def_instr(offset.ssa),
+               "Unimplemented non-zero nir_intrinsic_load_input offset");
 
    Temp prim_mask = get_arg(ctx, ctx->args->prim_mask);
 
@@ -3216,8 +3218,6 @@ visit_access_shared2_amd(isel_context* ctx, nir_intrinsic_instr* instr)
    Temp address = as_vgpr(ctx, get_ssa_temp(ctx, instr->src[is_store].ssa));
    Builder bld(ctx->program, ctx->block);
 
-   assert(bld.program->gfx_level >= GFX7);
-
    bool is64bit = (is_store ? instr->src[0].ssa->bit_size : instr->def.bit_size) == 64;
    uint8_t offset0 = nir_intrinsic_offset0(instr);
    uint8_t offset1 = nir_intrinsic_offset1(instr);
@@ -4707,7 +4707,8 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
 
       if (src.regClass() == s1) {
          bld.copy(Definition(dst), src);
-      } else if (dst.regClass() == v1 && src.regClass() == v1) {
+      } else if (dst.type() == RegType::vgpr && src.type() == RegType::vgpr && dst.size() == 1 &&
+                 src.size() == 1) {
          bld.vop3(aco_opcode::v_permlane16_b32, Definition(dst), src,
                   bld.as_uniform(get_ssa_temp(ctx, instr->src[1].ssa)),
                   bld.as_uniform(get_ssa_temp(ctx, instr->src[2].ssa)));

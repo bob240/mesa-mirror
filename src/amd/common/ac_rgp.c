@@ -463,7 +463,7 @@ static void ac_sqtt_fill_asic_info(const struct radeon_info *rad_info,
    chunk->l1_cache_size = rad_info->tcp_cache_size;
    chunk->lds_size = rad_info->lds_size_per_workgroup;
 
-   strncpy(chunk->gpu_name, rad_info->name, SQTT_GPU_NAME_MAX_SIZE - 1);
+   strncpy(chunk->gpu_name, ac_get_family_name(rad_info->family), SQTT_GPU_NAME_MAX_SIZE - 1);
 
    chunk->alu_per_clock = 0.0;
    chunk->texture_per_clock = 0.0;
@@ -1046,7 +1046,7 @@ ac_sqtt_dump_data(const struct radeon_info *rad_info, struct ac_sqtt_trace *sqtt
                                       sizeof(struct sqtt_code_object_database_record),
                                       record, &elf_size_calc, flags);
          /* Align to 4 bytes per the RGP file spec. */
-         code_object_record.size = ALIGN(elf_size_calc, 4);
+         code_object_record.size = align(elf_size_calc, 4);
          fseek(output, file_offset, SEEK_SET);
          fwrite(&code_object_record, sizeof(struct sqtt_code_object_database_record),
                 1, output);

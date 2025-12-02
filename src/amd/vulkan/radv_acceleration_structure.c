@@ -162,7 +162,7 @@ radv_get_acceleration_structure_layout(struct radv_device *device,
       offset += bvh_size / 64 * 4;
 
    /* The BVH and hence bvh_offset needs 64 byte alignment for RT nodes. */
-   offset = ALIGN(offset, 64);
+   offset = align(offset, 64);
    accel_struct->bvh_offset = offset;
 
    /* root node */
@@ -319,6 +319,9 @@ radv_get_build_config(VkDevice _device, struct vk_acceleration_structure_build_s
 
    if (state->build_info->geometryCount == 1)
       update_key |= RADV_BUILD_FLAG_UPDATE_SINGLE_GEOMETRY;
+
+   if (device->meta_state.accel_struct_build.build_args.propagate_cull_flags)
+      update_key |= VK_BUILD_FLAG_PROPAGATE_CULL_FLAGS;
 
    state->config.update_key[0] = update_key;
 }

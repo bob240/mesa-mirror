@@ -1231,7 +1231,7 @@ ntq_emit_comparison(struct v3d_compile *c,
 static struct nir_alu_instr *
 ntq_get_alu_parent(nir_src src)
 {
-        if (src.ssa->parent_instr->type != nir_instr_type_alu)
+        if (!nir_src_is_alu(src))
                 return NULL;
         nir_alu_instr *instr = nir_def_as_alu(src.ssa);
         if (!instr)
@@ -1626,6 +1626,12 @@ ntq_emit_alu(struct v3d_compile *c, nir_alu_instr *instr)
 
         case nir_op_imul:
                 result = vir_UMUL(c, src[0], src[1]);
+                break;
+        case nir_op_umul24:
+                result = vir_UMUL24_RTOP0(c, src[0], src[1]);
+                break;
+        case nir_op_imul24:
+                result = vir_SMUL24(c, src[0], src[1]);
                 break;
 
         case nir_op_seq:
@@ -2155,7 +2161,7 @@ v3d_optimize_nir(struct v3d_compile *c, struct nir_shader *s)
 
                 NIR_PASS(progress, s, nir_lower_alu_to_scalar, NULL, NULL);
                 NIR_PASS(progress, s, nir_lower_phis_to_scalar, NULL, NULL);
-                NIR_PASS(progress, s, nir_copy_prop);
+                NIR_PASS(progress, s, nir_opt_copy_prop);
                 NIR_PASS(progress, s, nir_opt_remove_phis);
                 NIR_PASS(progress, s, nir_opt_dce);
                 NIR_PASS(progress, s, nir_opt_dead_cf);
@@ -2183,7 +2189,7 @@ v3d_optimize_nir(struct v3d_compile *c, struct nir_shader *s)
 
                 if (nir_opt_loop(s)) {
                    progress = true;
-                   NIR_PASS(progress, s, nir_copy_prop);
+                   NIR_PASS(progress, s, nir_opt_copy_prop);
                    NIR_PASS(progress, s, nir_opt_dce);
                 }
 
@@ -2236,15 +2242,8 @@ v3d_optimize_nir(struct v3d_compile *c, struct nir_shader *s)
                 }
 
                 if (lower_flrp != 0) {
-                        bool lower_flrp_progress = false;
-
-                        NIR_PASS(lower_flrp_progress, s, nir_lower_flrp,
-                                 lower_flrp,
-                                 false /* always_precise */);
-                        if (lower_flrp_progress) {
-                                NIR_PASS(progress, s, nir_opt_constant_folding);
-                                progress = true;
-                        }
+                        NIR_PASS(progress, s, nir_lower_flrp,
+                                 lower_flrp, false /* always_precise */);
 
                         /* Nothing should rematerialize any flrps, so we only
                          * need to do this lowering once.
@@ -2269,6 +2268,9 @@ v3d_optimize_nir(struct v3d_compile *c, struct nir_shader *s)
          */
         NIR_PASS(progress, s, v3d_nir_lower_algebraic, c);
         NIR_PASS(progress, s, nir_opt_cse);
+
+        nir_opt_uub_options uub_options = {.opt_imul = true};
+        NIR_PASS(progress, s, nir_opt_uub, &uub_options);
 
         nir_move_options sink_opts =
                 nir_move_const_undef | nir_move_comparisons | nir_move_copies |
@@ -3110,7 +3112,7 @@ nir_src_derived_from_reg(nir_src src)
         if (nir_load_reg_for_def(def))
                 return true;
 
-        nir_instr *parent = def->parent_instr;
+        nir_instr *parent = nir_def_instr(def);
         switch (parent->type) {
         case nir_instr_type_alu: {
                 nir_alu_instr *alu = nir_instr_as_alu(parent);

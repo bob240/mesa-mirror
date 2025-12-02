@@ -103,12 +103,13 @@ radv_emit_sqtt_userdata(const struct radv_cmd_buffer *cmd_buffer, const void *da
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   const bool is_gfx_or_ace = cmd_buffer->qf == RADV_QUEUE_GENERAL || cmd_buffer->qf == RADV_QUEUE_COMPUTE;
    const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    const uint32_t *dwords = (uint32_t *)data;
 
-   /* SQTT user data packets aren't supported on SDMA queues. */
-   if (cmd_buffer->qf == RADV_QUEUE_TRANSFER)
+   /* SQTT user data packets are only supported on GFX or ACE queues. */
+   if (!is_gfx_or_ace)
       return;
 
    while (num_dwords > 0) {
@@ -281,7 +282,7 @@ radv_sqtt_init_bo(struct radv_device *device)
    size += device->sqtt.buffer_size * (uint64_t)max_se;
 
    struct radeon_winsys_bo *bo = NULL;
-   result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_VRAM,
+   result = radv_bo_create(device, NULL, size, 4096, RADEON_DOMAIN_GTT,
                            RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM,
                            RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
    device->sqtt.bo = bo;
@@ -391,6 +392,11 @@ radv_sqtt_init(struct radv_device *device)
    device->sqtt.buffer_size = (uint32_t)debug_get_num_option("RADV_THREAD_TRACE_BUFFER_SIZE", 32 * 1024 * 1024);
    device->sqtt.instruction_timing_enabled = radv_is_instruction_timing_enabled();
 
+   if (device->ws->reserve_vmid(device->ws) < 0) {
+      fprintf(stderr, "radv: Failed to reserve VMID for SQTT tracing.\n");
+      return false;
+   }
+
    if (!radv_sqtt_init_bo(device))
       return false;
 
@@ -426,6 +432,9 @@ radv_sqtt_finish(struct radv_device *device)
    radv_unregister_queues(device, sqtt);
 
    ac_sqtt_finish(sqtt);
+
+   if (device->ws)
+      device->ws->unreserve_vmid(device->ws);
 }
 
 static bool
@@ -498,9 +507,9 @@ radv_begin_sqtt(struct radv_queue *queue)
    /* Enable SQG events that collects thread trace data. */
    ac_emit_cp_spi_config_cntl(cs.b, pdev->info.gfx_level, true);
 
-   radv_perfcounter_emit_reset(&cs, true);
-
    if (device->spm.bo) {
+      ac_emit_spm_reset(cs.b);
+
       /* Enable all shader stages by default. */
       radv_perfcounter_emit_shaders(device, &cs, ac_sqtt_get_shader_mask(&pdev->info));
 
@@ -512,7 +521,7 @@ radv_begin_sqtt(struct radv_queue *queue)
 
    if (device->spm.bo) {
       radeon_check_space(ws, cs.b, 8);
-      radv_perfcounter_emit_spm_start(device, &cs);
+      ac_emit_spm_start(cs.b, cs.hw_ip);
    }
 
    result = ws->cs_finalize(cs.b);
@@ -574,13 +583,14 @@ radv_end_sqtt(struct radv_queue *queue)
 
    if (device->spm.bo) {
       radeon_check_space(ws, cs.b, 8);
-      radv_perfcounter_emit_spm_stop(device, &cs);
+      ac_emit_spm_stop(cs.b, cs.hw_ip, &pdev->info);
    }
 
    /* Stop SQTT. */
    radv_emit_sqtt_stop(device, &cs);
 
-   radv_perfcounter_emit_reset(&cs, true);
+   if (device->spm.bo)
+      ac_emit_spm_reset(cs.b);
 
    /* Restore previous state by disabling SQG events. */
    ac_emit_cp_spi_config_cntl(cs.b, pdev->info.gfx_level, false);
@@ -656,10 +666,14 @@ radv_get_sqtt_trace(struct radv_queue *queue, struct ac_sqtt_trace *sqtt_trace)
 {
    struct radv_device *device = radv_queue_device(queue);
    const struct radv_physical_device *pdev = radv_device_physical(device);
+   const struct radv_instance *instance = radv_physical_device_instance(pdev);
    const struct radeon_info *gpu_info = &pdev->info;
 
    if (!ac_sqtt_get_trace(&device->sqtt, gpu_info, sqtt_trace)) {
-      if (!radv_sqtt_resize_bo(device))
+      /* Do not try to automatically resize the SQTT buffer for per-submit captures because this
+       * doesn't make much sense and the buffer size can be increased by the user.
+       */
+      if (!instance->vk.trace_per_submit && !radv_sqtt_resize_bo(device))
          fprintf(stderr, "radv: Failed to resize the SQTT buffer.\n");
       return false;
    }

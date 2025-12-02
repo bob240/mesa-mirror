@@ -78,6 +78,7 @@ struct radv_shader_stage_key {
 
    uint8_t optimisations_disabled : 1;
    uint8_t keep_statistic_info : 1;
+   uint8_t keep_executable_info : 1;
    uint8_t view_index_from_device_index : 1;
 
    /* Shader version (up to 8) to force re-compilation when RADV_BUILD_ID_OVERRIDE is enabled. */
@@ -89,7 +90,7 @@ struct radv_shader_stage_key {
    /* Whether the shader is used with indirect pipeline binds. */
    uint8_t indirect_bindable : 1;
 
-   uint32_t reserved : 18;
+   uint32_t reserved : 17;
 };
 
 struct radv_ps_epilog_key {
@@ -721,6 +722,8 @@ radv_shader_need_push_constants_upload(const struct radv_shader *shader)
    const struct radv_userdata_info *loc = radv_get_user_sgpr_info(shader, AC_UD_PUSH_CONSTANTS);
    return loc->sgpr_idx != -1;
 }
+
+void radv_precompute_registers_hw_gs(struct radv_device *device, struct radv_shader_info *es_info, struct radv_shader_info *gs_info);
 
 void radv_precompute_registers_hw_ngg(struct radv_device *device, const struct ac_shader_config *config,
                                       struct radv_shader_info *info);

@@ -5,6 +5,7 @@
 
 #include "util/bitset.h"
 #include "util/macros.h"
+#include "util/sparse_bitset.h"
 #include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include "util/u_memory.h"
@@ -233,12 +234,9 @@ agx_calc_register_demand(agx_context *ctx, bool remat)
       unsigned demand = reserved_size(ctx);
 
       /* Everything live-in */
-      {
-         int i;
-         BITSET_FOREACH_SET(i, block->live_in, ctx->alloc) {
-            if (classes[i] == RA_GPR)
-               demand += widths[i];
-         }
+      U_SPARSE_BITSET_FOREACH_SET(&block->live_in, i) {
+         if (classes[i] == RA_GPR)
+            demand += widths[i];
       }
 
       max_demand = MAX2(demand, max_demand);
@@ -615,8 +613,7 @@ find_regs(struct ra_ctx *rctx, agx_instr *I, unsigned dest_idx, unsigned count,
       assert(!rctx->early_killed && "no live range splits with early kill");
       assert(cls == RA_GPR && "no memory live range splits");
 
-      struct util_dynarray copies = {0};
-      util_dynarray_init(&copies, NULL);
+      struct util_dynarray copies = UTIL_DYNARRAY_INIT;
 
       reg = assign_regs_by_copying(rctx, I->dest[dest_idx], I, &copies);
 
@@ -675,8 +672,7 @@ reserve_live_in(struct ra_ctx *rctx)
    agx_builder b =
       agx_init_builder(rctx->shader, agx_before_block(rctx->block));
 
-   int i;
-   BITSET_FOREACH_SET(i, rctx->block->live_in, rctx->shader->alloc) {
+   U_SPARSE_BITSET_FOREACH_SET(&rctx->block->live_in, i) {
       /* Skip values defined in loops when processing the loop header */
       if (!BITSET_TEST(rctx->visited, i))
          continue;
@@ -1192,8 +1188,7 @@ agx_ra_assign_local(struct ra_ctx *rctx)
              rctx->bound[i] * sizeof(*block->reg_to_ssa_out[i]));
    }
 
-   int i;
-   BITSET_FOREACH_SET(i, block->live_out, rctx->shader->alloc) {
+   U_SPARSE_BITSET_FOREACH_SET(&block->live_out, i) {
       block->reg_to_ssa_out[rctx->classes[i]][rctx->ssa_to_reg[i]] = i;
    }
 

@@ -13,6 +13,7 @@ use crate::sph::{OutputTopology, PixelImap};
 pub use crate::ssa_value::*;
 use compiler::as_slice::*;
 use compiler::cfg::CFG;
+use compiler::dataflow::ForwardDataflow;
 use compiler::smallvec::SmallVec;
 use nak_ir_proc::*;
 use std::cmp::{max, min};
@@ -4919,6 +4920,23 @@ impl DisplayOp for OpMov {
 }
 impl_display_for_op!(OpMov);
 
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpMovm {
+    pub dst: Dst,
+
+    #[src_type(GPR)]
+    pub src: Src,
+}
+
+impl DisplayOp for OpMovm {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "movm.16.m8n8.trans {}", self.src)
+    }
+}
+
+impl_display_for_op!(OpMovm);
+
 #[derive(Copy, Clone)]
 pub struct PrmtSelByte(u8);
 
@@ -7939,6 +7957,7 @@ pub enum Op {
     I2I(Box<OpI2I>),
     FRnd(Box<OpFRnd>),
     Mov(Box<OpMov>),
+    Movm(Box<OpMovm>),
     Prmt(Box<OpPrmt>),
     Sel(Box<OpSel>),
     Sgxt(Box<OpSgxt>),
@@ -8081,7 +8100,7 @@ impl Op {
             | Op::DSetP(_) => false,
 
             // Matrix Multiply Add
-            Op::Imma(_) | Op::Hmma(_) | Op::Ldsm(_) => false,
+            Op::Imma(_) | Op::Hmma(_) | Op::Ldsm(_) | Op::Movm(_) => false,
 
             // Integer ALU
             Op::BRev(_) | Op::Flo(_) | Op::PopC(_) => false,
@@ -8756,6 +8775,24 @@ impl BasicBlock {
     }
 }
 
+/// Stores the index of an instruction in a given Function
+///
+/// The block and instruction indices are stored in a memory-efficient way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InstrIdx {
+    pub block_idx: u32,
+    pub instr_idx: u32,
+}
+
+impl InstrIdx {
+    pub fn new(bi: usize, ii: usize) -> Self {
+        Self {
+            block_idx: bi.try_into().expect("Block index overflow"),
+            instr_idx: ii.try_into().expect("Instruction index overflow"),
+        }
+    }
+}
+
 pub struct Function {
     pub ssa_alloc: SSAValueAllocator,
     pub phi_alloc: PhiAllocator,
@@ -8847,10 +8884,26 @@ impl fmt::Display for Function {
     }
 }
 
+impl Index<InstrIdx> for Function {
+    type Output = Instr;
+
+    fn index(&self, index: InstrIdx) -> &Self::Output {
+        // Removed at compile time (except for 16-bit targets)
+        let block_idx: usize = index.block_idx.try_into().unwrap();
+        let instr_idx: usize = index.instr_idx.try_into().unwrap();
+        &self.blocks[block_idx].instrs[instr_idx]
+    }
+}
+
 #[derive(Debug)]
 pub struct ComputeShaderInfo {
     pub local_size: [u16; 3],
     pub smem_size: u16,
+}
+
+#[derive(Debug)]
+pub struct VertexShaderInfo {
+    pub isbe_space_sharing_enable: bool,
 }
 
 #[derive(Debug)]
@@ -8924,7 +8977,7 @@ pub struct TessellationShaderInfo {
 #[derive(Debug)]
 pub enum ShaderStageInfo {
     Compute(ComputeShaderInfo),
-    Vertex,
+    Vertex(VertexShaderInfo),
     Fragment(FragmentShaderInfo),
     Geometry(GeometryShaderInfo),
     TessellationInit(TessellationInitShaderInfo),
@@ -9215,6 +9268,14 @@ pub trait ShaderModel {
     /// Worst-case access-after-write latency
     fn worst_latency(&self, write: &Op, dst_idx: usize) -> u32;
 
+    /// Upper bound on latency
+    ///
+    /// Every '*_latency' function must return latencies that are
+    /// bounded.  Ex: self.war_latency() <= self.latency_upper_bound().
+    /// This is only used for compile-time optimization.  If unsure, be
+    /// conservative.
+    fn latency_upper_bound(&self) -> u32;
+
     /// Maximum encodable instruction delay
     fn max_instr_delay(&self) -> u8;
 
@@ -9258,6 +9319,98 @@ pub struct Shader<'a> {
     pub sm: &'a dyn ShaderModel,
     pub info: ShaderInfo,
     pub functions: Vec<Function>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+struct IsbeSpaceSharingStateTracker {
+    has_attribute_store: bool,
+    has_attribute_load: bool,
+    can_overlap_io: bool,
+}
+
+impl IsbeSpaceSharingStateTracker {
+    pub const fn new() -> Self {
+        Self {
+            has_attribute_store: false,
+            has_attribute_load: false,
+            can_overlap_io: true,
+        }
+    }
+
+    pub fn visit_instr(&mut self, instr: &Instr) {
+        // Track attribute store. (XXX: ISBEWR)
+        self.has_attribute_store |= matches!(instr.op, Op::ASt(_));
+
+        // Track attribute load.
+        if matches!(instr.op, Op::ALd(_) | Op::Isberd(_)) {
+            self.has_attribute_load = true;
+
+            // If we have any attribute load after an attribute store,
+            // we cannot overlap IO.
+            if self.has_attribute_store {
+                self.can_overlap_io = false;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: &Self) {
+        // Propagate details on attribute store and overlap IO.
+        self.has_attribute_store |= other.has_attribute_store;
+        self.can_overlap_io &= other.can_overlap_io;
+
+        // If a previous block has any attribute store and we found an attribute load,
+        // we cannot overlap IO.
+        if other.has_attribute_store && self.has_attribute_load {
+            self.can_overlap_io = false;
+        }
+    }
+}
+
+fn can_isbe_space_sharing_be_enabled(f: &Function) -> bool {
+    let mut state_in = Vec::new();
+    for block in &f.blocks {
+        let mut sim = IsbeSpaceSharingStateTracker::new();
+
+        for instr in block.instrs.iter() {
+            sim.visit_instr(&instr);
+        }
+
+        if !sim.can_overlap_io {
+            return false;
+        }
+
+        state_in.push(sim);
+    }
+
+    let mut state_out: Vec<_> = (0..f.blocks.len())
+        .map(|_| IsbeSpaceSharingStateTracker::new())
+        .collect();
+
+    ForwardDataflow {
+        cfg: &f.blocks,
+        block_in: &mut state_in[..],
+        block_out: &mut state_out[..],
+        transfer: |_block_idx, _block, sim_out, sim_in| {
+            if sim_out == sim_in {
+                false
+            } else {
+                *sim_out = *sim_in;
+                true
+            }
+        },
+        join: |sim_in, pred_sim_out| {
+            sim_in.merge(pred_sim_out);
+        },
+    }
+    .solve();
+
+    for state in state_in {
+        if !state.can_overlap_io {
+            return false;
+        }
+    }
+
+    true
 }
 
 impl Shader<'_> {
@@ -9321,6 +9474,16 @@ impl Shader<'_> {
         self.info.max_warps_per_sm = max_warps_per_sm(
             self.info.num_gprs as u32 + self.sm.hw_reserved_gprs(),
         );
+
+        if self.sm.sm() >= 50 {
+            if let ShaderStageInfo::Vertex(vertex_info) = &mut self.info.stage {
+                assert!(self.functions.len() == 1);
+                vertex_info.isbe_space_sharing_enable =
+                    can_isbe_space_sharing_be_enabled(
+                        self.functions.get(0).unwrap(),
+                    );
+            }
+        }
     }
 }
 

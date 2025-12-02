@@ -141,7 +141,7 @@ static void si_sqtt_start(struct si_context *sctx, struct radeon_cmdbuf *cs)
    si_emit_spi_config_cntl(sctx, cs, true);
 
    if (sctx->spm.bo) {
-      si_pc_emit_spm_reset(cs);
+      ac_emit_spm_reset(&cs->current);
       si_pc_emit_shaders(cs, ac_sqtt_get_shader_mask(&sctx->screen->info));
       si_emit_spm_setup(sctx, cs);
    }
@@ -149,7 +149,7 @@ static void si_sqtt_start(struct si_context *sctx, struct radeon_cmdbuf *cs)
    si_emit_sqtt_start(sctx, cs, ip_type);
 
    if (sctx->spm.bo)
-      si_pc_emit_spm_start(cs);
+      ac_emit_spm_start(&cs->current, AMD_IP_GFX);
 }
 
 static void si_sqtt_stop(struct si_context *sctx, struct radeon_cmdbuf *cs)
@@ -185,8 +185,7 @@ static void si_sqtt_stop(struct si_context *sctx, struct radeon_cmdbuf *cs)
    si_cp_dma_wait_for_idle(sctx, cs);
 
    if (sctx->spm.bo)
-      si_pc_emit_spm_stop(cs, sctx->screen->info.never_stop_sq_perf_counters,
-                          sctx->screen->info.never_send_perfcounter_stop);
+      ac_emit_spm_stop(&cs->current, AMD_IP_GFX, &sctx->screen->info);
 
    /* Make sure to wait-for-idle before stopping SQTT. */
    sctx->barrier_flags |= SI_BARRIER_SYNC_PS | SI_BARRIER_SYNC_CS |
@@ -198,7 +197,7 @@ static void si_sqtt_stop(struct si_context *sctx, struct radeon_cmdbuf *cs)
    si_emit_sqtt_stop(sctx, cs, ip_type);
 
    if (sctx->spm.bo)
-      si_pc_emit_spm_reset(cs);
+      ac_emit_spm_reset(&cs->current);
 
    /* Restore previous state by disabling SQG events. */
    si_emit_spi_config_cntl(sctx, cs, false);
@@ -253,6 +252,7 @@ si_sqtt_resize_bo(struct si_context *sctx)
    /* Destroy the previous thread trace BO. */
    struct pb_buffer_lean *bo = sctx->sqtt->bo;
    radeon_bo_reference(sctx->screen->ws, &bo, NULL);
+   sctx->sqtt->bo = NULL;
 
    if (sctx->sqtt->buffer_size < UINT32_MAX / 2) {
       /* Double the size of the thread trace buffer per SE. */
@@ -331,7 +331,7 @@ bool si_init_sqtt(struct si_context *sctx)
       debug_get_bool_option("AMD_THREAD_TRACE_INSTRUCTION_TIMING", true);
    sctx->sqtt->start_frame = 10;
 
-   const char *trigger = getenv("AMD_THREAD_TRACE_TRIGGER");
+   const char *trigger = os_get_option("AMD_THREAD_TRACE_TRIGGER");
    if (trigger) {
       sctx->sqtt->start_frame = atoi(trigger);
       if (sctx->sqtt->start_frame <= 0) {
@@ -488,7 +488,7 @@ void si_handle_sqtt(struct si_context *sctx, struct radeon_cmdbuf *rcs)
 
          if (sctx->spm.ptr)
             sctx->ws->buffer_unmap(sctx->ws, sctx->spm.bo);
-      } else {
+      } else if (sctx->sqtt->bo) {
          if (!sctx->sqtt->trigger_file) {
             sctx->sqtt->start_frame = num_frames + 10;
          }
@@ -769,7 +769,7 @@ si_sqtt_add_code_object(struct si_context *sctx,
       record->shader_data[i].hw_stage = hw_stage;
       record->shader_data[i].is_combined = false;
       record->shader_data[i].scratch_memory_size = shader->config.scratch_bytes_per_wave;
-      record->shader_data[i].lds_size = ALIGN(shader->config.lds_size, ac_shader_get_lds_alloc_granularity(sctx->gfx_level));
+      record->shader_data[i].lds_size = align(shader->config.lds_size, ac_shader_get_lds_alloc_granularity(sctx->gfx_level));
       record->shader_data[i].wavefront_size = shader->wave_size;
 
       record->shader_stages_mask |= 1 << i;

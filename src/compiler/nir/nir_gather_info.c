@@ -514,6 +514,9 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
       }
       if (nir_intrinsic_writes_external_memory(instr))
          shader->info.writes_memory = true;
+      if (shader->info.stage == MESA_SHADER_FRAGMENT &&
+          nir_deref_mode_is_one_of(deref, nir_var_any_pixel_local))
+         shader->info.fs.accesses_pixel_local_storage = true;
       break;
    }
    case nir_intrinsic_image_deref_load:
@@ -597,6 +600,7 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
    case nir_intrinsic_load_per_vertex_output:
    case nir_intrinsic_load_per_view_output:
    case nir_intrinsic_load_per_primitive_output:
+   case nir_intrinsic_load_pixel_local:
       if (shader->info.stage == MESA_SHADER_TESS_CTRL &&
           instr->intrinsic == nir_intrinsic_load_output &&
           !is_patch_special) {
@@ -625,6 +629,10 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
          shader->info.mesh.ms_cross_invocation_output_access |= slot_mask;
 
       if (shader->info.stage == MESA_SHADER_FRAGMENT &&
+          instr->intrinsic == nir_intrinsic_load_pixel_local)
+         shader->info.fs.accesses_pixel_local_storage = true;
+
+      if (shader->info.stage == MESA_SHADER_FRAGMENT &&
           nir_intrinsic_io_semantics(instr).fb_fetch_output)
          shader->info.fs.uses_fbfetch_output = true;
       break;
@@ -633,6 +641,7 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
    case nir_intrinsic_store_per_vertex_output:
    case nir_intrinsic_store_per_view_output:
    case nir_intrinsic_store_per_primitive_output:
+   case nir_intrinsic_store_pixel_local:
       if (shader->info.stage == MESA_SHADER_TESS_CTRL &&
           instr->intrinsic == nir_intrinsic_store_output &&
           !is_patch_special) {
@@ -672,6 +681,10 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
       if (shader->info.stage == MESA_SHADER_FRAGMENT &&
           nir_intrinsic_io_semantics(instr).dual_source_blend_index)
          shader->info.fs.color_is_dual_source = true;
+
+      if (shader->info.stage == MESA_SHADER_FRAGMENT &&
+          instr->intrinsic == nir_intrinsic_store_pixel_local)
+         shader->info.fs.accesses_pixel_local_storage = true;
       break;
 
    case nir_intrinsic_load_color0:
@@ -893,7 +906,8 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
           instr->intrinsic == nir_intrinsic_image_deref_samples ||
           instr->intrinsic == nir_intrinsic_bindless_image_levels ||
           instr->intrinsic == nir_intrinsic_bindless_image_size ||
-          instr->intrinsic == nir_intrinsic_bindless_image_samples)
+          instr->intrinsic == nir_intrinsic_bindless_image_samples ||
+          instr->intrinsic == nir_intrinsic_get_ssbo_size)
          shader->info.uses_resource_info_query = true;
       break;
    }
@@ -1048,6 +1062,7 @@ nir_shader_gather_info(nir_shader *shader, nir_function_impl *entrypoint)
       shader->info.vs.double_inputs = 0;
    }
    if (shader->info.stage == MESA_SHADER_FRAGMENT) {
+      shader->info.fs.accesses_pixel_local_storage = false;
       shader->info.fs.uses_sample_qualifier = false;
       shader->info.fs.uses_discard = false;
       shader->info.fs.color_is_dual_source = false;

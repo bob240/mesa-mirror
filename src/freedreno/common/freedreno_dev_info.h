@@ -70,6 +70,20 @@ struct fd_dev_info {
    };
 
    struct {
+      uint32_t RB_DBG_ECO_CNTL;
+      uint32_t RB_DBG_ECO_CNTL_blit;
+      uint32_t RB_RBP_CNTL;
+   } magic;
+
+   struct {
+         uint32_t reg;
+         uint32_t value;
+   } magic_raw[64];
+
+   struct {
+      /*
+       * A6XX / gen6
+       */
       uint32_t reg_size_vec4;
 
       /* The size (in instrlen units (128 bytes)) of instruction cache where
@@ -210,6 +224,11 @@ struct fd_dev_info {
        */
       bool has_ubwc_linear_mipmap_fallback;
 
+      /* Whether threshold for linear mipmaps for compressed textures is in
+       * blocks, if false then threshold is in texels.
+       */
+      bool supports_linear_mipmap_threshold_in_blocks;
+
       /* Whether 4 nops are needed after the second pred[tf] of a
        * pred[tf]/pred[ft] pair to work around a hardware issue.
        */
@@ -225,29 +244,6 @@ struct fd_dev_info {
 
       /* A702 cuts A LOT of things.. */
       bool is_a702;
-
-      struct {
-         uint32_t PC_POWER_CNTL;
-         uint32_t TPL1_DBG_ECO_CNTL;
-         uint32_t GRAS_DBG_ECO_CNTL;
-         uint32_t SP_CHICKEN_BITS;
-         uint32_t UCHE_CLIENT_PF;
-         uint32_t PC_MODE_CNTL;
-         uint32_t SP_DBG_ECO_CNTL;
-         uint32_t RB_DBG_ECO_CNTL;
-         uint32_t RB_DBG_ECO_CNTL_blit;
-         uint32_t HLSQ_DBG_ECO_CNTL;
-         uint32_t RB_RBP_CNTL;
-         uint32_t VPC_DBG_ECO_CNTL;
-         uint32_t UCHE_UNKNOWN_0E12;
-
-         uint32_t RB_CCU_DBG_ECO_CNTL;
-      } magic;
-
-      struct {
-            uint32_t reg;
-            uint32_t value;
-      } magic_raw[64];
 
       /* maximum number of descriptor sets */
       uint32_t max_sets;
@@ -267,9 +263,19 @@ struct fd_dev_info {
 
       /* True if sel.b supports (neg) that behaves as fneg. */
       bool has_sel_b_fneg;
-   } a6xx;
 
-   struct {
+      /* Whether CP_REG_TEST::PRED_BIT exists so that there are 32 predicates
+       * that can be written by CP_REG_TEST instead of just 1.
+       */
+      bool has_pred_bit;
+
+      /* True if PC_DGEN_SO_CNTL is present. */
+      bool has_pc_dgen_so_cntl;
+
+      /*
+       * A7XX / gen7
+       */
+
       /* stsc may need to be done twice for the same range to workaround
        * _something_, observed in blob's disassembly.
        */
@@ -386,7 +392,7 @@ struct fd_dev_info {
        * driver.
        */
       bool has_hw_bin_scaling;
-   } a7xx;
+   } props;
 };
 
 struct fd_dev_id {

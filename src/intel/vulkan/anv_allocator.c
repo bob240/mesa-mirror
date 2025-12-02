@@ -360,8 +360,8 @@ anv_block_pool_init(struct anv_block_pool *pool,
    VkResult result;
 
    /* Make sure VMA addresses are aligned for the block pool */
-   assert(anv_is_aligned(start_address, device->info->mem_alignment));
-   assert(anv_is_aligned(initial_size, device->info->mem_alignment));
+   assert(util_is_aligned(start_address, device->info->mem_alignment));
+   assert(util_is_aligned(initial_size, device->info->mem_alignment));
    assert(max_size > 0);
    assert(max_size > initial_size);
 
@@ -1034,7 +1034,7 @@ anv_state_stream_init(struct anv_state_stream *stream,
    stream->next = block_size;
 
    stream->total_size = 0;
-   util_dynarray_init(&stream->all_blocks, NULL);
+   stream->all_blocks = UTIL_DYNARRAY_INIT;
 
    VG(VALGRIND_CREATE_MEMPOOL(stream, 0, false));
 }
@@ -1551,9 +1551,18 @@ anv_bo_vma_calc_alignment_requirement(struct anv_device *device,
    const bool is_small_heap = anv_bo_is_small_heap(alloc_flags);
    uint32_t align = 64; /* A cache line */
 
-   /* If it's big enough to store a tiled resource, we need 64K alignment */
-   if (size >= 64 * 1024 && !is_small_heap)
-      align = MAX2(64 * 1024, align);
+   /* If it's big enough to store a 64K tiled resource, we need 64K alignment.
+    * Wa_22015614752 requires that some images be aligned to 64k when used on
+    * multiple engines, so allocation that might contain 4k tiled images need
+    * to be aligned to 64k.
+    */
+   const uint64_t image_alignment =
+      (size >= 64 * 1024 ||
+       (device->queue_count > 1 &&
+        intel_needs_workaround(device->info, 22015614752))) ?
+      64 * 1024 : 4 * 1024;
+   if (size >= 4 * 1024 && !is_small_heap)
+      align = MAX2(image_alignment, align);
 
    /* If we're using the AUX map, make sure we follow the required
     * alignment.

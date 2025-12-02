@@ -115,16 +115,11 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
    const VkMemoryType *mem_type =
       &dev->physical_device->memory_properties
           .memoryTypes[alloc_info->memoryTypeIndex];
-   const VkMemoryDedicatedAllocateInfo *dedicated_info =
-      vk_find_struct_const(alloc_info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
-   const bool is_dedicated =
-      dedicated_info && (dedicated_info->image != VK_NULL_HANDLE ||
-                         dedicated_info->buffer != VK_NULL_HANDLE);
 
    struct vn_renderer_bo *bo;
    VkResult result = vn_renderer_bo_create_from_dma_buf(
-      dev->renderer, is_dedicated ? alloc_info->allocationSize : 0, fd,
-      mem_type->propertyFlags, &bo);
+      dev->renderer, alloc_info->allocationSize, fd, mem_type->propertyFlags,
+      &bo);
    if (result != VK_SUCCESS)
       return result;
 
@@ -441,6 +436,7 @@ vn_MapMemory2(VkDevice device,
    const VkDeviceSize size = pMemoryMapInfo->size;
    const struct vk_device_memory *mem_vk = &mem->base.vk;
    const bool need_bo = !mem->base_bo;
+   void *placed_addr = NULL;
    void *ptr = NULL;
    VkResult result;
 
@@ -462,7 +458,14 @@ vn_MapMemory2(VkDevice device,
          return vn_error(dev->instance, result);
    }
 
-   ptr = vn_renderer_bo_map(dev->renderer, mem->base_bo);
+   if (pMemoryMapInfo->flags & VK_MEMORY_MAP_PLACED_BIT_EXT) {
+      const VkMemoryMapPlacedInfoEXT *placed_info = vk_find_struct_const(
+         pMemoryMapInfo->pNext, MEMORY_MAP_PLACED_INFO_EXT);
+      assert(placed_info != NULL);
+      placed_addr = placed_info->pPlacedAddress;
+   }
+
+   ptr = vn_renderer_bo_map(dev->renderer, mem->base_bo, placed_addr);
    if (!ptr) {
       /* vn_renderer_bo_map implies a roundtrip on success, but not here. */
       if (need_bo) {

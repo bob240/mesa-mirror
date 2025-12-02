@@ -6,7 +6,7 @@
 
 #include "gallium/include/pipe/p_defines.h"
 #include "poly/cl/libpoly.h"
-#include "poly/nir/poly_nir_lower_gs.h"
+#include "poly/nir/poly_nir.h"
 #include "util/format/u_formats.h"
 #include "agx_abi.h"
 #include "agx_linker.h"
@@ -73,8 +73,8 @@ map_vs_part_uniform(nir_intrinsic_instr *intr, unsigned nr_attribs)
    case nir_intrinsic_load_base_instance:
       return AGX_ABI_VUNI_BASE_INSTANCE(nr_attribs);
 
-   case nir_intrinsic_load_input_assembly_buffer_poly:
-      return AGX_ABI_VUNI_INPUT_ASSEMBLY(nr_attribs);
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+      return AGX_ABI_VUNI_VERTEX_PARAMS(nr_attribs);
 
    default:
       return -1;
@@ -162,7 +162,7 @@ lower_adjacency(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       UNREACHABLE("unknown");
    }
 
-   id = poly_nir_load_vertex_id(b, id, key->sw_index_size_B);
+   id = poly_nir_load_vertex_id(b, id);
 
    nir_def_replace(&intr->def, id);
    return true;
@@ -216,11 +216,14 @@ agx_nir_vs_prolog(nir_builder *b, const void *key_)
    }
 
    if (!key->hw) {
-      poly_nir_lower_sw_vs(b->shader, key->sw_index_size_B);
+      b->cursor = nir_before_impl(nir_shader_get_entrypoint(b->shader));
+      poly_nir_lower_sw_vs(b->shader);
    } else if (key->adjacency) {
       nir_shader_intrinsics_pass(b->shader, lower_adjacency,
                                  nir_metadata_control_flow, (void *)key);
    }
+   nir_inline_sysval(b->shader, nir_intrinsic_load_index_size_poly,
+                     key->sw_index_size_B);
 
    /* Finally, lower uniforms according to our ABI */
    unsigned nr = DIV_ROUND_UP(BITSET_LAST_BIT(key->component_mask), 4);
@@ -473,8 +476,8 @@ agx_nir_fs_epilog(nir_builder *b, const void *key_)
 
    /* Alpha-to-coverage must be lowered before alpha-to-one */
    if (key->blend.alpha_to_coverage)
-      NIR_PASS(_, b->shader, nir_lower_alpha_to_coverage, tib.nr_samples,
-               false, NULL);
+      NIR_PASS(_, b->shader, nir_lower_alpha_to_coverage, tib.nr_samples, false,
+               NULL);
 
    /* Depth/stencil writes must be deferred until after all discards,
     * particularly alpha-to-coverage.

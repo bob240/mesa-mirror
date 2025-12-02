@@ -99,18 +99,37 @@ brw_emit_tcs_thread_end(brw_shader &s)
 
    const brw_builder bld = brw_builder(&s);
 
-   /* Emit a URB write to end the thread.  On Broadwell, we use this to write
-    * zero to the "TR DS Cache Disable" bit (we haven't implemented a fancy
-    * algorithm to set it optimally).  On other platforms, we simply write
-    * zero to a reserved/MBZ patch header DWord which has no consequence.
+   /* Otherwise, we emit a URB write which writes zero to a reserved/MBZ
+    * patch header DWord to end the thread.  We use DWord 0 for legacy
+    * layouts, and DWord 6 for reversed layouts.
     */
+   const bool reversed = s.devinfo->ver >= 12;
+   unsigned components = 1;
+   unsigned offset = 0;
+
    brw_reg srcs[URB_LOGICAL_NUM_SRCS];
    srcs[URB_LOGICAL_SRC_HANDLE] = s.tcs_payload().patch_urb_output;
-   srcs[URB_LOGICAL_SRC_CHANNEL_MASK] = brw_imm_ud(WRITEMASK_X);
    srcs[URB_LOGICAL_SRC_DATA] = brw_imm_ud(0);
+
+   if (s.devinfo->ver >= 20) {
+      offset = 28; /* .z of slot 1 */
+   } else if (reversed) {
+      srcs[URB_LOGICAL_SRC_CHANNEL_MASK] = brw_imm_ud(WRITEMASK_Z);
+
+      brw_reg zeroes[3] = { brw_imm_ud(0), brw_imm_ud(0), brw_imm_ud(0) };
+      srcs[URB_LOGICAL_SRC_DATA] = bld.vgrf(BRW_TYPE_UD, 3);
+      bld.VEC(srcs[URB_LOGICAL_SRC_DATA], zeroes, 3);
+
+      components = 3;
+      offset = 1;
+   } else {
+      srcs[URB_LOGICAL_SRC_CHANNEL_MASK] = brw_imm_ud(WRITEMASK_X);
+   }
+
    brw_urb_inst *urb = bld.URB_WRITE(srcs, ARRAY_SIZE(srcs));
    urb->eot = true;
-   urb->components = 1;
+   urb->offset = offset;
+   urb->components = components;
 }
 
 static void
@@ -211,7 +230,7 @@ brw_compile_tcs(const struct brw_compiler *compiler,
                             key->separate_tess_vue_layout);
 
    brw_nir_apply_key(nir, compiler, &key->base, dispatch_width);
-   brw_nir_lower_vue_inputs(nir, &input_vue_map);
+   brw_nir_lower_tcs_inputs(nir, devinfo, &input_vue_map);
    brw_nir_lower_tcs_outputs(nir, devinfo, &vue_prog_data->vue_map,
                              key->_tes_primitive_mode);
    intel_nir_lower_patch_vertices_in(nir, key->input_vertices);
@@ -263,7 +282,7 @@ brw_compile_tcs(const struct brw_compiler *compiler,
       return NULL;
 
    /* URB entry sizes are stored as a multiple of 64 bytes. */
-   vue_prog_data->urb_entry_size = ALIGN(output_size_bytes, 64) / 64;
+   vue_prog_data->urb_entry_size = align(output_size_bytes, 64) / 64;
 
    /* HS does not use the usual payload pushing from URB to GRFs,
     * because we don't have enough registers for a full-size payload, and

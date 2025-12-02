@@ -38,6 +38,7 @@
 #include "draw/draw_context.h"
 #include "gallivm/lp_bld_type.h"
 #include "gallivm/lp_bld_nir.h"
+#include "gallivm/lp_bld_init.h"
 #include "util/disk_cache.h"
 #include "util/hex.h"
 #include "util/os_misc.h"
@@ -369,6 +370,7 @@ llvmpipe_init_screen_caps(struct pipe_screen *screen)
    caps->texture_multisample = true;
    caps->sample_shading = true;
    caps->gl_spirv = true;
+   caps->depth_bounds_test = true;
    caps->post_depth_coverage = true;
    caps->shader_clock = true;
    caps->packed_uniforms = true;
@@ -496,7 +498,7 @@ static const struct nir_shader_compiler_options gallivm_nir_options = {
 
 static void
 llvmpipe_finalize_nir(struct pipe_screen *screen,
-                      struct nir_shader *nir)
+                      struct nir_shader *nir, bool optimize)
 {
    lp_build_opt_nir(nir);
 }

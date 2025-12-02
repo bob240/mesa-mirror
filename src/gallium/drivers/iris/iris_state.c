@@ -5258,6 +5258,10 @@ iris_store_tes_state(const struct intel_device_info *devinfo,
 #endif
       te.OutputTopology = tes_data->output_topology;
       te.TEDomain = tes_data->domain;
+#if GFX_VER >= 12
+      te.PatchHeaderLayout = tes_data->domain == INTEL_TESS_DOMAIN_TRI ?
+                             REVERSED_TRI_INSIDE_SEPARATE : REVERSED;
+#endif
       te.TEEnable = true;
       te.MaximumTessellationFactorOdd = 63.0;
       te.MaximumTessellationFactorNotOdd = 64.0;
@@ -5970,7 +5974,7 @@ pin_scratch_space(struct iris_context *ice,
       scratch_addr = ref->offset +
                      iris_resource_bo(ref->res)->address -
                      IRIS_MEMZONE_SCRATCH_START;
-      assert((scratch_addr & 0x3f) == 0 && scratch_addr < (1 << 26));
+      assert(util_is_aligned(scratch_addr, 64) && scratch_addr < (1 << 26));
 #else
       scratch_addr = scratch_bo->address;
 #endif
@@ -6905,6 +6909,34 @@ emit_wa_18020335297_dummy_draw(struct iris_batch *batch)
 }
 
 static void
+setup_autostrip_state(struct iris_context *ice,
+                      struct iris_batch *batch,
+                      bool enable)
+{
+#if GFX_VERx10 >= 200
+   if (ice->state.autostrip_state != enable) {
+      iris_emit_pipe_control_flush(batch,
+                                   "Wa_14024997852",
+                                   PIPE_CONTROL_CS_STALL);
+      /* VF */
+      iris_emit_reg(batch, GENX(VFL_SCRATCH_PAD), vfl) {
+         vfl.AutostripDisable = !enable;
+         vfl.PartialAutostripDisable = !enable;
+         vfl.AutostripDisableMask = true;
+         vfl.PartialAutostripDisableMask = true;
+      }
+      /* TE and Mesh. */
+      iris_emit_reg(batch, GENX(FF_MODE), ff) {
+         ff.TEAutostripDisable = !enable;
+         ff.MeshShaderAutostripDisable = !enable;
+         ff.MeshShaderPartialAutostripDisable = !enable;
+      }
+      ice->state.autostrip_state = enable;
+   }
+#endif
+}
+
+static void
 iris_upload_dirty_render_state(struct iris_context *ice,
                                struct iris_batch *batch,
                                const struct pipe_draw_info *draw,
@@ -6938,6 +6970,28 @@ iris_upload_dirty_render_state(struct iris_context *ice,
    struct iris_binder *binder = &ice->state.binder;
    struct iris_fs_data *fs_data =
       iris_fs_data(ice->shaders.prog[MESA_SHADER_FRAGMENT]);
+
+   /* Wa_14024997852: When Draw Cut Index or primitive id is enabled
+    * and topology is tri list, we need to toggle autostrip.
+    *
+    * Note that we do not take primitive id in to account because it
+    * is mentioned only in xe2 clone of this wa and autostrip has been
+    * disabled globally on xe2 (+xe3 a0) by kernel due to 14021490052
+    * workaround.
+    */
+   if (intel_needs_workaround(batch->screen->devinfo, 14024997852) &&
+       dirty & (IRIS_DIRTY_VF | IRIS_DIRTY_VF_TOPOLOGY)) {
+      bool tri_list_topology =
+         translate_prim_type(draw->mode, ice->state.vertices_per_patch) ==
+         _3DPRIM_TRILIST;
+
+      /* Enable autostrip unless having triangle list topology and
+       * IndexedDrawCutIndexEnable (only used on primitive_restart).
+       */
+      setup_autostrip_state(ice, batch,
+                            tri_list_topology &&
+                            draw->primitive_restart);
+   }
 
    /* When MSAA is enabled, instead of using BLENDFACTOR_ZERO use
     * CONST_COLOR, CONST_ALPHA and supply zero by using blend constants.
@@ -9335,7 +9389,7 @@ iris_upload_gpgpu_walker(struct iris_context *ice,
          vfe.URBEntryAllocationSize = 2;
 
          vfe.CURBEAllocationSize =
-            ALIGN(cs_data->push.per_thread.regs * dispatch.threads +
+            align(cs_data->push.per_thread.regs * dispatch.threads +
                   cs_data->push.cross_thread.regs, 2);
       }
    }
@@ -9353,15 +9407,15 @@ iris_upload_gpgpu_walker(struct iris_context *ice,
       uint32_t *curbe_data_map =
          stream_state(batch, ice->state.dynamic_uploader,
                       &ice->state.last_res.cs_thread_ids,
-                      ALIGN(push_const_size, 64), 64,
+                      align(push_const_size, 64), 64,
                       &curbe_data_offset);
       assert(curbe_data_map);
-      memset(curbe_data_map, 0x5a, ALIGN(push_const_size, 64));
+      memset(curbe_data_map, 0x5a, align(push_const_size, 64));
       iris_fill_cs_push_const_buffer(screen, shader, dispatch.threads,
                                      curbe_data_map);
 
       iris_emit_cmd(batch, GENX(MEDIA_CURBE_LOAD), curbe) {
-         curbe.CURBETotalDataLength = ALIGN(push_const_size, 64);
+         curbe.CURBETotalDataLength = align(push_const_size, 64);
          curbe.CURBEDataStartAddress = curbe_data_offset;
       }
    }
@@ -9899,6 +9953,16 @@ iris_emit_raw_pipe_control(struct iris_batch *batch,
       iris_batch_sync_region_end(batch);
       return;
    }
+#endif
+
+#if GFX_VER >= 12
+   /* BSpec 47112 (xe), 56551 (xe2): Instruction_PIPE_CONTROL (ComputeCS):
+    * SW must follow below programming restrictions when programming
+    * PIPE_CONTROL command:
+    *   "Command Streamer Stall Enable" must be always set.
+    */
+   if (batch->name == IRIS_BATCH_COMPUTE)
+      flags |= PIPE_CONTROL_CS_STALL;
 #endif
 
    /* The "L3 Read Only Cache Invalidation Bit" docs say it "controls the

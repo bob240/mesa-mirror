@@ -103,7 +103,7 @@ lower_urb_read_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
     * Add the (OWord) offset of the write to this value.
     */
    if (urb->offset) {
-      bld.ADD(payload, payload, brw_imm_ud(urb->offset * 16));
+      bld.ADD(payload, payload, brw_imm_ud(urb->offset));
       urb->offset = 0;
    }
 
@@ -224,7 +224,7 @@ lower_urb_write_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
     * Add the (OWord) offset of the write to this value.
     */
    if (urb->offset) {
-      bld.ADD(payload, payload, brw_imm_ud(urb->offset * 16));
+      bld.ADD(payload, payload, brw_imm_ud(urb->offset));
       urb->offset = 0;
    }
 
@@ -953,6 +953,7 @@ lower_sampler_logical_send(const brw_builder &bld, brw_tex_inst *tex)
    send->mlen = mlen;
    send->header_size = header_size;
    send->sfid = BRW_SFID_SAMPLER;
+   send->bindless_surface = surface_bindless;
    uint sampler_ret_type = brw_type_size_bits(send->dst.type) == 16
       ? GFX8_SAMPLER_RETURN_FORMAT_16BITS
       : GFX8_SAMPLER_RETURN_FORMAT_32BITS;
@@ -992,7 +993,6 @@ lower_sampler_logical_send(const brw_builder &bld, brw_tex_inst *tex)
        * we can use the surface handle directly as the extended descriptor.
        */
       send->src[SEND_SRC_EX_DESC] = retype(surface, BRW_TYPE_UD);
-      send->ex_bso = compiler->extended_bindless_surface_offset;
    } else {
       /* Immediate portion of the descriptor */
       send->desc = brw_sampler_desc(devinfo,
@@ -1072,8 +1072,6 @@ static void
 setup_surface_descriptors(const brw_builder &bld, brw_send_inst *send, uint32_t desc,
                           const brw_reg &surface, const brw_reg &surface_handle)
 {
-   const brw_compiler *compiler = bld.shader->compiler;
-
    /* We must have exactly one of surface and surface_handle */
    assert((surface.file == BAD_FILE) != (surface_handle.file == BAD_FILE));
 
@@ -1090,7 +1088,6 @@ setup_surface_descriptors(const brw_builder &bld, brw_send_inst *send, uint32_t 
        * we can use the surface handle directly as the extended descriptor.
        */
       send->src[SEND_SRC_EX_DESC] = retype(surface_handle, BRW_TYPE_UD);
-      send->ex_bso = compiler->extended_bindless_surface_offset;
    } else {
       send->desc = desc;
       const brw_builder ubld = bld.uniform();
@@ -1099,6 +1096,8 @@ setup_surface_descriptors(const brw_builder &bld, brw_send_inst *send, uint32_t 
       send->src[SEND_SRC_DESC] = component(tmp, 0);
       send->src[SEND_SRC_EX_DESC] = brw_imm_ud(0);
    }
+
+   send->bindless_surface = surface_handle.file != BAD_FILE;
 }
 
 static void
@@ -1107,7 +1106,6 @@ setup_lsc_surface_descriptors(const brw_builder &bld, brw_send_inst *send,
                               int32_t base_offset)
 {
    const ASSERTED intel_device_info *devinfo = bld.shader->devinfo;
-   const brw_compiler *compiler = bld.shader->compiler;
 
    assert(base_offset == 0 || devinfo->ver >= 20);
 
@@ -1123,19 +1121,19 @@ setup_lsc_surface_descriptors(const brw_builder &bld, brw_send_inst *send,
    const unsigned base_offset_bits =
       util_bitpack_sint(base_offset, 0, max_imm_bits - 1);
 
+   /* On Gfx20+ UGM always uses ExBSO which implies bindless. */
+   send->bindless_surface =
+      surf_type == LSC_ADDR_SURFTYPE_BSS ||
+      (devinfo->ver >= 20 && surf_type == LSC_ADDR_SURFTYPE_SS);
+
    switch (surf_type) {
    case LSC_ADDR_SURFTYPE_BSS:
-      send->ex_bso = compiler->extended_bindless_surface_offset;
-      FALLTHROUGH;
    case LSC_ADDR_SURFTYPE_SS:
       assert(surface.file != BAD_FILE);
       /* We assume that the driver provided the handle in the top 20 bits so
        * we can use the surface handle directly as the extended descriptor.
        */
       send->src[SEND_SRC_EX_DESC] = retype(surface, BRW_TYPE_UD);
-      /* Gfx20+ assumes ExBSO with UGM */
-      if (devinfo->ver >= 20 && send->sfid == BRW_SFID_UGM)
-         send->ex_bso = true;
 
       /* We're already using the extended descriptor to hold the surface
        * handle. But now the immediate extended descriptor bits in the
@@ -1407,7 +1405,6 @@ static void
 lower_hdc_memory_logical_send(const brw_builder &bld, brw_mem_inst *mem)
 {
    const intel_device_info *devinfo = bld.shader->devinfo;
-   const brw_compiler *compiler = bld.shader->compiler;
 
    /* Get the logical send arguments. */
    brw_reg binding = mem->src[MEMORY_LOGICAL_BINDING];
@@ -1643,6 +1640,8 @@ lower_hdc_memory_logical_send(const brw_builder &bld, brw_mem_inst *mem)
       send->exec_size = components > 8 ? 16 : 8;
    }
 
+   send->bindless_surface = binding_type == LSC_ADDR_SURFTYPE_BSS;
+
    /* Set up descriptors */
    switch (binding_type) {
    case LSC_ADDR_SURFTYPE_FLAT:
@@ -1650,8 +1649,6 @@ lower_hdc_memory_logical_send(const brw_builder &bld, brw_mem_inst *mem)
       send->src[SEND_SRC_EX_DESC] = brw_imm_ud(0);
       break;
    case LSC_ADDR_SURFTYPE_BSS:
-      send->ex_bso = compiler->extended_bindless_surface_offset;
-      FALLTHROUGH;
    case LSC_ADDR_SURFTYPE_SS:
       desc |= GFX9_BTI_BINDLESS;
 
@@ -1713,8 +1710,9 @@ lower_lsc_varying_pull_constant_logical_send(const brw_builder &bld,
    inst = NULL;
 
    send->sfid = BRW_SFID_UGM;
-   send->ex_bso = surf_type == LSC_ADDR_SURFTYPE_BSS &&
-                       compiler->extended_bindless_surface_offset;
+   send->bindless_surface =
+      surf_type == LSC_ADDR_SURFTYPE_BSS ||
+      (devinfo->ver >= 20 && surf_type == LSC_ADDR_SURFTYPE_SS);
 
    assert(!compiler->indirect_ubos_use_sampler);
 
@@ -2199,11 +2197,6 @@ lower_lsc_memory_fence_and_interlock(const brw_builder &bld, struct brw_send_ins
       enum lsc_flush_type flush_type =
          lsc_fence_msg_desc_flush_type(devinfo, intrinsic_desc);
 
-      if (send->sfid == BRW_SFID_TGM) {
-         scope = LSC_FENCE_TILE;
-         flush_type = LSC_FLUSH_TYPE_EVICT;
-      }
-
       /* Wa_14012437816:
        *
        *   "For any fence greater than local scope, always set flush type to
@@ -2429,8 +2422,7 @@ brw_lower_uniform_pull_constant_loads(brw_shader &s)
                                    LSC_CACHE(devinfo, LOAD, L1STATE_L3MOCS));
 
          send->mlen = lsc_msg_addr_len(devinfo, LSC_ADDR_SIZE_A32, 1);
-         send->ex_bso = surface_handle.file != BAD_FILE &&
-                             s.compiler->extended_bindless_surface_offset;
+         send->bindless_surface = surface_handle.file != BAD_FILE;
          send->ex_mlen = 0;
          send->header_size = 0;
          send->has_side_effects = false;
@@ -2525,17 +2517,18 @@ brw_lower_send_descriptors(brw_shader &s)
       uint32_t ex_desc_imm = send->ex_desc |
          brw_message_ex_desc(devinfo, send->ex_mlen);
 
-      if (ex_desc.file == IMM)
+      if (ex_desc.file == IMM && !send->bindless_surface)
          ex_desc_imm |= ex_desc.ud;
 
       bool needs_addr_reg = false;
-      if (ex_desc.file != IMM)
+      if (ex_desc.file != IMM || send->bindless_surface)
          needs_addr_reg = true;
       if (devinfo->ver < 12 && ex_desc.file == IMM &&
           (ex_desc_imm & INTEL_MASK(15, 12)) != 0)
          needs_addr_reg = true;
 
-      if (send->ex_bso) {
+      if (send->bindless_surface &&
+          s.compiler->extended_bindless_surface_offset) {
          needs_addr_reg = true;
          /* When using the extended bindless offset, the whole extended
           * descriptor is the surface handle.
@@ -2549,7 +2542,7 @@ brw_lower_send_descriptors(brw_shader &s)
       if (needs_addr_reg) {
          brw_reg addr_reg = ubld.vaddr(BRW_TYPE_UD,
                                        BRW_ADDRESS_SUBREG_INDIRECT_EX_DESC);
-         if (ex_desc.file == IMM)
+         if (ex_desc.file == IMM && !send->bindless_surface)
             ubld.MOV(addr_reg, brw_imm_ud(ex_desc_imm));
          else if (ex_desc_imm == 0)
             ubld.MOV(addr_reg, ex_desc);

@@ -248,44 +248,6 @@ typedef enum IntraRefreshMode
    HMFT_INTRA_REFRESH_MODE_MAX
 } IntraRefreshMode;
 
-// IMFVideoSampleAllocatorEx only works with MFVideoFormat.
-#ifndef MFVideoFormat_L32
-DEFINE_MEDIATYPE_GUID( MFVideoFormat_L32, D3DFMT_INDEX32 );
-#endif
-
-#ifndef CODECAPI_AVEncVideoEnableFramePsnrYuv
-// AVEncVideoEnableFramePsnrYuv (BOOL)
-// Indicates whether to enable or disable reporting frame PSNR of YUV planes for video encoding.
-// VARIANT_FALSE: disable; VARIANT_TRUE: enable
-DEFINE_CODECAPI_GUID( AVEncVideoEnableFramePsnrYuv,
-                      "2BBCDD1D-BC47-430E-B2E8-64801B47F5F0",
-                      0x2bbcdd1d,
-                      0xbc47,
-                      0x430e,
-                      0xb2,
-                      0xe8,
-                      0x64,
-                      0x80,
-                      0x1b,
-                      0x47,
-                      0xf5,
-                      0xf0 )
-#define CODECAPI_AVEncVideoEnableFramePsnrYuv DEFINE_CODECAPI_GUIDNAMED( AVEncVideoEnableFramePsnrYuv )
-
-typedef struct _MFSampleExtensionPsnrYuv
-{
-   FLOAT psnrY;   // PSNR for Y plane
-   FLOAT psnrU;   // PSNR for U plane
-   FLOAT psnrV;   // PSNR for V plane
-} MFSampleExtensionPsnrYuv;
-
-// MFSampleExtension_FramePsnrYuv {1C633A3D-566F-4752-833B-2907DF5415E1}
-// Type: IMFMediaBuffer
-// A MFSampleExtensionPsnrYuv structure that specifies the PSNR data of YUV planes of an encoded video frame.
-DEFINE_GUID( MFSampleExtension_FramePsnrYuv, 0x1c633a3d, 0x566f, 0x4752, 0x83, 0x3b, 0x29, 0x07, 0xdf, 0x54, 0x15, 0xe1 );
-
-#endif
-
 #ifndef CODECAPI_AVEncVideoEnableSpatialAdaptiveQuantization
 // AVEncVideoEnableSpatialAdaptiveQuantization (BOOL)
 // Indicates whether to enable or disable spatial adaptive quantization for video encoding.
@@ -385,6 +347,33 @@ DEFINE_CODECAPI_GUID( AVEncVideoSatdMapBlockSize,
 // Type: IMFMediaBuffer
 // The SATD map of an encoded video frame.
 DEFINE_GUID( MFSampleExtension_VideoEncodeSatdMap, 0xadf61d96, 0xc2d3, 0x4b57, 0xa1, 0x38, 0xdd, 0xe4, 0xd3, 0x51, 0xea, 0xa9 );
+
+#endif
+
+// MFSampleExtension_VideoEncodeReconstructedPicture {3E8A1B7F-5C92-4D6E-B834-F0A729E65C48}
+// Type: IMFMediaBuffer
+// The reconstructed picture data of an encoded video frame (Experimental).
+DEFINE_GUID(
+   MFSampleExtension_VideoEncodeReconstructedPicture, 0x3e8a1b7f, 0x5c92, 0x4d6e, 0xb8, 0x34, 0xf0, 0xa7, 0x29, 0xe6, 0x5c, 0x48 );
+
+#ifndef CODECAPI_AVEncVideoReconstructedPictureOutputMode
+// AVEncVideoReconstructedPictureOutputMode (VT_UI4) (Experimental, Testing only)
+// Specifies the reconstructed picture output mode for video encoding.
+// 0: disable; 1: blit copy; 2: read-only shared resource
+DEFINE_CODECAPI_GUID( AVEncVideoReconstructedPictureOutputMode,
+                      "4A7B2E8F-1D93-4C6A-B548-91E2F8C5A7D3",
+                      0x4a7b2e8f,
+                      0x1d93,
+                      0x4c6a,
+                      0xb5,
+                      0x48,
+                      0x91,
+                      0xe2,
+                      0xf8,
+                      0xc5,
+                      0xa7,
+                      0xd3 )
+#define CODECAPI_AVEncVideoReconstructedPictureOutputMode DEFINE_CODECAPI_GUIDNAMED( AVEncVideoReconstructedPictureOutputMode )
 
 #endif
 
@@ -559,6 +548,8 @@ DEFINE_CODECAPI_GUID( AVEncWorkProcessPriority,
 #endif
 
 #define MFT_INPUT_QUEUE_DEPTH 8
+#define MFT_STAT_POOL_MIN_SIZE                                                                                                     \
+   2   // when MFSample is destroyed, the stat texture is returned via some other threads and it could be after ProcessInput.
 
 class __declspec( uuid( HMFT_GUID ) ) CDX12EncHMFT : CMFD3DManager,
                                                      public RuntimeClass<RuntimeClassFlags<RuntimeClassType::WinRtClassicComMix>,
@@ -600,12 +591,6 @@ class __declspec( uuid( HMFT_GUID ) ) CDX12EncHMFT : CMFD3DManager,
    HRESULT OnFlush();
 
    HRESULT ConfigureSampleAllocator();
-   HRESULT ConfigureMapSampleAllocator(
-      IMFVideoSampleAllocatorEx *spAllocator, UINT32 width, UINT32 height, GUID subtype, UINT32 poolSize );
-   void ConfigureMapSampleAllocatorHelper( ComPtr<IMFVideoSampleAllocatorEx> &allocator,
-                                           const union pipe_enc_cap_gpu_stats_map &outputStatsMap,
-                                           uint32_t blockSize,
-                                           BOOL &useAllocatorFlag );
    HRESULT ConfigureBitstreamOutputSampleAttributes( IMFSample *pSample,
                                                      const LPDX12EncodeContext pDX12EncodeContext,
                                                      DWORD dwReceivedInput,
@@ -619,13 +604,19 @@ class __declspec( uuid( HMFT_GUID ) ) CDX12EncHMFT : CMFD3DManager,
                                                               pipe_resource *pPipeResourceSATDMapStats,
                                                               ComPtr<ID3D12Fence> &pResolveStatsCompletionFence,
                                                               UINT64 ResolveStatsCompletionFenceValue,
+                                                              pipe_resource *pPipeResourceReconstructedPicture,
+                                                              UINT PipeResourceReconstructedPictureSubresource,
+                                                              ComPtr<ID3D12Fence> &spReconstructedPictureCompletionFence,
+                                                              UINT64 ReconstructedPictureCompletionFenceValue,
                                                               ID3D12CommandQueue *pSyncObjectQueue );
-   void GetSliceBitstreamMetadata( LPDX12EncodeContext pDX12EncodeContext, uint32_t slice_idx, std::vector<struct codec_unit_location_t> &codec_unit_metadata );
-   void ProcessSliceBitstreamZeroCopy( LPDX12EncodeContext pDX12EncodeContext,
+   bool GetSliceBitstreamMetadata( LPDX12EncodeContext pDX12EncodeContext,
+                                   uint32_t slice_idx,
+                                   std::vector<struct codec_unit_location_t> &codec_unit_metadata );
+   bool ProcessSliceBitstreamZeroCopy( LPDX12EncodeContext pDX12EncodeContext,
                                        uint32_t slice_idx,
                                        ComPtr<IMFMediaBuffer> &spMediaBuffer,
                                        std::vector<struct codec_unit_location_t> &mfsample_codec_unit_metadata );
-      void FinalizeAndEmitOutputSample( LPDX12EncodeContext pDX12EncodeContext,
+   void FinalizeAndEmitOutputSample( LPDX12EncodeContext pDX12EncodeContext,
                                      ComPtr<IMFMediaBuffer> &spMediaBuffer,
                                      ComPtr<IMFSample> &spOutputSample,
                                      struct codec_unit_location_t *pCodecUnitMetadata,
@@ -633,6 +624,7 @@ class __declspec( uuid( HMFT_GUID ) ) CDX12EncHMFT : CMFD3DManager,
                                      DWORD dwReceivedInput,
                                      BOOL bIsLastSlice,
                                      uint64_t ResolveStatsCompletionFenceValue );
+
    HRESULT UpdateAvailableInputType();
    HRESULT InternalCheckInputType( IMFMediaType *pType );
    HRESULT InternalCheckOutputType( IMFMediaType *pType );
@@ -769,6 +761,15 @@ class __declspec( uuid( HMFT_GUID ) ) CDX12EncHMFT : CMFD3DManager,
    UINT32 m_uiVideoOutputQPMapBlockSize = 0;
    UINT32 m_uiVideoOutputBitsUsedMapBlockSize = 0;
    UINT32 m_uiVideoSatdMapBlockSize = 0;
+
+   typedef enum RECON_PIC_OUTPUT_MODE
+   {
+      RECON_PIC_OUTPUT_MODE_DISABLED = 0,
+      RECON_PIC_OUTPUT_MODE_BLIT_COPY = 1,
+      RECON_PIC_OUTPUT_MODE_READ_ONLY_SHARED_RESOURCE = 2,
+   } RECON_PIC_OUTPUT_MODE;
+
+   RECON_PIC_OUTPUT_MODE m_VideoReconstructedPictureMode = RECON_PIC_OUTPUT_MODE_DISABLED;
 
    UINT32 m_uiSliceGenerationMode = 0;
    BOOL m_bSliceGenerationModeSet = FALSE;

@@ -102,7 +102,8 @@ begin_end_tp('render_pass',
           Arg(type='uint8_t',  var='loadCPP',     c_format='%u'),
           Arg(type='uint8_t',  var='storeCPP',    c_format='%u'),
           Arg(type='bool',     var='hasDepth',    c_format='%s', to_prim_type='({} ? "true" : "false")'),
-          Arg(type='str',      var='ubwc',        c_format='%s', length_arg='11', copy_func='strncpy'),],
+          Arg(type='str',      var='ubwc',        c_format='%s', length_arg='11', copy_func='strncpy'),
+          Arg(type='const char *', var='cbDisableReason', c_format='%s'),],
     tp_struct=[Arg(type='uint16_t', name='width',               var='fb->width',                                            c_format='%u'),
                Arg(type='uint16_t', name='height',              var='fb->height',                                           c_format='%u'),
                Arg(type='uint8_t',  name='attachment_count',    var='fb->attachment_count',                                 c_format='%u'),
@@ -135,8 +136,10 @@ begin_end_tp('draw',
               ], tp_default_enabled=False)
 
 begin_end_tp('binning_ib')
+begin_end_tp('concurrent_binning_ib')
 begin_end_tp('draw_ib_sysmem')
 begin_end_tp('draw_ib_gmem')
+begin_end_tp('concurrent_binning_barrier')
 
 begin_end_tp('generic_clear',
     args=[Arg(type='enum VkFormat',  var='format',  c_format='%s', to_prim_type='vk_format_description({})->short_name'),

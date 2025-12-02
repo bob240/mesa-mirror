@@ -119,7 +119,7 @@ dxil_spirv_nir_prep(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_deref);
 
    /* Pick off the single entrypoint that we want */
@@ -905,6 +905,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
       .frag_coord = true,
       .point_coord = true,
       .front_face = true,
+      .layer_id = true,
    };
    NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals_to_varyings);
 
@@ -966,10 +967,11 @@ dxil_spirv_nir_passes(nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_input_attachments,
                  &(nir_input_attachment_options){
-                     .use_fragcoord_sysval = false,
-                     .use_layer_id_sysval = !conf->lower_view_index,
                      .use_view_id_for_layer = !conf->lower_view_index,
                  });
+
+      /* Lower sysvals again to get rid of load_layer_id */
+      NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals_to_varyings);
 
       NIR_PASS(_, nir, dxil_nir_lower_discard_and_terminate);
       NIR_PASS(_, nir, nir_lower_returns);
@@ -1027,7 +1029,8 @@ dxil_spirv_nir_passes(nir_shader *nir,
    NIR_PASS(_, nir, dxil_nir_lower_int_cubemaps, false);
 
    NIR_PASS(_, nir, nir_lower_clip_cull_distance_array_vars);
-   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir), true, true);
+   NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir),
+            nir_var_shader_out | nir_var_shader_in);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -1064,7 +1067,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
       do
       {
          progress = false;
-         NIR_PASS(progress, nir, nir_copy_prop);
+         NIR_PASS(progress, nir, nir_opt_copy_prop);
          NIR_PASS(progress, nir, nir_opt_copy_prop_vars);
          NIR_PASS(progress, nir, nir_opt_deref);
          NIR_PASS(progress, nir, nir_opt_dce);
@@ -1073,7 +1076,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
          NIR_PASS(progress, nir, nir_opt_cse);
          if (nir_opt_loop(nir)) {
             progress = true;
-            NIR_PASS(progress, nir, nir_copy_prop);
+            NIR_PASS(progress, nir, nir_opt_copy_prop);
             NIR_PASS(progress, nir, nir_opt_dce);
          }
          NIR_PASS(progress, nir, nir_lower_vars_to_ssa);

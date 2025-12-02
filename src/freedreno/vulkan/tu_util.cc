@@ -54,6 +54,8 @@ static const struct debug_control tu_debug_options[] = {
    { "check_cmd_buffer_status", TU_DEBUG_CHECK_CMD_BUFFER_STATUS },
    { "comm", TU_DEBUG_COMM },
    { "nofdm", TU_DEBUG_NOFDM },
+   { "nocb", TU_DEBUG_NO_CONCURRENT_BINNING },
+   { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
    { NULL, 0 }
 };
 
@@ -272,7 +274,7 @@ tu_tiling_config_update_tile_layout(struct tu_framebuffer *fb,
 
       /* Check that we did the math right. */
       min_layer_stride = tile_align_h * tile_align_w * pass->min_cpp;
-      assert(align(min_layer_stride, gmem_align) == min_layer_stride);
+      assert(util_is_aligned(min_layer_stride, gmem_align));
    }
 
    /* will force to sysmem, don't bother trying to have a valid tile config
@@ -287,11 +289,12 @@ tu_tiling_config_update_tile_layout(struct tu_framebuffer *fb,
    /* There aren't that many different tile widths possible, so just walk all
     * of them finding which produces the lowest number of bins.
     */
-   const uint32_t max_tile_width = MIN2(
-      dev->physical_device->info->tile_max_w, util_align_npot(fb->width, tile_align_w));
+   const uint32_t max_tile_width =
+      MIN3(dev->physical_device->info->tile_max_w,
+           util_align_npot(fb->width, tile_align_w), fb->max_tile_w_constraint);
    const uint32_t max_tile_height =
-      MIN2(dev->physical_device->info->tile_max_h,
-           align(fb->height, tile_align_h));
+      MIN3(dev->physical_device->info->tile_max_h,
+           align(fb->height, tile_align_h), fb->max_tile_h_constraint);
    for (tile_size.width = tile_align_w; tile_size.width <= max_tile_width;
         tile_size.width += tile_align_w) {
       tile_size.height = pass->gmem_pixels[gmem_layout] / (tile_size.width * layers);
@@ -376,7 +379,7 @@ tu_tiling_config_update_pipe_layout(struct tu_vsc_config *vsc,
     * area can prevent bin merging from happening. Maximize the size of each
     * pipe instead of minimizing it.
     */
-   if (fdm && dev->physical_device->info->a6xx.has_bin_mask &&
+   if (fdm && dev->physical_device->info->props.has_bin_mask &&
        !TU_DEBUG(NO_BIN_MERGING)) {
       vsc->pipe0.width = 4;
       vsc->pipe0.height = 8;

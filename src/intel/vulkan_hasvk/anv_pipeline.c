@@ -90,7 +90,7 @@ anv_shader_stage_to_nir(struct anv_device *device,
    }
 
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
-              nir_shader_get_entrypoint(nir), true, false);
+              nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
    const struct nir_lower_sysvals_to_varyings_options sysvals_to_varyings = {
       .point_coord = true,
@@ -477,10 +477,7 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_wpos_center);
       NIR_PASS(_, nir, nir_lower_input_attachments,
-               &(nir_input_attachment_options) {
-                   .use_fragcoord_sysval = true,
-                   .use_layer_id_sysval = true,
-               });
+               &(nir_input_attachment_options) { });
    }
 
    NIR_PASS(_, nir, anv_nir_lower_ycbcr_textures, layout);
@@ -521,7 +518,7 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
     * calculations often create and then constant-fold so that, when we
     * get to anv_nir_lower_ubo_loads, we can detect constant offsets.
     */
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
 
    NIR_PASS(_, nir, anv_nir_lower_ubo_loads);
@@ -565,7 +562,7 @@ anv_pipeline_lower_nir(struct anv_pipeline *pipeline,
           * used by the shader to chunk_size -- which does simplify the logic.
           */
          const unsigned chunk_size = 16;
-         const unsigned shared_size = ALIGN(nir->info.shared_size, chunk_size);
+         const unsigned shared_size = align(nir->info.shared_size, chunk_size);
          assert(shared_size <=
                 intel_compute_slm_calculate_size(compiler->devinfo->ver, nir->info.shared_size));
 

@@ -1116,6 +1116,7 @@ void st_init_extensions(struct pipe_screen *screen,
 #else
    EXT_CAP(EXT_semaphore_win32,              fence_signal);
 #endif
+   EXT_CAP(EXT_shader_pixel_local_storage,   shader_pixel_local_storage_size);
    EXT_CAP(EXT_shader_realtime_clock,        shader_realtime_clock);
    EXT_CAP(EXT_shader_samples_identical,     shader_samples_identical);
    EXT_CAP(EXT_texture_array,                max_texture_array_layers);
@@ -1265,7 +1266,9 @@ void st_init_extensions(struct pipe_screen *screen,
        * pipe cap.
        */
       extensions->EXT_gpu_shader4 = GL_TRUE;
-      extensions->EXT_texture_buffer_object = GL_TRUE;
+
+      if (!screen->caps.buffer_sampler_view_rgba_only)
+         extensions->EXT_texture_buffer_object = GL_TRUE;
 
       if (consts->MaxTransformFeedbackBuffers &&
           screen->caps.shader_array_components)
@@ -1330,6 +1333,8 @@ void st_init_extensions(struct pipe_screen *screen,
    } else {
       consts->GLSLZeroInit = screen->caps.glsl_zero_init;
    }
+
+   consts->VertexProgramDefaultOut = options->vertex_program_default_out;
 
    if (extensions->EXT_semaphore) {
       consts->MaxTimelineSemaphoreValueDifference = screen->caps.max_timeline_semaphore_difference;
@@ -1562,7 +1567,7 @@ void st_init_extensions(struct pipe_screen *screen,
        screen->caps.buffer_sampler_view_rgba_only)
       extensions->ARB_texture_buffer_object = GL_FALSE;
 
-   if (extensions->ARB_texture_buffer_object) {
+   if (screen->caps.texture_buffer_objects) {
       consts->MaxTextureBufferSize =
          screen->caps.max_texel_buffer_elements;
       consts->TextureBufferOffsetAlignment =
@@ -1578,7 +1583,7 @@ void st_init_extensions(struct pipe_screen *screen,
 
    extensions->OES_texture_buffer =
       consts->Program[MESA_SHADER_COMPUTE].MaxImageUniforms &&
-      extensions->ARB_texture_buffer_object &&
+      screen->caps.texture_buffer_objects &&
       extensions->ARB_texture_buffer_range &&
       extensions->ARB_texture_buffer_object_rgb32;
 

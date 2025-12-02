@@ -130,6 +130,8 @@ files_mesa_util = files(
   'texcompress_astc_luts.h',
   'texcompress_astc_luts_wrap.cpp',
   'texcompress_astc_luts_wrap.h',
+  'texcompress_astc.cpp',
+  'texcompress_astc.h',
   'timespec.h',
   'u_atomic.c',
   'u_atomic.h',
@@ -194,6 +196,7 @@ elif host_machine.cpu_family() in ['x86', 'x86_64'] and cc.get_id() != 'msvc'
     include_directories : [inc_util],
     c_args : [no_override_init_args, sse2_args],
     gnu_symbol_visibility : 'hidden',
+    build_by_default : false,
   )
   libmesa_util_links += [libmesa_util_clflush]
   if with_clflushopt
@@ -203,6 +206,7 @@ elif host_machine.cpu_family() in ['x86', 'x86_64'] and cc.get_id() != 'msvc'
       include_directories : [inc_util],
       c_args : [no_override_init_args] + clflushopt_args,
       gnu_symbol_visibility : 'hidden',
+      build_by_default : false,
     )
     libmesa_util_links += [libmesa_util_clflushopt]
   endif
@@ -445,6 +449,7 @@ if with_tests
     'tests/register_allocate_test.cpp',
     'tests/roundeven_test.cpp',
     'tests/set_test.cpp',
+    'tests/sparse_bitset_test.cpp',
     'tests/string_buffer_test.cpp',
     'tests/timespec_test.cpp',
     'tests/u_atomic_test.cpp',

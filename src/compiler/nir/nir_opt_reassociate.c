@@ -234,7 +234,7 @@ build_chain(struct chain *c, nir_scalar def, unsigned reserved_count)
           c->length + reserved_plus_remaining + 2 <= MAX_CHAIN_LENGTH) {
 
          /* Any interior nodes cannot be the root */
-         src.def->parent_instr->pass_flags = PASS_FLAG_INTERIOR;
+         nir_def_instr(src.def)->pass_flags = PASS_FLAG_INTERIOR;
 
          /* Recurse, reserving space for the next sources */
          build_chain(c, src, reserved_count + remaining);
@@ -519,7 +519,7 @@ nir_opt_reassociate(nir_shader *nir, nir_reassociate_options opts)
    /* Clear pass flags. All instructions are possible roots, a priori. Interior
     * nodes are indicated with a non-zero pass flags, set as we go.
     */
-   util_dynarray_init(&chains, NULL);
+   chains = UTIL_DYNARRAY_INIT;
    nir_shader_clear_pass_flags(nir);
 
    /* We use nir_def indices, which are function-local, so the algorithm runs on
@@ -590,7 +590,7 @@ nir_opt_reassociate_loop(nir_shader *nir, nir_reassociate_options in_opts)
 
             NIR_PASS(progress, nir, nir_opt_algebraic);
             NIR_PASS(progress, nir, nir_opt_constant_folding);
-            NIR_PASS(progress, nir, nir_copy_prop);
+            NIR_PASS(progress, nir, nir_opt_copy_prop);
             NIR_PASS(progress, nir, nir_opt_cse);
             NIR_PASS(progress, nir, nir_opt_dce);
             any_progress |= progress;

@@ -1038,8 +1038,8 @@ get_descriptor_pool(struct zink_context *ctx, struct zink_program *pg, enum zink
    struct zink_descriptor_pool_multi *mpool = CALLOC_STRUCT(zink_descriptor_pool_multi);
    if (!mpool)
       return NULL;
-   util_dynarray_init(&mpool->overflowed_pools[0], NULL);
-   util_dynarray_init(&mpool->overflowed_pools[1], NULL);
+   mpool->overflowed_pools[0] = UTIL_DYNARRAY_INIT;
+   mpool->overflowed_pools[1] = UTIL_DYNARRAY_INIT;
    mpool->pool_key = pool_key;
    if (!set_pool(bs, pg, mpool, type)) {
       multi_pool_destroy(screen, mpool);
@@ -1727,6 +1727,7 @@ zink_descriptors_deinit(struct zink_context *ctx)
       VKSCR(DestroyDescriptorSetLayout)(screen->dev, ctx->dd.push_dsl[0]->layout, NULL);
    if (ctx->dd.push_dsl[1])
       VKSCR(DestroyDescriptorSetLayout)(screen->dev, ctx->dd.push_dsl[1]->layout, NULL);
+   VKSCR(DestroyDescriptorSetLayout)(screen->dev, ctx->dd.old_push_dsl, NULL);
 }
 
 /* called on screen creation */
@@ -1768,7 +1769,8 @@ zink_descriptor_util_init_fbfetch(struct zink_context *ctx)
       return;
 
    struct zink_screen *screen = zink_screen(ctx->base.screen);
-   VKSCR(DestroyDescriptorSetLayout)(screen->dev, ctx->dd.push_dsl[0]->layout, NULL);
+   /* save this layout; it may be used by programs, and tracking that is extra complexity */
+   ctx->dd.old_push_dsl = ctx->dd.push_dsl[0]->layout;
    //don't free these now, let ralloc free on teardown to avoid invalid access
    //ralloc_free(ctx->dd.push_dsl[0]);
    //ralloc_free(ctx->dd.push_layout_keys[0]);

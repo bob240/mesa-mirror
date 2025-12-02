@@ -315,11 +315,13 @@ try_create_device_factory(struct util_dl_library *d3d12_mod)
       /* It's possible there's a D3D12Core.dll next to the .exe, for development/testing purposes. If so, we'll be notified
       * by environment variables what the relative path is and the version to use.
       */
-      const char *d3d12core_relative_path = getenv("DZN_AGILITY_RELATIVE_PATH");
-      const char *d3d12core_sdk_version = getenv("DZN_AGILITY_SDK_VERSION");
+      char *d3d12core_relative_path = os_get_option_dup("DZN_AGILITY_RELATIVE_PATH");
+      char *d3d12core_sdk_version = os_get_option_dup("DZN_AGILITY_SDK_VERSION");
       if (d3d12core_relative_path && d3d12core_sdk_version) {
          ID3D12SDKConfiguration_SetSDKVersion(sdk_config, atoi(d3d12core_sdk_version), d3d12core_relative_path);
       }
+      free(d3d12core_relative_path);
+      free(d3d12core_sdk_version);
       ID3D12SDKConfiguration_Release(sdk_config);
    }
 #endif
@@ -1799,7 +1801,7 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
    instance->vk.physical_devices.enumerate = dzn_enumerate_physical_devices;
    instance->vk.physical_devices.destroy = dzn_physical_device_destroy;
    instance->debug_flags =
-      parse_debug_string(getenv("DZN_DEBUG"), dzn_debug_options);
+      parse_debug_string(os_get_option("DZN_DEBUG"), dzn_debug_options);
 
 #ifdef _WIN32
    if (instance->debug_flags & DZN_DEBUG_DEBUGGER) {
@@ -1836,13 +1838,13 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
    instance->d3d12_mod = util_dl_open(UTIL_DL_PREFIX "d3d12" UTIL_DL_EXT);
    if (!instance->d3d12_mod) {
       dzn_instance_destroy(instance, pAllocator);
-      return vk_error(NULL, VK_ERROR_INITIALIZATION_FAILED);
+      return vk_error(NULL, VK_ERROR_INCOMPATIBLE_DRIVER);
    }
 
    instance->d3d12.serialize_root_sig = d3d12_get_serialize_root_sig(instance->d3d12_mod);
    if (!instance->d3d12.serialize_root_sig) {
       dzn_instance_destroy(instance, pAllocator);
-      return vk_error(NULL, VK_ERROR_INITIALIZATION_FAILED);
+      return vk_error(NULL, VK_ERROR_INCOMPATIBLE_DRIVER);
    }
 
    instance->factory = try_create_device_factory(instance->d3d12_mod);
@@ -2404,7 +2406,7 @@ dzn_device_create(struct dzn_physical_device *pdev,
          }
 
          mtx_init(&device->device_heaps[type].lock, mtx_plain);
-         util_dynarray_init(&device->device_heaps[type].slot_freelist, NULL);
+         device->device_heaps[type].slot_freelist = UTIL_DYNARRAY_INIT;
          device->device_heaps[type].next_alloc_slot = 0;
       }
    }

@@ -104,10 +104,7 @@ compile_shader(struct anv_device *device,
 
    if (stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_input_attachments,
-                 &(nir_input_attachment_options) {
-                    .use_fragcoord_sysval = true,
-                    .use_layer_id_sysval = true,
-                 });
+                 &(nir_input_attachment_options) { });
    } else {
       nir_lower_compute_system_values_options options = {
          .has_base_workgroup_id = true,
@@ -125,7 +122,7 @@ compile_shader(struct anv_device *device,
    nir->info.shared_size = 0;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
 

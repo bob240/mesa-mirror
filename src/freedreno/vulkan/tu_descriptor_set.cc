@@ -62,9 +62,9 @@ descriptor_size(struct tu_device *dev,
        * two separate descriptors are required.
        */
       return A6XX_TEX_CONST_DWORDS * 4 * (1 +
-         COND(dev->physical_device->info->a6xx.storage_16bit &&
-              !dev->physical_device->info->a6xx.has_isam_v, 1) +
-         COND(dev->physical_device->info->a7xx.storage_8bit, 1));
+         COND(dev->physical_device->info->props.storage_16bit &&
+              !dev->physical_device->info->props.has_isam_v, 1) +
+         COND(dev->physical_device->info->props.storage_8bit, 1));
    case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
       return binding->descriptorCount;
    case VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR:
@@ -602,7 +602,7 @@ tu_descriptor_set_create(struct tu_device *device,
          &layout->binding[layout->binding_count - 1];
       if (binding->type == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK) {
          layout_size = binding->offset +
-            ALIGN(variable_count, 4 * A6XX_TEX_CONST_DWORDS);
+            align(variable_count, 4 * A6XX_TEX_CONST_DWORDS);
       } else {
          uint32_t stride = binding->size;
          layout_size = binding->offset + variable_count * stride;
@@ -617,58 +617,27 @@ tu_descriptor_set_create(struct tu_device *device,
          return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
       }
 
-      /* try to allocate linearly first, so that we don't spend
-       * time looking for gaps if the app only allocates &
-       * resets via the pool. */
-      if (pool->current_offset + layout_size <= pool->size) {
-         set->mapped_ptr = (uint32_t*)(pool_base(pool) + pool->current_offset);
-         set->va = pool->host_bo ? 0 : pool->bo->iova + pool->current_offset;
+      uint64_t current_offset = pool->current_offset;
 
-         if (!pool->host_memory_base) {
-            pool->entries[pool->entry_count].offset = pool->current_offset;
-            pool->entries[pool->entry_count].size = layout_size;
-            pool->entries[pool->entry_count].set = set;
-            pool->entry_count++;
-         }
-         pool->current_offset += layout_size;
-      } else if (!pool->host_memory_base) {
-         uint64_t offset = 0;
-         int index;
+      if (!pool->host_memory_base) {
+         uint64_t pool_vma_offset =
+            util_vma_heap_alloc(&pool->bo_heap, set->size, 1);
+         if (!pool_vma_offset)
+            return vk_error(device, VK_ERROR_FRAGMENTED_POOL);
 
-         for (index = 0; index < pool->entry_count; ++index) {
-            if (pool->entries[index].size == 0)
-               continue;
-
-            if (pool->entries[index].offset - offset >= layout_size)
-               break;
-            offset = pool->entries[index].offset + pool->entries[index].size;
-         }
-
-         if (pool->size - offset < layout_size) {
-            vk_object_free(&device->vk, NULL, set);
+         assert(pool_vma_offset >= TU_POOL_HEAP_OFFSET &&
+                pool_vma_offset <= pool->size + TU_POOL_HEAP_OFFSET);
+         set->offset = pool_vma_offset - TU_POOL_HEAP_OFFSET;
+         current_offset = set->offset;
+      } else {
+         if (current_offset + set->size > pool->size)
             return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
-         }
 
-         set->mapped_ptr = (uint32_t*)(pool_base(pool) + offset);
-         set->va = pool->host_bo ? 0 : pool->bo->iova + offset;
+         pool->current_offset += set->size;
+      }
 
-         memmove(&pool->entries[index + 1], &pool->entries[index],
-            sizeof(pool->entries[0]) * (pool->entry_count - index));
-         pool->entries[index].offset = offset;
-         pool->entries[index].size = layout_size;
-         pool->entries[index].set = set;
-         pool->entry_count++;
-      } else
-         return vk_error(device, VK_ERROR_OUT_OF_POOL_MEMORY);
-   } else if (!pool->host_memory_base) {
-      /* Also keep track of zero sized descriptor sets, such as descriptor
-       * sets with just dynamic descriptors, so that we can free the sets on
-       * vkDestroyDescriptorPool().
-       */
-      pool->entries[pool->entry_count].offset = ~0;
-      pool->entries[pool->entry_count].size = 0;
-      pool->entries[pool->entry_count].set = set;
-      pool->entry_count++;
+      set->mapped_ptr = (uint32_t*)(pool_base(pool) + current_offset);
+      set->va = pool->host_bo ? 0 : pool->bo->iova + current_offset;
    }
 
    if (layout->has_immutable_samplers) {
@@ -693,6 +662,7 @@ tu_descriptor_set_create(struct tu_device *device,
 
    vk_descriptor_set_layout_ref(&layout->vk);
    list_addtail(&set->pool_link, &pool->desc_sets);
+   pool->entry_count++;
 
    *out_set = set;
    return VK_SUCCESS;
@@ -701,30 +671,17 @@ tu_descriptor_set_create(struct tu_device *device,
 static void
 tu_descriptor_set_destroy(struct tu_device *device,
              struct tu_descriptor_pool *pool,
-             struct tu_descriptor_set *set,
-             bool free_bo)
+             struct tu_descriptor_set *set)
 {
    assert(!pool->host_memory_base);
 
-   if (free_bo && !pool->host_memory_base) {
-      for (int i = 0; i < pool->entry_count; ++i) {
-         if (pool->entries[i].set == set) {
-            if (set->size) {
-               ASSERTED uint32_t offset =
-                  (uint8_t *) set->mapped_ptr - pool_base(pool);
-               assert(pool->entries[i].offset == offset);
-            } else {
-               assert(pool->entries[i].size == 0);
-            }
-
-            memmove(&pool->entries[i], &pool->entries[i+1],
-               sizeof(pool->entries[i]) * (pool->entry_count - i - 1));
-            --pool->entry_count;
-            break;
-         }
-      }
+   if (set->size) {
+      util_vma_heap_free(&pool->bo_heap,
+                         (uint64_t) set->offset + TU_POOL_HEAP_OFFSET,
+                         set->size);
    }
 
+   pool->entry_count--;
    vk_object_free(&device->vk, NULL, set);
 }
 
@@ -793,8 +750,6 @@ tu_CreateDescriptorPool(VkDevice _device,
       uint64_t host_size = pCreateInfo->maxSets * sizeof(struct tu_descriptor_set);
       host_size += dynamic_size;
       size += host_size;
-   } else {
-      size += sizeof(struct tu_descriptor_pool_entry) * pCreateInfo->maxSets;
    }
 
    pool = (struct tu_descriptor_pool *) vk_object_zalloc(
@@ -806,6 +761,12 @@ tu_CreateDescriptorPool(VkDevice _device,
       pool->host_memory_base = (uint8_t*)pool + sizeof(struct tu_descriptor_pool);
       pool->host_memory_ptr = pool->host_memory_base;
       pool->host_memory_end = (uint8_t*)pool + size;
+   } else {
+      if (bo_size) {
+         util_vma_heap_init(&pool->bo_heap, TU_POOL_HEAP_OFFSET,
+                            bo_size + TU_POOL_HEAP_OFFSET);
+         pool->bo_heap.alloc_high = false;
+      }
    }
 
    if (bo_size) {
@@ -845,6 +806,20 @@ fail_alloc:
    return ret;
 }
 
+static void
+tu_destroy_descriptor_pool_entries(struct tu_device *device,
+                                   struct tu_descriptor_pool *pool)
+{
+   list_for_each_entry_safe (struct tu_descriptor_set, set, &pool->desc_sets,
+                             pool_link) {
+      vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
+      if (!pool->host_memory_base)
+         tu_descriptor_set_destroy(device, pool, set);
+   }
+
+   list_inithead(&pool->desc_sets);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 tu_DestroyDescriptorPool(VkDevice _device,
                          VkDescriptorPool _pool,
@@ -858,18 +833,12 @@ tu_DestroyDescriptorPool(VkDevice _device,
 
    TU_RMV(resource_destroy, device, pool);
 
-   list_for_each_entry_safe(struct tu_descriptor_set, set,
-                            &pool->desc_sets, pool_link) {
-      vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
-   }
-
-   if (!pool->host_memory_base) {
-      for(int i = 0; i < pool->entry_count; ++i) {
-         tu_descriptor_set_destroy(device, pool, pool->entries[i].set, false);
-      }
-   }
+   tu_destroy_descriptor_pool_entries(device, pool);
 
    if (pool->size) {
+      if (!pool->host_memory_base)
+         util_vma_heap_finish(&pool->bo_heap);
+
       if (pool->host_bo)
          vk_free2(&device->vk.alloc, pAllocator, pool->host_bo);
       else
@@ -887,19 +856,15 @@ tu_ResetDescriptorPool(VkDevice _device,
    VK_FROM_HANDLE(tu_device, device, _device);
    VK_FROM_HANDLE(tu_descriptor_pool, pool, descriptorPool);
 
-   list_for_each_entry_safe(struct tu_descriptor_set, set,
-                            &pool->desc_sets, pool_link) {
-      vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
-   }
-   list_inithead(&pool->desc_sets);
+   tu_destroy_descriptor_pool_entries(device, pool);
 
-   if (!pool->host_memory_base) {
-      for(int i = 0; i < pool->entry_count; ++i) {
-         tu_descriptor_set_destroy(device, pool, pool->entries[i].set, false);
-      }
-      pool->entry_count = 0;
+   if (!pool->host_memory_base && pool->size) {
+      util_vma_heap_finish(&pool->bo_heap);
+      util_vma_heap_init(&pool->bo_heap, TU_POOL_HEAP_OFFSET,
+                         pool->size + TU_POOL_HEAP_OFFSET);
    }
 
+   pool->entry_count = 0;
    pool->current_offset = 0;
    pool->host_memory_ptr = pool->host_memory_base;
 
@@ -967,7 +932,7 @@ tu_FreeDescriptorSets(VkDevice _device,
       }
 
       if (set && !pool->host_memory_base)
-         tu_descriptor_set_destroy(device, pool, set, true);
+         tu_descriptor_set_destroy(device, pool, set);
    }
    return VK_SUCCESS;
 }
@@ -1023,18 +988,18 @@ write_buffer_descriptor_addr(const struct tu_device *device,
    /* This prevents any misconfiguration, but 16-bit descriptor capable of both
     * 16-bit and 32-bit access through isam.v will of course only be functional
     * when 16-bit storage is supported. */
-   assert(!info->a6xx.has_isam_v || info->a6xx.storage_16bit);
+   assert(!info->props.has_isam_v || info->props.storage_16bit);
    /* Any configuration enabling 8-bit storage support will also provide 16-bit
     * storage support and 16-bit descriptors capable of 32-bit isam loads. This
     * indirectly ensures we won't need more than two descriptors for access of
     * any size.
     */
-   assert(!info->a7xx.storage_8bit || (info->a6xx.storage_16bit &&
-                                       info->a6xx.has_isam_v));
+   assert(!info->props.storage_8bit || (info->props.storage_16bit &&
+                                       info->props.has_isam_v));
 
    unsigned num_descriptors = 1 +
-      COND(info->a6xx.storage_16bit && !info->a6xx.has_isam_v, 1) +
-      COND(info->a7xx.storage_8bit, 1);
+      COND(info->props.storage_16bit && !info->props.has_isam_v, 1) +
+      COND(info->props.storage_8bit, 1);
    memset(dst, 0, num_descriptors * A6XX_TEX_CONST_DWORDS * sizeof(uint32_t));
 
    if (!buffer_info || buffer_info->address == 0)
@@ -1045,7 +1010,7 @@ write_buffer_descriptor_addr(const struct tu_device *device,
    unsigned offset = va & 0x3f;
    uint32_t range = buffer_info->range;
 
-   if (info->a6xx.storage_16bit) {
+   if (info->props.storage_16bit) {
       dst[0] = A6XX_TEX_CONST_0_TILE_MODE(TILE6_LINEAR) | A6XX_TEX_CONST_0_FMT(FMT6_16_UINT);
       dst[1] = DIV_ROUND_UP(range, 2);
       dst[2] =
@@ -1060,7 +1025,7 @@ write_buffer_descriptor_addr(const struct tu_device *device,
    /* Set up the 32-bit descriptor when 16-bit storage isn't supported or the
     * 16-bit descriptor cannot be used for 32-bit loads through isam.v.
     */
-   if (!info->a6xx.storage_16bit || !info->a6xx.has_isam_v) {
+   if (!info->props.storage_16bit || !info->props.has_isam_v) {
       dst[0] = A6XX_TEX_CONST_0_TILE_MODE(TILE6_LINEAR) | A6XX_TEX_CONST_0_FMT(FMT6_32_UINT);
       dst[1] = DIV_ROUND_UP(range, 4);
       dst[2] =
@@ -1072,7 +1037,7 @@ write_buffer_descriptor_addr(const struct tu_device *device,
       dst += A6XX_TEX_CONST_DWORDS;
    }
 
-   if (info->a7xx.storage_8bit) {
+   if (info->props.storage_8bit) {
       dst[0] = A6XX_TEX_CONST_0_TILE_MODE(TILE6_LINEAR) | A6XX_TEX_CONST_0_FMT(FMT6_8_UINT);
       dst[1] = range;
       dst[2] =
@@ -1306,10 +1271,11 @@ tu_update_descriptor_sets(const struct tu_device *device,
             memcpy(dst, src, to_write);
 
             binding_layout++;
-            ptr = set->mapped_ptr + binding_layout->offset / 4;
             dst_offset = 0;
             src += to_write;
             remaining -= to_write;
+            if (remaining)
+               ptr = set->mapped_ptr + binding_layout->offset / 4;
          } while (remaining > 0);
 
          continue;
@@ -1414,7 +1380,9 @@ tu_update_descriptor_sets(const struct tu_device *device,
             src_remaining -= to_write;
             dst_remaining -= to_write;
             remaining -= to_write;
-            
+            if (!remaining)
+               break;
+
             if (src_remaining == 0) {
                src_binding_layout++;
                src_ptr = src_set->mapped_ptr + src_binding_layout->offset / 4;

@@ -183,7 +183,7 @@ i915_optimize_nir(struct nir_shader *s)
       progress = false;
 
       NIR_PASS(progress, s, nir_lower_vars_to_ssa);
-      NIR_PASS(progress, s, nir_copy_prop);
+      NIR_PASS(progress, s, nir_opt_copy_prop);
       NIR_PASS(progress, s, nir_opt_algebraic);
       NIR_PASS(progress, s, nir_opt_constant_folding);
       NIR_PASS(progress, s, nir_opt_remove_phis);
@@ -225,7 +225,8 @@ i915_optimize_nir(struct nir_shader *s)
 }
 
 static void
-i915_finalize_nir(struct pipe_screen *pscreen, struct nir_shader *s)
+i915_finalize_nir(struct pipe_screen *pscreen, struct nir_shader *s,
+                  bool optimize)
 {
    if (s->info.stage == MESA_SHADER_FRAGMENT)
       i915_optimize_nir(s);

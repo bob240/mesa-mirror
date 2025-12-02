@@ -462,6 +462,11 @@ by a particular renderpass/blit.
 
 	<reg32 offset="0x0a61" name="CP_BV_PROTECT_STATUS" variants="A7XX"/>
 	<reg32 offset="0x0a64" name="CP_BV_HW_FAULT" variants="A7XX"/>
+	<reg32 offset="0x0a66" name="CP_BV_RB_RPTR" variants="A7XX"/>
+	<reg64 offset="0x0a6d" name="CP_BV_IB1_BASE" variants="A7XX"/>
+	<reg32 offset="0x0a70" name="CP_BV_IB1_REM_SIZE" variants="A7XX"/>
+	<reg64 offset="0x0a71" name="CP_BV_IB2_BASE" variants="A7XX"/>
+	<reg32 offset="0x0a74" name="CP_BV_IB2_REM_SIZE" variants="A7XX"/>
 	<reg32 offset="0x0a81" name="CP_BV_DRAW_STATE_ADDR" variants="A7XX"/>
 	<reg32 offset="0x0a82" name="CP_BV_DRAW_STATE_DATA" variants="A7XX"/>
 	<reg32 offset="0x0a83" name="CP_BV_ROQ_DBG_ADDR" variants="A7XX"/>
@@ -470,6 +475,20 @@ by a particular renderpass/blit.
 	<reg32 offset="0x0a86" name="CP_BV_SQE_UCODE_DBG_DATA" variants="A7XX"/>
 	<reg32 offset="0x0a87" name="CP_BV_SQE_STAT_ADDR" variants="A7XX"/>
 	<reg32 offset="0x0a88" name="CP_BV_SQE_STAT_DATA" variants="A7XX"/>
+
+	<reg32 offset="0x0a8f" name="CP_BV_ROQ_AVAIL_RB" variants="A7XX">
+		<doc>number of remaining dwords incl current dword being consumed?</doc>
+		<bitfield name="REM" low="16" high="31"/>
+	</reg32>
+	<reg32 offset="0x0a90" name="CP_BV_ROQ_AVAIL_IB1" variants="A7XX">
+		<doc>number of remaining dwords incl current dword being consumed?</doc>
+		<bitfield name="REM" low="16" high="31"/>
+	</reg32>
+	<reg32 offset="0x0a91" name="CP_BV_ROQ_AVAIL_IB2" variants="A7XX">
+		<doc>number of remaining dwords incl current dword being consumed?</doc>
+		<bitfield name="REM" low="16" high="31"/>
+	</reg32>
+
 	<reg32 offset="0x0a96" name="CP_BV_MEM_POOL_DBG_ADDR" variants="A7XX"/>
 	<reg32 offset="0x0a97" name="CP_BV_MEM_POOL_DBG_DATA" variants="A7XX"/>
 	<reg64 offset="0x0a98" name="CP_BV_RB_RPTR_ADDR" variants="A7XX"/>
@@ -1929,7 +1948,14 @@ by a particular renderpass/blit.
 	<reg32 offset="0x8100" name="GRAS_LRZ_CNTL" type="a6xx_gras_lrz_cntl" usage="rp_blit" variants="A6XX-A7XX"/>
 	<reg32 offset="0x8212" name="GRAS_LRZ_CNTL" type="a6xx_gras_lrz_cntl" usage="rp_blit" variants="A8XX-"/>
 
-	<reg32 offset="0x8007" name="GRAS_LRZ_CB_CNTL" variants="A7XX" usage="rp_blit"/>
+	<reg32 offset="0x8007" name="GRAS_LRZ_CB_CNTL" variants="A7XX" usage="rp_blit">
+		<doc>
+			The total size of the LRZ image array (not including
+			fast clear buffer), used as a stride for double
+			buffering used with concurrent binning.
+		</doc>
+		<bitfield name="DOUBLE_BUFFER_STRIDE" low="8" high="31" shr="8"/>
+	</reg32>
 	<reg32 offset="0x8101" name="GRAS_LRZ_CB_CNTL" usage="rp_blit" variants="A8XX-">
 		<bitfield name="DOUBLE_BUFFER_PITCH" low="8" high="31" shr="8"/>
 	</reg32>
@@ -3151,7 +3177,7 @@ by a particular renderpass/blit.
 	<reg32 offset="0x9804" name="PC_MODE_CNTL" low="0" high="7" variants="A6XX-A7XX" usage="rp_blit"/>
 	<reg32 offset="0x9b00" name="PC_MODE_CNTL" low="0" high="14" variants="A8XX" usage="rp_blit"/>
 
-	<reg32 offset="0x9805" name="PC_POWER_CNTL" low="0" high="2" usage="rp_blit"/>
+	<reg32 offset="0x9805" name="PC_POWER_CNTL" low="0" high="2" variants="A6XX" usage="rp_blit"/>
 
 	<bitset name="a6xx_pc_ps_cntl" inline="yes">
 		<bitfield name="PRIMITIVEIDEN" pos="0" type="boolean"/>
@@ -3431,7 +3457,7 @@ by a particular renderpass/blit.
 		</reg32>
 	</array>
 
-	<reg32 offset="0xa0f8" name="VFD_POWER_CNTL" low="0" high="2" usage="rp_blit"/>
+	<reg32 offset="0xa0f8" name="VFD_POWER_CNTL" low="0" high="2" variants="A6XX" usage="rp_blit"/>
 
 	<reg32 offset="0xa600" name="VFD_DBG_ECO_CNTL" variants="A7XX-" usage="init"/>
 
@@ -4347,8 +4373,9 @@ by a particular renderpass/blit.
 	<reg32 offset="0xab21" name="SP_WINDOW_OFFSET" type="a6xx_reg_xy" variants="A7XX" usage="rp_blit"/>
 	<reg32 offset="0xab07" name="SP_WINDOW_OFFSET" type="a6xx_reg_xy" variants="A8XX-" usage="rp_blit"/>
 
-	<!-- always 0x100000 or 0x1000000? -->
-	<reg32 offset="0xb600" name="TPL1_DBG_ECO_CNTL" low="0" high="25" usage="init"/>
+	<reg32 offset="0xb600" name="TPL1_DBG_ECO_CNTL" usage="init">
+		<bitfield name="LINEAR_MIPMAP_FALLBACK_IN_BLOCKS" pos="25" type="boolean" variants="A6XX-A7XX"/>
+	</reg32>
 	<reg32 offset="0xb601" name="TPL1_ADDR_MODE_CNTL" type="a5xx_address_mode" variants="A6XX"/>
 	<reg32 offset="0xb602" name="TPL1_DBG_ECO_CNTL1" usage="init">
 		<!-- Affects UBWC in some way, if BLIT_OP_SCALE is done with this bit set

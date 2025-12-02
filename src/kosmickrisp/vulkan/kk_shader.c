@@ -8,8 +8,8 @@
 #include "kk_shader.h"
 
 #include "kk_cmd_buffer.h"
-#include "kk_descriptor_set_layout.h"
 #include "kk_debug.h"
+#include "kk_descriptor_set_layout.h"
 #include "kk_device.h"
 #include "kk_format.h"
 #include "kk_nir_lower_vbo.h"
@@ -100,7 +100,7 @@ kk_preprocess_nir(UNUSED struct vk_physical_device *vk_pdev, nir_shader *nir,
     * jump, which is illegal.
     */
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
-            nir_shader_get_entrypoint(nir), true, false);
+            nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
    msl_preprocess_nir(nir);
 }
@@ -286,8 +286,8 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
           "Fixed-function attributes not used in Vulkan");
    NIR_PASS(_, nir, nir_recompute_io_bases, nir_var_shader_in);
    /* the shader_out portion of this is load-bearing even for tess eval */
-   NIR_PASS(_, nir, nir_io_add_const_offset_to_base,
-            nir_var_shader_in | nir_var_shader_out);
+   /* Fold constant offset srcs for IO. */
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
    struct kk_attribute attributes[KK_MAX_ATTRIBS] = {};
    uint64_t attribs_read = nir->info.inputs_read >> VERT_ATTRIB_GENERIC0;
@@ -318,7 +318,7 @@ kk_lower_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
       nir_shader_intrinsics_pass(nir, msl_nir_vs_remove_point_size_write,
                                  nir_metadata_control_flow, NULL);
 
-   NIR_PASS(_, nir, msl_nir_layer_id_type);
+   NIR_PASS(_, nir, msl_nir_vs_io_types);
 }
 
 static void
@@ -368,7 +368,8 @@ kk_lower_fs_blend(nir_shader *nir,
          };
       }
    }
-   NIR_PASS(_, nir, nir_io_add_const_offset_to_base, nir_var_shader_out);
+   /* Fold constant offset srcs for IO. */
+   NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_lower_blend, &opts);
 }
 
@@ -404,10 +405,7 @@ kk_lower_fs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, kk_nir_swizzle_fragment_output,
             nir_metadata_control_flow, (void *)state);
 
-   /* Metal's sample mask is uint. */
-   NIR_PASS(_, nir, msl_nir_sample_mask_type);
-
-   NIR_PASS(_, nir, msl_nir_fix_stencil_type);
+   NIR_PASS(_, nir, msl_nir_fs_io_types);
 
    if (state->ms && state->ms->rasterization_samples &&
        state->ms->sample_mask != UINT16_MAX)
@@ -483,10 +481,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir,
             nir_lower_io_lower_64bit_to_32 |
                nir_lower_io_use_interpolated_input_intrinsics);
 
-   if (!nir->info.shared_memory_explicit_layout) {
-      NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
-               shared_var_info);
-   }
+   NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
+            shared_var_info);
+
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
             nir_address_format_32bit_offset);
 
@@ -653,7 +650,7 @@ kk_compile_shader(struct kk_device *dev, struct vk_shader_compile_info *info,
    }
    msl_optimize_nir(nir);
    modify_nir_info(nir);
-   shader->msl_code = nir_to_msl(nir, NULL);
+   shader->msl_code = nir_to_msl(nir, NULL, dev->disabled_workarounds);
    const char *entrypoint_name = nir_shader_get_entrypoint(nir)->function->name;
 
    /* We need to steal so it doesn't get destroyed with the nir. Needs to happen
@@ -716,7 +713,7 @@ nir_opts(nir_shader *nir)
       progress = false;
 
       NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
 
@@ -734,8 +731,6 @@ nir_opts(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_phi_precision);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_io_add_const_offset_to_base,
-               nir_var_shader_in | nir_var_shader_out);
 
       NIR_PASS(progress, nir, nir_opt_undef);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
@@ -1208,6 +1203,7 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
          shader->pipeline.gfx.mtl_depth_stencil_state_handle;
    cmd->state.gfx.is_depth_stencil_dynamic = requires_dynamic_depth_stencil;
    cmd->state.gfx.dirty |= KK_DIRTY_PIPELINE;
+   cmd->state.gfx.dirty |= KK_DIRTY_VB;
 }
 
 static void

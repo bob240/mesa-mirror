@@ -52,8 +52,10 @@ brw_emit_gs_thread_end(brw_shader &s)
 
       brw_reg srcs[URB_LOGICAL_NUM_SRCS];
       srcs[URB_LOGICAL_SRC_HANDLE] = s.gs_payload().urb_handles;
+      srcs[URB_LOGICAL_SRC_DATA] = brw_imm_ud(0);
+      srcs[URB_LOGICAL_SRC_CHANNEL_MASK] = brw_imm_ud(0);
       urb = abld.URB_WRITE(srcs, ARRAY_SIZE(srcs));
-      urb->components = 0;
+      urb->components = 1;
    } else {
       brw_reg srcs[URB_LOGICAL_NUM_SRCS];
       srcs[URB_LOGICAL_SRC_HANDLE] = s.gs_payload().urb_handles;
@@ -221,7 +223,7 @@ brw_compile_gs(const struct brw_compiler *compiler,
 
    /* 1 HWORD = 32 bytes = 256 bits */
    prog_data->control_data_header_size_hwords =
-      ALIGN(control_data_header_size_bits, 256) / 256;
+      align(control_data_header_size_bits, 256) / 256;
 
    /* Compute the output vertex size.
     *
@@ -274,7 +276,7 @@ brw_compile_gs(const struct brw_compiler *compiler,
    unsigned output_vertex_size_bytes = prog_data->base.vue_map.num_slots * 16;
    assert(output_vertex_size_bytes <= GFX7_MAX_GS_OUTPUT_VERTEX_SIZE_BYTES);
    prog_data->output_vertex_size_hwords =
-      ALIGN(output_vertex_size_bytes, 32) / 32;
+      align(output_vertex_size_bytes, 32) / 32;
 
    /* Compute URB entry size.  The maximum allowed URB entry size is 32k.
     * That divides up as follows:
@@ -328,7 +330,7 @@ brw_compile_gs(const struct brw_compiler *compiler,
 
 
    /* URB entry sizes are stored as a multiple of 64 bytes in gfx7+. */
-   prog_data->base.urb_entry_size = ALIGN(output_size_bytes, 64) / 64;
+   prog_data->base.urb_entry_size = align(output_size_bytes, 64) / 64;
 
    assert(nir->info.gs.output_primitive < ARRAY_SIZE(gl_prim_to_hw_prim));
    prog_data->output_topology =

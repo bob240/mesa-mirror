@@ -2424,19 +2424,6 @@ static bool si_is_format_supported(struct pipe_screen *screen, enum pipe_format 
  * framebuffer handling
  */
 
-static void si_choose_spi_color_formats(struct si_surface *surf, unsigned format, unsigned swap,
-                                        unsigned ntype, bool is_depth)
-{
-   struct ac_spi_color_formats formats = {};
-
-   ac_choose_spi_color_formats(format, swap, ntype, is_depth, true, &formats);
-
-   surf->spi_shader_col_format = formats.normal;
-   surf->spi_shader_col_format_alpha = formats.alpha;
-   surf->spi_shader_col_format_blend = formats.blend;
-   surf->spi_shader_col_format_blend_alpha = formats.blend_alpha;
-}
-
 static void si_initialize_color_surface(struct si_context *sctx, struct si_surface *surf)
 {
    struct si_texture *tex = (struct si_texture *)surf->base.texture;
@@ -2476,8 +2463,14 @@ static void si_initialize_color_surface(struct si_context *sctx, struct si_surfa
    ac_init_cb_surface(&sctx->screen->info, &cb_state, &surf->cb);
 
    /* Determine pixel shader export format */
-   si_choose_spi_color_formats(surf, format, swap, ntype, tex->is_depth);
+   struct ac_spi_color_formats formats = {};
+   const bool rbplus = sctx->screen->info.rbplus_allowed;
+   ac_choose_spi_color_formats(format, swap, ntype, tex->is_depth, rbplus, &formats);
 
+   surf->spi_shader_col_format = formats.normal;
+   surf->spi_shader_col_format_alpha = formats.alpha;
+   surf->spi_shader_col_format_blend = formats.blend;
+   surf->spi_shader_col_format_blend_alpha = formats.blend_alpha;
    surf->color_initialized = true;
 }
 
@@ -4978,8 +4971,7 @@ void si_init_screen_state_functions(struct si_screen *sscreen)
                                 si_create_vertex_state, si_vertex_state_destroy);
 }
 
-static void si_init_compute_preamble_state(struct si_context *sctx,
-                                           struct si_pm4_state *pm4)
+void si_init_compute_preamble_state(struct si_context *sctx, struct si_pm4_state *pm4)
 {
    uint64_t border_color_va =
       sctx->border_color_buffer ? sctx->border_color_buffer->gpu_address : 0;
@@ -5127,13 +5119,18 @@ static bool gfx10_init_gfx_preamble_state(struct si_context *sctx)
    }
 
    if (sctx->uses_userq_reg_shadowing) {
-      ac_pm4_cmd_add(&pm4->base, PKT3(PKT3_CONTEXT_CONTROL, 1, 0));
-      ac_pm4_cmd_add(&pm4->base, CC0_UPDATE_LOAD_ENABLES(1) | CC0_LOAD_PER_CONTEXT_STATE(1) |
-                        CC0_LOAD_CS_SH_REGS(1) | CC0_LOAD_GFX_SH_REGS(1) |
-                        CC0_LOAD_GLOBAL_UCONFIG(1));
-      ac_pm4_cmd_add(&pm4->base, CC1_UPDATE_SHADOW_ENABLES(1) | CC1_SHADOW_PER_CONTEXT_STATE(1) |
-                        CC1_SHADOW_CS_SH_REGS(1) | CC1_SHADOW_GFX_SH_REGS(1) |
-                        CC1_SHADOW_GLOBAL_UCONFIG(1) | CC1_SHADOW_GLOBAL_CONFIG(1));
+      /* In case of GFX11_5, CONTEXT_CONTROL packet is added in si_init_cp_reg_shaodwing()
+       * function.
+       */
+      if (sctx->gfx_level != GFX11_5) {
+         ac_pm4_cmd_add(&pm4->base, PKT3(PKT3_CONTEXT_CONTROL, 1, 0));
+         ac_pm4_cmd_add(&pm4->base, CC0_UPDATE_LOAD_ENABLES(1) | CC0_LOAD_PER_CONTEXT_STATE(1) |
+                           CC0_LOAD_CS_SH_REGS(1) | CC0_LOAD_GFX_SH_REGS(1) |
+                           CC0_LOAD_GLOBAL_UCONFIG(1));
+         ac_pm4_cmd_add(&pm4->base, CC1_UPDATE_SHADOW_ENABLES(1) | CC1_SHADOW_PER_CONTEXT_STATE(1) |
+                           CC1_SHADOW_CS_SH_REGS(1) | CC1_SHADOW_GFX_SH_REGS(1) |
+                           CC1_SHADOW_GLOBAL_UCONFIG(1) | CC1_SHADOW_GLOBAL_CONFIG(1));
+      }
    } else if (sctx->is_gfx_queue && !sctx->uses_kernelq_reg_shadowing) {
       ac_pm4_cmd_add(&pm4->base, PKT3(PKT3_CONTEXT_CONTROL, 1, 0));
       ac_pm4_cmd_add(&pm4->base, CC0_UPDATE_LOAD_ENABLES(1));

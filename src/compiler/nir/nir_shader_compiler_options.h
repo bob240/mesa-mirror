@@ -200,6 +200,12 @@ typedef enum {
     */
    nir_io_radv_intrinsic_component_workaround = BITFIELD_BIT(10),
 
+   /**
+    * nir_recompute_io_bases will assign VARYING_SLOT_COL0-1 such that
+    * their bases are after all other inputs.
+    */
+   nir_io_assign_color_input_bases_after_all_other_inputs = BITFIELD_BIT(11),
+
    /* Options affecting the GLSL compiler or Gallium are below. */
 
    /**
@@ -207,15 +213,6 @@ typedef enum {
     * This is only affects GLSL compilation and Gallium.
     */
    nir_io_has_intrinsics = BITFIELD_BIT(16),
-
-   /**
-    * Whether clip and cull distance arrays should be separate. If this is not
-    * set, cull distances will be moved into VARYING_SLOT_CLIP_DISTn after clip
-    * distances, and shader_info::clip_distance_array_size will be the index
-    * of the first cull distance. nir_lower_clip_cull_distance_array_vars does
-    * that.
-    */
-   nir_io_separate_clip_cull_distance_arrays = BITFIELD_BIT(17),
 } nir_io_options;
 
 typedef enum {
@@ -564,6 +561,9 @@ typedef struct nir_shader_compiler_options {
     * to imul24, umul24 or imul.
     */
    bool has_mul24_relaxed;
+
+   /** Backend supports umul_16x16. */
+   bool has_umul_16x16;
 
    /** Backend supports 32-bit imad */
    bool has_imad32;

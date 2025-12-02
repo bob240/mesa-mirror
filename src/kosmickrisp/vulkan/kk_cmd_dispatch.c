@@ -60,6 +60,10 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdDispatch(VkCommandBuffer commandBuffer, uint32_t groupCountX,
                uint32_t groupCountY, uint32_t groupCountZ)
 {
+   /* Metal validation dislikes empty disptaches */
+   if (groupCountX * groupCountY * groupCountZ == 0)
+      return;
+
    kk_CmdDispatchBase(commandBuffer, 0, 0, 0, groupCountX, groupCountY,
                       groupCountZ);
 }
@@ -68,31 +72,14 @@ static void
 kk_flush_compute_state(struct kk_cmd_buffer *cmd)
 {
    mtl_compute_encoder *enc = kk_compute_encoder(cmd);
-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
    // Fill Metal argument buffer with descriptor set addresses
    struct kk_descriptor_state *desc = &cmd->state.cs.descriptors;
 
    if (desc->push_dirty)
       kk_cmd_buffer_flush_push_descriptors(cmd, desc);
-   /* After push descriptors' buffers are created. Otherwise, the buffer where
-    * they live will not be created and cannot make it resident */
-   if (desc->sets_not_resident)
-      kk_make_descriptor_resources_resident(cmd,
-                                            VK_PIPELINE_BIND_POINT_COMPUTE);
    if (desc->root_dirty)
       kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_COMPUTE);
-
-   /* Make user allocated heaps resident */
-   simple_mtx_lock(&dev->user_heap_cache.mutex);
-   if (cmd->encoder->main.user_heap_hash != dev->user_heap_cache.hash) {
-      cmd->encoder->main.user_heap_hash = dev->user_heap_cache.hash;
-      mtl_heap **heaps = util_dynarray_begin(&dev->user_heap_cache.handles);
-      uint32_t count =
-         util_dynarray_num_elements(&dev->user_heap_cache.handles, mtl_heap *);
-      mtl_compute_use_heaps(enc, heaps, count);
-   }
-   simple_mtx_unlock(&dev->user_heap_cache.mutex);
 
    struct kk_bo *root_buffer = desc->root.root_buffer;
    if (root_buffer)

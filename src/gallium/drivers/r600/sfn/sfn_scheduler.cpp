@@ -150,8 +150,7 @@ public:
    void finalize();
 
 private:
-   void
-   schedule_block(Block& in_block, Shader::ShaderBlocks& out_blocks, ValueFactory& vf);
+   void schedule_block(Block& in_block, Shader::ShaderBlocks& out_blocks);
 
    bool collect_ready(CollectInstructions& available);
 
@@ -174,17 +173,23 @@ private:
    template <typename I>
    bool schedule_cf(Shader::ShaderBlocks& out_blocks, std::list<I *>& ready_list);
 
-   bool schedule_alu(Shader::ShaderBlocks& out_blocks, ValueFactory& vf);
+   bool schedule_alu(Shader::ShaderBlocks& out_blocks);
    void start_new_block(Shader::ShaderBlocks& out_blocks, Block::Type type);
 
    bool schedule_alu_to_group_vec(AluGroup *group);
-   bool schedule_alu_multislot_to_group_vec(AluGroup *group, ValueFactory& vf);
+   bool schedule_alu_multislot_to_group_vec(AluGroup *group);
    bool schedule_alu_to_group_trans(AluGroup *group, std::list<AluInstr *>& readylist);
 
    bool schedule_exports(Shader::ShaderBlocks& out_blocks,
                          std::list<ExportInstr *>& ready_list);
 
    void maybe_split_alu_block(Shader::ShaderBlocks& out_blocks);
+
+   void apply_pv_ps_to_group(AluGroup& group, AluGroup& prev_group);
+   void apply_pv_ps_to_instr(AluGroup& group,
+                             AluInstr *prev,
+                             AluInlineConstants reg,
+                             int chan);
 
    template <typename I> bool schedule(std::list<I *>& ready_list);
 
@@ -235,6 +240,8 @@ private:
 
    ArrayCheckSet m_last_indirect_array_write;
    ArrayCheckSet m_last_direct_array_write;
+
+   ValueFactory *m_vf{nullptr};
 };
 
 Shader *
@@ -291,6 +298,7 @@ void
 BlockScheduler::run(Shader *shader)
 {
    Shader::ShaderBlocks scheduled_blocks;
+   m_vf = &shader->value_factory();
 
    for (auto& block : shader->func()) {
       sfn_log << SfnLog::schedule << "Process block " << block->id() << "\n";
@@ -299,16 +307,14 @@ BlockScheduler::run(Shader *shader)
          block->print(ss);
          sfn_log << ss.str() << "\n";
       }
-      schedule_block(*block, scheduled_blocks, shader->value_factory());
+      schedule_block(*block, scheduled_blocks);
    }
 
    shader->reset_function(scheduled_blocks);
 }
 
 void
-BlockScheduler::schedule_block(Block& in_block,
-                              Shader::ShaderBlocks& out_blocks,
-                              ValueFactory& vf)
+BlockScheduler::schedule_block(Block& in_block, Shader::ShaderBlocks& out_blocks)
 {
 
    assert(in_block.id() >= 0);
@@ -316,7 +322,7 @@ BlockScheduler::schedule_block(Block& in_block,
    current_shed = sched_fetch;
    auto last_shed = sched_fetch;
 
-   CollectInstructions cir(vf);
+   CollectInstructions cir(*m_vf);
    in_block.accept(cir);
 
    bool have_instr = collect_ready(cir);
@@ -370,7 +376,7 @@ BlockScheduler::schedule_block(Block& in_block,
          }
          break;
       case sched_alu:
-         if (!schedule_alu(out_blocks, vf)) {
+         if (!schedule_alu(out_blocks)) {
             assert(!m_current_block->lds_group_active());
             current_shed = sched_tex;
             continue;
@@ -530,7 +536,7 @@ BlockScheduler::finalize()
 }
 
 bool
-BlockScheduler::schedule_alu(Shader::ShaderBlocks& out_blocks, ValueFactory& vf)
+BlockScheduler::schedule_alu(Shader::ShaderBlocks& out_blocks)
 {
    bool success = false;
    AluGroup *group = nullptr;
@@ -581,7 +587,7 @@ BlockScheduler::schedule_alu(Shader::ShaderBlocks& out_blocks, ValueFactory& vf)
             }
             success = true;
          } else {
-            if (expected_ar_uses == 0) {
+            if (expected_ar_uses == 0 && !m_current_block->lds_group_active()) {
                start_new_block(out_blocks, Block::alu);
 
                if (!m_current_block->try_reserve_kcache(*group))
@@ -592,7 +598,7 @@ BlockScheduler::schedule_alu(Shader::ShaderBlocks& out_blocks, ValueFactory& vf)
             } else {
                sfn_log << SfnLog::schedule << "Don't add group because of " <<
                           m_current_block->expected_ar_uses()
-                       << "pending AR loads\n";
+                       << "pending AR loads or an active LDS group\n";
                group = nullptr;
             }
          }
@@ -613,7 +619,7 @@ BlockScheduler::schedule_alu(Shader::ShaderBlocks& out_blocks, ValueFactory& vf)
    while (free_slots && has_alu_ready) {
 
       if (!alu_multi_slot_ready.empty()) {
-         success |= schedule_alu_multislot_to_group_vec(group, vf);
+         success |= schedule_alu_multislot_to_group_vec(group);
          free_slots = group->free_slot_mask();
       }
 
@@ -795,6 +801,8 @@ void BlockScheduler::maybe_split_alu_block(Shader::ShaderBlocks& out_blocks)
    int used_slots = 0;
    int pending_slots = 0;
 
+   AluGroup *prev_group = nullptr;
+
    Instr *next_block_start = nullptr;
    for (auto cur_group : *m_current_block) {
 
@@ -834,8 +842,15 @@ void BlockScheduler::maybe_split_alu_block(Shader::ShaderBlocks& out_blocks)
                                          m_next_block_id++);
          sub_block->set_type(Block::alu, m_chip_class);
          sub_block->set_instr_flag(Instr::force_cf);
+         prev_group = nullptr;
       }
+
+      if (prev_group) {
+         apply_pv_ps_to_group(*group, *prev_group);
+      }
+
       sub_block->push_back(group);
+      prev_group = group;
       if (group->has_lds_group_start())
          sub_block->lds_group_start(*group->begin());
 
@@ -847,6 +862,49 @@ void BlockScheduler::maybe_split_alu_block(Shader::ShaderBlocks& out_blocks)
    }
    if (!sub_block->empty())
       out_blocks.push_back(sub_block);
+}
+
+void
+BlockScheduler::apply_pv_ps_to_group(AluGroup& group, AluGroup& prev_group)
+{
+
+   for (int i = 0; i < 4; ++i)
+      apply_pv_ps_to_instr(group, prev_group[i], ALU_SRC_PV, i);
+
+   if (prev_group.has_t())
+      apply_pv_ps_to_instr(group, prev_group[4], ALU_SRC_PS, 0);
+
+   for (auto instr : prev_group) {
+      if (!instr)
+         continue;
+
+      auto d = instr->dest();
+      if (d && d->uses().empty() && !(d->pin() == pin_array)) {
+         instr->override_or_clear_dest(m_vf->dummy_dest(instr->dest()->chan()));
+      }
+   }
+}
+
+void
+BlockScheduler::apply_pv_ps_to_instr(AluGroup& group,
+                                     AluInstr *prev,
+                                     AluInlineConstants reg,
+                                     int chan)
+{
+   if (!prev || !prev->has_alu_flag(alu_write))
+      return;
+
+   PRegister d = prev->dest();
+   if (d) {
+      auto ps = m_vf->inline_const(reg, chan);
+
+      for (auto instr : group) {
+         if (!instr)
+            continue;
+
+         instr->replace_source(d, ps);
+      }
+   }
 }
 
 template <typename I>
@@ -869,8 +927,8 @@ BlockScheduler::schedule_alu_to_group_vec(AluGroup *group)
    bool success = false;
    auto i = alu_vec_ready.begin();
    auto e = alu_vec_ready.end();
-   bool group_has_kill = false;
-   bool group_has_update_pred = false;
+   bool group_has_kill = group->has_kill_op();
+   bool group_has_update_pred = group->has_update_exec();
    while (i != e) {
       sfn_log << SfnLog::schedule << "Try schedule to vec " << **i;
 
@@ -945,6 +1003,7 @@ BlockScheduler::schedule_alu_to_group_vec(AluGroup *group)
          success = true;
 
          group_has_kill |= is_kill;
+         group_has_update_pred |= does_update_pred;
 
          sfn_log << SfnLog::schedule << " success\n";
       } else {
@@ -956,7 +1015,7 @@ BlockScheduler::schedule_alu_to_group_vec(AluGroup *group)
 }
 
 bool
-BlockScheduler::schedule_alu_multislot_to_group_vec(AluGroup *group, ValueFactory& vf)
+BlockScheduler::schedule_alu_multislot_to_group_vec(AluGroup *group)
 {
    assert(group);
    assert(!alu_multi_slot_ready.empty());
@@ -965,7 +1024,19 @@ BlockScheduler::schedule_alu_multislot_to_group_vec(AluGroup *group, ValueFactor
    auto i = alu_multi_slot_ready.begin();
    auto e = alu_multi_slot_ready.end();
 
+   bool group_has_kill = group->has_kill_op();
+
    while (i != e && util_bitcount(group->free_slot_mask()) > 1) {
+
+      /* A kill instruction and a predicate update in the same
+       * group don't mix well, so skip adding a predicate changing
+       * multi-slot op if we already have a kill. (There are no
+       * multi-slot kill ops).
+       */
+      if (group_has_kill && (*i)->has_alu_flag(alu_update_exec)) {
+         ++i;
+         continue;
+      }
 
       auto dest = (*i)->dest();
 
@@ -1038,6 +1109,10 @@ BlockScheduler::schedule_alu_to_group_trans(AluGroup *group,
    bool success = false;
    auto i = readylist.begin();
    auto e = readylist.end();
+
+   bool group_has_kill = group->has_kill_op();
+   bool group_has_update_pred = group->has_update_exec();
+
    while (i != e) {
 
       if (check_array_reads(**i)) {
@@ -1048,6 +1123,12 @@ BlockScheduler::schedule_alu_to_group_trans(AluGroup *group,
       sfn_log << SfnLog::schedule << "Try schedule to trans " << **i;
       if (!m_current_block->try_reserve_kcache(**i)) {
          sfn_log << SfnLog::schedule << " failed (kcache)\n";
+         ++i;
+         continue;
+      }
+
+      if ((group_has_kill && (*i)->has_alu_flag(alu_update_exec)) ||
+          (group_has_update_pred && (*i)->is_kill())) {
          ++i;
          continue;
       }
@@ -1246,7 +1327,8 @@ BlockScheduler::collect_ready_alu_vec(std::list<AluInstr *>& ready,
          ++i;
    }
 
-   if (predicate && *predicate && available.empty() && ready.size() < 16 &&
+   if (predicate && *predicate && available.empty() &&
+       ready.size() < (m_chip_class >= ISA_CC_EVERGREEN ? 16 : 3) &&
        (*predicate)->ready()) {
       assert((*predicate)->alu_slots() == 1);
       ready.push_back(*predicate);

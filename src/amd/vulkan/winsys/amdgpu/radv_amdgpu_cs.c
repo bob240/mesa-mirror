@@ -1142,6 +1142,9 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          struct radv_amdgpu_cs *cs = radv_amdgpu_cs(preambles[i]);
          struct radv_amdgpu_cs_ib_info ib;
 
+         if (ws->dump_ibs)
+            ws->base.cs_dump(&cs->base, stderr, NULL, 0, RADV_CS_DUMP_TYPE_PREAMBLE_IBS);
+
          assert(cs->num_ib_buffers == 1);
          ib = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
 
@@ -1152,6 +1155,9 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
       for (unsigned i = 0; i < ib_per_submit && cs_idx < cs_count; ++i) {
          struct radv_amdgpu_cs *cs = radv_amdgpu_cs(cs_array[cs_idx]);
          struct radv_amdgpu_cs_ib_info ib;
+
+         if (ws->dump_ibs)
+            ws->base.cs_dump(&cs->base, stderr, NULL, 0, RADV_CS_DUMP_TYPE_MAIN_IBS);
 
          if (cs_ib_idx == 0) {
             /* Make sure the whole CS fits into the same submission. */
@@ -1206,6 +1212,9 @@ radv_amdgpu_winsys_cs_submit_internal(struct radv_amdgpu_ctx *ctx, int queue_idx
          /* Assume that the full postamble fits into 1 IB. */
          struct radv_amdgpu_cs *cs = radv_amdgpu_cs(postamble_cs[i]);
          struct radv_amdgpu_cs_ib_info ib;
+
+         if (ws->dump_ibs)
+            ws->base.cs_dump(&cs->base, stderr, NULL, 0, RADV_CS_DUMP_TYPE_POSTAMBLE_IBS);
 
          assert(cs->num_ib_buffers == 1);
          ib = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
@@ -1459,12 +1468,30 @@ radv_amdgpu_winsys_get_cpu_addr(void *_cs, uint64_t addr, struct ac_addr_info *i
    return;
 }
 
+static const char *
+radv_amdgpu_get_dump_ibs_str(enum radv_cs_dump_type type)
+{
+   switch (type) {
+   case RADV_CS_DUMP_TYPE_PREAMBLE_IBS:
+      return "Preamble";
+   case RADV_CS_DUMP_TYPE_MAIN_IBS:
+      return "Main";
+   case RADV_CS_DUMP_TYPE_POSTAMBLE_IBS:
+      return "Postamble";
+   default:
+      UNREACHABLE("invalid CS dump type");
+   }
+}
+
 static void
 radv_amdgpu_winsys_cs_dump(struct ac_cmdbuf *_cs, FILE *file, const int *trace_ids, int trace_id_count,
                            enum radv_cs_dump_type type)
 {
    struct radv_amdgpu_cs *cs = (struct radv_amdgpu_cs *)_cs;
    struct radv_amdgpu_winsys *ws = cs->ws;
+   const bool dump_ibs = type == RADV_CS_DUMP_TYPE_PREAMBLE_IBS || type == RADV_CS_DUMP_TYPE_MAIN_IBS ||
+                         type == RADV_CS_DUMP_TYPE_POSTAMBLE_IBS;
+   const bool dump_ctx_rolls = type == RADV_CS_DUMP_TYPE_CTX_ROLLS;
 
    if (cs->chain_ib) {
       struct radv_amdgpu_cs_ib_info ib_info = radv_amdgpu_cs_ib_to_info(cs, cs->ib_buffers[0]);
@@ -1473,7 +1500,7 @@ radv_amdgpu_winsys_cs_dump(struct ac_cmdbuf *_cs, FILE *file, const int *trace_i
       radv_amdgpu_winsys_get_cpu_addr(cs, ib_info.ib_mc_address, &addr_info);
       assert(addr_info.cpu_addr);
 
-      if (type == RADV_CS_DUMP_TYPE_IBS) {
+      if (dump_ibs) {
          struct ac_ib_parser ib_parser = {
             .f = file,
             .ib = addr_info.cpu_addr,
@@ -1489,15 +1516,17 @@ radv_amdgpu_winsys_cs_dump(struct ac_cmdbuf *_cs, FILE *file, const int *trace_i
             .annotations = cs->annotations,
          };
 
-         ac_parse_ib(&ib_parser, "main IB");
+         char name[64];
+         snprintf(name, sizeof(name), "%s IB", radv_amdgpu_get_dump_ibs_str(type));
+
+         ac_parse_ib(&ib_parser, name);
       } else {
          uint32_t *ib_dw = addr_info.cpu_addr;
          ac_gather_context_rolls(file, &ib_dw, &cs->ib_buffers[0].cdw, 1, cs->annotations, &ws->info);
       }
    } else {
-      uint32_t **ibs = type == RADV_CS_DUMP_TYPE_CTX_ROLLS ? malloc(cs->num_ib_buffers * sizeof(uint32_t *)) : NULL;
-      uint32_t *ib_dw_sizes =
-         type == RADV_CS_DUMP_TYPE_CTX_ROLLS ? malloc(cs->num_ib_buffers * sizeof(uint32_t)) : NULL;
+      uint32_t **ibs = dump_ctx_rolls ? malloc(cs->num_ib_buffers * sizeof(uint32_t *)) : NULL;
+      uint32_t *ib_dw_sizes = dump_ctx_rolls ? malloc(cs->num_ib_buffers * sizeof(uint32_t)) : NULL;
 
       for (unsigned i = 0; i < cs->num_ib_buffers; i++) {
          struct radv_amdgpu_ib *ib = &cs->ib_buffers[i];
@@ -1509,12 +1538,12 @@ radv_amdgpu_winsys_cs_dump(struct ac_cmdbuf *_cs, FILE *file, const int *trace_i
             continue;
 
          if (cs->num_ib_buffers > 1) {
-            snprintf(name, sizeof(name), "main IB (chunk %d)", i);
+            snprintf(name, sizeof(name), "%s IB (chunk %d)", radv_amdgpu_get_dump_ibs_str(type), i);
          } else {
-            snprintf(name, sizeof(name), "main IB");
+            snprintf(name, sizeof(name), "%s IB", radv_amdgpu_get_dump_ibs_str(type));
          }
 
-         if (type == RADV_CS_DUMP_TYPE_IBS) {
+         if (dump_ibs) {
             struct ac_ib_parser ib_parser = {
                .f = file,
                .ib = mapped,
@@ -1537,7 +1566,7 @@ radv_amdgpu_winsys_cs_dump(struct ac_cmdbuf *_cs, FILE *file, const int *trace_i
          }
       }
 
-      if (type == RADV_CS_DUMP_TYPE_CTX_ROLLS) {
+      if (dump_ctx_rolls) {
          ac_gather_context_rolls(file, ibs, ib_dw_sizes, cs->num_ib_buffers, cs->annotations, &ws->info);
 
          free(ibs);

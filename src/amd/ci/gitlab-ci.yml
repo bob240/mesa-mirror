@@ -193,7 +193,6 @@ radv-tahiti-vkcts:
   timeout: 1h
   variables:
     CI_TRON_TIMEOUT__OVERALL__MINUTES: 50
-    RADV_PERFTEST: video_decode,video_encode
 
 radv-hawaii-vkcts:
   extends:
@@ -203,7 +202,6 @@ radv-hawaii-vkcts:
   timeout: 1h
   variables:
     CI_TRON_TIMEOUT__OVERALL__MINUTES: 50
-    RADV_PERFTEST: video_decode,video_encode
 
 radv-polaris10-vkcts:
   extends:
@@ -258,8 +256,6 @@ radv-navi21-vkcts:
   variables:
     CI_TRON_TIMEOUT__OVERALL__MINUTES: 30
     RADV_PERFTEST: transfer_queue,hic
-    # FIXME: GPU hangs
-    RADV_DEBUG: novideo
 
 radv-vangogh-vkcts:
   parallel: 2
@@ -313,8 +309,7 @@ radv-navi31-vkcts:
     - .navi31-test-valve
     - .radv-valve-rules
   variables:
-    # FIXME: Random GPU hangs on VCN
-    RADV_DEBUG: nomeshshader,novideo # Disable mesh shaders until task shaders stop hanging
+    RADV_DEBUG: nomeshshader # Disable mesh shaders until task shaders stop hanging
     RADV_PERFTEST: transfer_queue,hic
     CI_TRON_TIMEOUT__OVERALL__MINUTES: 20
 

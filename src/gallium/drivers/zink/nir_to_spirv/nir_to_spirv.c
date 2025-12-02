@@ -4522,8 +4522,8 @@ emit_block(struct ntv_context *ctx, struct nir_block *block)
       case nir_instr_type_call:
          UNREACHABLE("nir_instr_type_call not supported");
          break;
-      case nir_instr_type_parallel_copy:
-         UNREACHABLE("nir_instr_type_parallel_copy not supported");
+      case nir_instr_type_cmat_call:
+         UNREACHABLE("nir_instr_type_cmat_call not supported");
          break;
       case nir_instr_type_deref:
          emit_deref(ctx, nir_instr_as_deref(instr));

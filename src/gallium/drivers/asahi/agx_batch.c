@@ -634,8 +634,8 @@ asahi_add_attachment(struct attachments *att, struct agx_resource *rsrc)
    assert(att->count < MAX_ATTACHMENTS);
 
    att->list[att->count++] = (struct drm_asahi_attachment){
-      .size = rsrc->layout.size_B,
-      .pointer = rsrc->bo->va->addr,
+      .size = rsrc->layout.size_B - rsrc->layout.level_offsets_B[0],
+      .pointer = agx_map_gpu(rsrc),
    };
 }
 
@@ -815,8 +815,7 @@ agx_batch_submit(struct agx_context *ctx, struct agx_batch *batch,
    };
 
    /* Submit! */
-   struct util_dynarray cmdbuf;
-   util_dynarray_init(&cmdbuf, NULL);
+   struct util_dynarray cmdbuf = UTIL_DYNARRAY_INIT;
 
    if (compute) {
       /* Barrier on previous submission */

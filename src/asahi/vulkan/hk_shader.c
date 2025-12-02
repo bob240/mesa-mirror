@@ -8,7 +8,7 @@
  */
 #include "hk_shader.h"
 
-#include "poly/nir/poly_nir_lower_gs.h"
+#include "poly/nir/poly_nir.h"
 #include "agx_debug.h"
 #include "agx_device.h"
 #include "agx_helpers.h"
@@ -143,7 +143,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    do {
       progress = false;
       NIR_PASS(progress, nir, nir_lower_vars_to_ssa);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_loop);
@@ -166,7 +166,7 @@ hk_preprocess_nir_internal(struct vk_physical_device *vk_pdev, nir_shader *nir)
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
-            nir_shader_get_entrypoint(nir), true, false);
+            nir_shader_get_entrypoint(nir), nir_var_shader_out);
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
 
@@ -794,8 +794,6 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       NIR_PASS(_, nir, nir_lower_input_attachments,
                &(nir_input_attachment_options){
-                  .use_fragcoord_sysval = true,
-                  .use_layer_id_sysval = true,
                   .use_view_id_for_layer = is_multiview,
                });
 
@@ -867,7 +865,7 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
       progress = false;
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_algebraic);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_dce);
    } while (progress);
 
@@ -907,8 +905,8 @@ hk_lower_nir(struct hk_device *dev, nir_shader *nir,
    else if (nir->info.stage == MESA_SHADER_VERTEX)
       lower_indirect_modes |= nir_var_shader_in | nir_var_shader_out;
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs, lower_indirect_modes,
-            UINT32_MAX);
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            lower_indirect_modes, UINT32_MAX);
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size,
@@ -1046,7 +1044,7 @@ hk_lower_hw_vs(nir_shader *nir, struct hk_shader *shader, bool kill_psiz)
     *
     * Must be synced with pointSizeRange.
     */
-   NIR_PASS(_, nir, nir_lower_point_size, 1.0f, 511.95f);
+   NIR_PASS(_, nir, nir_lower_point_size, 1.0f, 511.95f, nir_type_invalid);
 
    if (kill_psiz) {
       NIR_PASS(_, nir, nir_shader_intrinsics_pass, kill_psiz_write,
@@ -1153,7 +1151,7 @@ hk_compile_nir(struct hk_device *dev, const VkAllocationCallbacks *pAllocator,
    shader->info.set_count = set_count;
 
    /* XXX: rename */
-   NIR_PASS(_, nir, hk_lower_uvs_index, nr_vbos);
+   NIR_PASS(_, nir, hk_lower_uvs_index, sw_stage, nr_vbos);
    NIR_PASS(_, nir, nir_shader_intrinsics_pass, lower_uniforms,
             nir_metadata_control_flow, &root);
 
@@ -1405,9 +1403,8 @@ hk_compile_shader(struct hk_device *dev, struct vk_shader_compile_info *info,
          NIR_PASS(_, nir, nir_recompute_io_bases, nir_var_shader_in);
       }
 
-      /* the shader_out portion of this is load-bearing even for tess eval */
-      NIR_PASS(_, nir, nir_io_add_const_offset_to_base,
-               nir_var_shader_in | nir_var_shader_out);
+      /* Fold constant offset srcs for IO. */
+      NIR_PASS(_, nir, nir_opt_constant_folding);
 
       for (enum hk_vs_variant v = 0; v < HK_VS_VARIANTS; ++v) {
          /* Only compile the software variant if we might use this shader with
@@ -1505,7 +1502,7 @@ nir_opts(nir_shader *nir)
       progress = false;
 
       NIR_PASS(progress, nir, nir_opt_loop);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_remove_phis);
       NIR_PASS(progress, nir, nir_opt_dce);
 
@@ -1523,8 +1520,6 @@ nir_opts(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_phi_precision);
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
-      NIR_PASS(progress, nir, nir_io_add_const_offset_to_base,
-               nir_var_shader_in | nir_var_shader_out);
 
       NIR_PASS(progress, nir, nir_opt_undef);
       NIR_PASS(progress, nir, nir_opt_loop_unroll);
@@ -1556,8 +1551,8 @@ hk_compile_shaders(struct vk_device *vk_dev, uint32_t shader_count,
                    info->set_layout_count, info->set_layouts, hk_features);
 
       if (nir->xfb_info) {
-         nir_io_add_const_offset_to_base(
-            nir, nir_var_shader_in | nir_var_shader_out);
+         /* Fold constant offset srcs for IO. */
+         NIR_PASS(_, nir, nir_opt_constant_folding);
 
          nir_io_add_intrinsic_xfb_info(nir);
       }

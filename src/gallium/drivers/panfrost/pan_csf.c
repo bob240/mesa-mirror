@@ -615,10 +615,8 @@ csf_submit_wait_and_dump(struct panfrost_batch *batch,
 
    /* Jobs won't be complete if blackhole rendering, that's ok */
    if (!ctx->is_noop && (dev->debug & PAN_DBG_SYNC) &&
-       *((uint64_t *)batch->csf.cs.state.cpu) != 0) {
+       *((uint64_t *)batch->csf.cs.state.cpu) != 0)
       crash = true;
-      dump = true;
-   }
 
    if (dump) {
       const struct drm_panthor_queue_submit *qsubmits =
@@ -658,7 +656,7 @@ GENX(csf_submit_batch)(struct panfrost_batch *batch)
    uint32_t vm_sync_handle = panthor_kmod_vm_sync_handle(dev->kmod.vm);
    struct util_dynarray syncops;
 
-   util_dynarray_init(&syncops, NULL);
+   syncops = UTIL_DYNARRAY_INIT;
 
    ret = csf_submit_collect_wait_ops(batch, &syncops, vm_sync_handle);
    if (ret)

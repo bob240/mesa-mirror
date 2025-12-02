@@ -10,7 +10,6 @@ shaders@point-vertex-id gl_vertexid gl_instanceid divisor,Fail
 shaders@point-vertex-id gl_vertexid gl_instanceid,Fail
 shaders@point-vertex-id gl_vertexid,Fail
 spec@!opengl 1.0@gl-1.0-user-clip-all-planes,Fail
-spec@!opengl 1.1@point-line-no-cull,Fail
 spec@!opengl 1.1@texwrap formats bordercolor,Fail
 spec@!opengl 1.1@texwrap formats bordercolor-swizzled,Fail
 spec@!opengl 1.1@texwrap formats bordercolor-swizzled@GL_INTENSITY12- swizzled- border color only,Fail
@@ -84,58 +83,6 @@ spec@arb_point_sprite@arb_point_sprite-mipmap,Fail
 spec@arb_shader_storage_buffer_object@compiler@atomicmin-swizzle.vert,Fail
 spec@arb_shader_texture_lod@execution@arb_shader_texture_lod-texgrad,Fail
 spec@arb_shader_texture_lod@execution@arb_shader_texture_lod-texgradcube,Fail
-spec@arb_texture_buffer_object@formats (fs- arb),Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_ALPHA16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_ALPHA32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY16I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY16UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY32I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY32UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY8I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_INTENSITY8UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE16I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE16UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE32I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE32UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE8I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE8UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA16I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA16UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA32I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA32UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA8I_EXT,Fail
-spec@arb_texture_buffer_object@formats (fs- arb)@GL_LUMINANCE_ALPHA8UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb),Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY16I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY16UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY32I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY32UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY8I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_INTENSITY8UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE16I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE16UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE32I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE32UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE8I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE8UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA16F_ARB,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA16I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA16UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA32F_ARB,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA32I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA32UI_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA8I_EXT,Fail
-spec@arb_texture_buffer_object@formats (vs- arb)@GL_LUMINANCE_ALPHA8UI_EXT,Fail
 spec@arb_texture_buffer_object@texture-buffer-size-clamp,Fail
 spec@arb_texture_buffer_object@texture-buffer-size-clamp@r8ui_texture_buffer_size_via_sampler,Fail
 spec@arb_texture_buffer_object@texture-buffer-size-clamp@rg8ui_texture_buffer_size_via_sampler,Fail
@@ -513,11 +460,8 @@ program@execute@builtin@builtin-float-sign-1.0.generated@sign float4,Fail
 program@execute@builtin@builtin-float-sign-1.0.generated@sign float8,Fail
 program@execute@builtin@builtin-long-abs-1.0.generated,Crash
 program@execute@builtin@builtin-long-clamp-1.1.generated,Crash
-program@execute@builtin@builtin-long-mad_hi-1.0.generated,Crash
-program@execute@builtin@builtin-long-mad_sat-1.0.generated,Crash
 program@execute@builtin@builtin-long-max-1.1.generated,Crash
 program@execute@builtin@builtin-long-min-1.1.generated,Crash
-program@execute@builtin@builtin-long-mul_hi-1.0.generated,Crash
 program@execute@builtin@builtin-long-popcount-1.2.generated,Fail
 program@execute@builtin@builtin-long-popcount-1.2.generated@popcount long1,Fail
 program@execute@builtin@builtin-long-popcount-1.2.generated@popcount long16,Fail
@@ -525,7 +469,6 @@ program@execute@builtin@builtin-long-popcount-1.2.generated@popcount long2,Fail
 program@execute@builtin@builtin-long-popcount-1.2.generated@popcount long4,Fail
 program@execute@builtin@builtin-long-popcount-1.2.generated@popcount long8,Fail
 program@execute@builtin@builtin-ulong-clamp-1.1.generated,Crash
-program@execute@builtin@builtin-ulong-mad_hi-1.0.generated,Crash
 program@execute@builtin@builtin-ulong-max-1.1.generated,Crash
 program@execute@builtin@builtin-ulong-min-1.1.generated,Crash
 program@execute@builtin@builtin-ulong-popcount-1.2.generated,Fail
@@ -881,6 +824,14 @@ dEQP-VK.pipeline.monolithic.logic_op_na_formats.r8g8b8a8_srgb.or_reverse_blend,F
 dEQP-VK.pipeline.monolithic.logic_op_na_formats.r8g8b8a8_srgb.set_blend,Fail
 dEQP-VK.pipeline.monolithic.logic_op_na_formats.r8g8b8a8_srgb.xor_blend,Fail
 
+ubsan-KHR-GL31.frag_coord_conventions.multisample,Fail
+ubsan-KHR-GL31.framebuffer_blit.multisampled_to_singlesampled_blit_color_config_test,Fail
+ubsan-KHR-GL31.transform_feedback3.skip_multiple_buffers,Fail
+ubsan-dEQP-VK.image.mutable.2d_array.r16g16_sint_r8g8b8a8_uint_draw_copy_resolve_mutable_resolve_att,Fail
+ubsan-dEQP-VK.image.mutable.2d_array.r32_uint_r8g8b8a8_uint_draw_copy_resolve_mutable_resolve_att,Fail
+ubsan-dEQP-VK.image.mutable.2d_array.r32g32_sint_r16g16b16a16_uint_draw_copy_resolve_mutable_color_att,Fail
+ubsan-dEQP-VK.pipeline.monolithic.logic_op_na_formats.b8g8r8a8_srgb.and_reverse_blend,Fail
+ubsan-dEQP-VK.pipeline.monolithic.logic_op_na_formats.r16g16_sfloat.or_reverse_blend,Fail
 ubsan-dEQP-VK.pipeline.monolithic.logic_op_na_formats.r8g8b8a8_srgb.or_inverted_blend,Fail
 
 # SKQP failing tests
@@ -1016,3 +967,6 @@ vk_wacky_yuv_formats,Fail
 vk_wacky_yuv_formats_cs,Fail
 vk_xfermodes2,Fail
 vk_xfermodes3,Fail
+
+# Bisected to 08b5876c379 ("v3d: only expose rgba buffer-textures")
+TransferPixelsTest,Fail

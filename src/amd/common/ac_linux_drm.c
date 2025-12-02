@@ -5,6 +5,7 @@
 
 #include "util/os_drm.h"
 #include "ac_linux_drm.h"
+#include "util/os_misc.h"
 #include "util/u_math.h"
 #include "util/u_sync_provider.h"
 #include "ac_gpu_info.h"
@@ -227,7 +228,7 @@ int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_n
 int ac_drm_bo_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size,
                     uint64_t addr, uint64_t flags, uint32_t ops)
 {
-   size = ALIGN(size, getpagesize());
+   size = align64(size, getpagesize());
 
    return ac_drm_bo_va_op_raw(
       dev, bo_handle, offset, size, addr,
@@ -295,9 +296,9 @@ int ac_drm_cs_ctx_create2(ac_drm_device *dev, uint32_t priority, uint32_t *ctx_i
 {
    int r;
    union drm_amdgpu_ctx args;
-   char *override_priority;
+   const char *override_priority;
 
-   override_priority = getenv("AMD_PRIORITY");
+   override_priority = os_get_option("AMD_PRIORITY");
    if (override_priority) {
       /* The priority is a signed integer. The variable type is
        * wrong. If parsing fails, priority is unchanged.
@@ -1109,4 +1110,15 @@ int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
    info->pci.valid = true;
 
    return 0;
+}
+
+void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *info)
+{
+#ifdef HAVE_AMDGPU_VIRTIO
+   if (dev->is_virtio) {
+      info->has_vm_always_valid = amdvgpu_has_vm_always_valid(dev->vdev);
+      return;
+   }
+#endif
+   info->has_vm_always_valid = true;
 }

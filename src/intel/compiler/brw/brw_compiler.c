@@ -107,6 +107,7 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
 
    compiler->precise_trig = debug_get_bool_option("INTEL_PRECISE_TRIG", false);
 
+   compiler->extended_bindless_surface_offset = devinfo->verx10 >= 125;
    compiler->use_tcs_multi_patch = devinfo->ver >= 12;
 
    compiler->indirect_ubos_use_sampler = devinfo->ver < 12;
@@ -279,6 +280,7 @@ brw_get_compiler_config_value(const struct brw_compiler *compiler)
       DEBUG_SOFT64,
       DEBUG_NO_SEND_GATHER,
       DEBUG_NO_VRT,
+      DEBUG_NO_FILL_OPT,
    };
    for (uint32_t i = 0; i < ARRAY_SIZE(debug_bits); i++) {
       insert_u64_bit(&config, INTEL_DEBUG(debug_bits[i]));

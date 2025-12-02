@@ -446,7 +446,7 @@ parse_offset(nir_scalar base, uint64_t *offset)
       }
    }
 
-   if (base.def->parent_instr->type == nir_instr_type_intrinsic) {
+   if (nir_def_is_intrinsic(base.def)) {
       nir_intrinsic_instr *intrin = nir_def_as_intrinsic(base.def);
       if (intrin->intrinsic == nir_intrinsic_load_vulkan_descriptor)
          base.def = NULL;
@@ -911,7 +911,7 @@ hoist_base_addr(nir_instr *instr, nir_instr *to_hoist)
       /* For ALU, recursively hoist the sources. */
       nir_alu_instr *alu = nir_instr_as_alu(to_hoist);
       for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++)
-         hoist_base_addr(instr, alu->src[i].src.ssa->parent_instr);
+         hoist_base_addr(instr, nir_def_instr(alu->src[i].src.ssa));
    }
 
    nir_instr_move(nir_before_instr(instr), to_hoist);
@@ -970,7 +970,7 @@ vectorize_loads(nir_builder *b, struct vectorize_ctx *ctx,
    /* update uses */
    if (first == low) {
       nir_def_rewrite_uses_after_instr(&low->intrin->def, low_def,
-                                 high_def->parent_instr);
+                                       nir_def_instr(high_def));
       nir_def_rewrite_uses(&high->intrin->def, high_def);
    } else {
       nir_def_rewrite_uses(&low->intrin->def, low_def);
@@ -989,7 +989,7 @@ vectorize_loads(nir_builder *b, struct vectorize_ctx *ctx,
 
       /* Hoist low base addr before first intrinsic. */
       nir_def *base = low->intrin->src[info->base_src].ssa;
-      hoist_base_addr(first->instr, base->parent_instr);
+      hoist_base_addr(first->instr, nir_def_instr(base));
       nir_src_rewrite(&first->intrin->src[info->base_src], base);
 
       if (nir_intrinsic_has_offset_shift(first->intrin)) {
@@ -1536,14 +1536,14 @@ try_vectorize_shared2(struct vectorize_ctx *ctx,
          return false;
    }
 
-   /* vectorize the accesses */
-   nir_builder b = nir_builder_at(nir_after_instr(first->is_store ? second->instr : first->instr));
-
-   nir_def *offset = first->intrin->src[first->is_store].ssa;
-   offset = nir_iadd_imm(&b, offset, nir_intrinsic_base(first->intrin));
+   /* Take low as base address. */
+   nir_def *offset = low->intrin->src[first->is_store].ssa;
    if (first != low)
-      offset = nir_iadd_imm(&b, offset, -(int)diff);
+      hoist_base_addr(&first->intrin->instr, nir_def_instr(offset));
+   nir_builder b = nir_builder_at(nir_after_instr(first->is_store ? second->instr : first->instr));
+   offset = nir_iadd_imm(&b, offset, nir_intrinsic_base(low->intrin));
 
+   /* vectorize the accesses */
    uint32_t access = nir_intrinsic_access(first->intrin);
    if (first->is_store) {
       nir_def *low_val = low->intrin->src[low->info->value_src].ssa;

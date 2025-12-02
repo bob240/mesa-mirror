@@ -98,6 +98,11 @@ unsigned pan_lookup_pushed_ubo(struct pan_ubo_push *push, unsigned ubo,
 struct pan_compile_inputs {
    unsigned gpu_id;
    uint32_t gpu_variant;
+   /* Used on Bifrost and Valhall for pixel_local_storage load/store to convert
+    * the format to a descriptor.
+    */
+   uint64_t (*get_conv_desc)(enum pipe_format fmt, unsigned rt,
+                             unsigned force_size, bool dithered);
    bool is_blend, is_blit;
    struct {
       unsigned nr_samples;
@@ -107,6 +112,9 @@ struct pan_compile_inputs {
    uint32_t view_mask;
 
    nir_variable_mode robust2_modes;
+   /* Whether or not descriptor accesses should add additional robustness
+    * checks. */
+   bool robust_descriptors;
 
    /* Mask of UBOs that may be moved to push constants */
    uint32_t pushable_ubos;
@@ -237,6 +245,11 @@ struct pan_shader_info {
 
       struct {
          bool writes_point_size;
+
+         /* True if this shader needs the extended FIFO format for
+          * more than just point size.
+          */
+         bool needs_extended_fifo;
 
          /* If the primary shader writes point size, the Valhall
           * driver may need a variant that does not write point

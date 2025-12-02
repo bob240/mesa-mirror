@@ -179,6 +179,9 @@ struct spill_ctx {
     */
    BITSET_WORD *S;
 
+   /* Widths of vectors */
+   uint32_t *size;
+
    /* Mapping of rematerializable values to their definitions, or NULL for nodes
     * that are not materializable.
     */
@@ -206,6 +209,14 @@ struct spill_ctx {
    uint32_t *spill_map;
    /* and the reverse */
    uint32_t *mem_map;
+   /* used to mark if a location has been stored to already. */
+   BITSET_WORD *spill_map_store;
+
+   /* Instruction that defines an SSA value. */
+   bi_instr **ssa_defs;
+
+   /* Block that defines an SSA value. */
+   bi_block **ssa_def_blocks;
 
    /* architecture */
    unsigned arch;
@@ -219,12 +230,11 @@ spill_block(struct spill_ctx *ctx, bi_block *block)
 
 /* Calculate the register demand of a node. This should be rounded up to
  * a power-of-two to match the equivalent calculations in RA.
- * For now just punt and return 1, but we'll want to revisit this later.
  */
 static inline unsigned
 node_size(struct spill_ctx *ctx, unsigned node)
 {
-   return 1;
+   return ctx->size[node];
 }
 
 /*
@@ -326,10 +336,10 @@ can_remat(bi_instr *I)
    case BI_OPCODE_IADD_IMM_I32:
    case BI_OPCODE_IADD_IMM_V2I16:
       return only_const_sources(I);
-   case BI_OPCODE_LD_BUFFER_I8:
-   case BI_OPCODE_LD_BUFFER_I16:
-   case BI_OPCODE_LD_BUFFER_I24:
-   case BI_OPCODE_LD_BUFFER_I32:
+   case BI_OPCODE_LD_PKA_I8:
+   case BI_OPCODE_LD_PKA_I16:
+   case BI_OPCODE_LD_PKA_I24:
+   case BI_OPCODE_LD_PKA_I32:
       /* TODO: Allow loads that write >1 reg. */
       return only_const_sources(I);
    case BI_OPCODE_MOV_I32:
@@ -356,14 +366,14 @@ remat_to(bi_builder *b, bi_index dst, struct spill_ctx *ctx, unsigned node)
       return bi_iadd_imm_i32_to(b, dst, I->src[0], I->index);
    case BI_OPCODE_IADD_IMM_V2I16:
       return bi_iadd_imm_v2i16_to(b, dst, I->src[0], I->index);
-   case BI_OPCODE_LD_BUFFER_I8:
-      return bi_ld_buffer_i8_to(b, dst, I->src[0], I->src[1]);
-   case BI_OPCODE_LD_BUFFER_I16:
-      return bi_ld_buffer_i16_to(b, dst, I->src[0], I->src[1]);
-   case BI_OPCODE_LD_BUFFER_I24:
-      return bi_ld_buffer_i24_to(b, dst, I->src[0], I->src[1]);
-   case BI_OPCODE_LD_BUFFER_I32:
-      return bi_ld_buffer_i32_to(b, dst, I->src[0], I->src[1]);
+   case BI_OPCODE_LD_PKA_I8:
+      return bi_ld_pka_i8_to(b, dst, I->src[0], I->src[1]);
+   case BI_OPCODE_LD_PKA_I16:
+      return bi_ld_pka_i16_to(b, dst, I->src[0], I->src[1]);
+   case BI_OPCODE_LD_PKA_I24:
+      return bi_ld_pka_i24_to(b, dst, I->src[0], I->src[1]);
+   case BI_OPCODE_LD_PKA_I32:
+      return bi_ld_pka_i32_to(b, dst, I->src[0], I->src[1]);
    case BI_OPCODE_MOV_I32:
       assert(I->src[0].type == BI_INDEX_CONSTANT ||
              I->src[0].type == BI_INDEX_FAU);
@@ -373,11 +383,32 @@ remat_to(bi_builder *b, bi_index dst, struct spill_ctx *ctx, unsigned node)
    }
 }
 
+static bi_cursor
+choose_spill_position(struct spill_ctx *ctx, unsigned node, bi_cursor fallback)
+{
+   bi_instr *producer = ctx->ssa_defs[node];
+   bi_block *block = ctx->ssa_def_blocks[node];
+
+   assert(producer);
+   assert(block);
+
+   if (ctx->block == block)
+      return fallback;
+
+   /* Don't insert spills in the middle of the PHI block. This breaks the
+    * assumption that phis are together at the start of each block. */
+   if (producer->op == BI_OPCODE_PHI) {
+      return bi_after_block_logical(block);
+   } else {
+      return bi_after_instr(producer);
+   }
+}
+
 static void
 insert_spill(bi_builder *b, struct spill_ctx *ctx, unsigned node)
 {
    assert(node < ctx->spill_max);
-   if (!ctx->remat[node]) {
+   if (!ctx->remat[node] && !BITSET_TEST(ctx->spill_map_store, node)) {
       bi_index idx = reconstruct_index(ctx, node);
       bi_index mem = bi_index_as_mem(idx, ctx);
       unsigned bits = 32;
@@ -389,6 +420,8 @@ insert_spill(bi_builder *b, struct spill_ctx *ctx, unsigned node)
        * instead of just remat.
        */
       b->shader->has_spill_pcopy_reserved = true;
+
+      BITSET_SET(ctx->spill_map_store, node);
    }
 }
 
@@ -461,7 +494,8 @@ cmp_dist(const void *left_, const void *right_, void *ctx_)
    struct spill_ctx *ctx = ctx_;
    const struct candidate *left = left_;
    const struct candidate *right = right_;
-
+   unsigned ldist = left->dist;
+   unsigned rdist = right->dist;
    /* We assume that rematerializing - even before every instruction - is
     * cheaper than spilling. As long as one of the nodes is rematerializable
     * (with distance > 0), we choose it over spilling. Within a class of nodes
@@ -469,13 +503,13 @@ cmp_dist(const void *left_, const void *right_, void *ctx_)
     */
    assert(left->node < ctx->n_alloc);
    assert(right->node < ctx->n_alloc);
-   bool remat_left = ctx->remat[left->node] != NULL && left->dist > 0;
-   bool remat_right = ctx->remat[right->node] != NULL && right->dist > 0;
+   bool remat_left = ctx->remat[left->node] != NULL && ldist > 0;
+   bool remat_right = ctx->remat[right->node] != NULL && rdist > 0;
 
    if (remat_left != remat_right)
       return remat_left ? 1 : -1;
    else
-      return (left->dist > right->dist) - (left->dist < right->dist);
+      return (ldist > rdist) - (ldist < rdist);
 }
 
 /*
@@ -535,9 +569,9 @@ insert_coupling_code(struct spill_ctx *ctx, bi_block *pred, bi_block *succ)
       }
 
       if (!spilled) {
-         /* Spill the phi source. TODO: avoid redundant spills here */
-         bi_builder b =
-            bi_init_builder(ctx->shader, bi_after_block_logical(pred));
+         bi_cursor c = choose_spill_position(ctx, I->src[s].value,
+                                             bi_after_block_logical(pred));
+         bi_builder b = bi_init_builder(ctx->shader, c);
 
          insert_spill(&b, ctx, I->src[s].value);
       }
@@ -581,7 +615,8 @@ insert_coupling_code(struct spill_ctx *ctx, bi_block *pred, bi_block *succ)
       if (spilled)
          continue;
 
-      bi_builder b = bi_init_builder(ctx->shader, bi_along_edge(pred, succ));
+      bi_cursor c = choose_spill_position(ctx, v, bi_along_edge(pred, succ));
+      bi_builder b = bi_init_builder(ctx->shader, c);
       insert_spill(&b, ctx, v);
    }
 
@@ -666,7 +701,7 @@ calculate_local_next_use(struct spill_ctx *ctx, struct util_dynarray *out)
    struct spill_block *sb = spill_block(ctx, ctx->block);
    unsigned ip = sb->cycles;
 
-   util_dynarray_init(out, NULL);
+   *out = UTIL_DYNARRAY_INIT;
 
    struct next_uses nu;
    init_next_uses(&nu, NULL);
@@ -699,12 +734,11 @@ calculate_local_next_use(struct spill_ctx *ctx, struct util_dynarray *out)
    destroy_next_uses(&nu);
 }
 
-
 /*
- * TODO: Implement section 4.2 of the paper.
- *
- * For now, we implement the simpler heuristic in Hack's thesis: sort
- * the live-in set (+ destinations of phis) by next-use distance.
+ * Let I_B be the set of live-in variables plus the set of variables defined
+ * by phis. Then W_entry will contain variables
+ * - I_B & <variables used in the loop>
+ * - I_B & <variables live-through the loop> (if there is space left)
  */
 static ATTRIBUTE_NOINLINE void
 compute_w_entry_loop_header(struct spill_ctx *ctx)
@@ -712,22 +746,85 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
    bi_block *block = ctx->block;
    struct spill_block *sb = spill_block(ctx, block);
 
-   unsigned nP = __bitset_count(block->ssa_live_in, BITSET_WORDS(ctx->n_alloc));
-   struct candidate *candidates = calloc(nP, sizeof(struct candidate));
-   unsigned j = 0;
+   const uint32_t flags_len = ctx->n_alloc;
+   bool *flag_mem = calloc(2 * flags_len, sizeof(bool));
+   bool *alive = flag_mem;
+   bool *used_in_loop = flag_mem + flags_len;
 
-   foreach_next_use(&sb->next_use_in, i, dist) {
-      assert(j < nP);
-      candidates[j++] = (struct candidate){.node = i, .dist = dist};
+   /* alive := live-in + defined by phis */
+   uint32_t i = 0;
+   BITSET_FOREACH_SET(i, ctx->block->ssa_live_in, ctx->n_alloc) {
+      alive[i] = true;
+   }
+   bi_foreach_phi_in_block(ctx->block, phi)
+   {
+      alive[phi->dest[0].value] = true;
    }
 
-   assert(j == nP);
+   /* Start with candidates := { v : v ∈ alive and used_in_loop(v) }. */
+   struct candidate *candidates =
+      calloc(ctx->n_alloc, sizeof(struct candidate));
+   uint32_t n_ca = 0;
 
-   /* Sort by next-use distance */
-   util_qsort_r(candidates, j, sizeof(struct candidate), cmp_dist, ctx);
+   uint32_t max_loop_pressure = 0;
+   BITSET_WORD *loop_block = BITSET_RZALLOC(NULL, ctx->shader->num_blocks);
+   bi_find_loop_blocks(ctx->shader, ctx->block, loop_block);
 
-   /* Take as much as we can */
-   for (unsigned i = 0; i < j; ++i) {
+   bi_foreach_block(ctx->shader, block) {
+      if (BITSET_TEST(loop_block, block->index)) {
+         bi_foreach_instr_in_block(block, I) {
+            max_loop_pressure = MAX2(max_loop_pressure, block->ssa_max_live);
+
+            bi_foreach_src(I, s) {
+               const uint32_t v = I->src[s].value;
+               const bool is_reg = I->src[s].type == BI_INDEX_NORMAL;
+
+               /* Only add live register values, and only add them once. */
+               if (!is_reg || !alive[v] || used_in_loop[v])
+                  continue;
+
+               const dist_t d = search_next_uses(&sb->next_use_in, v);
+               candidates[n_ca++] = (struct candidate){.node = v, .dist = d};
+               used_in_loop[v] = true;
+            }
+         }
+      }
+   }
+
+   ralloc_free(loop_block);
+
+   /* Sort by next-use distance. */
+   util_qsort_r(candidates, n_ca, sizeof(struct candidate), cmp_dist, ctx);
+
+   const uint32_t n_ca_loop = n_ca;
+
+   /* Find live-through values in case we want to add any. */
+   if (n_ca < ctx->k) {
+      for (i = 0; i < ctx->n_alloc; ++i) {
+         const bool live_through = alive[i] && !used_in_loop[i];
+         if (live_through) {
+            const dist_t d = search_next_uses(&sb->next_use_in, i);
+            candidates[n_ca++] = (struct candidate){.node = i, .dist = d};
+         }
+      }
+   }
+   const uint32_t n_lt = n_ca - n_ca_loop;
+
+   /* Sort live-through variables by next-use distance. */
+   util_qsort_r(candidates + n_ca_loop, n_lt, sizeof(struct candidate),
+                cmp_dist, ctx);
+
+   assert(max_loop_pressure >= n_lt);
+   /* If the pressure caused by vars inside the loop t is < k, we have space
+    * for more variables to put in W_entry. */
+   const uint32_t t = max_loop_pressure - n_lt;
+   if (t < ctx->k)
+      n_ca = CLAMP(n_ca_loop + (ctx->k - t), 0, n_ca);
+   else
+      n_ca = n_ca_loop;
+
+   /* Take as much as we can. */
+   for (unsigned i = 0; i < n_ca; ++i) {
       unsigned node = candidates[i].node;
       unsigned comps = node_size(ctx, node);
 
@@ -737,30 +834,23 @@ compute_w_entry_loop_header(struct spill_ctx *ctx)
       }
    }
 
-   assert(ctx->nW <= ctx->k);
+   assert(ctx->nW <= ctx->k && "invariant");
+
    free(candidates);
+   free(flag_mem);
 }
 
 /*
- * Compute W_entry for a block. Section 4.2 in the paper.
+ * The W_entry will contain variables that are W_exit in
+ * - all predecessors
+ * - some predecessors, sorted by next-use distance
  */
 static ATTRIBUTE_NOINLINE void
-compute_w_entry(struct spill_ctx *ctx)
+compute_w_entry_usual(struct spill_ctx *ctx)
 {
    bi_block *block = ctx->block;
    struct spill_block *sb = spill_block(ctx, block);
 
-   /* Nothing to do for start blocks */
-   if (bi_num_predecessors(block) == 0)
-      return;
-
-   /* Loop headers have a different heuristic */
-   if (block->loop_header) {
-      compute_w_entry_loop_header(ctx);
-      return;
-   }
-
-   /* Usual blocks follow */
    unsigned *freq = calloc(ctx->n_alloc, sizeof(unsigned));
 
    /* Record what's written at the end of each predecessor */
@@ -840,6 +930,26 @@ compute_w_entry(struct spill_ctx *ctx)
 
    free(freq);
    free(candidates);
+}
+
+/*
+ * Compute W_entry for a block. Section 4.2 in the paper.
+ */
+static ATTRIBUTE_NOINLINE void
+compute_w_entry(struct spill_ctx *ctx)
+{
+   bi_block *block = ctx->block;
+
+   /* Nothing to do for start blocks */
+   if (bi_num_predecessors(block) == 0)
+      return;
+
+   /* Loop headers have a different heuristic */
+   if (block->loop_header) {
+      compute_w_entry_loop_header(ctx);
+   } else {
+      compute_w_entry_usual(ctx);
+   }
 }
 
 /*
@@ -1077,7 +1187,8 @@ limit(struct spill_ctx *ctx, bi_instr *I, unsigned m)
           * another use
           */
          if (!BITSET_TEST(ctx->S, v) && candidates[i].dist < DIST_INFINITY) {
-            bi_builder b = bi_init_builder(ctx->shader, bi_before_instr(I));
+            bi_cursor c = choose_spill_position(ctx, v, bi_before_instr(I));
+            bi_builder b = bi_init_builder(ctx->shader, c);
             insert_spill(&b, ctx, v);
             BITSET_SET(ctx->S, v);
          }
@@ -1268,6 +1379,30 @@ min_algorithm(struct spill_ctx *ctx)
    util_dynarray_fini(&local_next_ip);
 }
 
+static void
+record_ssa_defs(bi_context *ctx, bi_instr **defs, bi_block **blocks)
+{
+   bi_foreach_block(ctx, b) {
+      bi_foreach_instr_in_block(b, I) {
+         if (I->nr_dests > 0 && bi_is_ssa(I->dest[0])) {
+            for (uint32_t vi = 0; vi < I->nr_dests; ++vi) {
+               const uint32_t v = I->dest[vi].value;
+
+               if (defs[v] != NULL || blocks[v] != NULL) {
+                  bi_print_instr(I, stderr);
+                  fprintf(stderr, "before\n");
+                  bi_print_instr(defs[v], stderr);
+               }
+               assert(defs[v] == NULL && "violating SSA");
+               assert(blocks[v] == NULL && "violating SSA");
+               defs[v] = I;
+               blocks[v] = b;
+            }
+         }
+      }
+   }
+}
+
 /*
  * spill to keep the number of registers in use
  * below `k`
@@ -1293,13 +1428,40 @@ bi_spill_ssa(bi_context *ctx, unsigned k, unsigned spill_base)
 
    dist_t *next_uses = rzalloc_array(memctx, dist_t, ctx->ssa_alloc + max_temps);
    bi_instr **remat = rzalloc_array(memctx, bi_instr *, ctx->ssa_alloc + max_temps);
+   uint32_t *sizes = rzalloc_array(memctx, uint32_t, ctx->ssa_alloc + max_temps);
 
    /* now record instructions that can be easily re-materialized */
+   /* while we're at it, calculate sizes too */
    bi_foreach_instr_global(ctx, I) {
+      if (I->nr_dests == 0 || I->dest[0].type != BI_INDEX_NORMAL)
+         continue;
+      unsigned idx = I->dest[0].value;
       if (can_remat(I))
-         remat[I->dest[0].value] = I;
+         remat[idx] = I;
+      bi_foreach_ssa_dest(I, d) {
+         idx = I->dest[d].value;
+         assert(sizes[idx] == 0 && "SSA broken");
+         switch (I->op) {
+         case BI_OPCODE_PHI:
+            break;
+         default:
+            sizes[idx] = bi_count_write_registers(I, d);
+            break;
+         }
+      }
    }
-
+   /* now that we know the rest of the sizes, find the sizes for PHI nodes */
+   bi_foreach_block(ctx, block) {
+      bi_foreach_phi_in_block(block, I) {
+         if (I->dest[0].type != BI_INDEX_NORMAL)
+            continue;
+         unsigned idx = I->dest[0].value;
+         sizes[idx] = 1;
+         bi_foreach_ssa_src(I, s) {
+            sizes[idx] = MAX2(sizes[idx], sizes[I->src[s].value]);
+         }
+      }
+   }
    struct spill_block *blocks =
       rzalloc_array(memctx, struct spill_block, ctx->num_blocks);
 
@@ -1313,14 +1475,22 @@ bi_spill_ssa(bi_context *ctx, unsigned k, unsigned spill_base)
    BITSET_WORD *S = ralloc_array(memctx, BITSET_WORD, BITSET_WORDS(n));
    uint32_t *spill_map = ralloc_array(memctx, uint32_t, n);
    uint32_t *mem_map = ralloc_array(memctx, uint32_t, n);
+   BITSET_WORD *spill_map_store = BITSET_RZALLOC(memctx, n);
+
+   bi_instr **ssa_defs = rzalloc_array(memctx, bi_instr *, n);
+   bi_block **ssa_def_blocks = rzalloc_array(memctx, bi_block *, n);
+   record_ssa_defs(ctx, ssa_defs, ssa_def_blocks);
 
    /* initialize to FFFFFFFF */
    memset(spill_map, 0xff, sizeof(uint32_t) * n);
    memset(mem_map, 0xff, sizeof(uint32_t) * n);
 
+   /* Required for finding blocks belonging to loops. */
+   bi_calc_dominance(ctx);
+
    bi_foreach_block(ctx, block) {
-      memset(W, 0, BITSET_WORDS(n) * sizeof(BITSET_WORD));
-      memset(S, 0, BITSET_WORDS(n) * sizeof(BITSET_WORD));
+      memset(W, 0, BITSET_BYTES(n));
+      memset(S, 0, BITSET_BYTES(n));
 
       struct spill_ctx sctx = {
          .memctx = memctx,
@@ -1333,11 +1503,15 @@ bi_spill_ssa(bi_context *ctx, unsigned k, unsigned spill_base)
          .k = k,
          .W = W,
          .S = S,
+         .size = sizes,
          .spill_max = n,
          .spill_base = spill_base,
          .spill_map = spill_map,
          .spill_bytes = spill_count,
+         .spill_map_store = spill_map_store,
          .mem_map = mem_map,
+         .ssa_defs = ssa_defs,
+         .ssa_def_blocks = ssa_def_blocks,
          .arch = ctx->arch,
       };
 
@@ -1359,11 +1533,15 @@ bi_spill_ssa(bi_context *ctx, unsigned k, unsigned spill_base)
          .k = k,
          .W = W,
          .S = S,
+         .size = sizes,
          .spill_max = n,
          .spill_base = spill_base,
          .spill_map = spill_map,
          .spill_bytes = spill_count,
+         .spill_map_store = spill_map_store,
          .mem_map = mem_map,
+         .ssa_defs = ssa_defs,
+         .ssa_def_blocks = ssa_def_blocks,
          .arch = ctx->arch,
       };
 

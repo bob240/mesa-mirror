@@ -6314,9 +6314,10 @@ optimize_nir(struct nir_shader *s, const struct nir_to_dxil_options *opts)
    do {
       progress = false;
       NIR_PASS(progress, s, nir_lower_vars_to_ssa);
-      NIR_PASS(progress, s, nir_lower_indirect_derefs, nir_var_function_temp, 4);
+      NIR_PASS(progress, s, nir_lower_indirect_derefs_to_if_else_trees,
+               nir_var_function_temp, 4);
       NIR_PASS(progress, s, nir_lower_alu_to_scalar, NULL, NULL);
-      NIR_PASS(progress, s, nir_copy_prop);
+      NIR_PASS(progress, s, nir_opt_copy_prop);
       NIR_PASS(progress, s, nir_opt_copy_prop_vars);
       NIR_PASS(progress, s, nir_lower_bit_size, lower_bit_size_callback, (void*)opts);
       NIR_PASS(progress, s, dxil_nir_lower_8bit_conv);
@@ -6635,6 +6636,8 @@ nir_to_dxil(struct nir_shader *s, const struct nir_to_dxil_options *opts,
    NIR_PASS(_, s, nir_lower_frexp);
    NIR_PASS(_, s, nir_lower_flrp, 16 | 32 | 64, true);
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out, type_size_vec4, nir_lower_io_lower_64bit_to_32);
+   s->info.disable_input_offset_src_constant_folding = true;
+   s->info.disable_output_offset_src_constant_folding = true;
    NIR_PASS(_, s, dxil_nir_ensure_position_writes);
    NIR_PASS(_, s, dxil_nir_lower_system_values);
    NIR_PASS(_, s, nir_lower_io_to_scalar, nir_var_shader_in | nir_var_system_value | nir_var_shader_out, NULL, NULL);

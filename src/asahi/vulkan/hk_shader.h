@@ -8,7 +8,7 @@
 #pragma once
 
 #include "asahi/compiler/agx_compile.h"
-#include "poly/nir/poly_nir_lower_gs.h"
+#include "poly/nir/poly_nir.h"
 #include "util/macros.h"
 #include "agx_linker.h"
 #include "agx_nir_lower_vbo.h"
@@ -342,7 +342,8 @@ hk_buffer_addr_format(VkPipelineRobustnessBufferBehaviorEXT robustness)
    }
 }
 
-bool hk_lower_uvs_index(nir_shader *s, unsigned vs_uniform_base);
+bool
+hk_lower_uvs_index(nir_shader *s, mesa_shader_stage sw_stage, unsigned nr_vbos);
 
 bool
 hk_nir_lower_descriptors(nir_shader *nir,

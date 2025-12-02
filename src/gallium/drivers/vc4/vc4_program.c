@@ -828,7 +828,7 @@ ntq_emit_pack_unorm_4x8(struct vc4_compile *c, nir_alu_instr *instr)
         /* If packing from a vec4 op (as expected), identify it so that we can
          * peek back at what generated its sources.
          */
-        if (instr->src[0].src.ssa->parent_instr->type == nir_instr_type_alu &&
+        if (nir_src_is_alu(instr->src[0].src) &&
             nir_def_as_alu(instr->src[0].src.ssa)->op ==
             nir_op_vec4) {
                 vec4 = nir_def_as_alu(instr->src[0].src.ssa);
@@ -997,7 +997,7 @@ static struct qreg ntq_emit_bcsel(struct vc4_compile *c, nir_alu_instr *instr,
 {
         if (nir_load_reg_for_def(instr->src[0].src.ssa))
                 goto out;
-        if (instr->src[0].src.ssa->parent_instr->type != nir_instr_type_alu)
+        if (!nir_src_is_alu(instr->src[0].src))
                 goto out;
         nir_alu_instr *compare =
                 nir_def_as_alu(instr->src[0].src.ssa);
@@ -1497,7 +1497,7 @@ vc4_optimize_nir(struct nir_shader *s)
                 NIR_PASS(_, s, nir_lower_vars_to_ssa);
                 NIR_PASS(progress, s, nir_lower_alu_to_scalar, NULL, NULL);
                 NIR_PASS(progress, s, nir_lower_phis_to_scalar, NULL, NULL);
-                NIR_PASS(progress, s, nir_copy_prop);
+                NIR_PASS(progress, s, nir_opt_copy_prop);
                 NIR_PASS(progress, s, nir_opt_remove_phis);
                 NIR_PASS(progress, s, nir_opt_dce);
                 NIR_PASS(progress, s, nir_opt_dead_cf);
@@ -1512,15 +1512,8 @@ vc4_optimize_nir(struct nir_shader *s)
                 NIR_PASS(progress, s, nir_opt_algebraic);
                 NIR_PASS(progress, s, nir_opt_constant_folding);
                 if (lower_flrp != 0) {
-                        bool lower_flrp_progress = false;
-
-                        NIR_PASS(lower_flrp_progress, s, nir_lower_flrp,
-                                 lower_flrp,
-                                 false /* always_precise */);
-                        if (lower_flrp_progress) {
-                                NIR_PASS(progress, s, nir_opt_constant_folding);
-                                progress = true;
-                        }
+                        NIR_PASS(progress, s, nir_lower_flrp,
+                                 lower_flrp, false /* always_precise */);
 
                         /* Nothing should rematerialize any flrps, so we only
                          * need to do this lowering once.
@@ -2312,7 +2305,7 @@ vc4_shader_ntq(struct vc4_context *vc4, enum qstage stage,
                 more_late_algebraic = false;
                 NIR_PASS(more_late_algebraic, c->s, nir_opt_algebraic_late);
                 NIR_PASS(_, c->s, nir_opt_constant_folding);
-                NIR_PASS(_, c->s, nir_copy_prop);
+                NIR_PASS(_, c->s, nir_opt_copy_prop);
                 NIR_PASS(_, c->s, nir_opt_dce);
                 NIR_PASS(_, c->s, nir_opt_cse);
         }
@@ -2516,11 +2509,12 @@ vc4_shader_state_create(struct pipe_context *pctx,
         }
 
         if (s->info.stage == MESA_SHADER_VERTEX)
-                NIR_PASS(_, s, nir_lower_point_size, 1.0f, 0.0f);
+                NIR_PASS(_, s, nir_lower_point_size, 1.0f, 0.0f, nir_type_invalid);
 
         NIR_PASS(_, s, nir_lower_io,
                  nir_var_shader_in | nir_var_shader_out | nir_var_uniform,
                  type_size, (nir_lower_io_options)0);
+        s->info.disable_output_offset_src_constant_folding = true;
 
         NIR_PASS(_, s, nir_normalize_cubemap_coords);
 

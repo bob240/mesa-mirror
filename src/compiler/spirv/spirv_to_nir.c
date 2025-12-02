@@ -73,6 +73,8 @@ static const struct spirv_capabilities implemented_capabilities = {
    .ComputeDerivativeGroupQuadsKHR = true,
    .CooperativeMatrixKHR = true,
    .CooperativeMatrixConversionsNV = true,
+   .CooperativeMatrixReductionsNV = true,
+   .CooperativeMatrixPerElementOperationsNV = true,
    .CoreBuiltinsARM = true,
    .CullDistance = true,
    .DemoteToHelperInvocation = true,
@@ -257,7 +259,7 @@ vtn_default_log_level(void)
       [NIR_SPIRV_DEBUG_LEVEL_INFO]  = "info",
       [NIR_SPIRV_DEBUG_LEVEL_ERROR] = "error",
    };
-   const char *str = getenv("MESA_SPIRV_LOG_LEVEL");
+   const char *str = os_get_option("MESA_SPIRV_LOG_LEVEL");
 
    if (str == NULL)
       return level;
@@ -400,7 +402,7 @@ _vtn_fail(struct vtn_builder *b, const char *file, unsigned line,
                file, line, fmt, args);
    va_end(args);
 
-   const char *dump_path = secure_getenv("MESA_SPIRV_FAIL_DUMP_PATH");
+   const char *dump_path = os_get_option_secure("MESA_SPIRV_FAIL_DUMP_PATH");
    if (dump_path)
       vtn_dump_shader(b, dump_path, "fail");
 
@@ -827,6 +829,7 @@ vtn_handle_debug_printf(struct vtn_builder *b, SpvOp ext_opcode,
 
    struct vtn_value *format = vtn_value(b, w[5], vtn_value_type_string);
 
+   b->shader->info.uses_printf = true;
    b->shader->printf_info_count++;
    b->shader->printf_info = reralloc(b->shader,
                                      b->shader->printf_info,
@@ -844,7 +847,7 @@ vtn_handle_debug_printf(struct vtn_builder *b, SpvOp ext_opcode,
       .string_size = strlen(format->str) + 1,
    };
 
-   uint32_t info_index = b->shader->printf_info_count - 1;
+   uint32_t info_index = b->shader->printf_info_count;
 
    if (argc) {
       glsl_struct_field *fields = calloc(argc, sizeof(glsl_struct_field));
@@ -4791,22 +4794,30 @@ vtn_vector_construct(struct vtn_builder *b, unsigned num_components,
    return &vec->def;
 }
 
+/*
+ * Creates a copy of `src`, reinterpreting it as `dest_type`.
+ */
 static struct vtn_ssa_value *
-vtn_composite_copy(struct vtn_builder *b, struct vtn_ssa_value *src)
+vtn_composite_copy_logical(struct vtn_builder *b, struct vtn_ssa_value *src, struct vtn_type* dest_type)
 {
    assert(!src->is_variable);
 
    struct vtn_ssa_value *dest = vtn_zalloc(b, struct vtn_ssa_value);
-   dest->type = src->type;
+   dest->type = glsl_get_bare_type(dest_type->type);
 
-   if (glsl_type_is_vector_or_scalar(src->type)) {
+   if (glsl_type_is_vector_or_scalar(dest_type->type)) {
       dest->def = src->def;
    } else {
-      unsigned elems = glsl_get_length(src->type);
-
+      unsigned elems = glsl_get_length(dest_type->type);
       dest->elems = vtn_alloc_array(b, struct vtn_ssa_value *, elems);
-      for (unsigned i = 0; i < elems; i++)
-         dest->elems[i] = vtn_composite_copy(b, src->elems[i]);
+
+      if (glsl_type_is_struct(dest_type->type) || glsl_type_is_interface(dest_type->type)) {
+         for (unsigned i = 0; i < elems; i++)
+            dest->elems[i] = vtn_composite_copy_logical(b, src->elems[i], dest_type->members[i]);
+      } else {
+         for (unsigned i = 0; i < elems; i++)
+            dest->elems[i] = vtn_composite_copy_logical(b, src->elems[i], dest_type->array_element);
+      }
    }
 
    return dest;
@@ -4814,13 +4825,14 @@ vtn_composite_copy(struct vtn_builder *b, struct vtn_ssa_value *src)
 
 static struct vtn_ssa_value *
 vtn_composite_insert(struct vtn_builder *b, struct vtn_ssa_value *src,
-                     struct vtn_ssa_value *insert, const uint32_t *indices,
-                     unsigned num_indices)
+                     struct vtn_type *src_type, struct vtn_ssa_value *insert,
+                     const uint32_t *indices, unsigned num_indices)
 {
    if (glsl_type_is_cmat(src->type))
       return vtn_cooperative_matrix_insert(b, src, insert, indices, num_indices);
 
-   struct vtn_ssa_value *dest = vtn_composite_copy(b, src);
+   /* Straight copy, use the source type as the destination type. */
+   struct vtn_ssa_value *dest = vtn_composite_copy_logical(b, src, src_type);
 
    struct vtn_ssa_value *cur = dest;
    unsigned i;
@@ -4963,15 +4975,15 @@ vtn_handle_composite(struct vtn_builder *b, SpvOp opcode,
 
    case SpvOpCompositeInsert:
       ssa = vtn_composite_insert(b, vtn_ssa_value(b, w[4]),
+                                 vtn_get_value_type(b, w[4]),
                                  vtn_ssa_value(b, w[3]),
                                  w + 5, count - 5);
       break;
 
    case SpvOpCopyLogical: {
-      ssa = vtn_composite_copy(b, vtn_ssa_value(b, w[3]));
-      struct vtn_type *dst_type = vtn_get_value_type(b, w[2]);
-      vtn_assert(vtn_types_compatible(b, type, dst_type));
-      ssa->type = glsl_get_bare_type(dst_type->type);
+      struct vtn_type *dest_type = vtn_get_value_type(b, w[2]);
+      vtn_assert(vtn_types_compatible(b, vtn_get_value_type(b, w[3]), dest_type));
+      ssa = vtn_composite_copy_logical(b, vtn_ssa_value(b, w[3]), dest_type);
       break;
    }
    case SpvOpCopyObject:
@@ -5480,6 +5492,7 @@ vtn_handle_execution_mode(struct vtn_builder *b, struct vtn_value *entry_point,
 
    case SpvExecutionModeLocalSize:
       if (mesa_shader_stage_uses_workgroup(b->shader->info.stage)) {
+         b->shader->info.workgroup_size_variable = false;
          b->shader->info.workgroup_size[0] = mode->operands[0];
          b->shader->info.workgroup_size[1] = mode->operands[1];
          b->shader->info.workgroup_size[2] = mode->operands[2];
@@ -5816,6 +5829,7 @@ vtn_handle_execution_mode_id(struct vtn_builder *b, struct vtn_value *entry_poin
    switch (mode->exec_mode) {
    case SpvExecutionModeLocalSizeId:
       if (mesa_shader_stage_uses_workgroup(b->shader->info.stage)) {
+         b->shader->info.workgroup_size_variable = false;
          b->shader->info.workgroup_size[0] = vtn_constant_uint(b, mode->operands[0]);
          b->shader->info.workgroup_size[1] = vtn_constant_uint(b, mode->operands[1]);
          b->shader->info.workgroup_size[2] = vtn_constant_uint(b, mode->operands[2]);
@@ -6998,6 +7012,8 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpCooperativeMatrixMulAddKHR:
    case SpvOpCooperativeMatrixConvertNV:
    case SpvOpCooperativeMatrixTransposeNV:
+   case SpvOpCooperativeMatrixReduceNV:
+   case SpvOpCooperativeMatrixPerElementOpNV:
       vtn_handle_cooperative_instruction(b, opcode, w, count);
       break;
 
@@ -7289,18 +7305,20 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
 
    b->shader = nir_shader_create(b, stage, nir_options);
    b->shader->info.float_controls_execution_mode = options->float_controls_execution_mode;
+   if (mesa_shader_stage_uses_workgroup(stage))
+      b->shader->info.workgroup_size_variable = true;
    b->shader->info.cs.shader_index = options->shader_index;
    b->shader->has_debug_info = options->debug_info;
    _mesa_blake3_compute(words, word_count * sizeof(uint32_t), b->shader->info.source_blake3);
 
-   const char *dump_path = secure_getenv("MESA_SPIRV_DUMP_PATH");
+   const char *dump_path = os_get_option_secure("MESA_SPIRV_DUMP_PATH");
    if (dump_path) {
       char blake3_str[BLAKE3_HEX_LEN];
       _mesa_blake3_format(blake3_str, b->shader->info.source_blake3);
       vtn_dump_shader(b, dump_path, blake3_str);
    }
 
-   const char *read_path = secure_getenv("MESA_SPIRV_READ_PATH");
+   const char *read_path = os_get_option_secure("MESA_SPIRV_READ_PATH");
    if (read_path) {
       char blake3_str[BLAKE3_HEX_LEN];
       _mesa_blake3_format(blake3_str, b->shader->info.source_blake3);
@@ -7418,21 +7436,23 @@ spirv_to_nir(const uint32_t *words, size_t word_count,
    /* Parse execution modes that depend on IDs. Must happen after we have
     * constants parsed.
     */
-   if (!options->create_library)
+   if (!options->create_library) {
       vtn_foreach_execution_mode(b, b->entry_point,
                                  vtn_handle_execution_mode_id, NULL);
 
-   if (b->workgroup_size_builtin) {
-      vtn_assert(mesa_shader_stage_uses_workgroup(stage));
-      vtn_assert(b->workgroup_size_builtin->type->type ==
-                 glsl_vector_type(GLSL_TYPE_UINT, 3));
+      if (b->workgroup_size_builtin) {
+         vtn_assert(mesa_shader_stage_uses_workgroup(stage));
+         vtn_assert(b->workgroup_size_builtin->type->type ==
+                    glsl_vector_type(GLSL_TYPE_UINT, 3));
 
-      nir_const_value *const_size =
-         b->workgroup_size_builtin->constant->values;
+         nir_const_value *const_size =
+            b->workgroup_size_builtin->constant->values;
 
-      b->shader->info.workgroup_size[0] = const_size[0].u32;
-      b->shader->info.workgroup_size[1] = const_size[1].u32;
-      b->shader->info.workgroup_size[2] = const_size[2].u32;
+         b->shader->info.workgroup_size_variable = false;
+         b->shader->info.workgroup_size[0] = const_size[0].u32;
+         b->shader->info.workgroup_size[1] = const_size[1].u32;
+         b->shader->info.workgroup_size[2] = const_size[2].u32;
+      }
    }
 
    /* Set types on all vtn_values */

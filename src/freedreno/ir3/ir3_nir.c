@@ -311,8 +311,7 @@ ir3_get_variable_size_align_bytes(const glsl_type *type, unsigned *size, unsigne
 
 bool
 ir3_optimize_loop(struct ir3_compiler *compiler,
-                  const struct ir3_shader_nir_options *options,
-                  nir_shader *s)
+                  struct ir3_optimize_options *options, nir_shader *s)
 {
    MESA_TRACE_FUNC();
 
@@ -329,7 +328,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       progress |= OPT(s, nir_lower_alu_to_scalar, NULL, NULL);
       progress |= OPT(s, nir_lower_phis_to_scalar, NULL, NULL);
 
-      progress |= OPT(s, nir_copy_prop);
+      progress |= OPT(s, nir_opt_copy_prop);
       progress |= OPT(s, nir_opt_deref);
       progress |= OPT(s, nir_opt_dce);
       progress |= OPT(s, nir_opt_cse);
@@ -375,6 +374,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       progress |= OPT(s, nir_lower_pack);
       progress |= OPT(s, nir_lower_bit_size, ir3_lower_bit_size, NULL);
       progress |= OPT(s, nir_opt_constant_folding);
+      progress |= OPT(s, nir_opt_uub, &options->opt_uub_options);
 
       /* Remove unused components from IO loads. */
       progress |= OPT(s, nir_opt_shrink_vectors, true);
@@ -397,10 +397,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
       progress |= OPT(s, nir_opt_offsets, &offset_options);
 
       if (lower_flrp != 0) {
-         if (OPT(s, nir_lower_flrp, lower_flrp, false /* always_precise */)) {
-            OPT(s, nir_opt_constant_folding);
-            progress = true;
-         }
+         OPT(s, nir_lower_flrp, lower_flrp, false /* always_precise */);
 
          /* Nothing should rematerialize any flrps, so we only
           * need to do this lowering once.
@@ -415,7 +412,7 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
           * things up if we want any hope of nir_opt_if or nir_opt_loop_unroll
           * to make progress.
           */
-         OPT(s, nir_copy_prop);
+         OPT(s, nir_opt_copy_prop);
          OPT(s, nir_opt_dce);
       }
       progress |= OPT(s, nir_opt_if, nir_opt_if_optimize_phi_true_false);
@@ -427,22 +424,6 @@ ir3_optimize_loop(struct ir3_compiler *compiler,
 
    OPT(s, nir_lower_var_copies);
    return did_progress;
-}
-
-static bool
-should_split_wrmask(const nir_instr *instr, const void *data)
-{
-   nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-
-   switch (intr->intrinsic) {
-   case nir_intrinsic_store_ssbo:
-   case nir_intrinsic_store_shared:
-   case nir_intrinsic_store_global:
-   case nir_intrinsic_store_scratch:
-      return true;
-   default:
-      return false;
-   }
 }
 
 static bool
@@ -492,13 +473,19 @@ ir3_nir_lower_io_vars_to_temporaries(nir_shader *s)
     * stop doing that once we're sure all drivers are doing their own
     * indirect i/o lowering.
     */
-   bool lower_input = s->info.stage == MESA_SHADER_VERTEX ||
-                      s->info.stage == MESA_SHADER_FRAGMENT;
-   bool lower_output = s->info.stage != MESA_SHADER_TESS_CTRL &&
-                       s->info.stage != MESA_SHADER_GEOMETRY;
-   if (lower_input || lower_output) {
+   nir_variable_mode lower_modes = 0;
+
+   if (s->info.stage == MESA_SHADER_VERTEX ||
+       s->info.stage == MESA_SHADER_FRAGMENT)
+      lower_modes |= nir_var_shader_in;
+
+   if (s->info.stage != MESA_SHADER_TESS_CTRL &&
+       s->info.stage != MESA_SHADER_GEOMETRY)
+      lower_modes |= nir_var_shader_out;
+
+   if (lower_modes) {
       NIR_PASS(_, s, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(s),
-               lower_output, lower_input);
+               lower_modes);
 
       /* nir_lower_io_vars_to_temporaries() creates global variables and copy
        * instructions which need to be cleaned up.
@@ -511,14 +498,14 @@ ir3_nir_lower_io_vars_to_temporaries(nir_shader *s)
    /* Regardless of the above, we need to lower indirect references to
     * compact variables such as clip/cull distances because due to how
     * TCS<->TES IO works we cannot handle indirect accesses that "straddle"
-    * vec4 components. nir_lower_indirect_derefs has a special case for
-    * compact variables, so it will actually lower them even though we pass
-    * in 0 modes.
+    * vec4 components. nir_lower_indirect_derefs_to_if_else_trees has a special
+    * case for compact variables, so it will actually lower them even though we
+    * pass in 0 modes.
     *
     * Using temporaries would be slightly better but
     * nir_lower_io_vars_to_temporaries currently doesn't support TCS i/o.
     */
-   NIR_PASS(_, s, nir_lower_indirect_derefs, 0, UINT32_MAX);
+   NIR_PASS(_, s, nir_lower_indirect_derefs_to_if_else_trees, 0, UINT32_MAX);
 }
 
 /**
@@ -702,8 +689,6 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
    NIR_PASS(_, s, nir_lower_frexp);
    NIR_PASS(_, s, nir_lower_amul, ir3_glsl_type_size);
 
-   OPT(s, nir_lower_wrmasks, should_split_wrmask, s);
-
    OPT(s, nir_lower_tex, &tex_options);
    OPT(s, nir_lower_load_const_to_scalar);
 
@@ -720,7 +705,8 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
    OPT(s, nir_lower_is_helper_invocation);
    OPT(s, nir_opt_combine_barriers, NULL, NULL);
 
-   ir3_optimize_loop(compiler, options, s);
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(compiler, &optimize_options, s);
 
    /* do idiv lowering after first opt loop to get a chance to propagate
     * constants for divide by immed power-of-two:
@@ -745,7 +731,7 @@ ir3_finalize_nir(struct ir3_compiler *compiler,
    bool vectorize_progress = OPT(s, nir_opt_load_store_vectorize, &vectorize_opts);
 
    if (idiv_progress || vectorize_progress)
-      ir3_optimize_loop(compiler, options, s);
+      ir3_optimize_loop(compiler, &optimize_options, s);
 
    OPT(s, nir_remove_dead_variables, nir_var_function_temp, NULL);
 
@@ -1035,7 +1021,8 @@ ir3_nir_post_finalize(struct ir3_shader *shader)
    if (compiler->gen >= 6)
       OPT(s, ir3_nir_lower_ssbo_size, compiler->options.storage_16bit ? 1 : 2);
 
-   ir3_optimize_loop(compiler, &shader->options.nir_options, s);
+   struct ir3_optimize_options optimize_options = {};
+   ir3_optimize_loop(compiler, &optimize_options, s);
 }
 
 static bool
@@ -1218,7 +1205,6 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    }
 
    /* Lower scratch writemasks */
-   progress |= OPT(s, nir_lower_wrmasks, should_split_wrmask, s);
    progress |= OPT(s, nir_lower_atomics, atomic_supported);
 
    if (OPT(s, nir_lower_locals_to_regs, 1)) {
@@ -1239,7 +1225,6 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    progress |= OPT(s, ir3_nir_lower_64b_global);
    progress |= OPT(s, ir3_nir_lower_64b_undef);
    progress |= OPT(s, nir_lower_int64);
-   progress |= OPT(s, ir3_nir_lower_64b_intrinsics);
    progress |= OPT(s, nir_lower_64bit_phis);
 
    progress |= OPT(s, ir3_nir_opt_subgroups, so);
@@ -1251,9 +1236,22 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
       ir3_setup_const_state(s, so, ir3_const_state_mut(so));
    }
 
+   /* At this point nir_opt_load_store_vectorize has run so it's safe to
+    * optimize imul to umul_16x16. Also call nir_opt_uub manually once to give
+    * it a chance to optimize imul, even if the previous passes didn't make any
+    * progress.
+    */
+   struct ir3_optimize_options optimize_options = {
+      .opt_uub_options = {
+         .opt_imul = true,
+      },
+   };
+
+   progress |= OPT(s, nir_opt_uub, &optimize_options.opt_uub_options);
+
    /* Cleanup code leftover from lowering passes before opt_preamble */
    if (progress) {
-      ir3_optimize_loop(so->compiler, options, s);
+      ir3_optimize_loop(so->compiler, &optimize_options, s);
 
       /* No need to run the optimize loop again if there's no progress after
        * this point.
@@ -1313,17 +1311,17 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
    }
 
    if (progress)
-      ir3_optimize_loop(so->compiler, options, s);
+      ir3_optimize_loop(so->compiler, &optimize_options, s);
 
    /* verify that progress is always set */
-   assert(!ir3_optimize_loop(so->compiler, options, s));
+   assert(!ir3_optimize_loop(so->compiler, &optimize_options, s));
 
    /* Fixup indirect load_const_ir3's which end up with a const base offset
     * which is too large to encode.  Do this late(ish) so we actually
     * can differentiate indirect vs non-indirect.
     */
    if (OPT(s, ir3_nir_fixup_load_const_ir3))
-      ir3_optimize_loop(so->compiler, options, s);
+      ir3_optimize_loop(so->compiler, &optimize_options, s);
 
    /* Do late algebraic optimization to turn add(a, neg(b)) back into
     * subs, then the mandatory cleanup after algebraic.  Note that it may
@@ -1364,7 +1362,7 @@ ir3_nir_lower_variant(struct ir3_shader_variant *so,
          OPT(s, nir_opt_16bit_tex_image, &opt_16bit_options);
       }
       OPT(s, nir_opt_constant_folding);
-      OPT(s, nir_copy_prop);
+      OPT(s, nir_opt_copy_prop);
       OPT(s, nir_opt_dce);
       OPT(s, nir_opt_cse);
    }

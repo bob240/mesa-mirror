@@ -136,18 +136,10 @@ gather_intrinsic_store_output_info(const nir_shader *nir, const nir_intrinsic_in
 {
    const nir_io_semantics io_sem = nir_intrinsic_io_semantics(instr);
    const unsigned location = io_sem.location;
-   const unsigned num_slots = io_sem.num_slots;
    const unsigned component = nir_intrinsic_component(instr);
    const unsigned write_mask = nir_intrinsic_write_mask(instr);
-   uint8_t *output_usage_mask = NULL;
 
    switch (nir->info.stage) {
-   case MESA_SHADER_VERTEX:
-      output_usage_mask = info->vs.output_usage_mask;
-      break;
-   case MESA_SHADER_TESS_EVAL:
-      output_usage_mask = info->tes.output_usage_mask;
-      break;
    case MESA_SHADER_FRAGMENT:
       if (location >= FRAG_RESULT_DATA0) {
          const unsigned fs_semantic = location + io_sem.dual_source_blend_index;
@@ -159,12 +151,6 @@ gather_intrinsic_store_output_info(const nir_shader *nir, const nir_intrinsic_in
       break;
    default:
       break;
-   }
-
-   if (output_usage_mask) {
-      for (unsigned i = 0; i < num_slots; i++) {
-         output_usage_mask[location + i] |= ((write_mask >> (i * 4)) & 0xf) << component;
-      }
    }
 
    if (consider_force_vrs && location == VARYING_SLOT_POS) {
@@ -603,6 +589,9 @@ gather_shader_info_tcs(struct radv_device *device, const nir_shader *nir,
    nir_gather_tcs_info(nir, &tcs_info, nir->info.tess._primitive_mode, nir->info.tess.spacing);
    ac_nir_get_tess_io_info(nir, &tcs_info, ~0ull, ~0, map_output, true, &info->tcs.io_info);
 
+   info->tcs.spacing = nir->info.tess.spacing;
+   info->tcs.ccw = nir->info.tess.ccw;
+   info->tcs.point_mode = nir->info.tess.point_mode;
    info->tcs.tcs_vertices_out = nir->info.tess.tcs_vertices_out;
    info->tcs.tes_inputs_read = ~0ULL;
    info->tcs.tes_patch_inputs_read = ~0ULL;
@@ -654,11 +643,11 @@ gather_shader_info_tes(struct radv_device *device, const nir_shader *nir, struct
 }
 
 void
-radv_get_legacy_gs_info(const struct radv_device *device, struct radv_shader_info *gs_info)
+radv_get_legacy_gs_info(const struct radv_device *device, struct radv_shader_info *es_info, struct radv_shader_info *gs_info)
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   struct radv_legacy_gs_info *out = &gs_info->gs_ring_info;
-   const unsigned esgs_vertex_stride = out->esgs_itemsize * 4;
+   struct radv_legacy_gs_info *out = &gs_info->legacy_gs_info;
+   const unsigned esgs_vertex_stride = es_info ? es_info->esgs_itemsize : out->esgs_itemsize;
    ac_legacy_gs_subgroup_info info;
 
    ac_legacy_gs_compute_subgroup_info(gs_info->gs.input_prim, gs_info->gs.vertices_out, gs_info->gs.invocations,
@@ -720,7 +709,7 @@ gather_shader_info_gs(struct radv_device *device, const nir_shader *nir, struct 
    if (info->is_ngg)
       gather_shader_info_ngg_query(device, info);
    else
-      info->gs_ring_info.esgs_itemsize = radv_compute_esgs_itemsize(device, info->gs.num_linked_inputs) / 4;
+      info->legacy_gs_info.esgs_itemsize = radv_compute_esgs_itemsize(device, info->gs.num_linked_inputs);
 }
 
 static void

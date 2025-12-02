@@ -227,7 +227,6 @@ validate_def(nir_def *def, validate_state *state)
    validate_assert(state, !BITSET_TEST(state->ssa_defs_found, def->index));
    BITSET_SET(state->ssa_defs_found, def->index);
 
-   validate_assert(state, def->parent_instr == state->instr);
    validate_num_components(state, def->num_components);
 
    list_validate(&def->uses);
@@ -353,7 +352,7 @@ validate_deref_instr(nir_deref_instr *instr, validate_state *state)
       validate_sized_src(&instr->parent, state, instr->def.bit_size,
                          instr->def.num_components);
 
-      nir_instr *parent_instr = instr->parent.ssa->parent_instr;
+      nir_instr *parent_instr = nir_def_instr(instr->parent.ssa);
 
       /* The parent must come from another deref instruction */
       validate_assert(state, parent_instr->type == nir_instr_type_deref);
@@ -483,7 +482,7 @@ validate_register_handle(nir_src handle_src,
                          validate_state *state)
 {
    nir_def *handle = handle_src.ssa;
-   nir_instr *parent = handle->parent_instr;
+   nir_instr *parent = nir_def_instr(handle);
 
    if (!validate_assert(state, parent->type == nir_instr_type_intrinsic))
       return;
@@ -778,36 +777,122 @@ validate_intrinsic_instr(nir_intrinsic_instr *instr, validate_state *state)
    }
 
    if (nir_intrinsic_has_io_semantics(instr) &&
-       !nir_intrinsic_infos[instr->intrinsic].has_dest) {
-      nir_io_semantics sem = nir_intrinsic_io_semantics(instr);
+       !nir_intrinsic_io_semantics(instr).no_validate) {
+      bool is_input = instr->intrinsic == nir_intrinsic_load_input ||
+                      instr->intrinsic == nir_intrinsic_load_per_vertex_input ||
+                      instr->intrinsic == nir_intrinsic_load_per_primitive_input ||
+                      instr->intrinsic == nir_intrinsic_load_interpolated_input ||
+                      instr->intrinsic == nir_intrinsic_load_input_vertex;
+      bool is_output = instr->intrinsic == nir_intrinsic_load_output ||
+                       instr->intrinsic == nir_intrinsic_load_per_vertex_output ||
+                       instr->intrinsic == nir_intrinsic_load_per_primitive_output ||
+                       instr->intrinsic == nir_intrinsic_load_per_view_output ||
+                       instr->intrinsic == nir_intrinsic_store_output ||
+                       instr->intrinsic == nir_intrinsic_store_per_vertex_output ||
+                       instr->intrinsic == nir_intrinsic_store_per_primitive_output ||
+                       instr->intrinsic == nir_intrinsic_store_per_view_output;
+      /* Driver-specific intrinsics with IO semantics are not validated. */
+      bool is_core_intrinsic = is_input || is_output;
 
-      /* An output that has no effect shouldn't be present in the IR. */
-      validate_assert(state,
-                      (nir_slot_is_sysval_output(sem.location, MESA_SHADER_NONE) &&
-                       !sem.no_sysval_output) ||
-                         (nir_slot_is_varying(sem.location, MESA_SHADER_NONE) &&
-                          !sem.no_varying) ||
-                         nir_instr_xfb_write_mask(instr) ||
-                         /* TCS can set no_varying and no_sysval_output, meaning
-                          * that the output is only read by TCS and not TES.
-                          */
-                         state->shader->info.stage == MESA_SHADER_TESS_CTRL);
-      validate_assert(state,
-                      (!sem.dual_source_blend_index &&
-                       !sem.fb_fetch_output &&
-                       !sem.fb_fetch_output_coherent) ||
-                         state->shader->info.stage == MESA_SHADER_FRAGMENT);
-      validate_assert(state,
-                      !sem.gs_streams ||
-                         state->shader->info.stage == MESA_SHADER_GEOMETRY);
-      validate_assert(state,
-                      !sem.high_dvec2 ||
-                         (state->shader->info.stage == MESA_SHADER_VERTEX &&
-                          instr->intrinsic == nir_intrinsic_load_input));
-      validate_assert(state,
-                      !sem.interp_explicit_strict ||
+      if (is_core_intrinsic) {
+         nir_io_semantics sem = nir_intrinsic_io_semantics(instr);
+         unsigned max_num_components;
+
+         /* Validate that a single intrinsic doesn't access past the maximum
+          * number of components per slot.
+          */
+         /* TODO: remove nir_io_radv_intrinsic_component_workaround */
+         if (state->shader->options->io_options &
+             nir_io_radv_intrinsic_component_workaround && sem.high_16bits)
+            max_num_components = 8;
+         else
+            max_num_components = 4;
+
+         if (nir_intrinsic_infos[instr->intrinsic].has_dest) {
+            /* Input and output loads shouldn't load from multiple slots at once. */
+            validate_assert(state, nir_intrinsic_component(instr) +
+                            instr->def.num_components <= max_num_components);
+         } else {
+            /* Output stores shouldn't write to multiple slots at once. */
+            validate_assert(state, nir_intrinsic_component(instr) +
+                            instr->num_components <= max_num_components);
+         }
+
+         if (is_input) {
+            validate_assert(state, !sem.no_sysval_output);
+            validate_assert(state, !sem.no_varying);
+            validate_assert(state, !sem.gs_streams);
+         } else {
+            /* An output that has no effect shouldn't be present in the IR. */
+            validate_assert(state,
+                            (nir_slot_is_sysval_output(sem.location, MESA_SHADER_NONE) &&
+                             !sem.no_sysval_output) ||
+                            (nir_slot_is_varying(sem.location, MESA_SHADER_NONE) &&
+                             !sem.no_varying) ||
+                            nir_instr_xfb_write_mask(instr) ||
+                            /* TCS can set no_varying and no_sysval_output, meaning
+                             * that the output is only read by TCS and not TES.
+                             */
+                            state->shader->info.stage == MESA_SHADER_TESS_CTRL);
+
+            validate_assert(state,
+                            !sem.gs_streams ||
+                            state->shader->info.stage == MESA_SHADER_GEOMETRY);
+         }
+
+         validate_assert(state,
+                         (!sem.dual_source_blend_index &&
+                          !sem.fb_fetch_output &&
+                          !sem.fb_fetch_output_coherent) ||
                          (state->shader->info.stage == MESA_SHADER_FRAGMENT &&
-                          instr->intrinsic == nir_intrinsic_load_input_vertex));
+                          is_output));
+
+         validate_assert(state,
+                         !sem.high_dvec2 ||
+                         (state->shader->info.stage == MESA_SHADER_VERTEX &&
+                          is_input));
+
+         validate_assert(state,
+                         !sem.interp_explicit_strict ||
+                            (state->shader->info.stage == MESA_SHADER_FRAGMENT &&
+                             instr->intrinsic == nir_intrinsic_load_input_vertex));
+
+         /* Non-constant src offset with num_slots == 1 is disallowed. */
+         if (sem.num_slots == 1) {
+            nir_src *offset_src = nir_get_io_offset_src(instr);
+
+            /* TODO: nir_opt_loop produces phi 0, 0 for store_output as follows,
+             * which isn't incorrect, but also isn't useful:
+             *
+             * Before:
+             *   %1 = load_const 0
+             *   loop {
+             *      if {
+             *      } else {
+             *      }
+             *   }
+             *   store_output(, %1)
+             *
+             * After:
+             *   %1 = load_const 0
+             *   if {
+             *   } else {
+             *      loop {
+             *         %38 = load_const 0
+             *      }
+             *   }
+             *   %52 = phi %1, %38
+             *   store_output(, %52)
+             *
+             * Test: KHR-GLES3.shaders.indexing.uniform_array.float_dynamic_loop_read_fragment
+             *
+             * So allow phis in offset_src with num_slots == 1 for now.
+             */
+            validate_assert(state,
+                            nir_src_is_const(*offset_src) ||
+                            nir_def_is_phi(offset_src->ssa));
+         }
+      }
    }
 
    if (nir_intrinsic_has_offset_shift(instr) &&
@@ -995,6 +1080,16 @@ validate_call_instr(nir_call_instr *instr, validate_state *state)
 }
 
 static void
+validate_cmat_call_instr(nir_cmat_call_instr *instr, validate_state *state)
+{
+   validate_assert(state, instr->num_params == nir_cmat_call_op_params(instr->op, instr->callee));
+
+   for (unsigned i = 0; i < instr->num_params; i++) {
+      validate_src(&instr->params[i], state);
+   }
+}
+
+static void
 validate_const_value(nir_const_value *val, unsigned bit_size,
                      bool is_null_constant, validate_state *state)
 {
@@ -1140,6 +1235,10 @@ validate_instr(nir_instr *instr, validate_state *state)
 
    case nir_instr_type_call:
       validate_call_instr(nir_instr_as_call(instr), state);
+      break;
+
+   case nir_instr_type_cmat_call:
+      validate_cmat_call_instr(nir_instr_as_cmat_call(instr), state);
       break;
 
    case nir_instr_type_intrinsic:
@@ -1741,7 +1840,7 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
       state->block = NULL;
    }
 
-   memset(state->ssa_defs_found, 0, BITSET_WORDS(impl->ssa_alloc) * sizeof(BITSET_WORD));
+   memset(state->ssa_defs_found, 0, BITSET_BYTES(impl->ssa_alloc));
    validate_ssa_dominance(impl, state);
 
    /* Restore the old dominance metadata */
@@ -1766,8 +1865,8 @@ validate_dominance(nir_function_impl *impl, validate_state *state)
 }
 
 typedef struct {
-   BITSET_WORD *live_in;
-   BITSET_WORD *live_out;
+   struct u_sparse_bitset live_in;
+   struct u_sparse_bitset live_out;
 } block_liveness_metadata;
 
 static void
@@ -1784,8 +1883,8 @@ validate_live_defs(nir_function_impl *impl, validate_state *state)
       md->live_in = block->live_in;
       md->live_out = block->live_out;
 
-      block->live_in = NULL;
-      block->live_out = NULL;
+      u_sparse_bitset_init(&block->live_in, impl->ssa_alloc, NULL);
+      u_sparse_bitset_init(&block->live_out, impl->ssa_alloc, NULL);
    }
 
    /* Call metadata passes and compare it against the preserved metadata */
@@ -1803,10 +1902,8 @@ validate_live_defs(nir_function_impl *impl, validate_state *state)
 
       size_t bitset_words = BITSET_WORDS(impl->ssa_alloc);
       if (bitset_words) {
-         validate_assert(state, !memcmp(md->live_in, block->live_in,
-                                        sizeof(BITSET_WORD) * bitset_words));
-         validate_assert(state, !memcmp(md->live_out, block->live_out,
-                                        sizeof(BITSET_WORD) * bitset_words));
+         validate_assert(state, !u_sparse_bitset_cmp(&md->live_in, &block->live_in));
+         validate_assert(state, !u_sparse_bitset_cmp(&md->live_out, &block->live_out));
       }
    }
    state->block = NULL;
@@ -1816,8 +1913,8 @@ validate_live_defs(nir_function_impl *impl, validate_state *state)
       nir_block *block = (nir_block *)entry->key;
       block_liveness_metadata *md = &blocks[entry - state->blocks->table];
 
-      ralloc_free(block->live_in);
-      ralloc_free(block->live_out);
+      u_sparse_bitset_free(&block->live_in);
+      u_sparse_bitset_free(&block->live_out);
 
       block->live_in = md->live_in;
       block->live_out = md->live_out;
@@ -1844,10 +1941,10 @@ validate_divergence(nir_function_impl *impl, validate_state *state)
    block_divergence_metadata *blocks = ralloc_array(state->mem_ctx,
                                                     block_divergence_metadata,
                                                     state->blocks->size);
-   BITSET_WORD *ssa_divergence = rzalloc_array(state->mem_ctx, BITSET_WORD,
-                                               BITSET_WORDS(impl->ssa_alloc));
-   BITSET_WORD *loop_invariance = rzalloc_array(state->mem_ctx, BITSET_WORD,
-                                                BITSET_WORDS(impl->ssa_alloc));
+   BITSET_WORD *ssa_divergence = BITSET_RZALLOC(state->mem_ctx,
+                                                impl->ssa_alloc);
+   BITSET_WORD *loop_invariance = BITSET_RZALLOC(state->mem_ctx,
+                                                 impl->ssa_alloc);
 
    set_foreach(state->blocks, entry) {
       nir_block *block = (nir_block *)entry->key;
@@ -2071,7 +2168,7 @@ validate_function_impl(nir_function_impl *impl, validate_state *state)
 
    state->ssa_defs_found = reralloc(state->mem_ctx, state->ssa_defs_found,
                                     BITSET_WORD, BITSET_WORDS(impl->ssa_alloc));
-   memset(state->ssa_defs_found, 0, BITSET_WORDS(impl->ssa_alloc) * sizeof(BITSET_WORD));
+   memset(state->ssa_defs_found, 0, BITSET_BYTES(impl->ssa_alloc));
 
    _mesa_set_clear(state->blocks, NULL);
    _mesa_set_resize(state->blocks, impl->num_blocks);
@@ -2186,6 +2283,9 @@ nir_validate_shader(nir_shader *shader, const char *when)
       nir_var_mem_global |
       nir_var_mem_push_const |
       nir_var_mem_constant |
+      nir_var_mem_pixel_local_in |
+      nir_var_mem_pixel_local_out |
+      nir_var_mem_pixel_local_inout |
       nir_var_image;
 
    if (mesa_shader_stage_is_callable(shader->info.stage))
@@ -2259,7 +2359,7 @@ nir_validate_ssa_dominance(nir_shader *shader, const char *when)
       state.ssa_defs_found = reralloc(state.mem_ctx, state.ssa_defs_found,
                                       BITSET_WORD,
                                       BITSET_WORDS(impl->ssa_alloc));
-      memset(state.ssa_defs_found, 0, BITSET_WORDS(impl->ssa_alloc) * sizeof(BITSET_WORD));
+      memset(state.ssa_defs_found, 0, BITSET_BYTES(impl->ssa_alloc));
 
       state.impl = impl;
       validate_ssa_dominance(impl, &state);
@@ -2269,6 +2369,25 @@ nir_validate_ssa_dominance(nir_shader *shader, const char *when)
       dump_errors(&state, when);
 
    destroy_validate_state(&state);
+}
+
+void
+_nir_assert_no_progress(bool progress, const char *when)
+{
+   if (!progress)
+      return;
+
+   /* Lock around dumping so that we get clean dumps in a multi-threaded
+    * scenario.
+    */
+   simple_mtx_lock(&fail_dump_mutex);
+
+   fprintf(stderr, "NIR assertion failed: Expected no progress from %s.\n",
+           when);
+   fflush(stderr);
+
+   simple_mtx_unlock(&fail_dump_mutex);
+   abort();
 }
 
 #endif /* NDEBUG */

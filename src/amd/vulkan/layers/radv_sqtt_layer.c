@@ -156,8 +156,7 @@ radv_sqtt_reloc_graphics_shaders(struct radv_device *device, struct radv_graphic
    return VK_SUCCESS;
 
 fail:
-   if (reloc->alloc)
-      radv_free_shader_memory(device, reloc->alloc);
+   radv_free_shader_memory(device, reloc->alloc);
    free(reloc);
    return result;
 }
@@ -1394,7 +1393,7 @@ radv_fill_code_object_record(struct radv_device *device, struct rgp_shader_data 
    shader_data->vgpr_count = shader->config.num_vgprs;
    shader_data->sgpr_count = shader->config.num_sgprs;
    shader_data->scratch_memory_size = shader->config.scratch_bytes_per_wave;
-   shader_data->lds_size = ALIGN(shader->config.lds_size, lds_increment);
+   shader_data->lds_size = align(shader->config.lds_size, lds_increment);
    shader_data->wavefront_size = shader->info.wave_size;
    shader_data->base_address = va & 0xffffffffffff;
    shader_data->elf_symbol_offset = 0;

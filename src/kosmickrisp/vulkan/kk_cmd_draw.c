@@ -111,6 +111,10 @@ kk_fill_common_attachment_description(
       force_attachment_load
          ? MTL_LOAD_ACTION_LOAD
          : vk_attachment_load_op_to_mtl_load_action(info->loadOp);
+
+   /* TODO_KOSMICKRISP Need to tackle issue #14344 */
+   if (load_action == MTL_LOAD_ACTION_DONT_CARE)
+      load_action = MTL_LOAD_ACTION_LOAD;
    mtl_render_pass_attachment_descriptor_set_load_action(descriptor,
                                                          load_action);
    /* We need to force attachment store to correctly handle situations where the
@@ -304,9 +308,15 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       kk_fill_common_attachment_description(
          attachment_descriptor, render->depth_att.iview,
          pRenderingInfo->pDepthAttachment, force_attachment_load);
-      mtl_render_pass_attachment_descriptor_set_clear_depth(
-         attachment_descriptor,
-         pRenderingInfo->pDepthAttachment->clearValue.depthStencil.depth);
+
+      /* clearValue.depthStencil.depth could have invalid values such as NaN
+       * which will trigger a Metal validation error. Ensure we only use this
+       * value if the attachment is actually cleared. */
+      if (pRenderingInfo->pDepthAttachment->loadOp ==
+          VK_ATTACHMENT_LOAD_OP_CLEAR)
+         mtl_render_pass_attachment_descriptor_set_clear_depth(
+            attachment_descriptor,
+            pRenderingInfo->pDepthAttachment->clearValue.depthStencil.depth);
    }
    if (render->stencil_att.iview) {
       const struct kk_image_view *iview = render->stencil_att.iview;
@@ -810,25 +820,8 @@ kk_flush_draw_state(struct kk_cmd_buffer *cmd)
 
    if (desc->push_dirty)
       kk_cmd_buffer_flush_push_descriptors(cmd, desc);
-   /* After push descriptors' buffers are created. Otherwise, the buffer where
-    * they live will not be created and cannot make it resident */
-   if (desc->sets_not_resident)
-      kk_make_descriptor_resources_resident(cmd,
-                                            VK_PIPELINE_BIND_POINT_GRAPHICS);
    if (desc->root_dirty)
       kk_upload_descriptor_root(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS);
-
-   /* Make user allocated heaps resident */
-   struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   simple_mtx_lock(&dev->user_heap_cache.mutex);
-   if (cmd->encoder->main.user_heap_hash != dev->user_heap_cache.hash) {
-      cmd->encoder->main.user_heap_hash = dev->user_heap_cache.hash;
-      mtl_heap **heaps = util_dynarray_begin(&dev->user_heap_cache.handles);
-      uint32_t count =
-         util_dynarray_num_elements(&dev->user_heap_cache.handles, mtl_heap *);
-      mtl_render_use_heaps(enc, heaps, count);
-   }
-   simple_mtx_unlock(&dev->user_heap_cache.mutex);
 
    struct kk_bo *root_buffer = desc->root.root_buffer;
    if (root_buffer) {
@@ -849,6 +842,10 @@ VKAPI_ATTR void VKAPI_CALL
 kk_CmdDraw(VkCommandBuffer commandBuffer, uint32_t vertexCount,
            uint32_t instanceCount, uint32_t firstVertex, uint32_t firstInstance)
 {
+   /* Metal validation dislikes empty calls */
+   if (instanceCount == 0 || vertexCount == 0)
+      return;
+
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
    kk_flush_draw_state(cmd);
@@ -891,6 +888,10 @@ kk_CmdDrawIndexed(VkCommandBuffer commandBuffer, uint32_t indexCount,
                   uint32_t instanceCount, uint32_t firstIndex,
                   int32_t vertexOffset, uint32_t firstInstance)
 {
+   /* Metal validation dislikes empty calls */
+   if (instanceCount == 0 || indexCount == 0)
+      return;
+
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
 
    kk_flush_draw_state(cmd);

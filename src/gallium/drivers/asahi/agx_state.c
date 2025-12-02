@@ -35,7 +35,6 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "poly/geometry.h"
-#include "poly/nir/poly_nir_lower_gs.h"
 #include "util/bitscan.h"
 #include "util/bitset.h"
 #include "util/blend.h"
@@ -726,7 +725,7 @@ agx_pack_texture(void *out, struct agx_resource *rsrc,
 
       if (rsrc->layout.compressed) {
          cfg.acceleration_buffer =
-            agx_map_texture_gpu(rsrc, 0) + rsrc->layout.metadata_offset_B +
+            agx_map_gpu(rsrc) + rsrc->layout.metadata_offset_B +
             (first_layer * rsrc->layout.compression_layer_stride_B);
       }
 
@@ -1262,7 +1261,7 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
          cfg.extended = true;
 
          cfg.acceleration_buffer =
-            agx_map_texture_gpu(tex, 0) + tex->layout.metadata_offset_B +
+            agx_map_gpu(tex) + tex->layout.metadata_offset_B +
             (layer * tex->layout.compression_layer_stride_B);
       }
 
@@ -1300,8 +1299,7 @@ agx_batch_upload_pbe(struct agx_batch *batch, struct agx_pbe_packed *out,
 
 static void
 agx_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader,
-                        uint index,
-                        const struct pipe_constant_buffer *cb)
+                        uint index, const struct pipe_constant_buffer *cb)
 {
    struct agx_context *ctx = agx_context(pctx);
    struct agx_stage *s = &ctx->stage[shader];
@@ -1312,8 +1310,8 @@ agx_set_constant_buffer(struct pipe_context *pctx, mesa_shader_stage shader,
    /* Upload user buffer immediately */
    if (constants->user_buffer && !constants->buffer) {
       u_upload_data_ref(ctx->base.const_uploader, 0, constants->buffer_size, 64,
-                    constants->user_buffer, &constants->buffer_offset,
-                    &constants->buffer);
+                        constants->user_buffer, &constants->buffer_offset,
+                        &constants->buffer);
    }
 
    unsigned mask = (1 << index);
@@ -1836,11 +1834,11 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
    NIR_PASS(_, nir, nir_lower_load_const_to_scalar);
    NIR_PASS(_, nir, agx_nir_cleanup_amul);
    NIR_PASS(_, nir, nir_opt_constant_folding);
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_cse);
    NIR_PASS(_, nir, nir_opt_dce);
    NIR_PASS(_, nir, nir_opt_shrink_vectors, true);
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
 
    NIR_PASS(
       _, nir, nir_opt_load_store_vectorize,
@@ -3762,8 +3760,9 @@ agx_index_buffer_rsrc_ptr(struct agx_batch *batch,
    struct agx_resource *rsrc = agx_resource(info->index.resource);
    agx_batch_reads(batch, rsrc);
 
-   *extent = ALIGN_POT(rsrc->layout.size_B, 4);
-   return rsrc->bo->va->addr;
+   *extent =
+      ALIGN_POT(rsrc->layout.size_B - rsrc->layout.level_offsets_B[0], 4);
+   return agx_map_gpu(rsrc);
 }
 
 static uint64_t
@@ -3926,23 +3925,27 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
                           const struct pipe_draw_start_count_bias *draw,
                           const struct pipe_draw_indirect_info *indirect)
 {
-   struct poly_ia_state ia = {
-      .index_buffer = input_index_buffer,
-      .index_buffer_range_el = index_buffer_size_B / info->index_size,
-      .verts_per_instance = draw ? draw->count : 0,
-   };
+   const uint32_t wg_size[3] = { 64, 1, 1 };
 
-   batch->uniforms.input_assembly =
-      agx_pool_upload_aligned(&batch->pool, &ia, sizeof(ia), 8);
+   struct poly_vertex_params vp;
+   poly_vertex_params_init(&vp, batch->ctx->vs->b.info.outputs, wg_size);
 
-   struct poly_geometry_params params = {
-      .indirect_desc = batch->geom_indirect,
-      .flat_outputs =
-         batch->ctx->stage[MESA_SHADER_FRAGMENT].shader->info.inputs_flat_shaded,
-      .input_topology = info->mode,
-      .xfb_offs_ptrs = {AGX_ZERO_PAGE_ADDRESS, AGX_ZERO_PAGE_ADDRESS,
-                        AGX_ZERO_PAGE_ADDRESS, AGX_ZERO_PAGE_ADDRESS},
-   };
+   if (info->index_size) {
+      vp.index_size_B = info->index_size;
+      vp.index_buffer = input_index_buffer;
+      vp.index_buffer_range_el = index_buffer_size_B / info->index_size;
+   }
+
+   struct poly_geometry_params params;
+   poly_geometry_params_init(&params, info->mode, wg_size);
+
+   params.flat_outputs =
+      batch->ctx->stage[MESA_SHADER_FRAGMENT].shader->info.inputs_flat_shaded;
+
+   params.xfb_offs_ptrs[0] = AGX_ZERO_PAGE_ADDRESS;
+   params.xfb_offs_ptrs[1] = AGX_ZERO_PAGE_ADDRESS;
+   params.xfb_offs_ptrs[2] = AGX_ZERO_PAGE_ADDRESS;
+   params.xfb_offs_ptrs[3] = AGX_ZERO_PAGE_ADDRESS;
 
    for (unsigned i = 0; i < ARRAY_SIZE(batch->ctx->streamout.targets); ++i) {
       struct agx_streamout_target *so =
@@ -3954,7 +3957,7 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       params.xfb_size[i] = size;
 
       if (rsrc) {
-         params.xfb_offs_ptrs[i] = rsrc->bo->va->addr;
+         params.xfb_offs_ptrs[i] = agx_map_gpu(rsrc);
          agx_batch_writes(batch, rsrc, 0);
          batch->incoherent_writes = true;
       }
@@ -3989,8 +3992,7 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
    /* Calculate input primitive count for direct draws, and allocate the vertex
     * & count buffers. GPU calculates and allocates for indirect draws.
     */
-   batch->uniforms.vertex_outputs = batch->ctx->vs->b.info.outputs;
-   params.input_mask = batch->uniforms.vertex_outputs;
+   batch->uniforms.vertex_outputs = vp.outputs;
    params.count_buffer_stride = batch->ctx->gs->gs.count_words * 4;
 
    bool prefix_sum = batch->ctx->gs->gs.prefix_sum;
@@ -4000,24 +4002,13 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       params.count_buffer = T.gpu;
    }
 
-   /* Workgroup size */
-   params.vs_grid[3] = params.gs_grid[3] = 64;
-   params.vs_grid[4] = params.gs_grid[4] = 1;
-   params.vs_grid[5] = params.gs_grid[5] = 1;
+   if (!indirect) {
+      poly_vertex_params_set_draw(&vp, draw->count, info->instance_count);
 
-   if (indirect) {
-      batch->uniforms.vertex_output_buffer_ptr =
-         agx_pool_alloc_aligned(&batch->pool, 8, 8).gpu;
-
-      params.vs_grid[2] = params.gs_grid[2] = 1;
-   } else {
-      params.vs_grid[0] = draw->count;
-      params.gs_grid[0] =
-         u_decomposed_prims_for_vertices(info->mode, draw->count);
-
-      params.primitives_log2 = util_logbase2_ceil(params.gs_grid[0]);
-
-      params.input_primitives = params.gs_grid[0] * info->instance_count;
+      struct poly_gs_info *gsi = &batch->ctx->gs->gs;
+      poly_geometry_params_set_draw(&params, info->mode,
+                                    gsi->shape, gsi->max_indices,
+                                    draw->count, info->instance_count);
 
       unsigned vb_size = poly_tcs_in_size(draw->count * info->instance_count,
                                           batch->uniforms.vertex_outputs);
@@ -4029,14 +4020,10 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
       }
 
       if (vb_size) {
-         uint64_t addr = agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
-         batch->uniforms.vertex_output_buffer_ptr =
-            agx_pool_upload(&batch->pool, &addr, 8);
-
-         params.input_buffer = addr;
+         vp.output_buffer =
+            agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
       }
 
-      struct poly_gs_info *gsi = &batch->ctx->gs->gs;
       if (gsi->shape == POLY_GS_SHAPE_DYNAMIC_INDEXED) {
          unsigned idx_size = params.input_primitives * gsi->max_indices;
 
@@ -4047,6 +4034,9 @@ agx_batch_geometry_params(struct agx_batch *batch, uint64_t input_index_buffer,
          batch->geom_index = params.output_index_buffer;
       }
    }
+
+   batch->uniforms.vertex_params =
+      agx_pool_upload_aligned(&batch->pool, &vp, sizeof(vp), 8);
 
    return agx_pool_upload_aligned_with_bo(&batch->pool, &params, sizeof(params),
                                           8, &batch->geom_params_bo);
@@ -4060,7 +4050,7 @@ agx_indirect_buffer_ptr(struct agx_batch *batch,
 
    struct agx_resource *rsrc = agx_resource(indirect->buffer);
    agx_batch_reads(batch, rsrc);
-   return rsrc->bo->va->addr + indirect->offset;
+   return agx_map_gpu(rsrc) + indirect->offset;
 }
 
 static void
@@ -4094,6 +4084,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
 
    assert(!info->primitive_restart && "should have been lowered");
 
+   uint64_t vp = batch->uniforms.vertex_params;
    uint64_t gp = batch->uniforms.geometry_params;
    struct agx_grid grid_vs, grid_gs;
    struct agx_workgroup wg = agx_workgroup(64, 1, 1);
@@ -4112,8 +4103,7 @@ agx_launch_gs_prerast(struct agx_batch *batch,
          .index_buffer = ib,
          .index_buffer_range_el = ib_extent / info->index_size,
          .draw = agx_indirect_buffer_ptr(batch, indirect),
-         .vertex_buffer = batch->uniforms.vertex_output_buffer_ptr,
-         .ia = batch->uniforms.input_assembly,
+         .vp = batch->uniforms.vertex_params,
          .p = batch->uniforms.geometry_params,
          .heap = agx_batch_heap(batch),
          .vs_outputs = batch->uniforms.vertex_outputs,
@@ -4127,10 +4117,10 @@ agx_launch_gs_prerast(struct agx_batch *batch,
       libagx_gs_setup_indirect_struct(batch, agx_1d(1), AGX_BARRIER_ALL, gsi);
 
       grid_vs = agx_grid_indirect_local(
-         gp + offsetof(struct poly_geometry_params, vs_grid));
+         vp + offsetof(struct poly_vertex_params, grid));
 
       grid_gs = agx_grid_indirect_local(
-         gp + offsetof(struct poly_geometry_params, gs_grid));
+         gp + offsetof(struct poly_geometry_params, grid));
    } else {
       grid_vs = agx_3d(draws->count, info->instance_count, 1);
 
@@ -4216,7 +4206,8 @@ agx_draw_without_restart(struct agx_batch *batch,
                           draw->index_bias, info->start_instance};
 
       u_upload_data_ref(ctx->base.const_uploader, 0, sizeof(desc), 4, &desc,
-                    &indirect_synthesized.offset, &indirect_synthesized.buffer);
+                        &indirect_synthesized.offset,
+                        &indirect_synthesized.buffer);
 
       indirect = &indirect_synthesized;
    } else {
@@ -4433,8 +4424,8 @@ util_draw_multi_upload_indirect(struct pipe_context *pctx,
 {
    struct pipe_draw_indirect_info indirect_ = *indirect;
    u_upload_data_ref(pctx->const_uploader, 0, 4, 4, &indirect->draw_count,
-                 &indirect_.indirect_draw_count_offset,
-                 &indirect_.indirect_draw_count);
+                     &indirect_.indirect_draw_count_offset,
+                     &indirect_.indirect_draw_count);
 
    pctx->draw_vbo(pctx, info, 0, &indirect_, draws, 1);
 }
@@ -4553,28 +4544,35 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       batch->cdm = agx_encoder_allocate(batch, dev);
    }
 
-   uint64_t ib = 0;
-   size_t ib_extent = 0;
-
-   if (info->index_size)
-      ib = agx_index_buffer_ptr(batch, info, draws, &ib_extent);
-
-   struct poly_ia_state ia = {
-      .index_buffer = ib,
-      .index_buffer_range_el = ib_extent,
-      .verts_per_instance = draws ? draws->count : 0,
-   };
-
-   batch->uniforms.input_assembly =
-      agx_pool_upload_aligned(&batch->pool, &ia, sizeof(ia), 8);
-
    agx_upload_draw_params(batch, indirect, draws, info);
+   agx_upload_vbos(batch);
+   agx_update_vs(batch, info->index_size);
+   agx_update_tcs(ctx, info);
+   /* XXX */
+   ctx->stage[MESA_SHADER_TESS_CTRL].dirty = ~0;
+   ctx->stage[MESA_SHADER_TESS_EVAL].dirty = ~0;
+   agx_update_descriptors(batch, ctx->vs);
+   agx_update_descriptors(batch, ctx->tcs);
+
+   batch->uniforms.vertex_outputs = ctx->vs->b.info.outputs;
+
+   const uint32_t wg_size[3] = { 64, 1, 1 };
+
+   struct poly_vertex_params vp;
+   poly_vertex_params_init(&vp, batch->ctx->vs->b.info.outputs, wg_size);
+
+   if (info->index_size) {
+      size_t ib_extent = 0;
+      vp.index_size_B = info->index_size;
+      vp.index_buffer = agx_index_buffer_ptr(batch, info, draws, &ib_extent);
+      vp.index_buffer_range_el = ib_extent;
+   }
 
    /* Setup parameters */
    uint64_t heap = agx_batch_heap(batch);
    assert((tcs->tess.output_stride & 3) == 0 && "must be aligned");
 
-   struct poly_tess_args args = {
+   struct poly_tess_params params = {
       .heap = heap,
       .tcs_stride_el = tcs->tess.output_stride / 4,
       .statistic = agx_get_query_address(
@@ -4590,28 +4588,19 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
    };
 
    if (!point_mode && tes->tess.primitive != TESS_PRIMITIVE_ISOLINES) {
-      args.ccw = !tes->tess.ccw;
+      params.ccw = !tes->tess.ccw;
    }
 
-   memcpy(&args.tess_level_outer_default, ctx->default_outer_level,
+   memcpy(&params.tess_level_outer_default, ctx->default_outer_level,
           sizeof(ctx->default_outer_level));
-   memcpy(&args.tess_level_inner_default, ctx->default_inner_level,
+   memcpy(&params.tess_level_inner_default, ctx->default_inner_level,
           sizeof(ctx->default_inner_level));
 
    struct agx_grid vs_grid, tcs_grid, tess_grid;
 
-   agx_upload_vbos(batch);
-   agx_update_vs(batch, info->index_size);
-   agx_update_tcs(ctx, info);
-   /* XXX */
-   ctx->stage[MESA_SHADER_TESS_CTRL].dirty = ~0;
-   ctx->stage[MESA_SHADER_TESS_EVAL].dirty = ~0;
-   agx_update_descriptors(batch, ctx->vs);
-   agx_update_descriptors(batch, ctx->tcs);
-
-   batch->uniforms.vertex_outputs = ctx->vs->b.info.outputs;
-
    if (indirect == NULL) {
+      poly_vertex_params_set_draw(&vp, draws->count, info->instance_count);
+
       unsigned in_patches = draws->count / patch_vertices;
       if (in_patches == 0)
          return;
@@ -4639,18 +4628,16 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
       struct agx_ptr blob =
          agx_pool_alloc_aligned_with_bo(&batch->pool, alloc, 4, &draw_bo);
 
-      args.tcs_buffer = blob.gpu + tcs_out_offs;
-      args.patches_per_instance = in_patches;
-      args.coord_allocs = blob.gpu + patch_coord_offs;
-      args.nr_patches = unrolled_patches;
-      args.out_draws = blob.gpu + draw_offs;
-      args.counts = blob.gpu + count_offs;
+      params.tcs_buffer = blob.gpu + tcs_out_offs;
+      params.patches_per_instance = in_patches;
+      params.coord_allocs = blob.gpu + patch_coord_offs;
+      params.nr_patches = unrolled_patches;
+      params.out_draws = blob.gpu + draw_offs;
+      params.counts = blob.gpu + count_offs;
 
       unsigned vb_size = poly_tcs_in_size(draws->count * info->instance_count,
                                           batch->uniforms.vertex_outputs);
-      uint64_t addr = agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
-      batch->uniforms.vertex_output_buffer_ptr =
-         agx_pool_upload(&batch->pool, &addr, 8);
+      vp.output_buffer = agx_pool_alloc_aligned(&batch->pool, vb_size, 4).gpu;
 
       vs_grid = agx_3d(draws->count, info->instance_count, 1);
       tcs_grid = agx_3d(in_patches * tcs->tess.output_patch_size,
@@ -4658,20 +4645,24 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
       tess_grid = agx_1d(unrolled_patches);
    } else if (indirect) {
-      args.out_draws =
+      params.out_draws =
          agx_pool_alloc_aligned_with_bo(&batch->pool, draw_stride, 4, &draw_bo)
             .gpu;
    }
 
+   uint64_t vertex_state =
+      agx_pool_upload_aligned(&batch->pool, &vp, sizeof(vp), 8);
+   batch->uniforms.vertex_params = vertex_state;
+
    uint64_t state =
-      agx_pool_upload_aligned(&batch->pool, &args, sizeof(args), 4);
+      agx_pool_upload_aligned(&batch->pool, &params, sizeof(params), 4);
+   batch->uniforms.tess_params = state;
 
    if (indirect) {
       perf_debug(dev, "Indirect tessellation");
 
       uint32_t grid_stride = sizeof(uint32_t) * 6;
 
-      uint64_t vertex_out_ptr = agx_pool_alloc_aligned(&batch->pool, 8, 8).gpu;
       uint64_t indirect_ptr = agx_indirect_buffer_ptr(batch, indirect);
 
       uint64_t tcs_statistic = agx_get_query_address(
@@ -4682,26 +4673,20 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
          agx_pool_alloc_aligned(&batch->pool, grid_stride * 3, 4).gpu;
 
       libagx_tess_setup_indirect(
-         batch, agx_1d(1), AGX_BARRIER_ALL, state, grids, 0 /* XXX: IA */,
-         indirect_ptr, vertex_out_ptr, 0, 0, 0 /* XXX: Index buffer */,
+         batch, agx_1d(1), AGX_BARRIER_ALL, state, grids, vertex_state,
+         indirect_ptr, 0, 0, 0 /* XXX: Index buffer */,
          ctx->vs->b.info.outputs, tcs_statistic);
-
-      batch->uniforms.vertex_output_buffer_ptr = vertex_out_ptr;
 
       vs_grid = agx_grid_indirect_local(grids + 0 * grid_stride);
       tcs_grid = agx_grid_indirect_local(grids + 1 * grid_stride);
       tess_grid = agx_grid_indirect_local(grids + 2 * grid_stride);
    }
 
-   batch->uniforms.tess_params = state;
-
    agx_launch(batch, vs_grid, agx_workgroup(64, 1, 1), ctx->vs, ctx->linked.vs,
               MESA_SHADER_VERTEX, 0);
 
    agx_launch(batch, tcs_grid, agx_workgroup(tcs->tess.output_patch_size, 1, 1),
               ctx->tcs, NULL, MESA_SHADER_TESS_CTRL, 0);
-
-   batch->uniforms.vertex_output_buffer_ptr = 0;
 
    uint64_t c_prims = agx_get_query_address(
       batch, ctx->pipeline_statistics[PIPE_STAT_QUERY_C_PRIMITIVES]);
@@ -4745,7 +4730,7 @@ agx_draw_patches(struct agx_context *ctx, const struct pipe_draw_info *info,
 
    struct pipe_draw_indirect_info copy_indirect = {
       .buffer = &indirect_rsrc.base,
-      .offset = args.out_draws - draw_bo->va->addr,
+      .offset = params.out_draws - draw_bo->va->addr,
       .stride = draw_stride,
       .draw_count = 1,
    };
@@ -5033,10 +5018,6 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    agx_update_gs(ctx, info, indirect);
 
    if (ctx->gs) {
-      batch->geom_indirect = agx_pool_alloc_aligned_with_bo(
-                                &batch->pool, 64, 4, &batch->geom_indirect_bo)
-                                .gpu;
-
       batch->uniforms.geometry_params =
          agx_batch_geometry_params(batch, ib, ib_extent, info, draws, indirect);
 
@@ -5135,7 +5116,7 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    struct pipe_draw_start_count_bias draw_gs;
 
    /* Wrap the pool allocation in a fake resource for meta-Gallium use */
-   struct agx_resource indirect_rsrc = {.bo = batch->geom_indirect_bo};
+   struct agx_resource indirect_rsrc = {.bo = batch->geom_params_bo};
    struct agx_resource index_rsrc = {};
 
    if (ctx->gs) {
@@ -5157,7 +5138,9 @@ agx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          indirect_gs = (struct pipe_draw_indirect_info){
             .draw_count = 1,
             .buffer = &indirect_rsrc.base,
-            .offset = batch->geom_indirect - indirect_rsrc.bo->va->addr,
+            .offset = batch->uniforms.geometry_params
+                    - indirect_rsrc.bo->va->addr
+                    + offsetof(struct poly_geometry_params, draw),
          };
 
          indirect = &indirect_gs;
@@ -5394,7 +5377,7 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    if (info->indirect) {
       struct agx_resource *rsrc = agx_resource(info->indirect);
       agx_batch_reads(batch, rsrc);
-      indirect = rsrc->bo->va->addr + info->indirect_offset;
+      indirect = agx_map_gpu(rsrc) + info->indirect_offset;
    }
 
    /* Increment the pipeline stats query.
@@ -5499,7 +5482,7 @@ agx_set_global_binding(struct pipe_context *pipe, unsigned first,
          struct agx_resource *rsrc = agx_resource(resources[i]);
 
          memcpy(&addr, handles[i], sizeof(addr));
-         addr += rsrc->bo->va->addr;
+         addr += agx_map_gpu(rsrc);
          memcpy(handles[i], &addr, sizeof(addr));
       } else {
          pipe_resource_reference(res, NULL);
@@ -5540,7 +5523,7 @@ agx_decompress_inplace(struct agx_batch *batch, struct pipe_surface *surf,
                                  surf->last_layer - surf->first_layer + 1);
 
    libagx_decompress(batch, grid, AGX_BARRIER_ALL, layout, surf->first_layer,
-                     level, agx_map_texture_gpu(rsrc, 0), images.gpu);
+                     level, agx_map_gpu(rsrc), images.gpu);
 }
 
 void

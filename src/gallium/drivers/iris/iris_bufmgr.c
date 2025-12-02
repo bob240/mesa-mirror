@@ -2305,7 +2305,7 @@ intel_aux_map_buffer_alloc(void *driver_ctx, uint32_t size)
    struct iris_bufmgr *bufmgr = (struct iris_bufmgr *)driver_ctx;
 
    unsigned int page_size = getpagesize();
-   size = MAX2(ALIGN(size, page_size), page_size);
+   size = MAX2(align(size, page_size), page_size);
 
    struct iris_bo *bo = alloc_fresh_bo(bufmgr, size, BO_ALLOC_CAPTURE);
    if (!bo) {
@@ -2654,16 +2654,16 @@ iris_bufmgr_get_for_fd(int fd, bool bo_reuse)
    }
 
    if (!intel_get_device_info_from_fd(fd, &devinfo, 8, -1))
-      return NULL;
+      goto unlock;
 
    if (devinfo.ver < 8 || devinfo.platform == INTEL_PLATFORM_CHV)
-      return NULL;
+      goto unlock;
 
 #ifndef INTEL_USE_ELK
    if (devinfo.ver < 9) {
       WARN_ONCE(devinfo.ver == 8,
                 "ERROR: Iris was compiled without support for Gfx version 8.\n");
-      return NULL;
+      goto unlock;
    }
 #endif
 

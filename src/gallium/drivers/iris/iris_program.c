@@ -66,7 +66,6 @@ vue_layout(bool separate_shader)
    .prefix.limit_trig_input_range =                        \
       screen->driconf.limit_trig_input_range
 #define BRW_KEY_INIT(base_key, _vue_layout) \
-   .base.program_string_id = (base_key).program_string_id,     \
    .base.limit_trig_input_range = (base_key).limit_trig_input_range, \
    .base.vue_layout = _vue_layout
 
@@ -581,9 +580,7 @@ iris_to_brw_fs_key(const struct iris_screen *screen,
       .persample_interp = key->persample_interp ? INTEL_ALWAYS : INTEL_NEVER,
       .multisample_fbo = key->multisample_fbo ? INTEL_ALWAYS : INTEL_NEVER,
       .force_dual_color_blend = key->force_dual_color_blend,
-      .coherent_fb_fetch = key->coherent_fb_fetch,
       .color_outputs_valid = key->color_outputs_valid,
-      .input_slots_valid = key->input_slots_valid,
       .ignore_sample_mask_out = !key->multisample_fbo,
       .null_push_constant_tbimr_workaround =
          screen->devinfo->needs_null_push_constant_tbimr_workaround,
@@ -1566,6 +1563,13 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
 
          case nir_intrinsic_load_output:
             if (devinfo->ver == 8) {
+               /* We're using a BTI as the load_output offset here which
+                * breaks newer NIR assumptions.
+                */
+               nir_io_semantics io_sem = nir_intrinsic_io_semantics(intrin);
+               io_sem.no_validate = true;
+               nir_intrinsic_set_io_semantics(intrin, io_sem);
+
                rewrite_src_with_bti(&b, bt, instr, &intrin->src[0],
                                     IRIS_SURFACE_GROUP_RENDER_TARGET_READ);
             }
@@ -1584,6 +1588,8 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
          }
       }
    }
+
+   nir_validate_shader(nir, "after iris_setup_binding_table");
 }
 
 static void
@@ -1889,7 +1895,7 @@ iris_compile_vs(struct iris_screen *screen,
       /* Check if variables were found. */
       if (nir_lower_clip_vs(nir, (1 << key->vue.nr_userclip_plane_consts) - 1,
                             true, false, NULL)) {
-         nir_lower_io_vars_to_temporaries(nir, impl, true, false);
+         nir_lower_io_vars_to_temporaries(nir, impl, nir_var_shader_out);
          nir_lower_global_vars_to_local(nir);
          nir_lower_vars_to_ssa(nir);
          nir_shader_gather_info(nir, impl);
@@ -2336,7 +2342,7 @@ iris_compile_tes(struct iris_screen *screen,
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_lower_clip_vs(nir, (1 << key->vue.nr_userclip_plane_consts) - 1,
                         true, false, NULL);
-      nir_lower_io_vars_to_temporaries(nir, impl, true, false);
+      nir_lower_io_vars_to_temporaries(nir, impl, nir_var_shader_out);
       nir_lower_global_vars_to_local(nir);
       nir_lower_vars_to_ssa(nir);
       nir_shader_gather_info(nir, impl);
@@ -2531,7 +2537,7 @@ iris_compile_gs(struct iris_screen *screen,
       nir_function_impl *impl = nir_shader_get_entrypoint(nir);
       nir_lower_clip_gs(nir, (1 << key->vue.nr_userclip_plane_consts) - 1,
                         false, NULL);
-      nir_lower_io_vars_to_temporaries(nir, impl, true, false);
+      nir_lower_io_vars_to_temporaries(nir, impl, nir_var_shader_out);
       nir_lower_global_vars_to_local(nir);
       nir_lower_vars_to_ssa(nir);
       nir_shader_gather_info(nir, impl);
@@ -3828,7 +3834,8 @@ iris_bind_cs_state(struct pipe_context *ctx, void *state)
 }
 
 static void
-iris_finalize_nir(struct pipe_screen *_screen, struct nir_shader *nir)
+iris_finalize_nir(struct pipe_screen *_screen, struct nir_shader *nir,
+                  bool optimize)
 {
    struct iris_screen *screen = (struct iris_screen *)_screen;
 

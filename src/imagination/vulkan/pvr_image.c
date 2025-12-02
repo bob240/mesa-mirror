@@ -29,12 +29,12 @@
 #include <string.h>
 
 #include "pvr_buffer.h"
-#include "pvr_csb.h"
 #include "pvr_device.h"
 #include "pvr_device_info.h"
 #include "pvr_entrypoints.h"
 #include "pvr_formats.h"
 #include "pvr_macros.h"
+#include "pvr_physical_device.h"
 #include "pvr_tex_state.h"
 #include "util/macros.h"
 #include "util/u_math.h"
@@ -64,7 +64,9 @@ static void pvr_image_init_memlayout(struct pvr_image *image)
    }
 }
 
-static void pvr_image_init_physical_extent(struct pvr_image *image)
+static void
+pvr_image_init_physical_extent(struct pvr_image *image,
+                               unsigned pbe_stride_align)
 {
    assert(image->memlayout != PVR_MEMLAYOUT_UNDEFINED);
 
@@ -89,8 +91,7 @@ static void pvr_image_init_physical_extent(struct pvr_image *image)
       if (image->vk.usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                              VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
          image->physical_extent.width =
-            ALIGN(image->physical_extent.width,
-                  ROGUE_PBESTATE_REG_WORD0_LINESTRIDE_UNIT_SIZE);
+            align(image->physical_extent.width, pbe_stride_align);
       }
    }
 }
@@ -110,11 +111,11 @@ static void pvr_image_setup_mip_levels(struct pvr_image *image)
    for (uint32_t i = 0; i < image->vk.mip_levels; i++) {
       struct pvr_mip_level *mip_level = &image->mip_levels[i];
 
-      mip_level->pitch = cpp * ALIGN(extent.width, extent_alignment);
-      mip_level->height_pitch = ALIGN(extent.height, extent_alignment);
+      mip_level->pitch = cpp * align(extent.width, extent_alignment);
+      mip_level->height_pitch = align(extent.height, extent_alignment);
       mip_level->size = image->vk.samples * mip_level->pitch *
                         mip_level->height_pitch *
-                        ALIGN(extent.depth, extent_alignment);
+                        align(extent.depth, extent_alignment);
       mip_level->offset = image->layer_size;
 
       image->layer_size += mip_level->size;
@@ -129,11 +130,11 @@ static void pvr_image_setup_mip_levels(struct pvr_image *image)
        * were present so we need to account for that in the `layer_size`.
        */
       while (extent.height != 1 || extent.width != 1 || extent.depth != 1) {
-         const uint32_t height_pitch = ALIGN(extent.height, extent_alignment);
-         const uint32_t pitch = cpp * ALIGN(extent.width, extent_alignment);
+         const uint32_t height_pitch = align(extent.height, extent_alignment);
+         const uint32_t pitch = cpp * align(extent.width, extent_alignment);
 
          image->layer_size += image->vk.samples * pitch * height_pitch *
-                              ALIGN(extent.depth, extent_alignment);
+                              align(extent.depth, extent_alignment);
 
          extent.height = u_minify(extent.height, 1);
          extent.width = u_minify(extent.width, 1);
@@ -151,6 +152,9 @@ static void pvr_image_setup_mip_levels(struct pvr_image *image)
 
    image->size = image->layer_size * image->vk.array_layers;
 }
+
+static unsigned
+get_pbe_stride_align(const struct pvr_device_info *dev_info);
 
 VkResult pvr_CreateImage(VkDevice _device,
                          const VkImageCreateInfo *pCreateInfo,
@@ -181,9 +185,12 @@ VkResult pvr_CreateImage(VkDevice _device,
     */
    image->alignment = 4096U;
 
+   unsigned pbe_stride_align =
+      get_pbe_stride_align(&device->pdevice->dev_info);
+
    /* Initialize the image using the saved information from pCreateInfo */
    pvr_image_init_memlayout(image);
-   pvr_image_init_physical_extent(image);
+   pvr_image_init_physical_extent(image, pbe_stride_align);
    pvr_image_setup_mip_levels(image);
 
    *pImage = pvr_image_to_handle(image);
@@ -574,4 +581,14 @@ void pvr_DestroyBufferView(VkDevice _device,
       return;
 
    vk_buffer_view_destroy(&device->vk, pAllocator, &bview->vk);
+}
+
+/* Leave this at the very end, to avoid leakage of HW-defs here */
+#include "pvr_csb.h"
+
+static unsigned
+get_pbe_stride_align(const struct pvr_device_info *dev_info)
+{
+   return PVR_HAS_FEATURE(dev_info, pbe_stride_align_1pixel) ?
+      1 : ROGUE_PBESTATE_REG_WORD0_LINESTRIDE_UNIT_SIZE;
 }

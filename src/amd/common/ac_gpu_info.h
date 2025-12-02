@@ -26,7 +26,6 @@ struct amd_ip_info {
    uint8_t ver_minor;
    uint8_t ver_rev;
    uint8_t num_queues;
-   uint8_t num_queue_slots;
    uint8_t num_instances;
    uint32_t ib_alignment;
    uint32_t ib_pad_dw_mask;
@@ -34,10 +33,7 @@ struct amd_ip_info {
 
 struct radeon_info {
    /* Device info. */
-   const char *name;
-   char lowercase_name[32];
-   const char *marketing_name;
-   char dev_filename[32];
+   char marketing_name[64];
    uint32_t num_se;           /* only enabled SEs */
    uint32_t num_rb;           /* only enabled RBs */
    uint32_t num_cu;           /* only enabled CUs */
@@ -81,7 +77,6 @@ struct radeon_info {
 
    /* Flags. */
    bool family_overridden; /* AMD_FORCE_FAMILY was used, skip command submission */
-   bool is_pro_graphics;
    bool has_graphics; /* false if the chip is compute-only */
    bool has_clear_state;
    bool has_distributed_tess;
@@ -103,6 +98,7 @@ struct radeon_info {
    bool has_ls_vgpr_init_bug;
    bool has_pops_missed_overlap_bug;
    bool has_null_index_buffer_clamping_bug;
+   bool has_cb_lt16bit_int_clamp_bug;
    bool has_zero_index_buffer_bug;
    bool has_image_load_dcc_bug;
    bool has_two_planes_iterate256_bug;
@@ -123,7 +119,7 @@ struct radeon_info {
    bool has_ngg_passthru_no_msg;
    bool has_export_conflict_bug;
    bool has_attr_ring_wait_bug;
-   bool has_cp_dma_with_null_prt_bug;
+   bool cp_dma_supports_sparse;
    bool has_vrs_ds_export_bug;
    bool has_taskmesh_indirect0_bug;
    bool sdma_supports_sparse;      /* Whether SDMA can safely access sparse resources. */
@@ -242,7 +238,14 @@ struct radeon_info {
    bool has_vm_always_valid;
    bool has_bo_metadata;
    bool has_eqaa_surface_allocator;
-   bool has_sparse_vm_mappings;
+   /* Sparse bindings and basic sparse features (2D image, etc.) */
+   bool has_sparse;
+   /* 3D sparse images */
+   bool has_sparse_image_3d;
+   /* 3D sparse images with standard block shape */
+   bool has_sparse_image_standard_3d;
+   /* Mip levels do not need to be aligned to the sparse block size */
+   bool has_sparse_unaligned_mip_size;
    bool has_gang_submit;
    bool has_gpuvm_fault_query;
    bool has_pcie_bandwidth_info;
@@ -339,7 +342,6 @@ struct radeon_info {
       uint32_t csa_size;
       uint32_t csa_alignment;
    } fw_based_mcbp;
-   bool has_fw_based_shadowing;
 
    /* Device supports hardware-accelerated raytracing using
     * image_bvh*_intersect_ray instructions
@@ -359,7 +361,7 @@ enum ac_query_gpu_info_result ac_query_gpu_info(int fd, void *dev_p, struct rade
 void ac_compute_driver_uuid(char *uuid, size_t size);
 
 void ac_compute_device_uuid(const struct radeon_info *info, char *uuid, size_t size);
-void ac_print_gpu_info(const struct radeon_info *info, FILE *f);
+void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd);
 int ac_get_gs_table_depth(enum amd_gfx_level gfx_level, enum radeon_family family);
 void ac_get_raster_config(const struct radeon_info *info, uint32_t *raster_config_p,
                           uint32_t *raster_config_1_p, uint32_t *se_tile_repeat_p);

@@ -42,7 +42,7 @@ if get_option('layout') != 'mirror'
 endif
 
 with_llvm = get_option('llvm')
-amd_with_llvm = get_option('amd-use-llvm')
+amd_with_llvm = with_llvm.allowed() and get_option('amd-use-llvm')
 
 with_mesa_debug = get_option('buildtype') == 'debug'
 
@@ -156,7 +156,13 @@ if gallium_drivers.contains('auto')
         'r300', 'r600', 'radeonsi', 'nouveau', 'virgl', 'svga', 'llvmpipe', 'softpipe',
         'iris', 'crocus', 'i915', 'zink'
       ]
-    elif ['arm', 'aarch64'].contains(host_machine.cpu_family())
+    elif ['aarch64'].contains(host_machine.cpu_family())
+      gallium_drivers = [
+        'v3d', 'vc4', 'freedreno', 'etnaviv', 'nouveau', 'svga',
+        'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
+        'zink', 'asahi'
+      ]
+    elif ['arm'].contains(host_machine.cpu_family())
       gallium_drivers = [
         'v3d', 'vc4', 'freedreno', 'etnaviv', 'nouveau', 'svga',
         'tegra', 'virgl', 'lima', 'panfrost', 'llvmpipe', 'softpipe', 'iris',
@@ -218,10 +224,11 @@ with_gallium_ethosu = gallium_drivers.contains('ethosu')
 foreach gallium_driver : gallium_drivers
   pre_args += '-DHAVE_@0@'.format(gallium_driver.to_upper())
 endforeach
+draw_with_llvm = with_llvm.allowed() and get_option('draw-use-llvm')
 with_llvm = with_llvm \
   .enable_if(with_gallium_i915, error_message : 'i915 Gallium driver requires LLVM for vertex shaders') \
   .enable_if(with_gallium_llvmpipe, error_message : 'LLVMPipe Gallium driver requires LLVM') \
-  .enable_if(with_gallium_r300, error_message : 'R300 Gallium driver requires LLVM for vertex shaders') \
+  .enable_if(with_gallium_r300 and draw_with_llvm, error_message : 'R300 Gallium driver requires LLVM for vertex shaders on IGP parts') \
   .enable_if(with_gallium_r600 and amd_with_llvm, error_message : 'R600 Gallium driver configured to require LLVM') \
   .enable_if(with_gallium_radeonsi and amd_with_llvm, error_message : 'RadeonSI Gallium driver configured to require LLVM')
 
@@ -249,7 +256,9 @@ if _vulkan_drivers.contains('auto')
   if system_has_kms_drm
     if host_machine.cpu_family().startswith('x86')
       _vulkan_drivers = ['amd', 'intel', 'intel_hasvk', 'nouveau', 'swrast']
-    elif ['arm', 'aarch64'].contains(host_machine.cpu_family())
+    elif ['aarch64'].contains(host_machine.cpu_family())
+      _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno', 'asahi']
+    elif ['arm'].contains(host_machine.cpu_family())
       _vulkan_drivers = ['swrast', 'intel', 'panfrost', 'freedreno']
     elif ['mips', 'mips64', 'ppc', 'ppc64', 'riscv32', 'riscv64'].contains(host_machine.cpu_family())
       _vulkan_drivers = ['amd', 'swrast']
@@ -367,8 +376,14 @@ endif
 if with_aco_tests and not with_amd_vk
   error('ACO tests require Radv')
 endif
+if with_aco_tests and not with_tools.contains('drm-shim')
+  error('ACO tests require AMDGPU drm-shim')
+endif
 if with_radv_tests and not with_amd_vk
   error('RADV tests require RADV')
+endif
+if with_radv_tests and not with_tools.contains('drm-shim')
+  error('RADV tests require AMDGPU drm-shim')
 endif
 
 with_microsoft_clc = get_option('microsoft-clc').enabled()
@@ -675,13 +690,20 @@ _va_drivers = [
   with_gallium_virgl,
 ]
 
+allow_fallback_for_libva = get_option('allow-fallback-for').contains('libva')
+fallback_libva_options = []
 _va = get_option('gallium-va') \
   .require(_va_drivers.contains(true),
            error_message : 'VA state tracker requires at least one of the following gallium drivers: r600, radeonsi, nouveau, d3d12 (with option gallium-d3d12-video), virgl.')
 _dep_va_name = host_machine.system() == 'windows' ? 'libva-win32' : 'libva'
-dep_va = dependency(_dep_va_name, version : '>= 1.8.0', required : _va)
+dep_va = dependency(
+  _dep_va_name, version : '>= 1.8.0',
+  required : _va,
+  allow_fallback: allow_fallback_for_libva,
+  default_options: fallback_libva_options
+)
 if dep_va.found()
-  dep_va_headers = dep_va.partial_dependency(compile_args : true)
+  dep_va_headers = dep_va.partial_dependency(compile_args : true, includes : true)
   if cc.has_header_symbol('va/va.h', 'VASurfaceAttribDRMFormatModifiers',
                           dependencies: dep_va_headers)
     pre_args += '-DHAVE_VA_SURFACE_ATTRIB_DRM_FORMAT_MODIFIERS'
@@ -1233,7 +1255,12 @@ else
   # Check for C and C++ arguments for MSVC compatibility. These are only used
   # in parts of the mesa code base that need to compile with MSVC, mainly
   # common code
-  _trial_msvc = ['-Werror=pointer-arith', '-Werror=vla', '-Werror=gnu-empty-initializer']
+  _trial_msvc = [
+    '-Werror=pointer-arith',
+    '-Werror=vla',
+    '-Werror=gnu-empty-initializer',
+    '-Wgnu-pointer-arith',
+  ]
   c_msvc_compat_args += cc.get_supported_arguments(_trial_msvc)
   cpp_msvc_compat_args += cpp.get_supported_arguments(_trial_msvc)
 endif
@@ -1470,7 +1497,10 @@ endif
 if cc.has_header_symbol('errno.h', 'program_invocation_name',
                         args : '-D_GNU_SOURCE')
    pre_args += '-DHAVE_PROGRAM_INVOCATION_NAME'
-elif with_tools.contains('intel')
+elif with_tools.contains('intel') and not with_platform_android
+  # Intel tools is supported on Android where the program name is from
+  # `getprogname()` without `program_invocation_name` in glibc.
+  # See `src/util/u_process.c` for more details.
   error('Intel tools require the program_invocation_name variable')
 endif
 
@@ -1617,7 +1647,7 @@ if dep_thread.found()
 endif
 
 with_expat = get_option('expat') \
-  .disable_auto_if(with_platform_android or with_platform_windows) \
+  .disable_auto_if(with_platform_windows) \
   .enable_if(with_intel_tools, error_message : 'Intel tools require expat')
 
 if host_machine.system() == 'darwin'
@@ -1750,7 +1780,6 @@ if with_clc
   # but we don't know what LLVM version we are using yet
   llvm_optional_modules += ['all-targets', 'windowsdriver', 'frontendhlsl', 'frontenddriver']
 endif
-draw_with_llvm = get_option('draw-use-llvm')
 if draw_with_llvm
   llvm_modules += 'native'
   # lto is needded with LLVM>=15, but we don't know what LLVM verrsion we are using yet
@@ -1794,8 +1823,12 @@ if dep_llvm.found()
     error('Lavapipe and llvmpipe require LLVM draw support.')
   endif
 
-  if (with_gallium_i915 or with_gallium_r300) and not draw_with_llvm
-    error('i915 and R300 require LLVM draw support for vertex shaders.')
+  if with_gallium_i915 and not draw_with_llvm
+    error('i915 requires LLVM draw support for vertex shaders.')
+  endif
+
+  if with_gallium_r300 and not draw_with_llvm and host_machine.cpu_family() == 'x86'
+    error('r300 requires LLVM draw support for vertex shaders.')
   endif
 
   if host_machine.system() != 'windows'
@@ -1901,6 +1934,7 @@ dep_lua = dependency('lua54', 'lua5.4', 'lua-5.4',
                      'lua53', 'lua5.3', 'lua-5.3',
                      'lua', required: false,
                      allow_fallback: with_tools.contains('freedreno'),
+                     disabler : true,
                      version: '>=5.3')
 
 # Be explicit about only using this lib on Windows, to avoid picking
@@ -2197,7 +2231,7 @@ endif
 
 with_sysprof = get_option('sysprof')
 if with_sysprof
-  dep_sysprof = dependency('sysprof-capture-4', version: '>= 3.38.0')
+  dep_sysprof = dependency('sysprof-capture-4', version: '>= 49.0')
   pre_args += '-DHAVE_SYSPROF'
 endif
 
@@ -2282,6 +2316,13 @@ else
   vulkan_icd_lib_path = get_option('prefix') / get_option('libdir')
 endif
 
+vulkan_manifest_per_architecture = get_option('vulkan-manifest-per-architecture')
+
+if vulkan_manifest_per_architecture
+  vulkan_manifest_suffix = '@0@.json'.format(host_machine.cpu())
+else
+  vulkan_manifest_suffix = 'json'
+endif
 
 subdir('include')
 subdir('bin')

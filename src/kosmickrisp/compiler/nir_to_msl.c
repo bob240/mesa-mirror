@@ -111,20 +111,20 @@ emit_local_vars(struct nir_to_msl_ctx *ctx, nir_shader *shader)
             shader->info.shared_size);
    }
    if (shader->scratch_size) {
-      P_IND(ctx, "uchar scratch[%d] = {0};\n", shader->scratch_size);
-   }
-   if (BITSET_TEST(shader->info.system_values_read,
-                   SYSTEM_VALUE_HELPER_INVOCATION)) {
-      P_IND(ctx, "bool gl_HelperInvocation = simd_is_helper_thread();\n");
+      /* KK_WORKAROUND_1 */
+      if (ctx->disabled_workarounds & BITFIELD64_BIT(1)) {
+         P_IND(ctx, "uchar scratch[%d];\n", shader->scratch_size);
+      } else {
+         P_IND(ctx, "uchar scratch[%d] = {0};\n", shader->scratch_size);
+      }
    }
 }
 
 static bool
 is_register(nir_def *def)
 {
-   return ((def->parent_instr->type == nir_instr_type_intrinsic) &&
-           (nir_instr_as_intrinsic(def->parent_instr)->intrinsic ==
-            nir_intrinsic_load_reg));
+   return ((nir_def_is_intrinsic(def)) &&
+           (nir_def_as_intrinsic(def)->intrinsic == nir_intrinsic_load_reg));
 }
 
 static void
@@ -166,8 +166,7 @@ src_to_msl(struct nir_to_msl_ctx *ctx, nir_src *src)
    if (bitcast)
       P(ctx, "as_type<%s>(", bitcast);
    if (is_register(src->ssa)) {
-      nir_intrinsic_instr *instr =
-         nir_instr_as_intrinsic(src->ssa->parent_instr);
+      nir_intrinsic_instr *instr = nir_def_as_intrinsic(src->ssa);
       if (src->ssa->bit_size != 1u) {
          P(ctx, "as_type<%s>(r%d)", msl_type_for_def(ctx->types, src->ssa),
            instr->src[0].ssa->index);
@@ -615,12 +614,12 @@ round_src_component_to_uint(struct nir_to_msl_ctx *ctx, nir_src *src,
 {
    bool is_float = msl_src_is_float(ctx, src);
    if (is_float) {
-      P(ctx, "uint(rint(");
+      P(ctx, "uint(max(int(rint(");
    }
    src_to_msl(ctx, src);
    P(ctx, ".%c", component);
    if (is_float) {
-      P(ctx, "))");
+      P(ctx, ")), int(0)))");
    }
 }
 
@@ -853,6 +852,8 @@ memory_modes_to_msl(struct nir_to_msl_ctx *ctx, nir_variable_mode modes)
       }
       requires_or = true;
    }
+   if (!requires_or)
+      P(ctx, "mem_flags::mem_none");
 }
 
 static uint32_t
@@ -964,9 +965,6 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, "gl_BaseInstance;\n");
       break;
    case nir_intrinsic_load_helper_invocation:
-      P(ctx, "gl_HelperInvocation;\n");
-      break;
-   case nir_intrinsic_is_helper_invocation:
       P(ctx, "simd_is_helper_thread();\n");
       break;
    case nir_intrinsic_ddx:
@@ -1071,10 +1069,21 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, "(ulong)&buf%d.contents[0];\n", nir_intrinsic_binding(instr));
       break;
    case nir_intrinsic_load_global: {
-      src_to_packed_load(ctx, &instr->src[0], "device",
-                         msl_type_for_def(ctx->types, &instr->def),
-                         instr->def.num_components);
-      P(ctx, ";\n");
+      enum gl_access_qualifier access = nir_intrinsic_access(instr);
+      const char *type = msl_type_for_def(ctx->types, &instr->def);
+      const char *addressing =
+         access & ACCESS_COHERENT ? "coherent device" : "device";
+      if (access & ACCESS_ATOMIC) {
+         assert(instr->num_components == 1u &&
+                "We can only do single component with atomics");
+         P(ctx, "atomic_load_explicit((%s atomic_%s*)", addressing, type);
+         src_to_msl(ctx, &instr->src[0]);
+         P(ctx, ", memory_order_relaxed);\n");
+      } else {
+         src_to_packed_load(ctx, &instr->src[0], addressing, type,
+                            instr->def.num_components);
+         P(ctx, ";\n");
+      }
       break;
    }
    case nir_intrinsic_load_global_constant: {
@@ -1096,9 +1105,24 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       break;
    }
    case nir_intrinsic_load_global_constant_offset: {
-      src_to_packed_load_offset(ctx, &instr->src[0], &instr->src[1], "device",
-                                msl_type_for_def(ctx->types, &instr->def),
-                                instr->def.num_components);
+      enum gl_access_qualifier access = nir_intrinsic_access(instr);
+      const char *type = msl_type_for_def(ctx->types, &instr->def);
+      const char *addressing =
+         access & ACCESS_COHERENT ? "coherent device" : "device";
+      if (access & ACCESS_ATOMIC) {
+         assert(instr->num_components == 1u &&
+                "We can only do single component with atomics");
+         P(ctx, "atomic_load_explicit((%s atomic_%s*)(", addressing, type);
+         src_to_msl(ctx, &instr->src[0]);
+         P(ctx, "+");
+         src_to_msl(ctx, &instr->src[1]);
+         P(ctx, ", memory_order_relaxed);\n");
+      } else {
+         src_to_packed_load_offset(ctx, &instr->src[0], &instr->src[1],
+                                   addressing,
+                                   msl_type_for_def(ctx->types, &instr->def),
+                                   instr->def.num_components);
+      }
       P(ctx, ";\n");
       break;
    }
@@ -1115,15 +1139,29 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       atomic_swap_to_msl(ctx, instr, "threadgroup", true);
       break;
    case nir_intrinsic_store_global: {
+      enum gl_access_qualifier access = nir_intrinsic_access(instr);
       const char *type = msl_type_for_src(ctx->types, &instr->src[0]);
-      src_to_packed_store(ctx, &instr->src[1], "device", type,
-                          instr->src[0].ssa->num_components);
-      writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
-                       instr->num_components);
-      P(ctx, " = ")
-      src_to_packed(ctx, &instr->src[0], type,
-                    instr->src[0].ssa->num_components);
-      P(ctx, ";\n");
+      const char *addressing =
+         access & ACCESS_COHERENT ? "coherent device" : "device";
+      if (access & ACCESS_ATOMIC) {
+         assert(instr->num_components == 1u &&
+                "We can only do single component with atomics");
+         P_IND(ctx, "atomic_store_explicit((%s atomic_%s*)", addressing, type);
+         src_to_msl(ctx, &instr->src[1]);
+         P(ctx, ", ")
+         src_to_packed(ctx, &instr->src[0], type,
+                       instr->src[0].ssa->num_components);
+         P(ctx, ", memory_order_relaxed);\n");
+      } else {
+         src_to_packed_store(ctx, &instr->src[1], addressing, type,
+                             instr->src[0].ssa->num_components);
+         writemask_to_msl(ctx, nir_intrinsic_write_mask(instr),
+                          instr->num_components);
+         P(ctx, " = ")
+         src_to_packed(ctx, &instr->src[0], type,
+                       instr->src[0].ssa->num_components);
+         P(ctx, ";\n");
+      }
       break;
    }
    case nir_intrinsic_barrier: {
@@ -1245,6 +1283,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       break;
    case nir_intrinsic_load_texture_handle_kk: {
       const char *access = "";
+      const char *coherent = nir_intrinsic_access(instr) & ACCESS_COHERENT
+                                ? ", memory_coherence_device"
+                                : "";
       switch (nir_intrinsic_flags(instr)) {
       case MSL_ACCESS_READ:
          access = ", access::read";
@@ -1254,15 +1295,23 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
          break;
       case MSL_ACCESS_READ_WRITE:
          access = ", access::read_write";
+         /* TODO_KOSMICKRISP We shouldn't need this line below but it doesn't
+          * seem we get the correct access values for what should be device
+          * coherent textures from NIR. Example test:
+          * dEQP-VK.memory_model.message_passing.ext.u32.coherent.fence_fence.atomicwrite.device.payload_local.image.guard_local.buffer.comp
+          * This test declares the texture as devicecoherent, but in NIR it
+          * appears as resctrict only with no coherent.
+          */
+         coherent = ", memory_coherence_device";
          break;
       }
-      P_IND(ctx, "texture%s%s<%s%s> t%d = *(constant texture%s%s<%s%s>*)",
+      P_IND(ctx, "texture%s%s<%s%s%s> t%d = *(constant texture%s%s<%s%s%s>*)",
             texture_dim(nir_intrinsic_image_dim(instr)),
             nir_intrinsic_image_array(instr) ? "_array" : "",
-            tex_type_name(nir_intrinsic_dest_type(instr)), access,
+            tex_type_name(nir_intrinsic_dest_type(instr)), access, coherent,
             instr->def.index, texture_dim(nir_intrinsic_image_dim(instr)),
             nir_intrinsic_image_array(instr) ? "_array" : "",
-            tex_type_name(nir_intrinsic_dest_type(instr)), access);
+            tex_type_name(nir_intrinsic_dest_type(instr)), access, coherent);
       src_to_msl(ctx, &instr->src[0]);
       P(ctx, ";\n");
       break;
@@ -1353,17 +1402,12 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       P(ctx, ");\n");
       break;
    case nir_intrinsic_elect:
-      /* If we don't add && "(ulong)simd_ballot(true)"" the following CTS tests
-       * fail:
-       * dEQP-VK.subgroups.ballot_other.graphics.subgroupballotfindlsb
-       * dEQP-VK.subgroups.ballot_other.compute.subgroupballotfindlsb
-       * Weird Metal bug:
-       * if (simd_is_first())
-       *    temp = 3u;
-       * else
-       *    temp = simd_ballot(true); <- This will return all active threads...
-       */
-      P(ctx, "simd_is_first() && (ulong)simd_ballot(true);\n");
+      /* KK_WORKAROUND_3 */
+      if (ctx->disabled_workarounds & BITFIELD64_BIT(3)) {
+         P(ctx, "simd_is_first();\n");
+      } else {
+         P(ctx, "simd_is_first() && (ulong)simd_ballot(true);\n");
+      }
       break;
    case nir_intrinsic_read_first_invocation:
       P(ctx, "simd_broadcast_first(");
@@ -1729,6 +1773,7 @@ instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
       assert(!"We should have lowered derefs by now");
       break;
    case nir_instr_type_call:
+   case nir_instr_type_cmat_call:
       assert(!"We should have inlined all functions by now");
       break;
    case nir_instr_type_tex:
@@ -1747,7 +1792,6 @@ instr_to_msl(struct nir_to_msl_ctx *ctx, nir_instr *instr)
       // undefs get inlined into their uses (and we shouldn't see them hopefully)
       break;
    case nir_instr_type_phi:
-   case nir_instr_type_parallel_copy:
       assert(!"NIR should be taken out of SSA");
       break;
    }
@@ -1788,31 +1832,15 @@ cf_node_to_metal(struct nir_to_msl_ctx *ctx, nir_cf_node *node)
    case nir_cf_node_loop: {
       nir_loop *loop = nir_cf_node_as_loop(node);
       assert(!nir_loop_has_continue_construct(loop));
-      /* We need to loop to infinite since MSL compiler crashes if we have
-       something like (simplified version):
-       * // clang-format off
-       * while (true) {
-       *     if (some_conditional) {
-       *         break_loop = true;
-       *     } else {
-       *         break_loop = false;
-       *     }
-       *     if (break_loop) {
-       *         break;
-       *     }
-       * }
-       * // clang-format on
-       * The issue I believe is that some_conditional wouldn't change the value
-       * no matter in which iteration we are (something like fetching the same
-       * value from a buffer) and the MSL compiler doesn't seem to like that
-       * much to the point it crashes.
-       * With this for loop now, we trick the MSL compiler into believing we are
-       * not doing an infinite loop (wink wink)
-       */
-      P_IND(ctx,
-            "for (uint64_t no_crash = 0u; no_crash < %" PRIu64
-            "; ++no_crash) {\n",
-            UINT64_MAX);
+      /* KK_WORKAROUND_2 */
+      if (ctx->disabled_workarounds & BITFIELD64_BIT(2)) {
+         P_IND(ctx, "while (true) {\n");
+      } else {
+         P_IND(ctx,
+               "for (uint64_t no_crash = 0u; no_crash < %" PRIu64
+               "; ++no_crash) {\n",
+               UINT64_MAX);
+      }
       ctx->indentlevel++;
       foreach_list_typed(nir_cf_node, node, node, &loop->body) {
          cf_node_to_metal(ctx, node);
@@ -1876,12 +1904,16 @@ msl_preprocess_nir(struct nir_shader *nir)
 
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_function_temp, NULL);
+
+   /* lower_system_values needs to go before is_helper_invocation since it will
+    * generate discards. */
+   NIR_PASS(_, nir, nir_lower_system_values);
+
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      nir_input_attachment_options input_attachment_options = {
-         .use_fragcoord_sysval = true,
-         .use_layer_id_sysval = true,
-      };
+      nir_input_attachment_options input_attachment_options = { };
       NIR_PASS(_, nir, nir_lower_input_attachments, &input_attachment_options);
+      /* KK_WORKAROUND_4 */
+      NIR_PASS(_, nir, nir_lower_is_helper_invocation);
    }
    NIR_PASS(_, nir, nir_opt_combine_barriers, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -1891,13 +1923,11 @@ msl_preprocess_nir(struct nir_shader *nir)
             nir_var_function_temp | nir_var_shader_in | nir_var_shader_out);
    NIR_PASS(_, nir, nir_lower_alu_to_scalar, kk_scalarize_filter, NULL);
 
-   NIR_PASS(_, nir, nir_lower_indirect_derefs,
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 0,
             glsl_get_natural_size_align_bytes,
             glsl_get_natural_size_align_bytes);
-
-   NIR_PASS(_, nir, nir_lower_system_values);
 
    nir_lower_compute_system_values_options csv_options = {
       .has_base_global_invocation_id = 0,
@@ -1924,7 +1954,7 @@ msl_optimize_nir(struct nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_dce);
       NIR_PASS(progress, nir, nir_opt_cse);
       NIR_PASS(progress, nir, nir_opt_dead_cf);
-      NIR_PASS(progress, nir, nir_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
       NIR_PASS(progress, nir, nir_opt_deref);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
       NIR_PASS(progress, nir, nir_opt_copy_prop_vars);
@@ -1944,7 +1974,7 @@ msl_optimize_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, msl_nir_lower_algebraic_late);
    NIR_PASS(_, nir, nir_convert_from_ssa, true, false);
    nir_trivialize_registers(nir);
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
 
    return progress;
 }
@@ -2006,7 +2036,7 @@ predeclare_ssa_values(struct nir_to_msl_ctx *ctx, nir_function_impl *impl)
 }
 
 char *
-nir_to_msl(nir_shader *shader, void *mem_ctx)
+nir_to_msl(nir_shader *shader, void *mem_ctx, uint64_t disabled_workarounds)
 {
    /* Need to rename the entrypoint here since hardcoded shaders used by vk_meta
     * don't go through the preprocess step since we are the ones creating them.
@@ -2016,6 +2046,7 @@ nir_to_msl(nir_shader *shader, void *mem_ctx)
    struct nir_to_msl_ctx ctx = {
       .shader = shader,
       .text = _mesa_string_buffer_create(mem_ctx, 1024),
+      .disabled_workarounds = disabled_workarounds,
    };
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    msl_gather_info(&ctx);
@@ -2049,6 +2080,7 @@ nir_to_msl(nir_shader *shader, void *mem_ctx)
    ctx.indentlevel--;
    P(&ctx, "}\n");
    char *ret = ctx.text->buf;
+   _mesa_hash_table_destroy(ctx.types, NULL);
    ralloc_steal(mem_ctx, ctx.text->buf);
    ralloc_free(ctx.text);
    return ret;

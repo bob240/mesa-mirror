@@ -34,14 +34,7 @@
  */
 
 #include "pipe/p_defines.h"
-#include "pipe/p_state.h"
-#include "util/u_debug.h"
-#include "util/u_dump.h"
-#include "util/u_memory.h"
-#include "util/u_math.h"
 #include "util/format/u_format.h"
-#include "util/u_cpu_detect.h"
-#include "lp_bld_debug.h"
 #include "lp_bld_type.h"
 #include "lp_bld_const.h"
 #include "lp_bld_conv.h"
@@ -1181,7 +1174,7 @@ lp_build_sample_aos(struct lp_build_sample_context *bld,
       lp_build_else(&if_ctx);
       {
          /* Use the magnification filter */
-         lp_build_sample_mipmap(bld, 
+         lp_build_sample_mipmap(bld,
                                 mag_filter, PIPE_TEX_MIPFILTER_NONE,
                                 s, t, r, offsets,
                                 ilevel0, NULL, NULL,

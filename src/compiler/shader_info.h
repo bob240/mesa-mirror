@@ -244,6 +244,12 @@ typedef struct shader_info {
    /* Whether flrp has been lowered. */
    bool flrp_lowered:1;
 
+   /* Whether nir_opt_constant_folding should not fold offset srcs of
+    * IO intrinsics.
+    */
+   bool disable_input_offset_src_constant_folding:1;
+   bool disable_output_offset_src_constant_folding:1;
+
    /* Whether nir_lower_io has been called to lower derefs.
     * nir_variables for inputs and outputs might not be present in the IR.
     */
@@ -458,6 +464,11 @@ typedef struct shader_info {
          bool pixel_interlock_unordered:1;
          bool sample_interlock_ordered:1;
          bool sample_interlock_unordered:1;
+
+         /**
+          * whether this shader has pixel_local_storage load/store instructions
+          */
+         bool accesses_pixel_local_storage:1;
 
          /**
           * Flags whether NIR's base types on the FS color outputs should be

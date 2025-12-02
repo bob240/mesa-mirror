@@ -710,6 +710,7 @@ generate_fs_loop(struct gallivm_state *gallivm,
    LLVMValueRef z_fb, s_fb;
    LLVMValueRef zs_samples = lp_build_const_int32(gallivm, key->zsbuf_nr_samples);
    LLVMValueRef z_out = NULL, s_out = NULL;
+   LLVMValueRef min_depth_bounds = NULL, max_depth_bounds = NULL;
    struct lp_build_for_loop_state loop_state, sample_loop_state = {0};
    struct lp_build_mask_context mask;
    struct nir_shader *nir = shader->base.ir.nir;
@@ -733,6 +734,7 @@ generate_fs_loop(struct gallivm_state *gallivm,
    unsigned depth_mode;
    const struct util_format_description *zs_format_desc = NULL;
    if (key->depth.enabled ||
+       key->depth.depth_bounds_test ||
        key->stencil[0].enabled) {
       zs_format_desc = util_format_description(key->zsbuf_format);
 
@@ -930,6 +932,14 @@ generate_fs_loop(struct gallivm_state *gallivm,
                                 depth_ptr, &sample_offset, 1, "");
    }
 
+   if (key->depth.depth_bounds_test) {
+      min_depth_bounds = lp_jit_context_min_depth_bounds(gallivm, context_type, context_ptr);
+      min_depth_bounds = lp_build_broadcast(gallivm, vec_type, min_depth_bounds);
+
+      max_depth_bounds = lp_jit_context_max_depth_bounds(gallivm, context_type, context_ptr);
+      max_depth_bounds = lp_build_broadcast(gallivm, vec_type, max_depth_bounds);
+   }
+
    if (depth_mode & EARLY_DEPTH_TEST) {
       z = lp_build_depth_clamp(gallivm, builder, key->depth_clamp,
                                key->restrict_depth_values, type,
@@ -950,6 +960,7 @@ generate_fs_loop(struct gallivm_state *gallivm,
                                   stencil_refs,
                                   z, z_fb, s_fb,
                                   facing,
+                                  min_depth_bounds, max_depth_bounds,
                                   &z_value, &s_value,
                                   !key->multisample,
                                   key->restrict_depth_values);
@@ -1376,6 +1387,7 @@ generate_fs_loop(struct gallivm_state *gallivm,
                                   stencil_refs,
                                   z, z_fb, s_fb,
                                   facing,
+                                  min_depth_bounds, max_depth_bounds,
                                   &z_value, &s_value,
                                   false,
                                   key->restrict_depth_values);
@@ -3353,6 +3365,14 @@ generate_fragment(struct llvmpipe_context *lp,
       LLVMValueRef mask_store =
          lp_build_array_alloca(gallivm, mask_type,
                                num_loop_samp, "mask_store");
+
+      /*
+       * XXX: might be worth storing the x/y pos of a sample compacted
+       * into a int32 (we only need the upper 12 bits of the floats), rather
+       * than as 2 separate floats, making access quite a bit easier in
+       * interpolation (as we always access them both simultaneously), just
+       * doing unpack shuffle.
+       */
       LLVMTypeRef flt_type = LLVMFloatTypeInContext(gallivm->context);
       LLVMValueRef glob_sample_pos =
          LLVMAddGlobal(gallivm->module,
@@ -3417,31 +3437,16 @@ generate_fragment(struct llvmpipe_context *lp,
       LLVMValueRef color_store[PIPE_MAX_COLOR_BUFS][TGSI_NUM_CHANNELS];
       bool pixel_center_integer = nir->info.fs.pixel_center_integer;
 
-      /*
-       * The shader input interpolation info is not explicitely baked in the
-       * shader key, but everything it derives from (TGSI, and flatshade) is
-       * already included in the shader key.
-       */
-      lp_build_interp_soa_init(&interp,
-                               gallivm,
-                               nir->num_inputs,
-                               inputs,
-                               pixel_center_integer,
-                               key->coverage_samples,
-                               LLVMTypeOf(sample_pos_array),
-                               glob_sample_pos,
-                               num_loop,
-                               builder, fs_type,
-                               a0_ptr, dadx_ptr, dady_ptr,
-                               x, y);
+      LLVMValueRef smask_val = NULL;
+      if (key->multisample) {
+         smask_val =
+            LLVMBuildLoad2(builder, int32_type,
+                           lp_jit_context_sample_mask(gallivm, variant->jit_context_type, context_ptr),
+                           "");
+      }
 
       for (unsigned i = 0; i < num_fs; i++) {
          if (key->multisample) {
-            LLVMValueRef smask_val =
-               LLVMBuildLoad2(builder, int32_type,
-                              lp_jit_context_sample_mask(gallivm, variant->jit_context_type, context_ptr),
-                              "");
-
             /*
              * For multisampling, extract the per-sample mask from the
              * incoming 64-bit mask, store to the per sample mask storage. Or
@@ -3485,6 +3490,24 @@ generate_fragment(struct llvmpipe_context *lp,
             LLVMBuildStore(builder, mask, mask_ptr);
          }
       }
+
+      /*
+       * The shader input interpolation info is not explicitely baked in the
+       * shader key, but everything it derives from (TGSI, and flatshade) is
+       * already included in the shader key.
+       */
+      lp_build_interp_soa_init(&interp,
+                               gallivm,
+                               nir->num_inputs,
+                               inputs,
+                               pixel_center_integer,
+                               key->coverage_samples,
+                               LLVMTypeOf(sample_pos_array),
+                               glob_sample_pos,
+                               num_loop,
+                               builder, fs_type, smask_val,
+                               a0_ptr, dadx_ptr, dady_ptr,
+                               x, y);
 
       generate_fs_loop(gallivm,
                        shader, key,
@@ -3566,7 +3589,8 @@ generate_fragment(struct llvmpipe_context *lp,
 
          bool do_branch = ((key->depth.enabled
                             || key->stencil[0].enabled
-                            || key->alpha.enabled)
+                            || key->alpha.enabled
+                            || key->depth.depth_bounds_test)
                            && !nir->info.fs.uses_discard);
 
          color_ptr = LLVMBuildLoad2(builder, int8p_type,
@@ -3876,6 +3900,7 @@ generate_variant(struct llvmpipe_context *lp,
          !key->multisample &&
          !key->blend.alpha_to_coverage &&
          !key->depth.enabled &&
+         !key->depth.depth_bounds_test &&
          !nir->info.fs.uses_discard &&
          !(nir->info.outputs_written & BITFIELD64_BIT(FRAG_RESULT_SAMPLE_MASK)) &&
          !nir->info.fs.uses_fbfetch_output;
@@ -3946,6 +3971,7 @@ generate_variant(struct llvmpipe_context *lp,
    const bool linear_pipeline =
          !key->stencil[0].enabled &&
          !key->depth.enabled &&
+         !key->depth.depth_bounds_test &&
          !nir->info.fs.uses_discard &&
          !key->blend.logicop_enable &&
          (key->cbuf_format[0] == PIPE_FORMAT_B8G8R8A8_UNORM ||
@@ -4479,12 +4505,14 @@ make_variant_key(struct llvmpipe_context *lp,
       const struct util_format_description *zsbuf_desc =
          util_format_description(zsbuf_format);
 
-      if (lp->depth_stencil->depth_enabled &&
+      if ((lp->depth_stencil->depth_enabled ||
+          lp->depth_stencil->depth_bounds_test) &&
           util_format_has_depth(zsbuf_desc)) {
          key->zsbuf_format = zsbuf_format;
          key->depth.enabled = lp->depth_stencil->depth_enabled;
          key->depth.writemask = lp->depth_stencil->depth_writemask;
          key->depth.func = lp->depth_stencil->depth_func;
+         key->depth.depth_bounds_test = lp->depth_stencil->depth_bounds_test;
       }
       if (lp->depth_stencil->stencil[0].enabled &&
           util_format_has_stencil(zsbuf_desc)) {

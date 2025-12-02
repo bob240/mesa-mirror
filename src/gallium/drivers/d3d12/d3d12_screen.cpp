@@ -1162,6 +1162,7 @@ d3d12_interop_query_device_info(struct pipe_screen *pscreen, uint32_t data_size,
       d3d12_interop_device_info1 *info1 = (d3d12_interop_device_info1 *)data;
       info1->set_context_queue_priority_manager = d3d12_context_set_queue_priority_manager;
       info1->set_video_encoder_max_async_queue_depth = d3d12_video_encoder_set_max_async_queue_depth;
+      info1->get_video_enc_last_slice_completion_fence = d3d12_video_encoder_get_last_slice_completion_fence;
       return sizeof(*info1);
    }
 
@@ -1420,11 +1421,13 @@ try_create_device_factory(util_dl_library *d3d12_mod)
       /* It's possible there's a D3D12Core.dll next to the .exe, for development/testing purposes. If so, we'll be notified
        * by environment variables what the relative path is and the version to use.
        */
-      const char *d3d12core_relative_path = getenv("D3D12_AGILITY_RELATIVE_PATH");
-      const char *d3d12core_sdk_version = getenv("D3D12_AGILITY_SDK_VERSION");
+      char *d3d12core_relative_path = os_get_option_dup("D3D12_AGILITY_RELATIVE_PATH");
+      char *d3d12core_sdk_version = os_get_option_dup("D3D12_AGILITY_SDK_VERSION");
       if (d3d12core_relative_path && d3d12core_sdk_version) {
          (void)sdk_config->SetSDKVersion(atoi(d3d12core_sdk_version), d3d12core_relative_path);
       }
+      free(d3d12core_relative_path);
+      free(d3d12core_sdk_version);
       sdk_config->Release();
    }
 #endif

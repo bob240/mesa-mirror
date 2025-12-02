@@ -408,10 +408,7 @@ iris_ensure_indirect_generation_shader(struct iris_batch *batch)
    NIR_PASS(_, nir, nir_propagate_invariant, false);
 
    NIR_PASS(_, nir, nir_lower_input_attachments,
-              &(nir_input_attachment_options) {
-                 .use_fragcoord_sysval = true,
-                 .use_layer_id_sysval = true,
-              });
+              &(nir_input_attachment_options) { });
 
    /* Reset sizes before gathering information */
    nir->global_mem_size = 0;
@@ -419,7 +416,7 @@ iris_ensure_indirect_generation_shader(struct iris_batch *batch)
    nir->info.shared_size = 0;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
-   NIR_PASS(_, nir, nir_copy_prop);
+   NIR_PASS(_, nir, nir_opt_copy_prop);
    NIR_PASS(_, nir, nir_opt_constant_folding);
    NIR_PASS(_, nir, nir_opt_dce);
 

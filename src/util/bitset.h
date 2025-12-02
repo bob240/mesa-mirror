@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include "util/bitscan.h"
 #include "util/macros.h"
+#include "ralloc.h"
 
 /****************************************************************************
  * generic bitset implementation
@@ -46,6 +47,7 @@
  */
 #define BITSET_WORDS(bits) (((bits) + BITSET_WORDBITS - 1) / BITSET_WORDBITS)
 #define BITSET_DECLARE(name, bits) BITSET_WORD name[BITSET_WORDS(bits)]
+#define BITSET_BYTES(bits) (BITSET_WORDS(bits) * sizeof(BITSET_WORD))
 
 /* bitset operations
  */
@@ -421,7 +423,7 @@ __bitset_next_set(unsigned i, BITSET_WORD *tmp,
 #define BITSET_FOREACH_SET(__i, __set, __size) \
    for (BITSET_WORD __tmp = (__size) == 0 ? 0 : *(__set), *__foo = &__tmp; __foo != NULL; __foo = NULL) \
       for (__i = 0; \
-           (__i = __bitset_next_set(__i, &__tmp, __set, __size)) < __size;)
+           (__i = __bitset_next_set(__i, &__tmp, __set, __size)) < (__size);)
 
 static inline void
 __bitset_next_range(unsigned *start, unsigned *end, const BITSET_WORD *set,
@@ -492,6 +494,12 @@ static inline BITSET_WORD *
 BITSET_CALLOC(unsigned size)
 {
     return (BITSET_WORD *) calloc(BITSET_WORDS(size), sizeof(BITSET_WORD));
+}
+
+static inline BITSET_WORD *
+BITSET_RZALLOC(const void *memctx, unsigned size)
+{
+   return (BITSET_WORD *)rzalloc_size(memctx, BITSET_BYTES(size));
 }
 
 #ifdef __cplusplus

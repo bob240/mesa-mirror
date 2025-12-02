@@ -150,13 +150,14 @@ pan_preload_emit_blend(unsigned rt,
          cfg.equation.color_mask = 0xf;
 
 #if PAN_ARCH >= 6
-         nir_alu_type type = preload_shader->key.surfaces[rt].type;
-
          cfg.internal.fixed_function.num_comps = 4;
          cfg.internal.fixed_function.conversion.memory_format =
             GENX(pan_dithered_format_from_pipe_format)(iview->format, false);
+#if PAN_ARCH < 9
+         nir_alu_type type = preload_shader->key.surfaces[rt].type;
          cfg.internal.fixed_function.conversion.register_format =
             nir_type_to_reg_fmt(type);
+#endif
 
          cfg.internal.fixed_function.rt = rt;
 #endif
@@ -405,7 +406,7 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
    unsigned coord_comps = 0;
    unsigned sig_offset = 0;
    char sig[256];
-   bool first = true;
+   sig[0] = '\0';
    for (unsigned i = 0; i < ARRAY_SIZE(key->surfaces); i++) {
       const char *type_str, *dim_str;
       if (key->surfaces[i].type == nir_type_invalid)
@@ -445,19 +446,16 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
       coord_comps = MAX2(coord_comps, (key->surfaces[i].dim ?: 3) +
                                          (key->surfaces[i].array ? 1 : 0));
 
-      if (sig_offset >= sizeof(sig)) {
-         first = false;
+      if (sig_offset >= sizeof(sig))
          continue;
-      }
 
       sig_offset +=
          snprintf(sig + sig_offset, sizeof(sig) - sig_offset,
                   "%s[%s;%s;%s%s;samples=%d]",
-                  first ? "" : ",", gl_frag_result_name(key->surfaces[i].loc),
+                  sig_offset == 0 ? "" : ",",
+                  gl_frag_result_name(key->surfaces[i].loc),
                   type_str, dim_str, key->surfaces[i].array ? "[]" : "",
                   key->surfaces[i].samples);
-
-      first = false;
    }
 
    nir_builder b = nir_builder_init_simple_shader(
@@ -551,9 +549,7 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
       .is_blit = true,
       .no_idvs = true,
    };
-   struct util_dynarray binary;
-
-   util_dynarray_init(&binary, NULL);
+   struct util_dynarray binary = UTIL_DYNARRAY_INIT;
 
    shader = rzalloc(cache->shaders.preload, struct pan_preload_shader_data);
 
@@ -564,7 +560,6 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
 
    pan_shader_preprocess(b.shader, inputs.gpu_id);
    pan_shader_lower_texture_early(b.shader, inputs.gpu_id);
-   pan_shader_lower_texture(b.shader, inputs.gpu_id);
    pan_shader_postprocess(b.shader, inputs.gpu_id);
 
    if (PAN_ARCH == 4) {

@@ -47,7 +47,9 @@ fn init_info_from_nir(nak: &nak_compiler, nir: &nir_shader) -> ShaderInfo {
                     smem_size: nir.info.shared_size.try_into().unwrap(),
                 })
             }
-            MESA_SHADER_VERTEX => ShaderStageInfo::Vertex,
+            MESA_SHADER_VERTEX => ShaderStageInfo::Vertex(VertexShaderInfo {
+                isbe_space_sharing_enable: false,
+            }),
             MESA_SHADER_FRAGMENT => {
                 let info_fs = unsafe { &nir.info.__bindgen_anon_1.fs };
                 ShaderStageInfo::Fragment(FragmentShaderInfo {
@@ -3780,6 +3782,15 @@ impl<'a> ShaderFromNir<'a> {
                     offset,
                 });
                 self.set_dst(&intrin.def, dst);
+            }
+            nir_intrinsic_cmat_mov_transpose_nv => {
+                let dst = b.alloc_ssa(RegFile::GPR);
+                let src = self.get_src(&srcs[0]);
+                b.push_op(OpMovm {
+                    dst: dst.clone().into(),
+                    src,
+                });
+                self.set_dst(&intrin.def, dst.into());
             }
             nir_intrinsic_cmat_muladd_nv => {
                 let flags: nak_nir_cmat_mul_add_flags =

@@ -57,13 +57,11 @@ struct radv_layer_dispatch_tables {
 };
 
 struct radv_device_cache_key {
-   uint32_t keep_shader_info : 1;
    uint32_t image_2d_view_of_3d : 1;
    uint32_t mesh_shader_queries : 1;
    uint32_t primitives_generated_query : 1;
-   uint32_t trap_excp_flags : 4;
 
-   uint32_t reserved : 24;
+   uint32_t reserved : 29;
 };
 
 enum radv_force_vrs {
@@ -185,13 +183,6 @@ struct radv_device {
 
    /* Backup in-memory cache to be used if the app doesn't provide one */
    struct vk_pipeline_cache *mem_cache;
-
-   /*
-    * use different counters so MSAA MRTs get consecutive surface indices,
-    * even if MASK is allocated in between.
-    */
-   uint32_t image_mrt_offset_counter;
-   uint32_t fmask_mrt_offset_counter;
 
    struct list_head shader_arenas;
    struct hash_table_u64 *capture_replay_arena_vas;

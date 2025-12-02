@@ -188,6 +188,7 @@ struct gl_extensions
    GLboolean EXT_shader_image_load_formatted;
    GLboolean EXT_shader_image_load_store;
    GLboolean EXT_shader_integer_mix;
+   GLboolean EXT_shader_pixel_local_storage;
    GLboolean EXT_shader_realtime_clock;
    GLboolean EXT_shader_samples_identical;
    GLboolean EXT_sRGB;
@@ -943,6 +944,9 @@ struct gl_constants
     * a frame, but always getting framebuffer completeness.
     */
    bool GLThreadNopCheckFramebufferStatus;
+
+   /** (driconf) Initialize outputs of vertex program to a default value vec4(0, 0, 0, 1) */
+   GLboolean VertexProgramDefaultOut;
 
    /** GL_ARB_sparse_texture */
    GLuint MaxSparseTextureSize;

@@ -42,6 +42,7 @@ struct ir3_info {
    uint16_t nops_count;   /* # of nop instructions, including nopN */
    uint16_t mov_count;
    uint16_t cov_count;
+   uint16_t loops;
    uint16_t stp_count;
    uint16_t ldp_count;
    /* NOTE: max_reg, etc, does not include registers not touched
@@ -608,22 +609,12 @@ struct ir3_instruction {
 
    /* List of this instruction's repeat group. Vectorized NIR instructions are
     * emitted as multiple scalar instructions that are linked together using
-    * this field. After RA, the ir3_combine_rpt pass iterates these groups and,
-    * if the register assignment allows it, merges them into a (rptN)
+    * these fields. After RA, the ir3_combine_rpt pass iterates these groups
+    * and, if the register assignment allows it, merges them into a (rptN)
     * instruction.
-    *
-    * NOTE: this is not a typical list as there is no empty list head. The list
-    * head is stored in the first instruction of the repeat group so also refers
-    * to a list entry. In order to distinguish the list's first entry, we use
-    * serialno: instructions in a repeat group are always emitted consecutively
-    * so the first will have the lowest serialno.
-    *
-    * As this is not a typical list, we have to be careful with using the
-    * existing list helper. For example, using list_length on the first
-    * instruction will yield one less than the number of instructions in its
-    * group.
     */
-   struct list_head rpt_node;
+   struct ir3_instruction *rpt_prev;
+   struct ir3_instruction *rpt_next;
 
    uint32_t serialno;
 
@@ -777,10 +768,6 @@ struct ir3_block {
    uint32_t dom_post_index;
 
    uint32_t loop_depth;
-
-#if MESA_DEBUG
-   uint32_t serialno;
-#endif
 };
 
 enum ir3_cursor_option {
@@ -802,15 +789,7 @@ struct ir3_builder {
    struct ir3_cursor cursor;
 };
 
-static inline uint32_t
-block_id(struct ir3_block *block)
-{
-#if MESA_DEBUG
-   return block->serialno;
-#else
-   return (uint32_t)(unsigned long)block;
-#endif
-}
+uint32_t block_id(struct ir3_block *block);
 
 static inline struct ir3_block *
 ir3_start_block(struct ir3 *ir)
@@ -2042,22 +2021,20 @@ __ssa_srcp_n(struct ir3_instruction *instr, unsigned n)
 /* Iterate over all instructions in a repeat group. */
 #define foreach_instr_rpt(__rpt, __instr)                                      \
    if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
-      for (struct ir3_instruction *__rpt = __instr, *__first = __instr;        \
-           __first || __rpt != __instr;                                        \
-           __first = NULL, __rpt =                                             \
-                              list_entry(__rpt->rpt_node.next,                 \
-                                         struct ir3_instruction, rpt_node))
+      for (struct ir3_instruction *__rpt = __instr; __rpt;                     \
+           __rpt = __rpt->rpt_next)
 
 /* Iterate over all instructions except the first one in a repeat group. */
 #define foreach_instr_rpt_excl(__rpt, __instr)                                 \
    if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
-      list_for_each_entry (struct ir3_instruction, __rpt, &__instr->rpt_node,  \
-                           rpt_node)
+      for (struct ir3_instruction *__rpt = __instr->rpt_next; __rpt;           \
+           __rpt = __rpt->rpt_next)
 
 #define foreach_instr_rpt_excl_safe(__rpt, __instr)                            \
-   if (assert(ir3_instr_is_first_rpt(__instr)), true)                          \
-      list_for_each_entry_safe (struct ir3_instruction, __rpt,                 \
-                                &__instr->rpt_node, rpt_node)
+   if (assert(ir3_instr_is_first_rpt(__instr)), __instr->rpt_next)             \
+      for (struct ir3_instruction *__rpt = __instr->rpt_next,                  \
+                                  *__next = __rpt->rpt_next;                   \
+           __rpt; __rpt = __next, __next = __next ? __next->rpt_next : NULL)
 
 /* iterators for blocks: */
 #define foreach_block(__block, __list)                                         \

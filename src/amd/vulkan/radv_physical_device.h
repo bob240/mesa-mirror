@@ -64,8 +64,9 @@ struct radv_physical_device_cache_key {
    uint32_t use_llvm : 1;
    uint32_t use_ngg : 1;
    uint32_t use_ngg_culling : 1;
+   uint32_t no_implicit_varying_subgroup_size : 1;
 
-   uint32_t reserved : 10;
+   uint32_t reserved : 9;
 };
 
 enum radv_video_enc_hw_ver {
@@ -228,6 +229,8 @@ struct radv_physical_device {
 
 VK_DEFINE_HANDLE_CASTS(radv_physical_device, vk.base, VkPhysicalDevice, VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
+bool radv_sparse_enabled(const struct radv_physical_device *pdev);
+
 static inline struct radv_instance *
 radv_physical_device_instance(const struct radv_physical_device *pdev)
 {
@@ -239,7 +242,8 @@ radv_dedicated_sparse_queue_enabled(const struct radv_physical_device *pdev)
 {
    /* Dedicated sparse queue requires VK_QUEUE_SUBMIT_MODE_THREADED, which is incompatible with
     * VK_DEVICE_TIMELINE_MODE_EMULATED. */
-   return pdev->info.has_timeline_syncobj;
+   return pdev->info.has_timeline_syncobj &&
+          radv_sparse_enabled(pdev);
 }
 
 static inline bool
@@ -295,6 +299,12 @@ bool radv_emulate_rt(const struct radv_physical_device *pdev);
 
 bool radv_use_bvh8(const struct radv_physical_device *pdev);
 
+bool radv_is_dcc_disabled(const struct radv_physical_device *pdev);
+
+bool radv_are_dcc_stores_disabled(const struct radv_physical_device *pdev);
+
+bool radv_are_dcc_mips_disabled(const struct radv_physical_device *pdev);
+
 uint32_t radv_find_memory_index(const struct radv_physical_device *pdev, VkMemoryPropertyFlags flags);
 
 VkResult create_null_physical_device(struct vk_instance *vk_instance);
@@ -303,6 +313,8 @@ VkResult create_drm_physical_device(struct vk_instance *vk_instance, struct _drm
                                     struct vk_physical_device **out);
 
 void radv_physical_device_destroy(struct vk_physical_device *vk_pdev);
+
+bool radv_transfer_queue_enabled(const struct radv_physical_device *pdev);
 
 bool radv_compute_queue_enabled(const struct radv_physical_device *pdev);
 

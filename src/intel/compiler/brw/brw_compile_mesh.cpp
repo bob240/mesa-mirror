@@ -124,7 +124,7 @@ brw_nir_lower_tue_outputs(nir_shader *nir, brw_tue_map *map)
    NIR_PASS(_, nir, nir_lower_explicit_io,
             nir_var_mem_task_payload, nir_address_format_32bit_offset);
 
-   map->size_dw = ALIGN(DIV_ROUND_UP(nir->info.task_payload_size, 4), 8);
+   map->size_dw = align(DIV_ROUND_UP(nir->info.task_payload_size, 4), 8);
 }
 
 static void
@@ -203,7 +203,7 @@ brw_nir_align_launch_mesh_workgroups_instr(nir_builder *b,
    /* This will avoid special case in nir_lower_task_shader dealing with
     * not vec4-aligned payload when payload_in_shared workaround is enabled.
     */
-   nir_intrinsic_set_range(intrin, ALIGN(range, 16));
+   nir_intrinsic_set_range(intrin, align(range, 16));
 
    return true;
 }
@@ -505,7 +505,7 @@ brw_nir_lower_tue_inputs(nir_shader *nir, const brw_tue_map *map)
       /* The types for Task Output and Mesh Input should match, so their sizes
        * should also match.
        */
-      assert(!map || map->size_dw == ALIGN(DIV_ROUND_UP(nir->info.task_payload_size, 4), 8));
+      assert(!map || map->size_dw == align(DIV_ROUND_UP(nir->info.task_payload_size, 4), 8));
    } else {
       /* Mesh doesn't read any input, to make it clearer set the
        * task_payload_size to zero instead of keeping an incomplete size that
@@ -713,6 +713,9 @@ remap_io_to_dwords(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
 
    nir_src_rewrite(offset, nir_ishl_imm(b, offset->ssa, 2));
 
+   io_sem.no_validate = true;
+   nir_intrinsic_set_io_semantics(intrin, io_sem);
+
    return true;
 }
 
@@ -886,6 +889,10 @@ brw_nir_adjust_offset(nir_builder *b, nir_intrinsic_instr *intrin, uint32_t pitc
                offset_src->ssa,
                nir_imul_imm(b, index_src->ssa, pitch));
    nir_src_rewrite(offset_src, offset);
+
+   nir_io_semantics io_sem = nir_intrinsic_io_semantics(intrin);
+   io_sem.no_validate = true;
+   nir_intrinsic_set_io_semantics(intrin, io_sem);
 }
 
 static bool

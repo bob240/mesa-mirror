@@ -70,12 +70,12 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .KHR_driver_properties = true,
       .KHR_image_format_list = true,
       .KHR_imageless_framebuffer = true,
-      .KHR_sampler_mirror_clamp_to_edge = false,
+      .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_separate_depth_stencil_layouts = true,
       .KHR_shader_atomic_int64 = false,
+      .KHR_shader_float_controls = true,
       .KHR_shader_float16_int8 =
          false, /* TODO_KOSMICKRISP shaderInt8 shaderFloat16 */
-      .KHR_shader_float_controls = true,
       .KHR_shader_subgroup_extended_types = true,
       .KHR_spirv_1_4 = true,
       .KHR_timeline_semaphore = true,
@@ -86,7 +86,7 @@ kk_get_device_extensions(const struct kk_instance *instance,
       .EXT_sampler_filter_minmax = false,
       .EXT_scalar_block_layout = true,
       .EXT_separate_stencil_usage = true,
-      .EXT_shader_viewport_index_layer = false,
+      .EXT_shader_viewport_index_layer = true,
 
       /* Vulkan 1.3 */
       .KHR_copy_commands2 = true,
@@ -116,21 +116,24 @@ kk_get_device_extensions(const struct kk_instance *instance,
 
       /* Vulkan 1.4 */
       .KHR_push_descriptor = true,
+      .KHR_shader_expect_assume = true,
+      .KHR_vertex_attribute_divisor = true,
+      .EXT_vertex_attribute_divisor = true,
 
-   /* Optional extensions */
+      /* Optional extensions */
+      .KHR_shader_maximal_reconvergence = true,
+      .KHR_shader_relaxed_extended_instruction = true,
+      .KHR_shader_subgroup_uniform_control_flow = true,
 #ifdef KK_USE_WSI_PLATFORM
       .KHR_swapchain = true,
       .KHR_swapchain_mutable_format = true,
 #endif
+      .KHR_workgroup_memory_explicit_layout = true,
+
       .EXT_external_memory_metal = true,
       .EXT_mutable_descriptor_type = true,
       .EXT_shader_atomic_float = true,
       .EXT_shader_replicated_composites = true,
-
-      .KHR_shader_expect_assume = true,
-      .KHR_shader_maximal_reconvergence = true,
-      .KHR_shader_relaxed_extended_instruction = true,
-      .KHR_shader_subgroup_uniform_control_flow = true,
 
       .GOOGLE_decorate_string = true,
       .GOOGLE_hlsl_functionality1 = true,
@@ -145,7 +148,7 @@ kk_get_device_features(
 {
    *features = (struct vk_features){
       /* Vulkan 1.0 */
-      .robustBufferAccess = true,
+      .alphaToOne = true,
       .depthClamp = true,
       .drawIndirectFirstInstance = true,
       .dualSrcBlend = true,
@@ -157,10 +160,17 @@ kk_get_device_features(
        */
       .fragmentStoresAndAtomics = false,
       .imageCubeArray = true,
+      .independentBlend = true,
       .logicOp = true,
+      .multiViewport = true,
+      .robustBufferAccess = true,
+      .samplerAnisotropy = true,
       .shaderInt16 = true,
       .shaderInt64 = true,
       .shaderResourceMinLod = true,
+      .shaderSampledImageArrayDynamicIndexing = true,
+      .shaderStorageBufferArrayDynamicIndexing = true,
+      .shaderStorageImageArrayDynamicIndexing = true,
       /* TODO_KOSMICKRISP
        * Disabled because the following test
        * dEQP-VK.api.format_feature_flags2.r8_unorm and similars fail, need to
@@ -170,19 +180,24 @@ kk_get_device_features(
       .shaderStorageImageReadWithoutFormat = false,
       .shaderStorageImageWriteWithoutFormat = false,
       .shaderUniformBufferArrayDynamicIndexing = true,
-      .shaderSampledImageArrayDynamicIndexing = true,
-      .shaderStorageBufferArrayDynamicIndexing = true,
-      .shaderStorageImageArrayDynamicIndexing = true,
+      .textureCompressionASTC_LDR = true,
+      .textureCompressionBC = true,
+      .textureCompressionETC2 = true,
 
       /* Vulkan 1.1 */
       .multiview = true,
+      .samplerYcbcrConversion = true,
       .shaderDrawParameters = true,
       .storageBuffer16BitAccess = true,
+      /* TODO KOSMICKRISP
+       * Disabled due to failing tests (vertex fragment interface mismatch):
+       * dEQP-VK.spirv_assembly.instruction.graphics.16bit_storage.*
+       */
       .storageInputOutput16 = false,
       .storagePushConstant16 = true,
-      .variablePointersStorageBuffer = true,
-      .variablePointers = true,
       .uniformAndStorageBuffer16BitAccess = true,
+      .variablePointers = true,
+      .variablePointersStorageBuffer = true,
 
       /* Vulkan 1.2 */
       .descriptorBindingInlineUniformBlockUpdateAfterBind = true,
@@ -200,44 +215,37 @@ kk_get_device_features(
       .imagelessFramebuffer = true,
       .multiDrawIndirect = true,
       .runtimeDescriptorArray = true,
+      .samplerMirrorClampToEdge = true,
       .scalarBlockLayout = true,
       .separateDepthStencilLayouts = true,
       /* TODO_KOSMICKRISP shaderFloat16
        * Failing:
-       * dEQP-VK.spirv_assembly.instruction.compute.float16.opcompositeinsert.v4f16
-       * dEQP-VK.spirv_assembly.instruction.compute.float16.opcompositeinsert.v2f16arr5
-       * dEQP-VK.spirv_assembly.instruction.compute.float16.opcompositeinsert.v3f16arr5
-       * dEQP-VK.spirv_assembly.instruction.compute.float16.opcompositeinsert.v4f16arr3
-       * dEQP-VK.spirv_assembly.instruction.compute.float16.opcompositeinsert.struct16arr3
-       * dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.v3f16_frag
-       * dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.v4f16_frag
-       * dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.v2f16arr5_frag
-       * dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.v3f16arr5_frag
-       * dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.v4f16arr3_frag
-       * dEQP-VK.spirv_assembly.instruction.graphics.float16.opcompositeinsert.struct16arr3_frag
-       * dEQP-VK.memory_model.shared.16bit.nested_structs_arrays.0
-       * dEQP-VK.memory_model.shared.16bit.nested_structs_arrays.4
+       * dEQP-VK.spirv_assembly.instruction.*.float16.opcompositeinsert.*
+       * dEQP-VK.memory_model.shared.16bit.nested_structs_arrays.*
        */
       .shaderFloat16 = false,
       .shaderInputAttachmentArrayDynamicIndexing = true,
       .shaderInputAttachmentArrayNonUniformIndexing = true,
       /* TODO_KOSMICKRISP shaderInt8
-      * Multiple MSL compiler crashes if we enable shaderInt8, need to
-      * understand why and a workaround:
-      * dEQP-VK.memory_model.shared.8bit.vector_types.9
-      * dEQP-VK.memory_model.shared.8bit.basic_types.8
-      * dEQP-VK.memory_model.shared.8bit.basic_arrays.2
-      * dEQP-VK.memory_model.shared.8bit.arrays_of_arrays.1
-      * dEQP-VK.memory_model.shared.8bit.arrays_of_arrays.8
-      * Probably more
-      */
+       * Multiple MSL compiler crashes if we enable shaderInt8, need to
+       * understand why and a workaround:
+       * dEQP-VK.memory_model.shared.8bit.vector_types.9
+       * dEQP-VK.memory_model.shared.8bit.basic_types.8
+       * dEQP-VK.memory_model.shared.8bit.basic_arrays.2
+       * dEQP-VK.memory_model.shared.8bit.arrays_of_arrays.1
+       * dEQP-VK.memory_model.shared.8bit.arrays_of_arrays.8
+       * Probably more
+       */
       .shaderInt8 = false,
-      .shaderOutputViewportIndex = true,
       .shaderOutputLayer = true,
+      .shaderOutputViewportIndex = true,
       .shaderSampledImageArrayNonUniformIndexing = true,
       .shaderStorageBufferArrayNonUniformIndexing = true,
+      .shaderStorageImageArrayNonUniformIndexing = true,
       .shaderStorageTexelBufferArrayDynamicIndexing = true,
+      .shaderStorageTexelBufferArrayNonUniformIndexing = true,
       .shaderSubgroupExtendedTypes = true,
+      .shaderUniformBufferArrayNonUniformIndexing = true,
       .shaderUniformTexelBufferArrayDynamicIndexing = true,
       .shaderUniformTexelBufferArrayNonUniformIndexing = true,
       .storageBuffer8BitAccess = true,
@@ -265,12 +273,9 @@ kk_get_device_features(
       .vulkanMemoryModel = true,
       .vulkanMemoryModelDeviceScope = true,
 
-      /* Optional features */
-      .samplerAnisotropy = true,
-      .samplerYcbcrConversion = true,
-      .textureCompressionETC2 = true,
-      .textureCompressionASTC_LDR = true,
-      .textureCompressionBC = true,
+      /* Vulkan 1.4 */
+      .vertexAttributeInstanceRateDivisor = true,
+      .vertexAttributeInstanceRateZeroDivisor = true,
 
       /* VK_EXT_mutable_descriptor_type */
       .mutableDescriptorType = true,
@@ -284,6 +289,12 @@ kk_get_device_features(
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
 
+      /* VK_KHR_workgroup_memory_explicit_layout */
+      .workgroupMemoryExplicitLayout = true,
+      .workgroupMemoryExplicitLayoutScalarBlockLayout = true,
+      .workgroupMemoryExplicitLayout8BitAccess = true,
+      .workgroupMemoryExplicitLayout16BitAccess = true,
+
       /* VK_EXT_shader_replicated_composites */
       .shaderReplicatedComposites = true,
 
@@ -293,7 +304,7 @@ kk_get_device_features(
       /* VK_EXT_shader_atomic_float */
       .shaderBufferFloat32Atomics = true,
       .shaderBufferFloat32AtomicAdd = true,
-      .shaderSharedFloat32Atomics =    true,
+      .shaderSharedFloat32Atomics = true,
    };
 }
 
@@ -317,8 +328,8 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
    *properties = (struct vk_properties){
       .apiVersion = kk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
-      .vendorID = instance->force_vk_vendor != 0 ? instance->force_vk_vendor
-                                                 : 0x106b,
+      .vendorID =
+         instance->force_vk_vendor != 0 ? instance->force_vk_vendor : 0x106b,
       .deviceID = 100,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
@@ -470,7 +481,7 @@ kk_get_device_properties(const struct kk_physical_device *pdev,
                                       VK_RESOLVE_MODE_MAX_BIT,
       .independentResolveNone = true,
       .independentResolve = true,
-      .driverID = VK_DRIVER_ID_MESA_HONEYKRISP, // TODO_KOSMICKRISP Have our own
+      .driverID = VK_DRIVER_ID_MESA_KOSMICKRISP,
       .conformanceVersion = (VkConformanceVersion){1, 4, 3, 2},
       .denormBehaviorIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,
       .roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE,

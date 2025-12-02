@@ -29,6 +29,7 @@
 #include "hwdef/rogue_hw_defs.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_bo.h"
+#include "pvr_border.h"
 #include "pvr_cmd_buffer.h"
 #include "pvr_csb.h"
 #include "pvr_debug.h"
@@ -40,6 +41,7 @@
 #include "pvr_job_render.h"
 #include "pvr_macros.h"
 #include "pvr_pds.h"
+#include "pvr_physical_device.h"
 #include "pvr_query.h"
 #include "pvr_rogue_fw.h"
 #include "pvr_types.h"
@@ -51,6 +53,23 @@
 #include "vk_alloc.h"
 #include "vk_log.h"
 #include "vk_util.h"
+
+static_assert(pvr_cmd_length(PBESTATE_REG_WORD0) == 2,
+              "PBESTATE_REG_WORD0 cannot be stored in uint64_t");
+static_assert(pvr_cmd_length(PBESTATE_REG_WORD1) == 2,
+              "PBESTATE_REG_WORD1 cannot be stored in uint64_t");
+static_assert(ROGUE_NUM_PBESTATE_REG_WORDS >= 2,
+              "Cannot store both PBESTATE_REG_WORD{0,1}");
+
+static_assert(pvr_cmd_length(CR_PDS_BGRND0_BASE) == 2,
+              "CR_PDS_BGRND0_BASE cannot be stored in uint64_t");
+static_assert(pvr_cmd_length(CR_PDS_BGRND1_BASE) == 2,
+              "CR_PDS_BGRND1_BASE cannot be stored in uint64_t");
+static_assert(pvr_cmd_length(CR_PDS_BGRND3_SIZEINFO) == 2,
+              "CR_PDS_BGRND3_SIZEINFO cannot be stored in uint64_t");
+static_assert(ROGUE_NUM_CR_PDS_BGRND_WORDS == 3,
+              "Cannot store all CR_PDS_BGRND words");
+
 
 #define ROGUE_BIF_PM_FREELIST_BASE_ADDR_ALIGNSIZE 16U
 
@@ -169,7 +188,7 @@ VkResult pvr_free_list_create(struct pvr_device *device,
     * of the two values) and divide this by 4. If the PM page size is 4096
     * bytes then we end up with an alignment of 65536 bytes.
     */
-   cache_line_size = rogue_get_slc_cache_line_size(&device->pdevice->dev_info);
+   cache_line_size = pvr_get_slc_cache_line_size(&device->pdevice->dev_info);
 
    addr_alignment =
       MAX2(ROGUE_BIF_PM_FREELIST_BASE_ADDR_ALIGNSIZE, cache_line_size);
@@ -984,7 +1003,7 @@ static void pvr_geom_state_stream_init(struct pvr_render_ctx *ctx,
                  CR_TPU_BORDER_COLOUR_TABLE_VDM,
                  value) {
       value.border_colour_table_address =
-         device->border_color_table.table->vma->dev_addr;
+         device->border_color_table->table->vma->dev_addr;
    }
    stream_ptr += pvr_cmd_length(CR_TPU_BORDER_COLOUR_TABLE_VDM);
 
@@ -1300,7 +1319,7 @@ static void pvr_frag_state_stream_init(struct pvr_render_ctx *ctx,
                  CR_TPU_BORDER_COLOUR_TABLE_PDM,
                  value) {
       value.border_colour_table_address =
-         device->border_color_table.table->vma->dev_addr;
+         device->border_color_table->table->vma->dev_addr;
    }
    stream_ptr += pvr_cmd_length(CR_TPU_BORDER_COLOUR_TABLE_PDM);
 

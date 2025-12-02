@@ -40,6 +40,7 @@ struct radv_drirc {
 
    struct {
       bool disable_aniso_single_level;
+      bool disable_dcc;
       bool disable_dcc_mips;
       bool disable_dcc_stores;
       bool disable_depth_storage;
@@ -58,6 +59,9 @@ struct radv_drirc {
       bool tex_non_uniform;
       bool zero_vram;
       bool wait_for_vm_map_updates;
+      bool no_implicit_varying_subgroup_size;
+      bool rt_wave64;
+      bool hide_rebar_on_dgpu;
       char *app_layer;
       int override_uniform_offset_alignment;
    } debug;
@@ -108,5 +112,7 @@ VK_DEFINE_HANDLE_CASTS(radv_instance, vk.base, VkInstance, VK_OBJECT_TYPE_INSTAN
 const char *radv_get_debug_option_name(int id);
 
 const char *radv_get_perftest_option_name(int id);
+
+bool radv_is_rt_wave64_enabled(const struct radv_instance *instance);
 
 #endif /* RADV_INSTANCE_H */
