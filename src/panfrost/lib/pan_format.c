@@ -19,9 +19,6 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * Authors:
- *   Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
  */
 
 #include "pan_format.h"
@@ -51,6 +48,11 @@
 #define MALI_BLEND_AU_R5G5B5A1    (MALI_RGB5_A1_AU << 12)  | MALI_RGBA_SWIZZLE
 #define MALI_BLEND_PU_R5G5B5A1    (MALI_RGB5_A1_PU << 12)  | MALI_RGBA_SWIZZLE
 
+#define MALI_BLEND_R16F        (MALI_R16F << 12)           | MALI_RGBA_SWIZZLE
+#define MALI_BLEND_RG16F       (MALI_RG16F << 12)          | MALI_RGBA_SWIZZLE
+#define MALI_BLEND_RGBA16F     (MALI_RGBA16F << 12)        | MALI_RGBA_SWIZZLE
+#define MALI_BLEND_RG11F_B10F  (MALI_R11F_G11F_B10F << 12) | MALI_RGBA_SWIZZLE
+
 #if PAN_ARCH <= 5
 #define BFMT2(pipe, internal, writeback, srgb)                                 \
    [PIPE_FORMAT_##pipe] = {                                                    \
@@ -76,6 +78,18 @@
 #define BFMT_SRGB(pipe, writeback)                                             \
    BFMT2(pipe##_UNORM, R8G8B8A8, writeback, 0),                                \
       BFMT2(pipe##_SRGB, R8G8B8A8, writeback, 1)
+
+#if PAN_ARCH >= 9
+#define BFMT_FLOAT(pipe, internal_and_writeback)                               \
+   [PIPE_FORMAT_##pipe] = {                                                    \
+      MALI_COLOR_BUFFER_INTERNAL_FORMAT_##internal_and_writeback,              \
+      MALI_FLOAT_COLOR_FORMAT_##internal_and_writeback,                        \
+      {                                                                        \
+         MALI_BLEND_##internal_and_writeback,                                  \
+         MALI_BLEND_##internal_and_writeback,                                  \
+      },                                                                       \
+   }
+#endif
 
 const struct pan_blendable_format
    GENX(pan_blendable_formats)[PIPE_FORMAT_COUNT] = {
@@ -113,6 +127,13 @@ const struct pan_blendable_format
       BFMT(B5G5R5A1_UNORM, R5G5B5A1),
       BFMT(R5G5B5A1_UNORM, R5G5B5A1),
       BFMT(B5G5R5X1_UNORM, R5G5B5A1),
+
+#if PAN_ARCH >= 9
+      BFMT_FLOAT(R16_FLOAT, R16F),
+      BFMT_FLOAT(R16G16_FLOAT, RG16F),
+      BFMT_FLOAT(R16G16B16A16_FLOAT, RGBA16F),
+      BFMT_FLOAT(R11G11B10_FLOAT, RG11F_B10F),
+#endif
 };
 
 /* Convenience */
@@ -410,17 +431,13 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R16G16_UINT,             RG16UI,          RG01, L, VTR_IB),
    FMT(R32G32_UINT,             RG32UI,          RG01, L, VTR_IB),
    FMT(R8G8B8_UINT,             RGB8UI,          RGB1, L, V_____),
-   /* TODO: enable storage after CTS bug fix is merged:
-    * https://gitlab.khronos.org/Tracker/vk-gl-cts/-/issues/5700 */
-   FMT(R32G32B32_UINT,          RGB32UI,         RGB1, L, VTR___),
+   FMT(R32G32B32_UINT,          RGB32UI,         RGB1, L, VTR_IB),
    FMT(R8G8B8A8_UINT,           RGBA8UI,         RGBA, L, VTR_IB),
    FMT(R16G16B16A16_UINT,       RGBA16UI,        RGBA, L, VTR_IB),
    FMT(R32G32B32A32_UINT,       RGBA32UI,        RGBA, L, VTR_IB),
    FMT(R32_FLOAT,               R32F,            R001, L, VTR_IB),
    FMT(R32G32_FLOAT,            RG32F,           RG01, L, VTR_IB),
-   /* TODO: enable storage after CTS bug fix is merged:
-    * https://gitlab.khronos.org/Tracker/vk-gl-cts/-/issues/5700 */
-   FMT(R32G32B32_FLOAT,         RGB32F,          RGB1, L, VTR___),
+   FMT(R32G32B32_FLOAT,         RGB32F,          RGB1, L, VTR_IB),
    FMT(R32G32B32A32_FLOAT,      RGBA32F,         RGBA, L, VTR_IB),
    FMT(R8_UNORM,                R8_UNORM,        R001, L, VTR_IB),
    FMT(R16_UNORM,               R16_UNORM,       R001, L, VTR_IB),
@@ -508,9 +525,7 @@ const struct pan_format GENX(pan_pipe_format)[PIPE_FORMAT_COUNT] = {
    FMT(R32G32_SINT,             RG32I,           RG01, L, VTR_IB),
    FMT(R16G16_FLOAT,            RG16F,           RG01, L, VTR_IB),
    FMT(R8G8B8_SINT,             RGB8I,           RGB1, L, V_____),
-   /* TODO: enable storage after CTS bug fix is merged:
-    * https://gitlab.khronos.org/Tracker/vk-gl-cts/-/issues/5700 */
-   FMT(R32G32B32_SINT,          RGB32I,          RGB1, L, VTR___),
+   FMT(R32G32B32_SINT,          RGB32I,          RGB1, L, VTR_IB),
    FMT(R8G8B8A8_SINT,           RGBA8I,          RGBA, L, VTR_IB),
    FMT(R16G16B16A16_SINT,       RGBA16I,         RGBA, L, VTR_IB),
    FMT(R32G32B32A32_SINT,       RGBA32I,         RGBA, L, VTR_IB),

@@ -49,9 +49,8 @@
 #include "util/u_vbuf.h"
 #include "util/perf/cpu_trace.h"
 
-#include "clc/pan_compile.h"
+#include "compiler/pan_compiler.h"
 #include "compiler/nir/nir_serialize.h"
-#include "util/pan_lower_framebuffer.h"
 #include "decode.h"
 #include "pan_device.h"
 #include "pan_fence.h"
@@ -179,9 +178,13 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
    struct pipe_surface *surf = &batch->key.cbufs[rti];
    enum pipe_format fmt = surf->format;
 
+   bool is_float = util_format_is_float(fmt);
+   bool fixed_function = is_float ? info.fixed_function_float
+                                  : info.fixed_function;
+
    /* Use fixed-function if the equation permits, the format is blendable,
     * and no more than one unique constant is accessed */
-   if (info.fixed_function && dev->blendable_formats[fmt].internal &&
+   if (fixed_function && dev->blendable_formats[fmt].internal &&
        !blend->base.alpha_to_one &&
        pan_blend_is_homogenous_constant(info.constant_mask,
                                         ctx->blend_color.color)) {
@@ -208,6 +211,7 @@ panfrost_get_blend(struct panfrost_batch *batch, unsigned rti)
 
    pan_blend.rts[rti].format = fmt;
    pan_blend.rts[rti].nr_samples = nr_samples;
+   pan_blend.rts[rti].equation.is_float = is_float;
    memcpy(pan_blend.constants, ctx->blend_color.color,
           sizeof(pan_blend.constants));
 
@@ -393,12 +397,18 @@ panfrost_set_sampler_views(struct pipe_context *pctx,
       if (view)
          new_nr = p + 1;
 
+      if (view && view->target == PIPE_BUFFER)
+         BITSET_SET(ctx->texture_buffer[shader].mask, p);
+      else
+         BITSET_CLEAR(ctx->texture_buffer[shader].mask, p);
+
       pipe_sampler_view_reference(
          (struct pipe_sampler_view **)&ctx->sampler_views[shader][p], view);
    }
 
    for (; i < num_views + unbind_num_trailing_slots; i++) {
       unsigned p = i + start_slot;
+      BITSET_CLEAR(ctx->texture_buffer[shader].mask, p);
       pipe_sampler_view_reference(
          (struct pipe_sampler_view **)&ctx->sampler_views[shader][p], NULL);
    }
@@ -413,8 +423,14 @@ panfrost_set_sampler_views(struct pipe_context *pctx,
     * set sampler views */
    if (new_nr == 0) {
       for (i = 0; i < start_slot; ++i) {
-         if (ctx->sampler_views[shader][i])
+         struct pipe_sampler_view *view =
+            (struct pipe_sampler_view *)ctx->sampler_views[shader][i];
+         if (view)
             new_nr = i + 1;
+         if (view && view->target == PIPE_BUFFER)
+            BITSET_SET(ctx->texture_buffer[shader].mask, i);
+         else
+            BITSET_CLEAR(ctx->texture_buffer[shader].mask, i);
       }
    }
 
@@ -784,7 +800,7 @@ panfrost_get_query_result(struct pipe_context *pipe, struct pipe_query *q,
 
    case PIPE_QUERY_TIMESTAMP_DISJOINT: {
       vresult->timestamp_disjoint.frequency =
-         dev->kmod.props.timestamp_frequency;
+         dev->kmod.dev->props.timestamp_frequency;
       vresult->timestamp_disjoint.disjoint = false;
       break;
    }
@@ -1118,7 +1134,7 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
    assert(!ret);
 
    ctx->printf.bo =
-      panfrost_bo_create(dev, LIBPAN_PRINTF_BUFFER_SIZE, 0, "Printf Buffer");
+      panfrost_bo_create(dev, PAN_PRINTF_BUFFER_SIZE, 0, "Printf Buffer");
 
    if (ctx->printf.bo == NULL)
       goto failed;

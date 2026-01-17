@@ -168,8 +168,6 @@ struct lvp_physical_device {
 struct lvp_instance {
    struct vk_instance vk;
 
-   uint32_t apiVersion;
-
    uint64_t debug_flags;
 
    struct pipe_loader_device *devs;
@@ -579,10 +577,8 @@ struct lvp_event {
 struct lvp_buffer {
    struct vk_buffer vk;
 
-   struct lvp_device_memory *mem;
    struct pipe_resource *bo;
    uint64_t total_size;
-   uint64_t offset;
    void *map;
    struct pipe_transfer *transfer;
 };
@@ -605,7 +601,6 @@ struct lvp_buffer_view {
 struct lvp_query_pool {
    struct vk_query_pool vk;
    enum pipe_query_type base_type;
-   void *data; /* Used by queries that are not implemented by pipe_query */
    struct pipe_query *queries[0];
 };
 

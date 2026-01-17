@@ -25,10 +25,9 @@
 #include "wsi_common.h"
 
 #include "pvr_device_info.h"
-#include "pvr_instance.h"
+#include "pvr_formats.h"
 
-#if defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
-    defined(VK_USE_PLATFORM_WAYLAND_KHR)
+#if defined(VK_USE_PLATFORM_DISPLAY_KHR) || defined(VK_USE_PLATFORM_WAYLAND_KHR)
 #   define PVR_USE_WSI_PLATFORM true
 #else
 #   define PVR_USE_WSI_PLATFORM false
@@ -61,6 +60,8 @@ struct pvr_physical_device {
 
    pco_ctx *pco_ctx;
 
+   struct pvr_format_table formats;
+
    uint8_t device_uuid[SHA1_DIGEST_LENGTH];
    uint8_t cache_uuid[SHA1_DIGEST_LENGTH];
 };
@@ -70,21 +71,18 @@ VK_DEFINE_HANDLE_CASTS(pvr_physical_device,
                        VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
 
-VkResult
-pvr_physical_device_init(struct pvr_physical_device *pdevice,
-                         struct pvr_instance *instance,
-                         drmDevicePtr drm_render_device,
-                         drmDevicePtr drm_display_device);
+VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
+                                  struct pvr_instance *instance,
+                                  drmDevicePtr drm_render_device,
+                                  drmDevicePtr drm_display_device);
 
-void
-pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
-                              char *const *comp_display,
-                              char *const *comp_render);
+void pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
+                                   char *const *comp_display,
+                                   char *const *comp_render);
 
-void
-pvr_physical_device_destroy(struct vk_physical_device *vk_pdevice);
+void pvr_physical_device_destroy(struct vk_physical_device *vk_pdevice);
 
-void
-pvr_physical_device_free_pipeline_cache(struct pvr_physical_device *const pdevice);
+void pvr_physical_device_free_pipeline_cache(
+   struct pvr_physical_device *const pdevice);
 
 #endif /* PVR_PHYSICAL_DEVICE_H */

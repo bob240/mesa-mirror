@@ -23,10 +23,6 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * Authors (Collabora):
- *   Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
- *
  */
 
 #include "pan_shader.h"
@@ -38,6 +34,8 @@
 #include "nir_serialize.h"
 #include "pan_bo.h"
 #include "pan_context.h"
+#include "pan_compiler.h"
+#include "pan_nir.h"
 #include "shader_enums.h"
 
 static struct panfrost_uncompiled_shader *
@@ -137,14 +135,14 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
     * happens at CSO create time regardless.
     */
    if (mesa_shader_stage_is_compute(s->info.stage)) {
-      pan_shader_preprocess(s, panfrost_device_gpu_id(dev));
-      pan_shader_lower_texture_early(s, panfrost_device_gpu_id(dev));
-      pan_shader_postprocess(s, panfrost_device_gpu_id(dev));
+      pan_preprocess_nir(s, panfrost_device_gpu_id(dev));
+      pan_nir_lower_texture_early(s, panfrost_device_gpu_id(dev));
+      pan_postprocess_nir(s, panfrost_device_gpu_id(dev));
    }
 
    struct pan_compile_inputs inputs = {
       .gpu_id = panfrost_device_gpu_id(dev),
-      .gpu_variant = dev->kmod.props.gpu_variant,
+      .gpu_variant = dev->kmod.dev->props.gpu_variant,
       .get_conv_desc = screen->vtbl.get_conv_desc,
    };
 
@@ -161,7 +159,7 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
       if (s->info.has_transform_feedback_varyings) {
          NIR_PASS(_, s, nir_opt_constant_folding);
          NIR_PASS(_, s, nir_io_add_intrinsic_xfb_info);
-         NIR_PASS(_, s, pan_lower_xfb);
+         NIR_PASS(_, s, pan_nir_lower_xfb);
       }
    }
 
@@ -199,7 +197,7 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
    }
 
    if (dev->arch <= 5 && s->info.stage == MESA_SHADER_FRAGMENT) {
-      NIR_PASS(_, s, pan_lower_framebuffer, key->fs.rt_formats,
+      NIR_PASS(_, s, pan_nir_lower_framebuffer, key->fs.rt_formats,
                pan_raw_format_mask_midgard(key->fs.rt_formats), 0,
                panfrost_device_gpu_prod_id(dev) < 0x700);
    }
@@ -225,7 +223,7 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
 
    /* Lower resource indices */
    NIR_PASS(_, s, panfrost_nir_lower_res_indices, &inputs);
-   pan_shader_lower_texture_late(s, inputs.gpu_id);
+   pan_nir_lower_texture_late(s, inputs.gpu_id);
 
    if (dev->arch >= 9) {
       inputs.valhall.use_ld_var_buf = panfrost_use_ld_var_buf(s);
@@ -236,14 +234,17 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
 
    screen->vtbl.compile_shader(s, &inputs, &out->binary, &out->info);
 
-   if (s->info.stage == MESA_SHADER_VERTEX && out->info.vs.idvs) {
-      pan_stats_util_debug(dbg, "MESA_SHADER_POSITION",
-                           &out->info.stats);
-      pan_stats_util_debug(dbg, "MESA_SHADER_VERTEX",
-                           &out->info.stats_idvs_varying);
-   } else {
-      pan_stats_util_debug(dbg, mesa_shader_stage_name(s->info.stage),
-                           &out->info.stats);
+   /* Report stats only if we really got the shader compiled */
+   if (out->binary.size > 0) {
+      if (s->info.stage == MESA_SHADER_VERTEX && out->info.vs.idvs) {
+         pan_stats_util_debug(dbg, "MESA_SHADER_POSITION",
+                              &out->info.stats);
+         pan_stats_util_debug(dbg, "MESA_SHADER_VERTEX",
+                              &out->info.stats_idvs_varying);
+      } else {
+         pan_stats_util_debug(dbg, mesa_shader_stage_name(s->info.stage),
+                              &out->info.stats);
+      }
    }
 
    assert(req_local_mem >= out->info.wls_size);
@@ -549,25 +550,32 @@ panfrost_create_shader_state(struct pipe_context *pctx,
 
    /* Then run the suite of lowering and optimization, including I/O lowering */
    struct panfrost_device *dev = pan_device(pctx->screen);
-   pan_shader_preprocess(nir, panfrost_device_gpu_id(dev));
-   pan_shader_lower_texture_early(nir, panfrost_device_gpu_id(dev));
+   pan_preprocess_nir(nir, panfrost_device_gpu_id(dev));
+   pan_nir_lower_texture_early(nir, panfrost_device_gpu_id(dev));
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size, nir_lower_io_use_interpolated_input_intrinsics);
 
-   pan_shader_postprocess(nir, panfrost_device_gpu_id(dev));
+   pan_postprocess_nir(nir, panfrost_device_gpu_id(dev));
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       so->noperspective_varyings =
          pan_nir_collect_noperspective_varyings_fs(nir);
 
-   /* Vertex shaders get passed images through the vertex attribute descriptor
-    * array. We need to add an offset to all image intrinsics so they point
-    * to the right attribute.
-    */
+   unsigned attrib_offset = 0;
    if (nir->info.stage == MESA_SHADER_VERTEX && dev->arch <= 7) {
-      NIR_PASS(_, nir, pan_lower_image_index,
-               util_bitcount64(nir->info.inputs_read));
+      /* Vertex shaders get passed images through the vertex attribute
+       * descriptor array. We need to add an offset to all image intrinsics so
+       * they point to the right attribute.
+       */
+      attrib_offset += util_bitcount64(nir->info.inputs_read);
+      NIR_PASS(_, nir, pan_nir_lower_image_index, attrib_offset);
+   }
+   if (dev->arch >= 6 && dev->arch <= 7) {
+      /* Bifrost needs to use attributes to access texel buffers. We place these
+       * after images, which are also accessed using attributes. */
+      attrib_offset += BITSET_LAST_BIT(nir->info.images_used);
+      NIR_PASS(_, nir, pan_nir_lower_texel_buffer_fetch_index, attrib_offset);
    }
 
    /* If this shader uses transform feedback, compile the transform
@@ -686,8 +694,8 @@ panfrost_get_compute_state_info(struct pipe_context *pipe, void *cso,
    struct panfrost_compiled_shader *cs =
       util_dynarray_begin(&uncompiled->variants);
 
-   info->max_threads =
-      pan_compute_max_thread_count(&dev->kmod.props, cs->info.work_reg_count);
+   info->max_threads = pan_compute_max_thread_count(&dev->kmod.dev->props,
+                                                    cs->info.work_reg_count);
    info->private_memory = cs->info.tls_size;
    info->simd_sizes = pan_subgroup_size(dev->arch);
    info->preferred_simd_size = info->simd_sizes;

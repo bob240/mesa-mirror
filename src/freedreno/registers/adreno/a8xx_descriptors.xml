@@ -6,6 +6,7 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 <import file="adreno/adreno_common.xml"/>
 <import file="adreno/adreno_pm4.xml"/>
 <import file="adreno/a6xx_enums.xml"/>
+<import file="adreno/a8xx_enums.xml"/>
 
 <domain name="A8XX_TEX_SAMP" width="32">
 	<doc>Texture sampler dwords</doc>
@@ -42,11 +43,15 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<doc>Texture memobj dwords</doc>
 	<reg32 offset="0" name="0">
 		<bitfield name="BASE_LO" low="6" high="31" shr="6"/>
+		<doc>for type TEX_BUFFER</doc>
+		<bitfield name="INSTANCE_DESC_BASE_LO" low="0" high="31"/>
 	</reg32>
 	<reg32 offset="1" name="1">
 		<bitfield name="BASE_HI" low="0" high="16"/>
 		<bitfield name="TYPE" low="17" high="19" type="a6xx_tex_type"/>
 		<bitfield name="DEPTH" low="20" high="31" type="uint"/>
+		<doc> for type TEX_BUFFER, probably for D3D structured UAVs, normally set to 1 </doc>
+		<bitfield name="STRUCTSIZETEXELS" low="20" high="31" type="uint"/>
 	</reg32>
 	<reg32 offset="2" name="2">
 		<bitfield name="WIDTH" low="0" high="14" type="uint"/>
@@ -56,10 +61,10 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 	<reg32 offset="3" name="3">
 		<bitfield name="FMT" low="0" high="7" type="a6xx_format"/>
 		<bitfield name="SWAP" low="8" high="9" type="a3xx_color_swap"/>
-		<bitfield name="SWIZ_X" low="10" high="12" type="a6xx_tex_swiz"/>
-		<bitfield name="SWIZ_Y" low="13" high="15" type="a6xx_tex_swiz"/>
-		<bitfield name="SWIZ_Z" low="16" high="18" type="a6xx_tex_swiz"/>
-		<bitfield name="SWIZ_W" low="19" high="21" type="a6xx_tex_swiz"/>
+		<bitfield name="SWIZ_X" low="10" high="12" type="a8xx_tex_swiz"/>
+		<bitfield name="SWIZ_Y" low="13" high="15" type="a8xx_tex_swiz"/>
+		<bitfield name="SWIZ_Z" low="16" high="18" type="a8xx_tex_swiz"/>
+		<bitfield name="SWIZ_W" low="19" high="21" type="a8xx_tex_swiz"/>
 	</reg32>
 	<reg32 offset="4" name="4">
 		<bitfield name="TILE_MODE" low="0" high="1" type="a6xx_tile_mode"/>
@@ -96,7 +101,7 @@ xsi:schemaLocation="https://gitlab.freedesktop.org/freedreno/ rules-fd.xsd">
 		<bitfield name="UV_OFFSET_V" low="26" high="27" type="ufixed" radix="2"/> <!-- CHROMA_MIDPOINT_Y -->
 	</reg32>
 	<reg32 offset="8" name="8">
-		<bitfield name="FLAG_ARRAY_PITCH" low="0" high="14" shr="4" type="uint"/> <!-- FLAG_BUFFER_ARRAY_PITCH -->
+		<bitfield name="FLAG_ARRAY_PITCH" low="0" high="14" shr="12" type="uint"/> <!-- FLAG_BUFFER_ARRAY_PITCH -->
 		<!-- log2 size of the first level, required for mipmapping -->
 		<bitfield name="FLAG_BUFFER_LOGW" low="24" high="27" type="uint"/>
 		<bitfield name="FLAG_BUFFER_LOGH" low="28" high="31" type="uint"/>

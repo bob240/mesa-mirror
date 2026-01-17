@@ -138,7 +138,7 @@ static bool si_update_shaders_shared_by_vertex_and_mesh_pipe(struct si_context *
 
    bool fixed_func_face_culling_needed = !NGG || !si_shader_culling_enabled(new_vs);
    bool fixed_func_face_culling_has_effect = (!HAS_TESS && !HAS_GS && !HAS_MS) ||
-                                             new_vs->selector->rast_prim == MESA_PRIM_TRIANGLES;
+                                             new_vs->selector->info.rast_prim == MESA_PRIM_TRIANGLES;
 
    if (sctx->fixed_func_face_culling_needed != fixed_func_face_culling_needed ||
        sctx->fixed_func_face_culling_has_effect != fixed_func_face_culling_has_effect) {
@@ -424,8 +424,8 @@ static bool si_update_shaders(struct si_context *sctx)
    }
 
    struct si_shader *api_vs = si_get_api_vs_inline(sctx, GFX_VERSION, HAS_TESS, HAS_GS);
-   sctx->vs_uses_base_instance = api_vs->info.uses_base_instance;
-   sctx->vs_uses_draw_id = api_vs->info.uses_draw_id;
+   sctx->vs_uses_base_instance = api_vs->info.uses_sysval_base_instance;
+   sctx->vs_uses_draw_id = api_vs->info.uses_sysval_draw_id;
    sctx->vs_uses_vs_state_indexed = api_vs->info.uses_vs_state_indexed;
 
    struct si_shader *hw_vs = si_get_vs_inline(sctx, HAS_TESS, HAS_GS)->current;
@@ -1018,13 +1018,13 @@ static void si_emit_rasterizer_prim_state(struct si_context *sctx)
       /* 0 = no reset, 1 = reset per prim, 2 = reset per packet */
       if (GFX_VERSION >= GFX12) {
          radeon_opt_set_context_reg(R_028A44_PA_SC_LINE_STIPPLE_RESET,
-                                    SI_TRACKED_PA_SC_LINE_STIPPLE_RESET,
+                                    AC_TRACKED_PA_SC_LINE_STIPPLE_RESET,
                                     S_028A44_AUTO_RESET_CNTL(reset_per_prim ? 1 : 2));
       } else {
          struct si_state_rasterizer *rs = sctx->queued.named.rasterizer;
 
          radeon_opt_set_context_reg(R_028A0C_PA_SC_LINE_STIPPLE,
-                                    SI_TRACKED_PA_SC_LINE_STIPPLE,
+                                    AC_TRACKED_PA_SC_LINE_STIPPLE,
                                     rs->pa_sc_line_stipple |
                                     S_028A0C_AUTO_RESET_CNTL(reset_per_prim ? 1 : 2));
       }
@@ -1033,10 +1033,10 @@ static void si_emit_rasterizer_prim_state(struct si_context *sctx)
    if (NGG || HAS_GS) {
       if (GFX_VERSION >= GFX11) {
          radeon_opt_set_uconfig_reg(R_030998_VGT_GS_OUT_PRIM_TYPE,
-                                    SI_TRACKED_VGT_GS_OUT_PRIM_TYPE_UCONFIG, sctx->gs_out_prim);
+                                    AC_TRACKED_VGT_GS_OUT_PRIM_TYPE_UCONFIG, sctx->gs_out_prim);
       } else {
          radeon_opt_set_context_reg(R_028A6C_VGT_GS_OUT_PRIM_TYPE,
-                                    SI_TRACKED_VGT_GS_OUT_PRIM_TYPE, sctx->gs_out_prim);
+                                    AC_TRACKED_VGT_GS_OUT_PRIM_TYPE, sctx->gs_out_prim);
       }
    }
 
@@ -1178,17 +1178,17 @@ static void si_emit_ia_multi_vgt_param(struct si_context *sctx,
    if (GFX_VERSION == GFX9) {
       /* Workaround for SpecviewPerf13 Catia hang on GFX9. */
       if (prim != sctx->last_prim)
-         BITSET_CLEAR(sctx->tracked_regs.reg_saved_mask, SI_TRACKED_IA_MULTI_VGT_PARAM_UCONFIG);
+         BITSET_CLEAR(sctx->tracked_regs.reg_saved_mask, AC_TRACKED_IA_MULTI_VGT_PARAM_UCONFIG);
 
       radeon_opt_set_uconfig_reg_idx(R_030960_IA_MULTI_VGT_PARAM,
-                                     SI_TRACKED_IA_MULTI_VGT_PARAM_UCONFIG,
+                                     AC_TRACKED_IA_MULTI_VGT_PARAM_UCONFIG,
                                      4, ia_multi_vgt_param);
    } else if (GFX_VERSION >= GFX7) {
       radeon_opt_set_context_reg_idx(R_028AA8_IA_MULTI_VGT_PARAM,
-                                     SI_TRACKED_IA_MULTI_VGT_PARAM, 1, ia_multi_vgt_param);
+                                     AC_TRACKED_IA_MULTI_VGT_PARAM, 1, ia_multi_vgt_param);
    } else {
       radeon_opt_set_context_reg(R_028AA8_IA_MULTI_VGT_PARAM,
-                                 SI_TRACKED_IA_MULTI_VGT_PARAM, ia_multi_vgt_param);
+                                 AC_TRACKED_IA_MULTI_VGT_PARAM, ia_multi_vgt_param);
    }
    radeon_end();
 }
@@ -1498,9 +1498,9 @@ static void si_emit_draw_packets(struct si_context *sctx, const struct pipe_draw
                                                 MESA_SHADER_VERTEX);
    bool render_cond_bit = sctx->render_cond_enabled;
    const unsigned tracked_base_vertex_reg =
-      HAS_TESS ? SI_TRACKED_SPI_SHADER_USER_DATA_LS__BASE_VERTEX :
-      HAS_GS || NGG ? SI_TRACKED_SPI_SHADER_USER_DATA_ES__BASE_VERTEX :
-      SI_TRACKED_SPI_SHADER_USER_DATA_VS__BASE_VERTEX;
+      HAS_TESS ? AC_TRACKED_SPI_SHADER_USER_DATA_LS__BASE_VERTEX :
+      HAS_GS || NGG ? AC_TRACKED_SPI_SHADER_USER_DATA_ES__BASE_VERTEX :
+      AC_TRACKED_SPI_SHADER_USER_DATA_VS__BASE_VERTEX;
 
    if (!IS_DRAW_VERTEX_STATE && indirect) {
       assert(num_draws == 1);
@@ -2396,12 +2396,12 @@ static void si_draw(struct pipe_context *ctx,
           (old_ngg_culling ||
            /* If tess or GS is enabled, the shader just has to allow culling. */
            /* If tess and GS are disabled, the draw has to pass the total_direct_count check. */
-           (HAS_TESS || HAS_GS ? hw_vs->ngg_cull_vert_threshold == 0
-                               : total_direct_count > hw_vs->ngg_cull_vert_threshold))) {
+           (HAS_TESS || HAS_GS ? hw_vs->info.ngg_cull_vert_threshold == 0
+                               : total_direct_count > hw_vs->info.ngg_cull_vert_threshold))) {
          struct si_state_rasterizer *rs = sctx->queued.named.rasterizer;
 
          /* Check that the current shader allows culling. */
-         assert(hw_vs->ngg_cull_vert_threshold != UINT_MAX);
+         assert(hw_vs->info.ngg_cull_vert_threshold != UINT_MAX);
 
          uint16_t ngg_culling;
 

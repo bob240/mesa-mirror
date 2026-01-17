@@ -92,6 +92,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_maintenance9 = true,
       .KHR_map_memory2 = true,
       .KHR_multiview = true,
+      .KHR_pipeline_binary = true,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
 #ifdef HK_USE_WSI_PLATFORM
@@ -102,6 +103,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
 #endif
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
+      .KHR_robustness2 = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
@@ -199,6 +201,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_shader_stencil_export = true,
       .EXT_shader_subgroup_ballot = true,
       .EXT_shader_subgroup_vote = true,
+      .EXT_shader_uniform_buffer_unsized_array = true,
       .EXT_shader_viewport_index_layer = true,
       .EXT_subgroup_size_control = true,
 #ifdef HK_USE_WSI_PLATFORM
@@ -251,7 +254,7 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
-      .vertexPipelineStoresAndAtomics = true,
+      .vertexPipelineStoresAndAtomics = instance->vertex_stores,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -403,6 +406,9 @@ hk_get_device_features(
 
       /* VK_KHR_maintenance9 */
       .maintenance9 = true,
+
+      /* VK_KHR_pipeline_binary */
+      .pipelineBinaries = true,
 
       /* VK_KHR_pipeline_executable_properties */
       .pipelineExecutableInfo = true,
@@ -584,7 +590,7 @@ hk_get_device_features(
       .provokingVertexLast = true,
       .transformFeedbackPreservesProvokingVertex = true,
 
-      /* VK_EXT_robustness2 */
+      /* VK_KHR_robustness2 */
       .robustBufferAccess2 = true,
       .robustImageAccess2 = true,
       .nullDescriptor = true,
@@ -604,6 +610,9 @@ hk_get_device_features(
 
       /* VK_KHR_shader_subgroup_uniform_control_flow */
       .shaderSubgroupUniformControlFlow = true,
+
+      /* VK_EXT_shader_uniform_buffer_unsized_array */
+      .shaderUniformBufferUnsizedArray = true,
 
       /* VK_EXT_texel_buffer_alignment */
       .texelBufferAlignment = true,
@@ -631,6 +640,7 @@ hk_get_device_properties(const struct agx_device *dev,
                          const struct hk_instance *instance,
                          struct vk_properties *properties)
 {
+   /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts =
       VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
 
@@ -946,6 +956,13 @@ hk_get_device_properties(const struct agx_device *dev,
       /* VK_EXT_multi_draw */
       .maxMultiDrawCount = UINT16_MAX,
 
+      /* VK_KHR_pipeline_binary
+       *
+       * InternalCache properties are set by
+       * hk_physical_device_init_pipeline_cache()
+       */
+      .pipelineBinaryCompressedData = false,
+
       /* VK_EXT_pipeline_robustness */
       .defaultRobustnessStorageBuffers =
          VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT,
@@ -962,7 +979,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .provokingVertexModePerPipeline = true,
       .transformFeedbackPreservesTriangleFanProvokingVertex = true,
 
-      /* VK_EXT_robustness2 */
+      /* VK_KHR_robustness2 */
       .robustStorageBufferAccessSizeAlignment = HK_SSBO_BOUNDS_CHECK_ALIGNMENT,
       .robustUniformBufferAccessSizeAlignment = HK_MIN_UBO_ALIGNMENT,
 
@@ -1051,7 +1068,7 @@ hk_get_device_properties(const struct agx_device *dev,
 
    {
       struct mesa_sha1 sha1_ctx;
-      uint8_t sha1[20];
+      uint8_t sha1[SHA1_DIGEST_LENGTH];
 
       _mesa_sha1_init(&sha1_ctx);
       /* Make sure we don't match with other vendors */
@@ -1092,11 +1109,17 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 
    assert(len == sizeof(renderer) - 2);
 
-   char timestamp[41];
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
    _mesa_sha1_format(timestamp, instance->driver_build_sha);
 
    const uint64_t driver_flags = hk_physical_device_compiler_flags(pdev);
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+   if (pdev->vk.disk_cache != NULL) {
+      pdev->vk.properties.pipelineBinaryInternalCache = true;
+      pdev->vk.properties.pipelineBinaryInternalCacheControl = true;
+      pdev->vk.properties.pipelineBinaryPrefersInternalCache = true;
+      pdev->vk.properties.pipelineBinaryPrecompiledInternalCache = true;
+   }
 #endif
 }
 

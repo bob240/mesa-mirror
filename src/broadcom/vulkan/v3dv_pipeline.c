@@ -402,7 +402,7 @@ shader_module_compile_to_nir(struct v3dv_device *device,
    assert(nir->info.stage == gl_stage);
 
    if (V3D_DBG(SHADERDB) && (!stage->module || stage->module->nir == NULL)) {
-      char sha1buf[41];
+      char sha1buf[SHA1_DIGEST_STRING_LENGTH];
       _mesa_sha1_format(sha1buf, stage->pipeline->sha1);
       nir->info.name = ralloc_strdup(nir, sha1buf);
    }
@@ -489,7 +489,16 @@ lower_load_push_constant(nir_builder *b, nir_intrinsic_instr *instr,
                          struct lower_pipeline_layout_state *state)
 {
    assert(instr->intrinsic == nir_intrinsic_load_push_constant);
-   instr->intrinsic = nir_intrinsic_load_uniform;
+   nir_def *old = &instr->def;
+
+   nir_def *load =
+      nir_load_uniform(b, old->num_components,
+                       old->bit_size, instr->src->ssa,
+                       .base = nir_intrinsic_base(instr),
+                       .range = nir_intrinsic_range(instr),
+                       .dest_type = nir_type_uint | old->bit_size);
+
+   nir_def_replace(old, load);
 }
 
 static struct v3dv_descriptor_map*
@@ -1439,7 +1448,7 @@ pipeline_stage_create_binning(const struct v3dv_pipeline_stage *src,
    p_stage->spec_info = src->spec_info;
    p_stage->feedback = (VkPipelineCreationFeedback) { 0 };
    p_stage->robustness = src->robustness;
-   memcpy(p_stage->shader_sha1, src->shader_sha1, 20);
+   memcpy(p_stage->shader_sha1, src->shader_sha1, SHA1_DIGEST_LENGTH);
 
    return p_stage;
 }
@@ -2118,7 +2127,7 @@ pipeline_populate_compute_key(struct v3dv_pipeline *pipeline,
 }
 
 static struct v3dv_pipeline_shared_data *
-v3dv_pipeline_shared_data_new_empty(const unsigned char sha1_key[20],
+v3dv_pipeline_shared_data_new_empty(const unsigned char sha1_key[SHA1_DIGEST_LENGTH],
                                     struct v3dv_pipeline *pipeline,
                                     bool is_graphics_pipeline)
 {
@@ -2172,7 +2181,7 @@ v3dv_pipeline_shared_data_new_empty(const unsigned char sha1_key[20],
       new_entry->maps[BROADCOM_SHADER_GEOMETRY];
 
    new_entry->ref_cnt = 1;
-   memcpy(new_entry->sha1_key, sha1_key, 20);
+   memcpy(new_entry->sha1_key, sha1_key, SHA1_DIGEST_LENGTH);
 
    return new_entry;
 

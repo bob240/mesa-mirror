@@ -19,7 +19,76 @@ extern "C" {
 #define AMD_MAX_SA_PER_SE  2
 #define AMD_MAX_WGP        60
 
+/* Memory is divided among memory channels such that each 256B maps to a different memory channel
+ * and the memory channel index increments with each 256B block, which wraps around to 0 after
+ * the last memory channel index.
+ *
+ * For example, with 16 memory channels, address bits 8:11 contain the memory channel index.
+ * Let's call them "channel address bits". The number of memory channels can be a non-power-of-two
+ * on some chips.
+ *
+ * AMD GPUs usually assign 16 bits of memory bus to 1 memory channel. For example, 192-bit GDDR
+ * memory bus has 12 memory channels. APUs usually have 1 memory channel per 32 bits or 64 bits
+ * of memory bus. The physical memory channels don't always map 1:1 to AMD GPU memory channels.
+ *
+ * Memory channels are like separate cores. The advertised bandwidth and cache sizes are always
+ * for all memory channels combined. That means that each channel has only 1/num_memory_channels
+ * bandwidth and 1/memory_channels cache size. If all memory accesses unluckily end up in the same
+ * channel for all running shaders, the available memory bandwidth is only 1/num_memory_channels
+ * and the available cache size is also only 1/num_memory_channels. With 16 memory channels, that
+ * would be 16x worse cache and memory performance.
+ *
+ * Strategies to distribute work among all memory channels evenly:
+ *
+ * - Ring element sizes should be set to an odd multiple of 256 to make sure each element starts on
+ *   a different memory channel. This is similar to how LDS banks work, but the granularity is 256B
+ *   instead of 4B here. The simplest way to do that is that if the ring element size is > 256,
+ *   apply "|= 256;" to it. The scratch ring and the task shader payload ring do this.
+ *
+ * - For tree data structures in memory, try to randomize channel address bits, which can be done by
+ *   making sure that tree nodes start on an odd multiple of 256. All possible numbers of
+ *   ((address / 256) % num_memory_channels) should be represented equally in the node addresses.
+ *
+ * - If we have a ring buffer where we can't set the ring element size (e.g. TCS outputs where it's
+ *   set to 32K), each workgroup should write at least (num_memory_channels * 256) of TCS outputs
+ *   in bytes, and ideally twice that amount, to make sure each workgroup doesn't leave some memory
+ *   channels (and thus bandwidth) completely unused or underutilized. We could also shift
+ *   the placement of TCS outputs to a random 256*i offset within each 32K segment instead. Our TCS
+ *   workgroup size calculation takes this into account.
+ *
+ * - radeon_surf::tile_swizzle is a random number that randomizes channel address bits to make sure
+ *   some fixed image coordinates (x,y) map to a different memory channel for each image, so if
+ *   a shader were to access multiple images at some fixed image coordinates (x,y) with the same
+ *   bpp, each image would load from a different channel if radeon_surf::tile_swizzle is different.
+ *   If multiple render targets are bound, it's recommended that they all have different tile_swizzle,
+ *   so that MRT0 goes to channel A, MRT1 goes to channel B (A != B), etc. Other than that, image
+ *   tiling does the optimal thing for us. The main purpose of 4K and bigger tiling is to distribute
+ *   work among all memory channels evenly. Linear and 256B tiling generally don't do that.
+ *
+ * - Performance is also affected by how many memory channels a VMEM instruction or a clause
+ *   intersects. Stores are more sensitive to this than loads because they are often globally
+ *   coherent. For example, a 32-lane VMEM store can store to address range=128..640 (size=512),
+ *   which stores data to 3 memory channels, while storing to address range=256..768 stores the same
+ *   amount of data to only 2 memory channels. The latter case has better performance (less VMEM
+ *   latency) when all memory channels are already busy because the wave only has to wait for replies
+ *   from 2 channels instead of 3, and 1 channel has less work to do. Examples are:
+ *   - Our clear_buffer and copy_buffer compute shaders where the store address of lane 0 is always
+ *     a multiple of 256, so that each subgroup always stores to a 256B-aligned memory region of
+ *     size 256*N.
+ *   - Our image clear and blit compute shaders where the stored adress range of each compute
+ *     subgroup is always aligned to 256B and stores 256*N. That's accomplished by making compute
+ *     subgroups always clear or copy whole 256B image tiles, whose dimensions differ between tiling
+ *     modes.
+ *   - Vertex 0 of each TCS output starts on an address aligned to 256 to make TCS output stores
+ *     from each subgroup always store 256B-aligned blocks of 256*N bytes.
+ *
+ * Number 256 comes from GB_ADDR_CONFIG.PIPE_INTERLEAVE_SIZE. It's always 256 on all GCN and RDNA
+ * chips. "Pipe" means a memory channel in this context.
+ */
+#define AMD_MEMCHANNEL_INTERLEAVE_BYTES 256 /* always equal to GB_ADDR_CONFIG.PIPE_INTERLEAVE_SIZE */
+
 struct amdgpu_gpu_info;
+struct drm_amdgpu_info_device;
 
 struct amd_ip_info {
    uint8_t ver_major;
@@ -29,6 +98,48 @@ struct amd_ip_info {
    uint8_t num_instances;
    uint32_t ib_alignment;
    uint32_t ib_pad_dw_mask;
+};
+
+struct ac_cu_info {
+   uint32_t max_waves_per_simd;
+   uint32_t num_physical_sgprs_per_simd;
+   uint32_t num_physical_wave64_vgprs_per_simd;
+   uint32_t num_simd_per_compute_unit;
+   uint32_t min_sgpr_alloc;
+   uint32_t max_sgpr_alloc;
+   uint32_t sgpr_alloc_granularity;
+   uint32_t min_wave64_vgpr_alloc;
+   uint32_t max_vgpr_alloc;
+   uint32_t wave64_vgpr_alloc_granularity;
+
+   /* Flags */
+   bool has_lds_bank_count_16 : 1;
+   bool has_sram_ecc_enabled : 1;
+   /* Whether image_sample* instructions can be either a sampler or no-sampler access.*/
+   bool has_point_sample_accel : 1;
+   bool has_fast_fma32 : 1;
+   /* Whether chips support fused v_fma_mix* instructions.
+    * Otherwise, unfused v_mad_mix* is available on GFX9.
+    */
+   bool has_fma_mix : 1;
+   /* Whether chips support unfused multiply-add instructions. */
+   bool has_mad32 : 1;
+   /* Whether chips support double rate packed math instructions. */
+   bool has_packed_math_16bit : 1;
+   /* Whether chips support dot product instructions. A subset of these support a smaller
+    * instruction encoding which accumulates with the destination.
+    */
+   bool has_accelerated_dot_product : 1;
+   /* Device supports hardware-accelerated raytracing using
+    * image_bvh*_intersect_ray instructions
+    */
+   bool has_image_bvh_intersect_ray : 1;
+   /* Some GFX6 GPUs have a bug where it only looks at the x writemask component. */
+   bool has_gfx6_mrt_export_bug : 1;
+   /* Pre-GFX9: A bug where the alpha component of 10_10_10_2 formats is always unsigned.*/
+   bool has_vtx_format_alpha_adjust_bug : 1;
+   /* GFX6-7: SMEM accesses memory even when it's out of bounds */
+   bool has_smem_oob_access_bug : 1;
 };
 
 struct radeon_info {
@@ -87,8 +198,6 @@ struct radeon_info {
    bool rbplus_allowed; /* if RB+ is allowed */
    bool has_load_ctx_reg_pkt;
    bool has_out_of_order_rast;
-   bool has_packed_math_16bit;
-   bool has_accelerated_dot_product;
    bool cpdma_prefetch_writes_memory;
    bool has_gfx9_scissor_bug;
    bool has_htile_stencil_mipmap_bug;
@@ -97,7 +206,6 @@ struct radeon_info {
    bool has_small_prim_filter_sample_loc_bug;
    bool has_ls_vgpr_init_bug;
    bool has_pops_missed_overlap_bug;
-   bool has_null_index_buffer_clamping_bug;
    bool has_cb_lt16bit_int_clamp_bug;
    bool has_zero_index_buffer_bug;
    bool has_image_load_dcc_bug;
@@ -274,6 +382,7 @@ struct radeon_info {
    bool uses_kernel_cu_mask;
 
    /* Shader cores. */
+   struct ac_cu_info cu_info;
    uint16_t cu_mask[AMD_MAX_SE][AMD_MAX_SA_PER_SE];
    uint32_t r600_max_quad_pipes; /* wave size / 16 */
    uint32_t max_good_cu_per_sa;
@@ -281,16 +390,6 @@ struct radeon_info {
    uint32_t max_se;             /* number of shader engines incl. disabled ones */
    uint32_t max_sa_per_se;      /* shader arrays per shader engine */
    uint32_t num_cu_per_sh;
-   uint32_t max_waves_per_simd;
-   uint32_t num_physical_sgprs_per_simd;
-   uint32_t num_physical_wave64_vgprs_per_simd;
-   uint32_t num_simd_per_compute_unit;
-   uint32_t min_sgpr_alloc;
-   uint32_t max_sgpr_alloc;
-   uint32_t sgpr_alloc_granularity;
-   uint32_t min_wave64_vgpr_alloc;
-   uint32_t max_vgpr_alloc;
-   uint32_t wave64_vgpr_alloc_granularity;
    uint32_t scratch_wavesize_granularity_shift;
    uint32_t scratch_wavesize_granularity;
    uint32_t max_scratch_waves;
@@ -318,12 +417,12 @@ struct radeon_info {
    uint32_t r600_gb_backend_map; /* R600 harvest config */
    bool r600_gb_backend_map_valid;
    uint32_t r600_num_banks;
+   uint32_t r600_pipe_interleave_bytes;
    uint32_t mc_arb_ramcfg;
    uint32_t gb_addr_config;
    uint32_t pa_sc_tile_steering_override; /* CLEAR_STATE also sets this */
    uint32_t max_render_backends;  /* number of render backends incl. disabled ones */
    uint32_t num_tile_pipes; /* pipe count from PIPE_CONFIG */
-   uint32_t pipe_interleave_bytes;
    uint64_t enabled_rb_mask; /* bitmask of enabled physical RBs, up to max_render_backends bits */
    uint64_t max_alignment;   /* from addrlib */
    uint32_t pbb_max_alloc_count;
@@ -341,12 +440,11 @@ struct radeon_info {
       uint32_t shadow_alignment;
       uint32_t csa_size;
       uint32_t csa_alignment;
+      uint32_t eop_size;
+      uint32_t eop_alignment;
+      uint32_t sdma_csa_size;
+      uint32_t sdma_csa_alignment;
    } fw_based_mcbp;
-
-   /* Device supports hardware-accelerated raytracing using
-    * image_bvh*_intersect_ray instructions
-    */
-   bool has_image_bvh_intersect_ray;
 };
 
 enum ac_query_gpu_info_result {
@@ -357,6 +455,7 @@ enum ac_query_gpu_info_result {
 
 enum ac_query_gpu_info_result ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
                                                 bool require_pci_bus_info);
+void ac_fill_cu_info(struct radeon_info *info, struct drm_amdgpu_info_device *device_info);
 
 void ac_compute_driver_uuid(char *uuid, size_t size);
 

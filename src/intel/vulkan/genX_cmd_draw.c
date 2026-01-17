@@ -444,52 +444,34 @@ cmd_buffer_flush_gfx_push_constants(struct anv_cmd_buffer *cmd_buffer,
          continue;
 
       const struct anv_shader *shader = gfx->shaders[stage];
-      if (shader->prog_data->robust_ubo_ranges) {
-         const struct anv_pipeline_bind_map *bind_map = &shader->bind_map;
-         struct anv_push_constants *push = &gfx->base.push_constants;
+      const struct anv_pipeline_bind_map *bind_map = &shader->bind_map;
+      struct anv_push_constants *push = &gfx->base.push_constants;
+      u_foreach_bit(r, shader->prog_data->robust_ubo_ranges) {
+         const struct anv_push_range *range = &bind_map->push_ranges[r];
 
-         unsigned ubo_range_index = 0;
-         for (unsigned i = 0; i < 4; i++) {
-            const struct anv_push_range *range = &bind_map->push_ranges[i];
-            if (range->length == 0)
-               continue;
+         assert(range->length != 0);
+         assert(range->set < MAX_SETS);
 
-            /* Skip any push ranges that were not promoted from UBOs */
-            if (range->set >= MAX_SETS) {
-               /* The indexing in prog_data->robust_ubo_ranges is based off
-                * prog_data->ubo_ranges which does not include the
-                * prog_data->nr_params (Vulkan push constants).
-                */
-               if (range->set != ANV_DESCRIPTOR_SET_PUSH_CONSTANTS)
-                  ubo_range_index++;
-               continue;
-            }
+         unsigned bound_size =
+            get_push_range_bound_size(cmd_buffer, shader, range);
 
-            assert(shader->prog_data->robust_ubo_ranges & (1 << ubo_range_index));
+         uint8_t range_mask = 0;
 
-            unsigned bound_size =
-               get_push_range_bound_size(cmd_buffer, shader, range);
-
-            uint8_t range_mask = 0;
-
-            /* Determine the bound length of the range in 16-byte units */
-            if (bound_size > range->start * 32) {
-               bound_size = MIN2(
-                  DIV_ROUND_UP(bound_size - range->start * 32, 16),
-                  2 * range->length);
+         /* Determine the bound length of the range in 16-byte units */
+         if (bound_size > range->start * 32) {
+            bound_size = MIN2(
+               DIV_ROUND_UP(bound_size - range->start * 32, 16),
+               2 * range->length);
                range_mask = (uint8_t) bound_size;
                assert(bound_size < 256);
-            }
+         }
 
-            /* Update the pushed bound length constant if it changed */
-            if (range_mask != push->gfx.push_reg_mask[stage][ubo_range_index]) {
-               push->gfx.push_reg_mask[stage][ubo_range_index] = range_mask;
-               cmd_buffer->state.push_constants_dirty |=
-                  mesa_to_vk_shader_stage(stage);
-               gfx->base.push_constants_data_dirty = true;
-            }
-
-            ubo_range_index++;
+         /* Update the pushed bound length constant if it changed */
+         if (range_mask != push->gfx.push_reg_mask[stage][r]) {
+            push->gfx.push_reg_mask[stage][r] = range_mask;
+            cmd_buffer->state.push_constants_dirty |=
+               mesa_to_vk_shader_stage(stage);
+            gfx->base.push_constants_data_dirty = true;
          }
       }
    }
@@ -712,8 +694,9 @@ cmd_buffer_maybe_flush_rt_writes(struct anv_cmd_buffer *cmd_buffer,
        * in the shader always send the color.
        */
       anv_add_pending_pipe_bits(cmd_buffer,
-                                ANV_PIPE_RENDER_TARGET_CACHE_FLUSH_BIT |
-                                ANV_PIPE_STALL_AT_SCOREBOARD_BIT,
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                ANV_PIPE_RT_BTI_CHANGE,
                                 "change RT due to shader outputs");
 #endif
    }
@@ -854,6 +837,8 @@ cmd_buffer_flush_gfx_state(struct anv_cmd_buffer *cmd_buffer)
        */
       if (intel_needs_workaround(device->info, 16011411144)) {
          anv_add_pending_pipe_bits(cmd_buffer,
+                                   VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
+                                   VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
                                    ANV_PIPE_CS_STALL_BIT,
                                    "before SO_BUFFER change WA");
          genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
@@ -889,12 +874,16 @@ cmd_buffer_flush_gfx_state(struct anv_cmd_buffer *cmd_buffer)
       if (intel_needs_workaround(device->info, 16011411144)) {
          /* Wa_16011411144: also CS_STALL after touching SO_BUFFER change */
          anv_add_pending_pipe_bits(cmd_buffer,
+                                   VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
+                                   VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
                                    ANV_PIPE_CS_STALL_BIT,
                                    "after SO_BUFFER change WA");
          genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
       } else if (GFX_VER >= 10) {
          /* CNL and later require a CS stall after 3DSTATE_SO_BUFFER */
          anv_add_pending_pipe_bits(cmd_buffer,
+                                   VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
+                                   VK_PIPELINE_STAGE_2_VERTEX_INPUT_BIT,
                                    ANV_PIPE_CS_STALL_BIT,
                                    "after 3DSTATE_SO_BUFFER call");
       }
@@ -2365,6 +2354,8 @@ void genX(CmdBeginTransformFeedbackEXT)(
     *    commands are processed. This will likely require a pipeline flush."
     */
    anv_add_pending_pipe_bits(cmd_buffer,
+                             VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                              ANV_PIPE_CS_STALL_BIT,
                              "begin transform feedback");
    genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
@@ -2417,6 +2408,8 @@ void genX(CmdEndTransformFeedbackEXT)(
     *    commands are processed. This will likely require a pipeline flush."
     */
    anv_add_pending_pipe_bits(cmd_buffer,
+                             VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                              ANV_PIPE_CS_STALL_BIT,
                              "end transform feedback");
    genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);

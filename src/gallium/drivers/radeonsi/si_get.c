@@ -19,6 +19,7 @@
 #include <sys/utsname.h>
 #include "drm-uapi/drm.h"
 #include "aco_interface.h"
+#include "nir/nir_xfb_info.h"
 
 /* The capabilities reported by the kernel has priority
    over the existing logic in si_get_video_param */
@@ -54,7 +55,7 @@ si_is_compute_copy_faster(struct pipe_screen *pscreen,
 {
    if (cpu)
       /* very basic for now */
-      return width * height * depth > 64 * 64;
+      return (uint64_t)width * height * depth > 64 * 64;
    return false;
 }
 
@@ -82,7 +83,7 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
 {
    struct si_screen *sscreen = (struct si_screen *)screen;
    enum pipe_video_format codec = u_reduce_video_profile(profile);
-   bool fully_supported_profile = ((profile >= PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE) &&
+   bool fully_supported_profile = ((profile >= PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE) &&
                                    (profile <= PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH)) ||
                                   (profile == PIPE_VIDEO_PROFILE_HEVC_MAIN) ||
                                   (profile == PIPE_VIDEO_PROFILE_AV1_MAIN);
@@ -413,15 +414,13 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
       switch (codec) {
       case PIPE_VIDEO_FORMAT_MPEG12:
          return !(sscreen->info.vcn_ip_version >= VCN_3_0_33 || profile == PIPE_VIDEO_PROFILE_MPEG1);
-      case PIPE_VIDEO_FORMAT_MPEG4:
-         return !(sscreen->info.vcn_ip_version >= VCN_3_0_33);
       case PIPE_VIDEO_FORMAT_MPEG4_AVC:
          if ((sscreen->info.family == CHIP_POLARIS10 || sscreen->info.family == CHIP_POLARIS11) &&
              sscreen->info.uvd_fw_version < UVD_FW_1_66_16) {
             RVID_ERR("POLARIS10/11 firmware version need to be updated.\n");
             return false;
          }
-         return (profile != PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH10);
+         return fully_supported_profile;
       case PIPE_VIDEO_FORMAT_VC1:
          return !(sscreen->info.vcn_ip_version >= VCN_3_0_33);
       case PIPE_VIDEO_FORMAT_HEVC:
@@ -503,7 +502,6 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
    case PIPE_VIDEO_CAP_MAX_LEVEL:
       if ((profile == PIPE_VIDEO_PROFILE_MPEG2_SIMPLE ||
            profile == PIPE_VIDEO_PROFILE_MPEG2_MAIN ||
-           profile == PIPE_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE ||
            profile == PIPE_VIDEO_PROFILE_VC1_ADVANCED) &&
           sscreen->info.dec_caps.codec_info[codec - 1].valid) {
          return sscreen->info.dec_caps.codec_info[codec - 1].max_level;
@@ -514,17 +512,13 @@ static int si_get_video_param(struct pipe_screen *screen, enum pipe_video_profil
          case PIPE_VIDEO_PROFILE_MPEG2_SIMPLE:
          case PIPE_VIDEO_PROFILE_MPEG2_MAIN:
             return 3;
-         case PIPE_VIDEO_PROFILE_MPEG4_SIMPLE:
-            return 3;
-         case PIPE_VIDEO_PROFILE_MPEG4_ADVANCED_SIMPLE:
-            return 5;
          case PIPE_VIDEO_PROFILE_VC1_SIMPLE:
             return 1;
          case PIPE_VIDEO_PROFILE_VC1_MAIN:
             return 2;
          case PIPE_VIDEO_PROFILE_VC1_ADVANCED:
             return 4;
-         case PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE:
+         case PIPE_VIDEO_PROFILE_MPEG4_AVC_CONSTRAINED_BASELINE:
          case PIPE_VIDEO_PROFILE_MPEG4_AVC_MAIN:
          case PIPE_VIDEO_PROFILE_MPEG4_AVC_HIGH:
             return (sscreen->info.family < CHIP_TONGA) ? 41 : 52;
@@ -756,6 +750,73 @@ static bool enable_mesh_shader(struct si_screen *sscreen)
       !(sscreen->debug_flags & DBG(USE_LLVM));
 }
 
+static bool can_lower_mediump_io(mesa_shader_stage prev_stage, bool prev_stage_has_xfb,
+                                 mesa_shader_stage next_stage, bool config_option)
+{
+   /* This is the filter that determines when mediump IO is lowered.
+    *
+    * NOTE: LLVM fails to compile this test if VS inputs are 16-bit:
+    * dEQP-GLES31.functional.shaders.builtin_functions.integer.bitfieldinsert.uvec3_lowp_geometry
+    */
+   return (prev_stage == MESA_SHADER_VERTEX && next_stage == MESA_SHADER_FRAGMENT &&
+           !prev_stage_has_xfb && config_option) ||
+          prev_stage == MESA_SHADER_FRAGMENT;
+}
+
+static bool si_alu_to_scalar_packed_math_filter(const nir_instr *instr, const void *data)
+{
+   if (instr->type == nir_instr_type_alu) {
+      nir_alu_instr *alu = nir_instr_as_alu(instr);
+
+      if (alu->def.bit_size == 16 && alu->def.num_components == 2 &&
+          ac_nir_op_supports_packed_math_16bit(alu)) {
+         /* ACO requires that all but the first bit of swizzle must be equal. */
+         for (unsigned i = 0; i < nir_op_infos[alu->op].num_inputs; i++) {
+            if ((alu->src[i].swizzle[0] >> 1) != (alu->src[i].swizzle[1] >> 1))
+               return true;
+         }
+         return false;
+      }
+   }
+
+   return true;
+}
+
+static void lower_mediump_io(nir_shader *nir, bool config_option)
+{
+   nir_variable_mode modes = 0;
+
+   if (can_lower_mediump_io(nir->info.stage, nir->xfb_info != NULL, nir->info.next_stage,
+                            config_option))
+      modes |= nir_var_shader_out;
+
+   if (can_lower_mediump_io(nir->info.prev_stage, nir->info.prev_stage_has_xfb, nir->info.stage,
+                            config_option))
+      modes |= nir_var_shader_in;
+
+   if (modes) {
+      bool progress = false;
+
+      NIR_PASS(progress, nir, nir_lower_mediump_io, modes,
+               VARYING_BIT_PNTC | BITFIELD64_RANGE(VARYING_SLOT_VAR0, 32), true);
+
+      /* Update xfb info after mediump IO lowering. */
+      if (progress && nir->xfb_info)
+         nir_gather_xfb_info_from_intrinsics(nir);
+   }
+   NIR_PASS(_, nir, nir_clear_mediump_io_flag);
+}
+
+static void si_lower_mediump_io_default(nir_shader *nir)
+{
+   lower_mediump_io(nir, false);
+}
+
+static void si_lower_mediump_io_option(nir_shader *nir)
+{
+   lower_mediump_io(nir, true);
+}
+
 void si_init_screen_get_functions(struct si_screen *sscreen)
 {
    sscreen->b.get_name = si_get_name;
@@ -821,7 +882,7 @@ void si_init_screen_get_functions(struct si_screen *sscreen)
    options->lower_uniforms_to_ubo = true;
    options->lower_to_scalar = true;
    options->lower_to_scalar_filter =
-      sscreen->info.has_packed_math_16bit ? si_alu_to_scalar_packed_math_filter : NULL;
+      sscreen->info.cu_info.has_packed_math_16bit ? si_alu_to_scalar_packed_math_filter : NULL;
    options->max_unroll_iterations = 128;
    options->max_unroll_iterations_aggressive = 128;
    /* For OpenGL, rounding mode is undefined. We want fast packing with v_cvt_pkrtz_f16,
@@ -1268,10 +1329,9 @@ void si_init_screen_caps(struct si_screen *sscreen)
 
    caps->max_vertex_attrib_stride = 2048;
 
-   /* TODO: Gfx12 supports 64K textures, but Gallium can't represent them at the moment. */
-   caps->max_texture_2d_size = sscreen->info.gfx_level >= GFX12 ? 32768 : 16384;
+   caps->max_texture_2d_size = sscreen->info.gfx_level >= GFX12 ? 65536 : 16384;
    caps->max_texture_cube_levels = sscreen->info.has_3d_cube_border_color_mipmap ?
-      (sscreen->info.gfx_level >= GFX12 ? 16 : 15) /* 32K : 16K */ : 0;
+      (sscreen->info.gfx_level >= GFX12 ? 17 : 15) /* 64K : 16K */ : 0;
    caps->max_texture_3d_levels = sscreen->info.has_3d_cube_border_color_mipmap ?
       /* This is limited by maximums that both the texture unit and layered rendering support. */
       (sscreen->info.gfx_level >= GFX12 ? 15 : /* 16K */

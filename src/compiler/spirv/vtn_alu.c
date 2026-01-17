@@ -413,26 +413,16 @@ handle_fp_fast_math(struct vtn_builder *b, UNUSED struct vtn_value *val,
       SpvFPFastMathModeAllowReassocMask |
       SpvFPFastMathModeAllowTransformMask;
 
+   /* Decoration overrides defaults. */
+   b->nb.fp_math_ctrl = 0;
    if ((dec->operands[0] & can_fast_math) != can_fast_math)
-      b->nb.exact = true;
-
-   /* Decoration overrides defaults */
-   b->nb.fp_fast_math = 0;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
    if (!(dec->operands[0] & SpvFPFastMathModeNSZMask))
-      b->nb.fp_fast_math |=
-         FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE_FP16 |
-         FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE_FP32 |
-         FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE_FP64;
+      b->nb.fp_math_ctrl |= nir_fp_preserve_signed_zero;
    if (!(dec->operands[0] & SpvFPFastMathModeNotNaNMask))
-      b->nb.fp_fast_math |=
-         FLOAT_CONTROLS_NAN_PRESERVE_FP16 |
-         FLOAT_CONTROLS_NAN_PRESERVE_FP32 |
-         FLOAT_CONTROLS_NAN_PRESERVE_FP64;
+      b->nb.fp_math_ctrl |= nir_fp_preserve_nan;
    if (!(dec->operands[0] & SpvFPFastMathModeNotInfMask))
-      b->nb.fp_fast_math |=
-         FLOAT_CONTROLS_INF_PRESERVE_FP16 |
-         FLOAT_CONTROLS_INF_PRESERVE_FP32 |
-         FLOAT_CONTROLS_INF_PRESERVE_FP64;
+      b->nb.fp_math_ctrl |= nir_fp_preserve_inf;
 }
 
 void
@@ -441,18 +431,26 @@ vtn_handle_fp_fast_math(struct vtn_builder *b, struct vtn_value *val)
    /* Take the NaN/Inf/SZ preserve bits from the execution mode and set them
     * on the builder, so the generated instructions can take it from it.
     * We only care about some of them, check nir_alu_instr for details.
-    * We also copy all bit widths, because we can't easily get the correct one
-    * here.
     */
-#define FLOAT_CONTROLS2_BITS (FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP16 | \
-                              FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP32 | \
-                              FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP64)
-   static_assert(FLOAT_CONTROLS2_BITS == BITSET_MASK(9),
-      "enum float_controls and fp_fast_math out of sync!");
-   b->nb.fp_fast_math = b->shader->info.float_controls_execution_mode &
-      FLOAT_CONTROLS2_BITS;
+   unsigned bit_size;
+
+   /* Some ALU like modf and frexp return a struct of two values. */
+   if (!val->type)
+      bit_size = 0;
+   else if (glsl_type_is_struct(val->type->type))
+      bit_size = glsl_get_bit_size(val->type->type->fields.structure[0].type);
+   else
+      bit_size = glsl_get_bit_size(val->type->type);
+
+
+   switch (bit_size) {
+   case 16: b->nb.fp_math_ctrl = b->fp_math_ctrl_fp16; break;
+   case 32: b->nb.fp_math_ctrl = b->fp_math_ctrl_fp32; break;
+   case 64: b->nb.fp_math_ctrl = b->fp_math_ctrl_fp64; break;
+   default: b->nb.fp_math_ctrl = 0; break;
+   }
+
    vtn_foreach_decoration(b, val, handle_fp_fast_math, NULL);
-#undef FLOAT_CONTROLS2_BITS
 }
 
 nir_rounding_mode
@@ -729,8 +727,10 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
       return;
    }
 
-   b->nb.exact |= vtn_has_decoration(b, dest_val, SpvDecorationNoContraction);
    vtn_handle_fp_fast_math(b, dest_val);
+
+   if (b->exact || vtn_has_decoration(b, dest_val, SpvDecorationNoContraction))
+      b->nb.fp_math_ctrl |= nir_fp_exact;
    bool mediump_16bit = vtn_alu_op_mediump_16bit(b, opcode, dest_val);
 
    /* Collect the various SSA sources */
@@ -750,7 +750,7 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
          vtn_mediump_upconvert_value(b, dest);
 
       vtn_push_ssa_value(b, w[2], dest);
-      b->nb.exact = b->exact;
+      b->nb.fp_math_ctrl = b->exact ? nir_fp_exact : nir_fp_fast_math;
       return;
    }
 
@@ -839,53 +839,50 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
       dest->def = nir_fmul(&b->nb, src[0], src[1]);
       break;
 
-   case SpvOpIsNan: {
-      const bool save_exact = b->nb.exact;
+   case SpvOpIsNan:{
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
       dest->def = nir_fneu(&b->nb, src[0], src[0]);
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
    case SpvOpOrdered: {
-      const bool save_exact = b->nb.exact;
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
       dest->def = nir_iand(&b->nb, nir_feq(&b->nb, src[0], src[0]),
                                    nir_feq(&b->nb, src[1], src[1]));
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
    case SpvOpUnordered: {
-      const bool save_exact = b->nb.exact;
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
       dest->def = nir_ior(&b->nb, nir_fneu(&b->nb, src[0], src[0]),
                                   nir_fneu(&b->nb, src[1], src[1]));
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
    case SpvOpIsInf: {
-      const bool save_exact = b->nb.exact;
-      const unsigned save_fast_math = b->nb.fp_fast_math;
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
-      b->nb.fp_fast_math = 0;
+      b->nb.fp_math_ctrl = nir_fp_no_fast_math;
       nir_def *inf = nir_imm_floatN_t(&b->nb, INFINITY, src[0]->bit_size);
       dest->def = nir_feq(&b->nb, nir_fabs(&b->nb, src[0]), inf);
 
-      b->nb.exact = save_exact;
-      b->nb.fp_fast_math = save_fast_math;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
    case SpvOpFUnordEqual: {
-      const bool save_exact = b->nb.exact;
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
 
       /* This could also be implemented as !(a < b || b < a).  If one or both
        * of the source are numbers, later optimization passes can easily
@@ -901,7 +898,7 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
                          nir_fneu(&b->nb, src[0], src[0]),
                          nir_fneu(&b->nb, src[1], src[1])));
 
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
@@ -921,9 +918,9 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
          src[1] = tmp;
       }
 
-      const bool save_exact = b->nb.exact;
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
 
       /* Use the property FUnordLessThan(a, b) ≡ !FOrdGreaterThanEqual(a, b). */
       switch (op) {
@@ -936,7 +933,7 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
          nir_inot(&b->nb,
                   nir_build_alu(&b->nb, op, src[0], src[1], NULL, NULL));
 
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
@@ -946,9 +943,9 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
        * from the ALU will probably already be false if the operands are not
        * ordered so we don’t need to handle it specially.
        */
-      const bool save_exact = b->nb.exact;
+      const unsigned save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
-      b->nb.exact = true;
+      b->nb.fp_math_ctrl |= nir_fp_exact;
 
       /* This could also be implemented as (a < b || b < a).  If one or both
        * of the source are numbers, later optimization passes can easily
@@ -964,7 +961,7 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
                           nir_feq(&b->nb, src[0], src[0]),
                           nir_feq(&b->nb, src[1], src[1])));
 
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    }
 
@@ -1068,14 +1065,14 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
          break;
       }
 
-      const bool save_exact = b->nb.exact;
+      const bool save_fp_math_ctrl = b->nb.fp_math_ctrl;
 
       if (exact)
-         b->nb.exact = true;
+         b->nb.fp_math_ctrl |= nir_fp_exact;
 
       dest->def = nir_build_alu(&b->nb, op, src[0], src[1], src[2], src[3]);
 
-      b->nb.exact = save_exact;
+      b->nb.fp_math_ctrl = save_fp_math_ctrl;
       break;
    } /* default */
    }
@@ -1102,18 +1099,15 @@ vtn_handle_alu(struct vtn_builder *b, SpvOp opcode,
       vtn_mediump_upconvert_value(b, dest);
    vtn_push_ssa_value(b, w[2], dest);
 
-   b->nb.exact = b->exact;
+   b->nb.fp_math_ctrl = b->exact ? nir_fp_exact : nir_fp_fast_math;
 }
 
 void
 vtn_handle_integer_dot(struct vtn_builder *b, SpvOp opcode,
                        const uint32_t *w, unsigned count)
 {
-   struct vtn_value *dest_val = vtn_untyped_value(b, w[2]);
    const struct glsl_type *dest_type = vtn_get_type(b, w[1])->type;
    const unsigned dest_size = glsl_get_bit_size(dest_type);
-
-   b->nb.exact |= vtn_has_decoration(b, dest_val, SpvDecorationNoContraction);
 
    /* Collect the various SSA sources.
     *
@@ -1375,8 +1369,6 @@ vtn_handle_integer_dot(struct vtn_builder *b, SpvOp opcode,
    }
 
    vtn_push_nir_ssa(b, w[2], dest);
-
-   b->nb.exact = b->exact;
 }
 
 void

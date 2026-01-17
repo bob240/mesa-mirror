@@ -66,20 +66,32 @@ kk_get_nir_options(struct vk_physical_device *vk_pdev, mesa_shader_stage stage,
       .lower_doubles_options = (nir_lower_doubles_options)(~0),
       .lower_int64_options =
          nir_lower_ufind_msb64 | nir_lower_subgroup_shuffle64,
+      .io_options = nir_io_mediump_is_32bit,
    };
    return &options;
 }
+
+/* TODO_KOSMICKRISP Once we support robustness2, update these values. */
+static const struct vk_pipeline_robustness_state rs_all_supported = {
+   .uniform_buffers =
+      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+   .storage_buffers =
+      VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_ROBUST_BUFFER_ACCESS,
+   .images = VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_ROBUST_IMAGE_ACCESS_2_EXT,
+};
 
 static struct spirv_to_nir_options
 kk_get_spirv_options(struct vk_physical_device *vk_pdev,
                      UNUSED mesa_shader_stage stage,
                      const struct vk_pipeline_robustness_state *rs)
 {
+   if (KK_DEBUG(FORCE_ROBUSTNESS))
+      rs = &rs_all_supported;
    return (struct spirv_to_nir_options){
       .environment = NIR_SPIRV_VULKAN,
-      .ssbo_addr_format = nir_address_format_64bit_bounded_global,
+      .ssbo_addr_format = kk_buffer_addr_format(rs->storage_buffers),
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
-      .ubo_addr_format = nir_address_format_64bit_bounded_global,
+      .ubo_addr_format = kk_buffer_addr_format(rs->uniform_buffers),
       .shared_addr_format = nir_address_format_32bit_offset,
       .min_ssbo_alignment = KK_MIN_SSBO_ALIGNMENT,
       .min_ubo_alignment = KK_MIN_UBO_ALIGNMENT,
@@ -252,21 +264,21 @@ kk_nir_swizzle_fragment_output(nir_builder *b, nir_intrinsic_instr *intrin,
 
    /* Check if we have to apply any swizzle */
    if (!supported_format->is_native) {
-      unsigned channel_swizzle[] = {
-         supported_format->swizzle.red, supported_format->swizzle.green,
-         supported_format->swizzle.blue, supported_format->swizzle.alpha};
+      unsigned channel_unswizzle[] = {
+         supported_format->unswizzle.red, supported_format->unswizzle.green,
+         supported_format->unswizzle.blue, supported_format->unswizzle.alpha};
 
       if (intrin->intrinsic == nir_intrinsic_store_output) {
+         unsigned channel_swizzle[4] = {0u};
+         for (uint32_t i = 0u; i < 4; ++i)
+            channel_swizzle[channel_unswizzle[i]] = i;
+
          b->cursor = nir_before_instr(&intrin->instr);
          nir_def *to_replace = intrin->src[0].ssa;
          nir_def *swizzled = nir_swizzle(b, to_replace, channel_swizzle,
                                          to_replace->num_components);
          nir_src_rewrite(&intrin->src[0], swizzled);
       } else {
-         unsigned channel_unswizzle[4] = {0u};
-         for (uint32_t i = 0u; i < 4; ++i)
-            channel_unswizzle[channel_swizzle[i]] = i;
-
          b->cursor = nir_after_instr(&intrin->instr);
          nir_def *to_replace = &intrin->def;
          nir_def *swizzled = nir_swizzle(b, to_replace, channel_unswizzle,
@@ -387,7 +399,8 @@ lower_subpass_dim(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
 }
 
 static void
-kk_lower_fs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
+kk_lower_fs(struct kk_device *dev, nir_shader *nir,
+            const struct vk_graphics_pipeline_state *state)
 {
    if (state->cb)
       kk_lower_fs_blend(nir, state);
@@ -415,6 +428,15 @@ kk_lower_fs(nir_shader *nir, const struct vk_graphics_pipeline_state *state)
    else if (nir->info.fs.needs_full_quad_helper_invocations ||
             nir->info.fs.needs_coarse_quad_helper_invocations)
       NIR_PASS(_, nir, msl_lower_static_sample_mask, 0xFFFFFFFF);
+
+   /* KK_WORKAROUND_5 */
+   if (!(dev->disabled_workarounds & BITFIELD64_BIT(5)))
+      NIR_PASS(_, nir, msl_nir_fake_guard_for_discards);
+   /* KK_WORKAROUND_4 */
+   if (!(dev->disabled_workarounds & BITFIELD64_BIT(4))) {
+      NIR_PASS(_, nir, nir_lower_helper_writes, true);
+      NIR_PASS(_, nir, nir_lower_is_helper_invocation);
+   }
 }
 
 static void
@@ -424,6 +446,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir,
              struct vk_descriptor_set_layout *const *set_layouts,
              const struct vk_graphics_pipeline_state *state)
 {
+   if (KK_DEBUG(FORCE_ROBUSTNESS))
+      rs = &rs_all_supported;
+
    /* Massage IO related variables to please Metal */
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       NIR_PASS(_, nir, kk_nir_lower_vs_multiview, state->rp->view_mask);
@@ -431,7 +456,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir,
       /* kk_nir_lower_vs_multiview may create a temporary array to assign the
        * correct view index. Since we don't handle derefs, we need to get rid of
        * them. */
-      NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 0,
+      NIR_PASS(_, nir, nir_lower_vars_to_scratch, 0,
                glsl_get_natural_size_align_bytes,
                glsl_get_natural_size_align_bytes);
 
@@ -472,9 +497,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            nir_address_format_64bit_bounded_global);
+            kk_buffer_addr_format(rs->storage_buffers));
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
-            nir_address_format_64bit_bounded_global);
+            kk_buffer_addr_format(rs->uniform_buffers));
 
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4,
@@ -517,7 +542,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir,
    if (nir->info.stage == MESA_SHADER_VERTEX) {
       kk_lower_vs(nir, state);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      kk_lower_fs(nir, state);
+      kk_lower_fs(dev, nir, state);
    }
 
    /* Descriptor lowering needs to happen after lowering blend since we will
@@ -648,6 +673,7 @@ kk_compile_shader(struct kk_device *dev, struct vk_shader_compile_info *info,
    if (info->stage == MESA_SHADER_VERTEX) {
       kk_lower_vs_vbo(nir, state);
    }
+   msl_lower_nir_late(nir);
    msl_optimize_nir(nir);
    modify_nir_info(nir);
    shader->msl_code = nir_to_msl(nir, NULL, dev->disabled_workarounds);
@@ -941,6 +967,7 @@ kk_compile_graphics_pipeline(struct kk_device *device,
          pipeline_descriptor, max_amplification);
    }
 
+   vertex_shader->pipeline.gfx.sample_count = 1u;
    if (state->ms) {
       mtl_render_pipeline_descriptor_set_raster_sample_count(
          pipeline_descriptor, state->ms->rasterization_samples);
@@ -948,6 +975,8 @@ kk_compile_graphics_pipeline(struct kk_device *device,
          pipeline_descriptor, state->ms->alpha_to_coverage_enable);
       mtl_render_pipeline_descriptor_set_alpha_to_one(
          pipeline_descriptor, state->ms->alpha_to_one_enable);
+      vertex_shader->pipeline.gfx.sample_count =
+         state->ms->rasterization_samples;
    }
 
    vertex_shader->pipeline.gfx.handle =
@@ -1204,6 +1233,8 @@ kk_cmd_bind_graphics_shader(struct kk_cmd_buffer *cmd,
    cmd->state.gfx.is_depth_stencil_dynamic = requires_dynamic_depth_stencil;
    cmd->state.gfx.dirty |= KK_DIRTY_PIPELINE;
    cmd->state.gfx.dirty |= KK_DIRTY_VB;
+
+   cmd->state.gfx.sample_count = shader->pipeline.gfx.sample_count;
 }
 
 static void

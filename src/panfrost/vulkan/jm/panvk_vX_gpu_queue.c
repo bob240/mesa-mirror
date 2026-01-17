@@ -30,8 +30,10 @@
 #include "drm-uapi/panfrost_drm.h"
 
 static void
-panvk_queue_submit_batch(struct panvk_gpu_queue *queue, struct panvk_batch *batch,
-                         uint32_t *bos, unsigned nr_bos, uint32_t *in_fences,
+panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
+                         struct panvk_cmd_buffer *cmdbuf,
+                         struct panvk_batch *batch, uint32_t *bos,
+                         unsigned nr_bos, uint32_t *in_fences,
                          unsigned nr_in_fences)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
@@ -54,7 +56,15 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue, struct panvk_batch *batc
          for (uint32_t i = 0; i < batch->fb.layer_count; i++)
             memcpy(&ctxs[i], &batch->tiler.ctx_templ, sizeof(*ctxs));
       }
+
+      /* We don't keep track of BO <-> job relationship, so let's just flush the
+       * whole desc pool for now. */
+      panvk_pool_flush_maps(&cmdbuf->desc_pool);
    }
+
+   /* Flush pending synchronization requests before submitting the job, to
+    * make sure things are GPU-visible. */
+   pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
 
    if (batch->vtc_jc.first_job) {
       struct drm_panfrost_submit submit = {
@@ -73,11 +83,16 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue, struct panvk_batch *batc
          ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
                               NULL);
          assert(!ret);
+
+         /* If we want to read the descriptors back, we need to invalidate the
+          * whole desc pool, otherwise we might end up with stale data. */
+         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
       }
 
       if (PANVK_DEBUG(TRACE)) {
          pandecode_jc(dev->debug.decode_ctx, batch->vtc_jc.first_job,
-                      phys_dev->kmod.props.gpu_id);
+                      phys_dev->kmod.dev->props.gpu_id);
       }
 
       if (PANVK_DEBUG(DUMP))
@@ -85,7 +100,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue, struct panvk_batch *batc
 
       if (PANVK_DEBUG(SYNC))
          pandecode_abort_on_fault(dev->debug.decode_ctx, submit.jc,
-                                  phys_dev->kmod.props.gpu_id);
+                                  phys_dev->kmod.dev->props.gpu_id);
    }
 
    if (batch->frag_jc.first_job) {
@@ -111,18 +126,23 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue, struct panvk_batch *batc
          ret = drmSyncobjWait(dev->drm_fd, &submit.out_sync, 1, INT64_MAX, 0,
                               NULL);
          assert(!ret);
+
+         /* If we want to read the descriptors back, we need to invalidate the
+          * whole desc pool, otherwise we might end up with stale data. */
+         panvk_pool_invalidate_maps(&cmdbuf->desc_pool);
+         pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
       }
 
       if (PANVK_DEBUG(TRACE))
          pandecode_jc(dev->debug.decode_ctx, batch->frag_jc.first_job,
-                      phys_dev->kmod.props.gpu_id);
+                      phys_dev->kmod.dev->props.gpu_id);
 
       if (PANVK_DEBUG(DUMP))
          pandecode_dump_mappings(dev->debug.decode_ctx);
 
       if (PANVK_DEBUG(SYNC))
          pandecode_abort_on_fault(dev->debug.decode_ctx, submit.jc,
-                                  phys_dev->kmod.props.gpu_id);
+                                  phys_dev->kmod.dev->props.gpu_id);
    }
 
    if (PANVK_DEBUG(TRACE))
@@ -284,7 +304,7 @@ panvk_per_arch(gpu_queue_submit)(struct vk_queue *vk_queue, struct vk_queue_subm
 
          panvk_add_wait_event_syncobjs(batch, in_fences, &nr_in_fences);
 
-         panvk_queue_submit_batch(queue, batch, bos, nr_bos, in_fences,
+         panvk_queue_submit_batch(queue, cmdbuf, batch, bos, nr_bos, in_fences,
                                   nr_in_fences);
 
          panvk_signal_event_syncobjs(queue, batch);

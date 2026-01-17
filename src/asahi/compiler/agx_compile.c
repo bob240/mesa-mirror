@@ -184,7 +184,7 @@ gather_cf(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       unsigned location = sem.location + nir_src_as_uint(*offset);
       unsigned start_comp = (location * 4) + nir_intrinsic_component(intr);
 
-      BITSET_SET_RANGE(set, start_comp, start_comp + nr - 1);
+      BITSET_SET_COUNT(set, start_comp, nr);
    } else {
       unsigned start_comp = (sem.location * 4) + nir_intrinsic_component(intr);
       bool compact = sem.location == VARYING_SLOT_CLIP_DIST0 ||
@@ -197,8 +197,7 @@ gather_cf(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       nr = stride;
 
       for (unsigned i = 0; i < sem.num_slots; ++i) {
-         BITSET_SET_RANGE(set, start_comp + (i * stride),
-                          start_comp + (i * stride) + nr - 1);
+         BITSET_SET_COUNT(set, start_comp + (i * stride), nr);
       }
    }
 
@@ -242,10 +241,9 @@ assign_coefficient_regs(nir_shader *nir, struct agx_varyings_fs *var)
    static_assert(VARYING_SLOT_POS == 0, "special and handled first");
 
    for (unsigned i = VARYING_SLOT_POS + 1; i < VARYING_SLOT_MAX; ++i) {
-      bool smooth = BITSET_TEST_RANGE(info.smooth, i * 4, (i * 4) + 3);
-      bool flat = BITSET_TEST_RANGE(info.flat, i * 4, (i * 4) + 3);
-      bool noperspective =
-         BITSET_TEST_RANGE(info.noperspective, i * 4, (i * 4) + 3);
+      bool smooth = BITSET_TEST_COUNT(info.smooth, i * 4, 4);
+      bool flat = BITSET_TEST_COUNT(info.flat, i * 4, 4);
+      bool noperspective = BITSET_TEST_COUNT(info.noperspective, i * 4, 4);
 
       if (!(smooth || flat || noperspective))
          continue;
@@ -2264,7 +2262,13 @@ agx_emit_tex(agx_builder *b, nir_tex_instr *instr)
          break;
       case nir_tex_src_sampler_handle:
          b->shader->out->uses_sampler_heap = true;
-         sampler = index;
+         nir_intrinsic_instr *intr = nir_src_as_intrinsic(instr->src[i].src);
+         if (intr && intr->intrinsic == nir_intrinsic_bindless_sampler_agx) {
+            /* Heap offset */
+            sampler = agx_src_index(&intr->src[1]);
+         } else {
+            sampler = index;
+         }
          break;
 
       case nir_tex_src_texture_handle:
@@ -3064,7 +3068,11 @@ agx_optimize_nir(nir_shader *nir, bool soft_fault, uint16_t *preamble_size,
     */
    NIR_PASS(_, nir, agx_nir_lower_fminmax);
 
-   if (preamble_size && (!(agx_compiler_debug & AGX_DBG_NOPREAMBLE))) {
+   /* Force preamble generation for internal shaders since hk's meta copies
+    * depend on it for correctness with imgwblk intrinsics.
+    */
+   if (preamble_size &&
+       (!(agx_compiler_debug & AGX_DBG_NOPREAMBLE) || nir->info.internal)) {
       unsigned sizes[] = {
          *preamble_size,
          ts_count ? *ts_count : 1000 /* large finite */,
@@ -3669,7 +3677,8 @@ libagx_frcp(nir_builder *b, nir_def *x)
 static bool
 agx_nir_lower_fdiv(nir_builder *b, nir_alu_instr *alu, void *_)
 {
-   if (alu->op != nir_op_frcp || !alu->exact || alu->def.bit_size != 32)
+   if (alu->op != nir_op_frcp || !nir_alu_instr_is_exact(alu) ||
+       alu->def.bit_size != 32)
       return false;
 
    b->cursor = nir_before_instr(&alu->instr);
@@ -3687,7 +3696,7 @@ agx_preprocess_nir(nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
 
    /* Lower large arrays to scratch and small arrays to csel */
-   NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 256,
+   NIR_PASS(_, nir, nir_lower_vars_to_scratch, 256,
             glsl_get_natural_size_align_bytes, glsl_get_word_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_function_temp, ~0);
@@ -3803,7 +3812,7 @@ agx_compile_shader_nir(nir_shader *nir, struct agx_shader_key *key,
    /* Optimize scratch access for silly internal CL shaders */
    if (nir->info.internal) {
       NIR_PASS(_, nir, nir_lower_scratch_to_var);
-      NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 256,
+      NIR_PASS(_, nir, nir_lower_vars_to_scratch, 256,
                glsl_get_natural_size_align_bytes,
                glsl_get_natural_size_align_bytes);
       NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,

@@ -34,7 +34,6 @@
 #include "genxml/decode.h"
 #include "genxml/gen_macros.h"
 
-#include "clc/pan_compile.h"
 #include "kmod/pan_kmod.h"
 #include "util/os_file.h"
 #include "util/u_printf.h"
@@ -71,7 +70,8 @@ static void
 panvk_device_init_mempools(struct panvk_device *dev)
 {
    struct panvk_pool_properties rw_pool_props = {
-      .create_flags = 0,
+      .create_flags =
+         panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 16 * 1024,
       .label = "Device RW cached memory pool",
       .owns_bos = false,
@@ -82,7 +82,8 @@ panvk_device_init_mempools(struct panvk_device *dev)
    panvk_pool_init(&dev->mempools.rw, dev, NULL, NULL, &rw_pool_props);
 
    struct panvk_pool_properties rw_nc_pool_props = {
-      .create_flags = PAN_ARCH <= 9 ? 0 : PAN_KMOD_BO_FLAG_GPU_UNCACHED,
+      .create_flags =
+         panvk_device_adjust_bo_flags(dev, PAN_KMOD_BO_FLAG_GPU_UNCACHED),
       .slab_size = 16 * 1024,
       .label = "Device RW uncached memory pool",
       .owns_bos = false,
@@ -93,7 +94,8 @@ panvk_device_init_mempools(struct panvk_device *dev)
    panvk_pool_init(&dev->mempools.rw_nc, dev, NULL, NULL, &rw_nc_pool_props);
 
    struct panvk_pool_properties exec_pool_props = {
-      .create_flags = PAN_KMOD_BO_FLAG_EXECUTABLE,
+      .create_flags = panvk_device_adjust_bo_flags(
+         dev, PAN_KMOD_BO_FLAG_EXECUTABLE | PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 16 * 1024,
       .label = "Device executable memory pool (shaders)",
       .owns_bos = false,
@@ -205,7 +207,7 @@ static VkResult
 check_global_priority(const struct panvk_physical_device *phys_dev,
                       const VkDeviceQueueCreateInfo *create_info)
 {
-   const unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
+   const unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
    const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
       vk_find_struct_const(create_info->pNext,
                            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
@@ -218,7 +220,7 @@ check_global_priority(const struct panvk_physical_device *phys_dev,
       enum pan_kmod_group_allow_priority_flags requested_prio =
          global_priority_to_group_allow_priority_flag(priority);
       enum pan_kmod_group_allow_priority_flags allowed_prio_mask =
-         phys_dev->kmod.props.allowed_group_priorities_mask;
+         phys_dev->kmod.dev->props.allowed_group_priorities_mask;
 
       /* Non-medium priority context is not hooked-up in the JM backend, even
        * though the panfrost kmod advertize it. Manually filter non-medium
@@ -393,9 +395,9 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       .free = panvk_kmod_free,
       .priv = &device->vk.alloc,
    };
-   device->kmod.dev =
-      pan_kmod_dev_create(os_dupfd_cloexec(physical_device->kmod.dev->fd),
-                          PAN_KMOD_DEV_FLAG_OWNS_FD, &device->kmod.allocator);
+   device->kmod.dev = pan_kmod_dev_create(
+      os_dupfd_cloexec(physical_device->kmod.dev->fd),
+      physical_device->kmod.dev->flags, &device->kmod.allocator);
 
    if (!device->kmod.dev) {
       result = panvk_errorf(instance, VK_ERROR_OUT_OF_HOST_MEMORY,
@@ -480,12 +482,15 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
 #endif
 
    result = panvk_priv_bo_create(
-      device, pan_sample_positions_buffer_size(), 0,
+      device, pan_sample_positions_buffer_size(),
+      panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       VK_SYSTEM_ALLOCATION_SCOPE_DEVICE, &device->sample_positions);
    if (result != VK_SUCCESS)
       goto err_free_priv_bos;
 
    pan_upload_sample_positions(device->sample_positions->addr.host);
+   panvk_priv_bo_flush(device->sample_positions, 0,
+                       pan_sample_positions_buffer_size());
 
 #if PAN_ARCH >= 10
    result = panvk_per_arch(init_tiler_oom)(device);
@@ -493,7 +498,7 @@ panvk_per_arch(create_device)(struct panvk_physical_device *physical_device,
       goto err_free_priv_bos;
 #endif
 
-   result = panvk_priv_bo_create(device, LIBPAN_PRINTF_BUFFER_SIZE, 0,
+   result = panvk_priv_bo_create(device, PAN_PRINTF_BUFFER_SIZE, 0,
                                  VK_SYSTEM_ALLOCATION_SCOPE_DEVICE,
                                  &device->printf.bo);
    if (result != VK_SUCCESS)
@@ -607,6 +612,9 @@ err_free_priv_bos:
    simple_mtx_destroy(&device->as.lock);
 
 err_destroy_kdev:
+   if (device->debug.decode_ctx)
+      pandecode_destroy_context(device->debug.decode_ctx);
+
    pan_kmod_dev_destroy(device->kmod.dev);
 
 err_finish_dev:

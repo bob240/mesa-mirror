@@ -116,13 +116,9 @@
 
 struct v3dv_instance;
 struct v3dv_image;
+struct v3dv_format_plane;
+struct v3dv_format;
 struct v3d_simulator_file;
-
-/* Minimum required by the Vulkan 1.1 spec */
-#define MAX_MEMORY_ALLOCATION_SIZE (1ull << 30)
-
-/* Maximum performance counters number */
-#define V3D_MAX_PERFCNT 93
 
 struct v3dv_physical_device {
    struct vk_physical_device vk;
@@ -145,7 +141,7 @@ struct v3dv_physical_device {
    dev_t primary_devid;
    dev_t render_devid;
 
-   uint8_t driver_build_sha1[20];
+   uint8_t driver_build_sha1[SHA1_DIGEST_LENGTH];
    uint8_t pipeline_cache_uuid[VK_UUID_SIZE];
    uint8_t device_uuid[VK_UUID_SIZE];
    uint8_t driver_uuid[VK_UUID_SIZE];
@@ -229,6 +225,9 @@ bool v3dv_meta_can_use_tlb(struct v3dv_image *image,
 
 struct v3dv_instance {
    struct vk_instance vk;
+
+   struct driOptionCache dri_options;
+   struct driOptionCache available_dri_options;
 
    bool pipeline_cache_enabled;
    bool default_pipeline_cache_enabled;
@@ -616,41 +615,6 @@ struct v3dv_device_memory {
 
 #define V3D_OUTPUT_IMAGE_FORMAT_NO 255
 #define TEXTURE_DATA_FORMAT_NO     255
-
-#define V3DV_MAX_PLANE_COUNT 3
-struct v3dv_format_plane {
-   /* One of V3D42_OUTPUT_IMAGE_FORMAT_*, or OUTPUT_IMAGE_FORMAT_NO */
-   uint8_t rt_type;
-
-   /* One of V3D42_TEXTURE_DATA_FORMAT_*. */
-   uint8_t tex_type;
-
-   /* Swizzle to apply to the RGBA shader output for storing to the tile
-    * buffer, to the RGBA tile buffer to produce shader input (for
-    * blending), and for turning the rgba8888 texture sampler return
-    * value into shader rgba values.
-    */
-   uint8_t swizzle[4];
-
-   /* Whether the return value is 16F/I/UI or 32F/I/UI. */
-   uint8_t return_size;
-
-   /* Needs software unorm packing */
-   bool unorm;
-
-   /* Needs software snorm packing */
-   bool snorm;
-};
-
-struct v3dv_format {
-   /* Non 0 plane count implies supported */
-   uint8_t plane_count;
-
-   struct v3dv_format_plane planes[V3DV_MAX_PLANE_COUNT];
-
-   /* If the format supports (linear) filtering when texturing. */
-   bool supports_filtering;
-};
 
 /* Note that although VkImageAspectFlags would allow to combine more than one
  * PLANE bit, for all the use cases we implement that use VkImageAspectFlags,
@@ -1160,10 +1124,6 @@ struct v3dv_timestamp_query_cpu_job_info {
    /* This is one unless multiview is used */
    uint32_t count;
 };
-
-/* Number of perfmons required to handle all supported performance counters */
-#define V3DV_MAX_PERFMONS DIV_ROUND_UP(V3D_MAX_PERFCNT, \
-                                       DRM_V3D_MAX_PERF_COUNTERS)
 
 struct v3dv_perf_query {
    uint32_t kperfmon_ids[V3DV_MAX_PERFMONS];
@@ -1958,7 +1918,7 @@ struct v3dv_pipeline_stage {
    nir_shader *nir;
 
    /* The following is the combined hash of module+entrypoint+spec_info+nir */
-   unsigned char shader_sha1[20];
+   unsigned char shader_sha1[SHA1_DIGEST_LENGTH];
 
    /** A name for this program, so you can track it in shader-db output. */
    uint32_t program_id;
@@ -2135,7 +2095,7 @@ struct v3dv_pipeline_layout {
     */
    uint32_t ref_cnt;
 
-   unsigned char sha1[20];
+   unsigned char sha1[SHA1_DIGEST_LENGTH];
 };
 
 void
@@ -2231,7 +2191,7 @@ struct v3dv_descriptor_maps {
 struct v3dv_pipeline_shared_data {
    uint32_t ref_cnt;
 
-   unsigned char sha1_key[20];
+   unsigned char sha1_key[SHA1_DIGEST_LENGTH];
 
    struct v3dv_descriptor_maps *maps[BROADCOM_SHADER_STAGES];
    struct v3dv_shader_variant *variants[BROADCOM_SHADER_STAGES];
@@ -2317,7 +2277,7 @@ struct v3dv_pipeline {
    struct v3dv_pipeline_shared_data *shared_data;
 
    /* It is the combined stages sha1, layout sha1, plus the pipeline key sha1. */
-   unsigned char sha1[20];
+   unsigned char sha1[SHA1_DIGEST_LENGTH];
 
    /* In general we can reuse v3dv_device->default_attribute_float, so note
     * that the following can be NULL. In 7.x this is not used, so it will be
@@ -2519,16 +2479,16 @@ void v3dv_pipeline_cache_finish(struct v3dv_pipeline_cache *cache);
 void v3dv_pipeline_cache_upload_nir(struct v3dv_pipeline *pipeline,
                                     struct v3dv_pipeline_cache *cache,
                                     nir_shader *nir,
-                                    unsigned char sha1_key[20]);
+                                    unsigned char sha1_key[SHA1_DIGEST_LENGTH]);
 
 nir_shader* v3dv_pipeline_cache_search_for_nir(struct v3dv_pipeline *pipeline,
                                                struct v3dv_pipeline_cache *cache,
                                                const nir_shader_compiler_options *nir_options,
-                                               unsigned char sha1_key[20]);
+                                               unsigned char sha1_key[SHA1_DIGEST_LENGTH]);
 
 struct v3dv_pipeline_shared_data *
 v3dv_pipeline_cache_search_for_pipeline(struct v3dv_pipeline_cache *cache,
-                                        unsigned char sha1_key[20],
+                                        unsigned char sha1_key[SHA1_DIGEST_LENGTH],
                                         bool *cache_hit);
 
 void

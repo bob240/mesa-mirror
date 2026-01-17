@@ -12,6 +12,7 @@
 #include "nir_builder.h"
 
 #include "pan_shader.h"
+#include "pan_nir.h"
 
 struct panvk_fb_preload_shader_key {
    enum panvk_meta_object_key_type type;
@@ -22,6 +23,10 @@ struct panvk_fb_preload_shader_key {
    struct {
       nir_alu_type type;
    } color[8];
+   struct {
+      bool color[8];
+      bool z, s;
+   } read_sample_0;
 };
 
 static nir_def *
@@ -71,7 +76,7 @@ static nir_shader *
 get_preload_nir_shader(const struct panvk_fb_preload_shader_key *key)
 {
    nir_builder builder = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, pan_shader_get_compiler_options(PAN_ARCH),
+      MESA_SHADER_FRAGMENT, pan_get_nir_shader_compiler_options(PAN_ARCH),
       "panvk-meta-preload");
    nir_builder *b = &builder;
    nir_def *sample_id =
@@ -92,8 +97,9 @@ get_preload_nir_shader(const struct panvk_fb_preload_shader_key *key)
          if (key->color[i].type == nir_type_invalid)
             continue;
 
-         nir_def *texel = texel_fetch(b, key->view_type, key->color[i].type, i,
-                                      sample_id, coords);
+         nir_def *texel =
+            texel_fetch(b, key->view_type, key->color[i].type, i,
+                        key->read_sample_0.color[i] ? NULL : sample_id, coords);
 
          nir_store_output(
             b, texel, nir_imm_int(b, 0), .base = i,
@@ -105,8 +111,9 @@ get_preload_nir_shader(const struct panvk_fb_preload_shader_key *key)
    }
 
    if (key->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
-      nir_def *texel = texel_fetch(b, key->view_type, nir_type_float32, 0,
-                                   sample_id, coords);
+      nir_def *texel =
+         texel_fetch(b, key->view_type, nir_type_float32, 0,
+                     key->read_sample_0.z ? NULL : sample_id, coords);
 
       nir_store_output(b, nir_channel(b, texel, 0), nir_imm_int(b, 0),
                        .base = 0, .src_type = nir_type_float32,
@@ -116,9 +123,10 @@ get_preload_nir_shader(const struct panvk_fb_preload_shader_key *key)
    }
 
    if (key->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
-      nir_def *texel = texel_fetch(
-         b, key->view_type, nir_type_uint32,
-         key->aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? 1 : 0, sample_id, coords);
+      nir_def *texel =
+         texel_fetch(b, key->view_type, nir_type_uint32,
+                     key->aspects & VK_IMAGE_ASPECT_DEPTH_BIT ? 1 : 0,
+                     key->read_sample_0.s ? NULL : sample_id, coords);
 
       nir_store_output(b, nir_channel(b, texel, 0), nir_imm_int(b, 0),
                        .base = 0, .src_type = nir_type_uint32,
@@ -148,15 +156,15 @@ get_preload_shader(struct panvk_device *dev,
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    struct pan_compile_inputs inputs = {
-      .gpu_id = phys_dev->kmod.props.gpu_id,
-      .gpu_variant = phys_dev->kmod.props.gpu_variant,
+      .gpu_id = phys_dev->kmod.dev->props.gpu_id,
+      .gpu_variant = phys_dev->kmod.dev->props.gpu_variant,
       .is_blit = true,
    };
 
-   pan_shader_preprocess(nir, inputs.gpu_id);
-   pan_shader_lower_texture_early(nir, inputs.gpu_id);
-   pan_shader_postprocess(nir, inputs.gpu_id);
-   pan_shader_lower_texture_late(nir, inputs.gpu_id);
+   pan_preprocess_nir(nir, inputs.gpu_id);
+   pan_nir_lower_texture_early(nir, inputs.gpu_id);
+   pan_postprocess_nir(nir, inputs.gpu_id);
+   pan_nir_lower_texture_late(nir, inputs.gpu_id);
 
    VkResult result = panvk_per_arch(create_internal_shader)(
       dev, nir, &inputs, &shader);
@@ -167,13 +175,12 @@ get_preload_shader(struct panvk_device *dev,
 
 #if PAN_ARCH >= 9
    shader->spd = panvk_pool_alloc_desc(&dev->mempools.rw, SHADER_PROGRAM);
-   if (!panvk_priv_mem_host_addr(shader->spd)) {
+   if (!panvk_priv_mem_check_alloc(shader->spd)) {
       vk_shader_destroy(&dev->vk, &shader->vk, NULL);
       return panvk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
    }
 
-   pan_cast_and_pack(panvk_priv_mem_host_addr(shader->spd), SHADER_PROGRAM,
-                     cfg) {
+   panvk_priv_mem_write_desc(shader->spd, 0, SHADER_PROGRAM, cfg) {
       cfg.stage = MALI_SHADER_STAGE_FRAGMENT;
       cfg.fragment_coverage_bitmask_type = MALI_COVERAGE_BITMASK_TYPE_GL;
       cfg.register_allocation = MALI_SHADER_REGISTER_ALLOCATION_32_PER_THREAD;
@@ -224,6 +231,30 @@ get_reg_fmt(nir_alu_type type)
    }
 }
 
+static struct panvk_image_view *
+get_color_attachment_view(struct panvk_cmd_buffer *cmdbuf, uint32_t i)
+{
+   return cmdbuf->state.gfx.render.color_attachments.preload_iviews[i] != NULL
+             ? cmdbuf->state.gfx.render.color_attachments.preload_iviews[i]
+             : cmdbuf->state.gfx.render.color_attachments.iviews[i];
+}
+
+static struct panvk_image_view *
+get_z_attachment_view(struct panvk_cmd_buffer *cmdbuf)
+{
+   return cmdbuf->state.gfx.render.z_attachment.preload_iview
+             ? cmdbuf->state.gfx.render.z_attachment.preload_iview
+             : cmdbuf->state.gfx.render.z_attachment.iview;
+}
+
+static struct panvk_image_view *
+get_s_attachment_view(struct panvk_cmd_buffer *cmdbuf)
+{
+   return cmdbuf->state.gfx.render.s_attachment.preload_iview
+             ? cmdbuf->state.gfx.render.s_attachment.preload_iview
+             : cmdbuf->state.gfx.render.s_attachment.iview;
+}
+
 static void
 fill_textures(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
               const struct panvk_fb_preload_shader_key *key,
@@ -231,8 +262,7 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
 {
    if (key->aspects == VK_IMAGE_ASPECT_COLOR_BIT) {
       for (unsigned i = 0; i < fbinfo->rt_count; i++) {
-         struct panvk_image_view *iview =
-            cmdbuf->state.gfx.render.color_attachments.iviews[i];
+         struct panvk_image_view *iview = get_color_attachment_view(cmdbuf, i);
 
          if (iview)
             textures[i] = iview->descs.tex[0];
@@ -244,9 +274,11 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
 
    uint32_t idx = 0;
    if (key->aspects & VK_IMAGE_ASPECT_DEPTH_BIT) {
-      struct panvk_image_view *iview =
-         cmdbuf->state.gfx.render.z_attachment.iview
-            ?: cmdbuf->state.gfx.render.s_attachment.iview;
+      struct panvk_image_view *iview = NULL;
+      if (cmdbuf->state.gfx.render.z_attachment.iview)
+         iview = get_z_attachment_view(cmdbuf);
+      else
+         iview = get_s_attachment_view(cmdbuf);
 
       textures[idx++] = vk_format_has_depth(iview->vk.view_format)
                            ? iview->descs.zs.tex
@@ -254,9 +286,11 @@ fill_textures(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
    }
 
    if (key->aspects & VK_IMAGE_ASPECT_STENCIL_BIT) {
-      struct panvk_image_view *iview =
-         cmdbuf->state.gfx.render.s_attachment.iview
-            ?: cmdbuf->state.gfx.render.z_attachment.iview;
+      struct panvk_image_view *iview = NULL;
+      if (cmdbuf->state.gfx.render.s_attachment.iview)
+         iview = get_s_attachment_view(cmdbuf);
+      else
+         iview = get_z_attachment_view(cmdbuf);
 
       textures[idx++] = vk_format_has_depth(iview->vk.view_format)
                            ? iview->descs.zs.other_aspect_tex
@@ -511,7 +545,7 @@ cmd_emit_dcd(struct panvk_cmd_buffer *cmdbuf, struct pan_fb_info *fbinfo,
        */
       struct panvk_physical_device *pdev =
          to_panvk_physical_device(dev->vk.physical);
-      unsigned gpu_prod_id = pdev->kmod.props.gpu_id >> 16;
+      unsigned gpu_prod_id = pdev->kmod.dev->props.gpu_id >> 16;
 
       /* the PAN_ARCH check is redundant but allows compiler optimization
          when PAN_ARCH <= 6 */
@@ -717,18 +751,23 @@ cmd_preload_zs_attachments(struct panvk_cmd_buffer *cmdbuf,
    };
 
    if (fbinfo->zs.preload.z) {
+      struct panvk_image_view *iview = get_z_attachment_view(cmdbuf)
+                                          ? get_z_attachment_view(cmdbuf)
+                                          : get_s_attachment_view(cmdbuf);
+
       key.aspects = VK_IMAGE_ASPECT_DEPTH_BIT;
-      key.view_type =
-         cmdbuf->state.gfx.render.z_attachment.iview
-            ? cmdbuf->state.gfx.render.z_attachment.iview->vk.view_type
-            : cmdbuf->state.gfx.render.s_attachment.iview->vk.view_type;
+      key.view_type = iview->vk.view_type;
+      key.read_sample_0.z = iview->pview.nr_samples == 1 && key.samples > 1;
    }
 
    if (fbinfo->zs.preload.s) {
-      VkImageViewType view_type =
-         cmdbuf->state.gfx.render.s_attachment.iview
-            ? cmdbuf->state.gfx.render.s_attachment.iview->vk.view_type
-            : cmdbuf->state.gfx.render.z_attachment.iview->vk.view_type;
+      struct panvk_image_view *iview = get_s_attachment_view(cmdbuf)
+                                          ? get_s_attachment_view(cmdbuf)
+                                          : get_z_attachment_view(cmdbuf);
+
+      key.read_sample_0.s = iview->pview.nr_samples == 1 && key.samples > 1;
+
+      VkImageViewType view_type = iview->vk.view_type;
 
       key.aspects |= VK_IMAGE_ASPECT_STENCIL_BIT;
       if (!fbinfo->zs.preload.z)
@@ -757,9 +796,10 @@ cmd_preload_color_attachments(struct panvk_cmd_buffer *cmdbuf,
          continue;
 
       enum pipe_format pfmt = fbinfo->rts[i].view->format;
-      struct panvk_image_view *iview =
-         cmdbuf->state.gfx.render.color_attachments.iviews[i];
+      struct panvk_image_view *iview = get_color_attachment_view(cmdbuf, i);
 
+      key.read_sample_0.color[i] =
+         iview->pview.nr_samples == 1 && key.samples > 1;
       key.color[i].type = util_format_is_pure_uint(pfmt)   ? nir_type_uint32
                           : util_format_is_pure_sint(pfmt) ? nir_type_int32
                                                            : nir_type_float32;

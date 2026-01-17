@@ -64,11 +64,11 @@ emit_tls(struct panvk_cmd_buffer *cmdbuf)
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
    unsigned core_id_range;
-   pan_query_core_count(&phys_dev->kmod.props, &core_id_range);
+   pan_query_core_count(&phys_dev->kmod.dev->props, &core_id_range);
 
    if (cmdbuf->state.tls.info.tls.size) {
       unsigned thread_tls_alloc =
-         pan_query_thread_tls_alloc(&phys_dev->kmod.props);
+         pan_query_thread_tls_alloc(&phys_dev->kmod.dev->props);
       unsigned size = pan_get_total_stack_size(cmdbuf->state.tls.info.tls.size,
                                                thread_tls_alloc, core_id_range);
 
@@ -187,7 +187,7 @@ finish_cs(struct panvk_cmd_buffer *cmdbuf, uint32_t subqueue)
    panvk_per_arch(panvk_instr_end_work)(
       subqueue, cmdbuf, PANVK_INSTR_WORK_TYPE_CMDBUF, &instr_info_cmdbuf);
 
-   cs_finish(&cmdbuf->state.cs[subqueue].builder);
+   cs_end(&cmdbuf->state.cs[subqueue].builder);
 }
 
 static void
@@ -266,6 +266,9 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
          finish_cs(cmdbuf, i);
       }
    }
+
+   panvk_pool_flush_maps(&cmdbuf->cs_pool);
+   panvk_pool_flush_maps(&cmdbuf->desc_pool);
 
    return vk_command_buffer_end(&cmdbuf->vk);
 }
@@ -383,39 +386,6 @@ add_memory_dependency(struct panvk_cache_flush_info *cache_flush,
    }
 }
 
-static bool
-should_split_render_pass(const uint32_t wait_masks[static PANVK_SUBQUEUE_COUNT],
-                         VkAccessFlags2 src_access, VkAccessFlags2 dst_access)
-{
-   /* From the Vulkan 1.3.301 spec:
-    *
-    *    VUID-vkCmdPipelineBarrier-None-07892
-    *
-    *    "If vkCmdPipelineBarrier is called within a render pass instance, the
-    *    source and destination stage masks of any memory barriers must only
-    *    include graphics pipeline stages"
-    *
-    * We only consider the tiler and the fragment subqueues here.
-    */
-
-   /* split if the tiler subqueue waits for the fragment subqueue */
-   if (wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &
-       BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT))
-      return true;
-
-   /* split if the fragment subqueue self-waits with a feedback loop, because
-    * we lower subpassLoad to texelFetch
-    */
-   if ((wait_masks[PANVK_SUBQUEUE_FRAGMENT] &
-        BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT)) &&
-       (src_access & (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                      VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)) &&
-       (dst_access & VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT))
-      return true;
-
-   return false;
-}
-
 static void
 collect_cache_flush_info(enum panvk_subqueue_id subqueue,
                          struct panvk_cache_flush_info *cache_flush,
@@ -431,32 +401,41 @@ collect_cache_flush_info(enum panvk_subqueue_id subqueue,
 }
 
 static void
-collect_cs_deps(struct panvk_cmd_buffer *cmdbuf,
+collect_cs_deps(struct panvk_cmd_buffer *cmdbuf, const VkDependencyInfo *info,
                 struct panvk_sync_scope src, struct panvk_sync_scope dst,
                 struct panvk_cs_deps *deps)
 {
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-
    uint32_t wait_masks[PANVK_SUBQUEUE_COUNT] = {0};
    add_execution_dependency(wait_masks, src.stages, dst.stages);
 
-   /* within a render pass */
    if (cmdbuf->state.gfx.render.tiler || inherits_render_ctx(cmdbuf)) {
-      if (should_split_render_pass(wait_masks, src.access, dst.access)) {
-         deps->needs_draw_flush = true;
-      } else {
-         /* skip the tiler subqueue self-wait because we use the same
-          * scoreboard slot for the idvs jobs
+      if (info->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT) {
+         /* Instead of doing an actual fragment job dependency, use a FB
+          * barrier instead.
           */
-         wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &=
-            ~BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
-
-         /* skip the fragment subqueue self-wait because we emit the fragment
-          * job at the end of the render pass and there is nothing to wait yet
-          */
+         deps->needs_fb_barrier = true;
          wait_masks[PANVK_SUBQUEUE_FRAGMENT] &=
             ~BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT);
       }
+
+      /* From the Vulkan 1.4.335 spec:
+       *
+       *    VUID-vkCmdPipelineBarrier-dependencyFlags-07891
+       *
+       *    "If vkCmdPipelineBarrier is called within a render pass
+       *    instance, and the source stage masks of any memory barriers
+       *    include framebuffer-space stages, then dependencyFlags must
+       *    include VK_DEPENDENCY_BY_REGION_BIT"
+       */
+      for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++)
+         assert(!(wait_masks[i] & BITFIELD_BIT(PANVK_SUBQUEUE_FRAGMENT)));
+
+      /* skip the tiler subqueue self-wait because we use the same
+       * scoreboard slot for the idvs jobs
+       */
+      wait_masks[PANVK_SUBQUEUE_VERTEX_TILER] &=
+         ~BITFIELD_BIT(PANVK_SUBQUEUE_VERTEX_TILER);
    }
 
    for (uint32_t i = 0; i < PANVK_SUBQUEUE_COUNT; i++) {
@@ -578,7 +557,7 @@ panvk_per_arch(add_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
                            VK_QUEUE_FAMILY_IGNORED,
                            barrier_stage);
 
-      collect_cs_deps(cmdbuf, src, dst, out);
+      collect_cs_deps(cmdbuf, in, src, dst, out);
    }
 
    for (uint32_t i = 0; i < in->bufferMemoryBarrierCount; i++) {
@@ -590,7 +569,7 @@ panvk_per_arch(add_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
                            barrier->dstQueueFamilyIndex,
                            barrier_stage);
 
-      collect_cs_deps(cmdbuf, src, dst, out);
+      collect_cs_deps(cmdbuf, in, src, dst, out);
    }
 
    for (uint32_t i = 0; i < in->imageMemoryBarrierCount; i++) {
@@ -605,7 +584,7 @@ panvk_per_arch(add_cs_deps)(struct panvk_cmd_buffer *cmdbuf,
                            barrier->dstQueueFamilyIndex,
                            barrier_stage);
 
-      collect_cs_deps(cmdbuf, src, dst, out);
+      collect_cs_deps(cmdbuf, in, src, dst, out);
 
       if (barrier_stage == PANVK_BARRIER_STAGE_FIRST && transition.stages)
          out->needs_layout_transitions = true;
@@ -733,19 +712,12 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
                                     const VkDependencyInfo *pDependencyInfo)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-
-   /* Intra render pass barriers can be skipped iff we're inside a render
-    * pass. */
-   if ((cmdbuf->state.gfx.render.tiler || inherits_render_ctx(cmdbuf)) &&
-       (pDependencyInfo->dependencyFlags & VK_DEPENDENCY_BY_REGION_BIT))
-      return;
-
    struct panvk_cs_deps deps = {0};
 
    panvk_per_arch(add_cs_deps)(cmdbuf, PANVK_BARRIER_STAGE_FIRST, pDependencyInfo, &deps, false);
 
-   if (deps.needs_draw_flush)
-      panvk_per_arch(cmd_flush_draws)(cmdbuf);
+   if (deps.needs_fb_barrier)
+      panvk_per_arch(cmd_fb_barrier)(cmdbuf);
 
    panvk_per_arch(emit_barrier)(cmdbuf, deps);
 
@@ -762,62 +734,11 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
          cmdbuf, PANVK_BARRIER_STAGE_AFTER_LAYOUT_TRANSITION,
          pDependencyInfo, &trans_deps, false);
 
-      assert(!trans_deps.needs_draw_flush);
+      assert(!trans_deps.needs_fb_barrier);
 
       panvk_per_arch(emit_barrier)(cmdbuf, trans_deps);
    }
 }
-
-#if PAN_ARCH >= 11
-void
-panvk_per_arch(cs_next_iter_sb)(struct panvk_cmd_buffer *cmdbuf,
-                                enum panvk_subqueue_id subqueue,
-                                struct cs_index scratch_regs)
-{
-   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
-   struct cs_index iter_sb = cs_extract32(b, scratch_regs, 0);
-   struct cs_index sb_wait_mask = cs_extract32(b, scratch_regs, 1);
-
-   /* Wait for scoreboard to be available and select the next scoreboard entry */
-   cs_next_sb_entry(b, iter_sb, MALI_CS_SCOREBOARD_TYPE_ENDPOINT,
-                    MALI_CS_NEXT_SB_ENTRY_FORMAT_INDEX);
-
-   /* Setup indirect scoreboard wait mask now for indirect defer */
-   cs_move32_to(b, sb_wait_mask, 0);
-   cs_bit_set32(b, sb_wait_mask, sb_wait_mask, iter_sb);
-   cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_WAIT, sb_wait_mask);
-}
-#else
-void
-panvk_per_arch(cs_next_iter_sb)(struct panvk_cmd_buffer *cmdbuf,
-                                enum panvk_subqueue_id subqueue,
-                                struct cs_index scratch_regs)
-{
-   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
-   struct cs_index iter_sb = cs_extract32(b, scratch_regs, 0);
-   struct cs_index cmp_scratch = cs_extract32(b, scratch_regs, 1);
-
-   cs_load32_to(b, iter_sb, cs_subqueue_ctx_reg(b),
-                offsetof(struct panvk_cs_subqueue_context, iter_sb));
-
-   /* Select next scoreboard entry and wrap around if we get past the limit */
-   cs_add32(b, iter_sb, iter_sb, 1);
-   cs_add32(b, cmp_scratch, iter_sb, -SB_ITER(dev->csf.sb.iter_count));
-   cs_if(b, MALI_CS_CONDITION_GEQUAL, cmp_scratch) {
-      cs_move32_to(b, iter_sb, SB_ITER(0));
-   }
-
-   cs_match_iter_sb(b, x, iter_sb, cmp_scratch) {
-      cs_wait_slot(b, SB_ITER(x));
-      cs_select_sb_entries_for_async_ops(b, SB_ITER(x));
-   }
-
-   cs_store32(b, iter_sb, cs_subqueue_ctx_reg(b),
-              offsetof(struct panvk_cs_subqueue_context, iter_sb));
-   cs_flush_stores(b);
-}
-#endif
 
 static struct cs_buffer
 alloc_cs_buffer(void *cookie)
@@ -853,6 +774,8 @@ cs_reg_perm(struct cs_builder *b, unsigned reg)
 static void
 init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
 {
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(cmdbuf->vk.base.device->physical);
    struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
    const reg_perm_cb_t base_reg_perms[PANVK_SUBQUEUE_COUNT] = {
       [PANVK_SUBQUEUE_VERTEX_TILER] = panvk_cs_vt_reg_perm,
@@ -871,6 +794,8 @@ init_cs_builders(struct panvk_cmd_buffer *cmdbuf)
       struct cs_builder_conf conf = {
          .nr_registers = csif_info->cs_reg_count,
          .nr_kernel_registers = MAX2(csif_info->unpreserved_cs_reg_count, 4),
+         .compute_ep_limit =
+            PAN_ARCH >= 12 ? phys_dev->kmod.dev->props.max_tasks_per_core : 0,
          .alloc_buffer = alloc_cs_buffer,
          .cookie = cmdbuf,
          .ls_sb_slot = SB_ID(LS),
@@ -919,6 +844,9 @@ panvk_reset_cmdbuf(struct vk_command_buffer *vk_cmdbuf,
       u_trace_init(ut, &dev->utrace.utctx);
    }
 
+   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)
+      cs_builder_fini(&cmdbuf->state.cs[i].builder);
+
    memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
    init_cs_builders(cmdbuf);
 }
@@ -934,6 +862,9 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
 
    for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->utrace.uts); i++)
       u_trace_fini(&cmdbuf->utrace.uts[i]);
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(cmdbuf->state.cs); i++)
+      cs_builder_fini(&cmdbuf->state.cs[i].builder);
 
    panvk_pool_cleanup(&cmdbuf->cs_pool);
    panvk_pool_cleanup(&cmdbuf->desc_pool);
@@ -971,7 +902,8 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
       &cmdbuf->state.gfx.dynamic.sl;
 
    struct panvk_pool_properties cs_pool_props = {
-      .create_flags = 0,
+      .create_flags =
+         panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 64 * 1024,
       .label = "Command buffer CS pool",
       .prealloc = false,
@@ -981,7 +913,8 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
    panvk_pool_init(&cmdbuf->cs_pool, device, &pool->cs_bo_pool, NULL, &cs_pool_props);
 
    struct panvk_pool_properties desc_pool_props = {
-      .create_flags = 0,
+      .create_flags =
+         panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 64 * 1024,
       .label = "Command buffer descriptor pool",
       .prealloc = false,

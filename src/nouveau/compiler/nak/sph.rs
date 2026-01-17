@@ -4,7 +4,9 @@
 extern crate bitview;
 extern crate nvidia_headers;
 
-use crate::ir::{ShaderInfo, ShaderIoInfo, ShaderModel, ShaderStageInfo};
+use crate::ir::{
+    ShaderInfo, ShaderIoInfo, ShaderModel, ShaderModelInfo, ShaderStageInfo,
+};
 use bitview::{
     BitMutView, BitMutViewable, BitView, BitViewable, SetBit, SetField,
 };
@@ -301,7 +303,6 @@ impl ShaderProgramHeader {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn set_shader_local_memory_crs_size(
         &mut self,
         shader_local_memory_crs_size: u32,
@@ -440,7 +441,6 @@ impl ShaderProgramHeader {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn set_uses_underestimate(&mut self, uses_underestimate: bool) {
         assert!(self.shader_type == ShaderType::Fragment);
         self.set_bit(611, uses_underestimate);
@@ -464,7 +464,7 @@ impl ShaderProgramHeader {
 }
 
 pub fn encode_header(
-    sm: &dyn ShaderModel,
+    sm: &ShaderModelInfo,
     shader_info: &ShaderInfo,
     fs_key: Option<&nak_fs_key>,
 ) -> [u32; CURRENT_MAX_SHADER_HEADER_SIZE] {

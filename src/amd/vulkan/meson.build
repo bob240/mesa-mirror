@@ -71,6 +71,7 @@ libradv_files = files(
   'nir/radv_nir_apply_pipeline_layout.c',
   'nir/radv_nir_export_multiview.c',
   'nir/radv_nir_lower_abi.c',
+  'nir/radv_nir_lower_call_abi.c',
   'nir/radv_nir_lower_cooperative_matrix.c',
   'nir/radv_nir_lower_fs_barycentric.c',
   'nir/radv_nir_lower_fs_intrinsics.c',
@@ -88,7 +89,12 @@ libradv_files = files(
   'nir/radv_nir_opt_tid_function.c',
   'nir/radv_nir_remap_color_attachment.c',
   'nir/radv_nir_rt_common.c',
-  'nir/radv_nir_rt_shader.c',
+  'nir/radv_nir_rt_stage_common.c',
+  'nir/radv_nir_rt_stage_cps.c',
+  'nir/radv_nir_rt_stage_functions.c',
+  'nir/radv_nir_rt_stage_monolithic.c',
+  'nir/radv_nir_rt_traversal_shader.c',
+  'nir/radv_nir_trim_fs_color_exports.c',
   'radv_acceleration_structure.c',
   'radv_android.c',
   'radv_android.h',
@@ -319,8 +325,6 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
-# Deprecated: replaced by VK_DRIVER_FILES above
-devenv.append('VK_ICD_FILENAMES', _dev_icd.full_path())
 
 if with_radv_tests
   test(

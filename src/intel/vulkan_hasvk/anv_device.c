@@ -244,6 +244,7 @@ get_device_extensions(const struct anv_physical_device *device,
 #endif
       .KHR_push_descriptor                   = true,
       .KHR_relaxed_block_layout              = true,
+      .KHR_robustness2                       = true,
       .KHR_sampler_mirror_clamp_to_edge      = true,
       .KHR_sampler_ycbcr_conversion          = true,
       .KHR_separate_depth_stencil_layouts    = true,
@@ -570,7 +571,7 @@ get_features(const struct anv_physical_device *pdevice,
       .provokingVertexLast = true,
       .transformFeedbackPreservesProvokingVertex = true,
 
-      /* VK_EXT_robustness2 */
+      /* VK_KHR_robustness2 */
       .robustBufferAccess2 = true,
       .robustImageAccess2 = true,
       .nullDescriptor = true,
@@ -948,6 +949,10 @@ get_properties(const struct anv_physical_device *pdevice,
 {
    const struct intel_device_info *devinfo = &pdevice->info;
 
+   uint64_t page_size;
+   if (!os_get_page_size(&page_size))
+      page_size = 4096;         /* fallback */
+
    const uint32_t max_ssbos = pdevice->has_a64_buffer_access ? UINT16_MAX : 64;
    const uint32_t max_textures = 128;
    const uint32_t max_samplers =
@@ -1063,7 +1068,7 @@ get_properties(const struct anv_physical_device *pdevice,
       .maxViewportDimensions                    = { (1 << 14), (1 << 14) },
       .viewportBoundsRange                      = { INT16_MIN, INT16_MAX },
       .viewportSubPixelBits                     = 13, /* We take a float? */
-      .minMemoryMapAlignment                    = 4096, /* A page */
+      .minMemoryMapAlignment                    = page_size,
       /* The dataport requires texel alignment so we need to assume a worst
        * case of R32G32B32A32 which is 16 bytes.
        */
@@ -1155,7 +1160,7 @@ get_properties(const struct anv_physical_device *pdevice,
    /* VK_EXT_external_memory_host */
    {
       /* Userptr needs page aligned memory. */
-      props->minImportedHostPointerAlignment = 4096;
+      props->minImportedHostPointerAlignment = page_size;
    }
 
    /* VK_EXT_line_rasterization */
@@ -1203,7 +1208,7 @@ get_properties(const struct anv_physical_device *pdevice,
       props->transformFeedbackPreservesTriangleFanProvokingVertex = false;
    }
 
-   /* VK_EXT_robustness2 */
+   /* VK_KHR_robustness2 */
    {
       props->robustStorageBufferAccessSizeAlignment =
          ANV_SSBO_BOUNDS_CHECK_ALIGNMENT;
@@ -1400,15 +1405,15 @@ anv_physical_device_init_uuids(struct anv_physical_device *device)
    }
 
    unsigned build_id_len = build_id_length(note);
-   if (build_id_len < 20) {
+   if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
       return vk_errorf(device, VK_ERROR_INITIALIZATION_FAILED,
                        "build-id too short.  It needs to be a SHA");
    }
 
-   memcpy(device->driver_build_sha1, build_id_data(note), 20);
+   copy_build_id_to_sha1(device->driver_build_sha1, note);
 
    struct mesa_sha1 sha1_ctx;
-   uint8_t sha1[20];
+   uint8_t sha1[SHA1_DIGEST_LENGTH];
    STATIC_ASSERT(VK_UUID_SIZE <= sizeof(sha1));
 
    /* The pipeline cache UUID is used for determining when a pipeline cache is
@@ -1442,7 +1447,7 @@ anv_physical_device_init_disk_cache(struct anv_physical_device *device)
                                device->info.pci_device_id);
    assert(len == sizeof(renderer) - 2);
 
-   char timestamp[41];
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
    _mesa_sha1_format(timestamp, device->driver_build_sha1);
 
    const uint64_t driver_flags =

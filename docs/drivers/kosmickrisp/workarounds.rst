@@ -49,6 +49,55 @@ info on what was updated.
 Workarounds
 ===========
 
+KK_WORKAROUND_6
+---------------
+| macOS version: 26.0.1
+| Metal ticket: Not reported
+| Metal ticket status:
+| CTS test failure: ``dEQP-VK.spirv_assembly.instruction.*.float16.opcompositeinsert.*``
+| Comments:
+
+Metal does not respect its own Memory Coherency Model (MSL spec 4.8). From
+the spec:
+``By default, memory in the device address space has threadgroup coherence.``
+
+If we have a single thread compute dispatch so that we do (simplified version):
+
+.. code-block:: c
+
+   for (...) {
+      value = ssbo_data[0]; // ssbo_data is a device buffer
+      ...
+      ssbo_data[0] = new_value;
+   }
+
+``ssbo_data[0]`` will not correctly store/load the values so the value
+written in iteration 0, will not be available in iteration 1. The workaround
+to this issue is marking the device memory pointer through which the memory
+is accessed as coherent so that the value is stored and loaded correctly.
+Hopefully this does not affect performance much.
+
+| Log:
+| 2025-12-08: Workaround implemented and reported to Apple
+
+KK_WORKAROUND_5
+---------------
+| macOS version: 26.0.1
+| Metal ticket: Not reported
+| Metal ticket status:
+| CTS test failure: ``dEQP-VK.fragment_operations.early_fragment.discard_no_early_fragment_tests_depth``
+| Comments:
+
+Fragment shaders that have side effects (like writing to a buffer) will be
+prematurely discarded if there is a ``discard_fragment`` that will always
+execute. To work around this, we just make the discard "optional" by moving
+it inside a run time conditional that will always be true (such as is the
+fragment a helper?). This tricks the MSL compiler into not optimizing it into
+a premature discard.
+
+| Log:
+| 2025-12-01: Workaround implemented
+
 KK_WORKAROUND_4
 ---------------
 | macOS version: 26.0.1
@@ -98,8 +147,8 @@ The way to fix this is by changing the conditional to:
 KK_WORKAROUND_2
 ---------------
 | macOS version: 15.4.x
-| Metal ticket: Not reported
-| Metal ticket status:
+| Metal ticket: FB21065475 (@aitor)
+| Metal ticket status: Waiting resolution
 | CTS test crash: ``dEQP-VK.graphicsfuzz.cov-nested-loops-never-change-array-element-one`` and ``dEQP-VK.graphicsfuzz.disc-and-add-in-func-in-loop``
 | Comments:
 

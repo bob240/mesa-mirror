@@ -12,7 +12,6 @@ use std::cmp::max;
 use std::hash::Hash;
 use std::ops::Range;
 use std::slice;
-use std::{u16, u32, u8};
 
 #[derive(Clone)]
 enum RegUse<T: Clone> {
@@ -129,7 +128,7 @@ where
                 }
                 Entry::Occupied(mut occupied_entry) => {
                     let orig = occupied_entry.get_mut();
-                    *orig = merger(&orig, v);
+                    *orig = merger(orig, v);
                 }
             }
         }
@@ -542,7 +541,7 @@ impl TexQueueSimulationState {
 
         // Push registers (if we are a tex instruction)
         // We might need to insert a barrier if the queue is full
-        let push_level = if instr_needs_texbar(&instr) {
+        let push_level = if instr_needs_texbar(instr) {
             let dst = instr.dsts()[0].as_reg().unwrap();
             self.push(*dst)
         } else {
@@ -551,7 +550,7 @@ impl TexQueueSimulationState {
 
         // If the flush needs a barrier, the queue will not be full,
         // therefore the push will not need a barrier.
-        debug_assert!(!flush_level.is_some() || !push_level.is_some());
+        debug_assert!(flush_level.is_none() || push_level.is_none());
         flush_level.or(push_level)
     }
 }
@@ -597,7 +596,7 @@ fn instr_needs_texbar(instr: &Instr) -> bool {
 /// - Instead of pushing by 1 each element in the queue on a `push` op,
 ///   we could keep track of an in-flight range and use a wrapping timestamp
 ///   this improves performance but needs careful implementation to avoid bugs
-fn insert_texture_barriers(f: &mut Function, sm: &dyn ShaderModel) {
+fn insert_texture_barriers(f: &mut Function, sm: &ShaderModelInfo) {
     assert!(sm.is_kepler()); // Only kepler has texture barriers!
 
     let mut state_in: Vec<_> = (0..f.blocks.len())
@@ -615,7 +614,7 @@ fn insert_texture_barriers(f: &mut Function, sm: &dyn ShaderModel) {
 
             for instr in block.instrs.iter() {
                 // Ignore the barrier, we will recompute this later
-                let _bar = sim.visit_instr(&instr);
+                let _bar = sim.visit_instr(instr);
             }
 
             if *sim_out == sim {
@@ -643,7 +642,7 @@ fn insert_texture_barriers(f: &mut Function, sm: &dyn ShaderModel) {
     }
 }
 
-fn assign_barriers(f: &mut Function, sm: &dyn ShaderModel) {
+fn assign_barriers(f: &mut Function, sm: &ShaderModelInfo) {
     let mut uses = Box::new(RegTracker::new_with(&|| RegUse::None));
     let mut deps = DepGraph::new();
 
@@ -767,7 +766,7 @@ type AccumulatedDelay = u8;
 type DelayRegTracker = SparseRegTracker<RegUseMap<RegOrigin, AccumulatedDelay>>;
 
 struct BlockDelayScheduler<'a> {
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
     f: &'a Function,
     // Map from barrier to last waited cycle
     bars: [u32; 6],
@@ -802,7 +801,7 @@ impl BlockDelayScheduler<'_> {
             // current block is complete, so it is effectively executed at cycle
             // `0 - delay`, adding the latency we get `latency - delay`
             // Underflow means that the instruction is already done (delay > latency).
-            latency.checked_sub(delay.into()).unwrap_or(0)
+            latency.saturating_sub(delay.into())
         }
     }
 
@@ -897,10 +896,10 @@ impl BlockDelayScheduler<'_> {
                 src_dst_idx: u16::MAX,
             };
             reg_uses.for_each_pred(|c| {
-                c.add_read(read_origin.clone(), 0);
+                c.add_read(read_origin, 0);
             });
             reg_uses.for_each_carry(|c| {
-                c.add_read(read_origin.clone(), 0);
+                c.add_read(read_origin, 0);
             });
         }
 
@@ -915,7 +914,7 @@ impl BlockDelayScheduler<'_> {
     }
 }
 
-fn calc_delays(f: &mut Function, sm: &dyn ShaderModel) -> u64 {
+fn calc_delays(f: &mut Function, sm: &ShaderModelInfo) -> u64 {
     let mut instr_cycles: Vec<Vec<u32>> =
         f.blocks.iter().map(|b| vec![0; b.instrs.len()]).collect();
 
@@ -1011,7 +1010,7 @@ fn calc_delays(f: &mut Function, sm: &dyn ShaderModel) -> u64 {
         for (ip, i) in b.instrs.iter_mut().enumerate() {
             let delay = cycles[ip] - cycles.get(ip + 1).copied().unwrap_or(0);
             let delay: u8 = delay.try_into().expect("Delay overflow");
-            i.deps.delay = delay.max(MIN_INSTR_DELAY) as u8;
+            i.deps.delay = delay.max(MIN_INSTR_DELAY);
         }
     }
 
@@ -1174,7 +1173,7 @@ mod tests {
         assert_eq!(c_sim.push(reg_gpr(6..7)), None);
         // D: flushes the tex pushed by A
         let mut d_sim = b_sim;
-        d_sim.merge(&mut c_sim);
+        d_sim.merge(&c_sim);
         assert_eq!(c_sim.flush(reg_gpr(0..4)), Some(3));
         // the "shortest push path" would pass by B but in fact
         // by passing in B our texture is flushed off the queue.

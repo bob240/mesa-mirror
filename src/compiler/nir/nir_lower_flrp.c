@@ -344,8 +344,7 @@ convert_flrp_instruction(nir_builder *bld,
       UNREACHABLE("invalid bit_size");
 
    bld->cursor = nir_before_instr(&alu->instr);
-   bld->exact = alu->exact;
-   bld->fp_fast_math = alu->fp_fast_math;
+   bld->fp_math_ctrl = alu->fp_math_ctrl;
 
    /* There are two methods to implement flrp(x, y, t).  The strictly correct
     * implementation according to the GLSL spec is:
@@ -390,7 +389,7 @@ convert_flrp_instruction(nir_builder *bld,
     *   subtract, a multiply, and an FMA)... but in that case the other
     *   formulation should have been used.
     */
-   if (alu->exact) {
+   if (nir_alu_instr_is_exact(alu)) {
       if (have_ffma)
          replace_with_strict_ffma(bld, dead_flrp, alu);
       else
@@ -599,6 +598,9 @@ nir_lower_flrp(nir_shader *shader,
                unsigned lowering_mask,
                bool always_precise)
 {
+   if (shader->info.flrp_lowered || lowering_mask == 0)
+      return false;
+
    struct u_vector dead_flrp;
 
    if (!u_vector_init_pow2(&dead_flrp, 8, sizeof(struct nir_alu_instr *)))
@@ -618,6 +620,8 @@ nir_lower_flrp(nir_shader *shader,
       nir_instr_remove(&(*instr)->instr);
 
    u_vector_finish(&dead_flrp);
+
+   shader->info.flrp_lowered = true;
 
    return progress;
 }

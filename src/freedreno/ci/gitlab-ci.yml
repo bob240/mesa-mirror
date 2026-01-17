@@ -7,7 +7,7 @@ a200-gl:
     - .a200
     - .lumag-freedreno-manual-rules
   timeout: 180m
-  parallel: 2
+  parallel: 3
   variables:
     CI_TRON_TIMEOUT__OVERALL__MINUTES: 180
     DEQP_SUITE: freedreno-a200
@@ -120,7 +120,7 @@ a618-vk:
   variables:
     DEQP_SUITE: freedreno-a618-vk
     FLAKES_CHANNEL: "#freedreno-ci"
-    MESA_VK_IGNORE_CONFORMANCE_WARNING: 1
+    FDO_CI_CONCURRENT: 6  # We get OOMkills if we go too wide since VKCTS 1.4.4.0
 
 a618-vk-full:
   extends:

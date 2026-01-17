@@ -53,7 +53,7 @@
 #include "pan_public.h"
 #include "pan_resource.h"
 #include "pan_screen.h"
-#include "pan_shader.h"
+#include "pan_compiler.h"
 #include "pan_util.h"
 
 #include "pan_context.h"
@@ -145,7 +145,9 @@ get_max_msaa(struct panfrost_device *dev, enum pipe_format format)
 {
    unsigned max_tib_size = pan_query_tib_size(dev->model);
    unsigned max_cbuf_atts = pan_get_max_cbufs(dev->arch, max_tib_size);
-   unsigned format_size = util_format_get_blocksize(format);
+
+   unsigned format_size =
+      pan_format_tib_size(format, dev->blendable_formats[format].internal);
 
    unsigned max_msaa = pan_get_max_msaa(dev->arch, max_tib_size,
                                         max_cbuf_atts, format_size);
@@ -439,12 +441,12 @@ panfrost_walk_dmabuf_modifiers(struct pipe_screen *screen,
          for (unsigned r = 0; r < yuv_lowering.nres; r++) {
             enum pipe_format res_format = yuv_lowering.res_formats[r];
 
-            supported &= pan_image_test_modifier_with_format(&dev->kmod.props,
-                                                             mod, res_format);
+            supported &= pan_image_test_modifier_with_format(
+               &dev->kmod.dev->props, mod, res_format);
          }
       } else {
-         supported =
-            pan_image_test_modifier_with_format(&dev->kmod.props, mod, format);
+         supported = pan_image_test_modifier_with_format(&dev->kmod.dev->props,
+                                                         mod, format);
       }
 
       if (!supported)
@@ -727,9 +729,10 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    /* Compile side is TODO for Midgard. */
    caps->shader_clock = dev->arch >= 6 &&
-      dev->kmod.props.gpu_can_query_timestamp;
+      dev->kmod.dev->props.gpu_can_query_timestamp;
    caps->shader_realtime_clock = dev->arch >= 6 &&
-      dev->kmod.props.gpu_can_query_timestamp;
+      dev->kmod.dev->props.gpu_can_query_timestamp &&
+      dev->kmod.dev->props.timestamp_device_coherent;
 
    /* pixel_local_storage is initially for valhall and bifrost only */
    caps->shader_pixel_local_storage_fast_size =
@@ -795,10 +798,9 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
    /* Must be at least 64 for correct behaviour */
    caps->texture_buffer_offset_alignment = 64;
 
-   caps->query_time_elapsed =
-   caps->query_timestamp =
-      dev->kmod.props.gpu_can_query_timestamp &&
-      dev->kmod.props.timestamp_frequency != 0;
+   caps->query_time_elapsed = caps->query_timestamp =
+      dev->kmod.dev->props.gpu_can_query_timestamp &&
+      dev->kmod.dev->props.timestamp_frequency != 0;
 
    if (caps->query_timestamp)
       caps->timer_resolution = pan_gpu_time_to_ns(dev, 1);
@@ -913,9 +915,8 @@ panfrost_init_screen_caps(struct panfrost_screen *screen)
 
    caps->native_fence_fd = true;
 
-   caps->context_priority_mask =
-      from_kmod_group_allow_priority_flags(
-         dev->kmod.props.allowed_group_priorities_mask);
+   caps->context_priority_mask = from_kmod_group_allow_priority_flags(
+      dev->kmod.dev->props.allowed_group_priorities_mask);
 
    caps->astc_decode_mode = dev->arch >= 9 && (dev->compressed_formats & (1 << 30));
 
@@ -1005,7 +1006,7 @@ get_core_mask(const struct panfrost_device *dev,
               const struct pipe_screen_config *config,
               const char *option_name, uint64_t *mask)
 {
-   uint64_t present = dev->kmod.props.shader_present;
+   uint64_t present = dev->kmod.dev->props.shader_present;
    *mask = driQueryOptionu64(config->options, option_name) & present;
 
    if (!*mask) {
@@ -1060,8 +1061,12 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
       return NULL;
    }
 
+   unsigned core_id_range;
+   unsigned core_count =
+      pan_query_core_count(&dev->kmod.dev->props, &core_id_range);
+
    snprintf(screen->renderer_string, sizeof(screen->renderer_string),
-            "%s (Panfrost)", dev->model->name);
+            "%s MC%u (Panfrost)", dev->model->name, core_count);
 
    screen->afbc_tiled = driQueryOptionb(config->options, "pan_afbc_tiled");
 
@@ -1147,7 +1152,8 @@ panfrost_create_screen(int fd, const struct pipe_screen_config *config,
    }
 
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
-      screen->base.nir_options[i] = pan_shader_get_compiler_options(pan_screen(&screen->base)->dev.arch);
+      screen->base.nir_options[i] =
+         pan_get_nir_shader_compiler_options(dev->arch);
 
    switch (dev->arch) {
    case 4:

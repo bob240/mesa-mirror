@@ -79,6 +79,13 @@ struct amdgpu_userq {
    struct pb_buffer_lean *doorbell_bo;
    uint64_t *doorbell_bo_map;
 
+   /* For debugging where the ring is stuck, WRITE_DATA packet with unique number is
+    * inserted in the ring. The number will indicate the packets that are parsed by CP.
+    * This value is printed in job log.
+    */
+   uint64_t *write_data_pkt_dbg_count_ptr;
+   uint64_t write_data_pkt_dbg_count_va;
+
    /* In case of gfx11.5 shadow register address has to be initialized using LOAD_* packet.
     * Also for every new ib/job submission, the shadowed registers has to be loaded using LOAD_*
     * packets.
@@ -99,7 +106,15 @@ struct amdgpu_userq {
       struct amdgpu_userq_compute_data compute_data;
       struct amdgpu_userq_sdma_data sdma_data;
    };
+
+   /* Used in userq job log thread to only print if data has changed */
+   uint64_t last_submitted_job;
+   uint64_t last_completed_job;
+   uint64_t last_write_data_pkt_dbg_count;
 };
+
+void
+amdgpu_userq_start_job_log_thread(struct amdgpu_winsys *aws);
 
 bool
 amdgpu_userq_init(struct amdgpu_winsys *aws, struct amdgpu_userq *userq, enum amd_ip_type ip_type,

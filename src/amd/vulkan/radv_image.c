@@ -178,6 +178,9 @@ bool
 radv_are_formats_dcc_compatible(const struct radv_physical_device *pdev, const void *pNext, VkFormat format,
                                 VkImageCreateFlags flags, bool *sign_reinterpret)
 {
+   if (pdev->info.gfx_level >= GFX12)
+      return true;
+
    if (!radv_is_colorbuffer_format_supported(pdev, format))
       return false;
 
@@ -276,7 +279,7 @@ radv_use_dcc_for_image_early(struct radv_device *device, struct radv_image *imag
    if (pCreateInfo->tiling == VK_IMAGE_TILING_LINEAR)
       return false;
 
-   if (vk_format_is_subsampled(format) || vk_format_get_plane_count(format) > 1)
+   if (vk_format_is_subsampled(format) || (pdev->info.gfx_level < GFX12 && vk_format_get_plane_count(format) > 1))
       return false;
 
    if (!radv_image_use_fast_clear_for_image_early(device, image) &&
@@ -655,6 +658,23 @@ radv_get_surface_flags(struct radv_device *device, struct radv_image *image, uns
       break;
    default:
       UNREACHABLE("unhandled image type");
+   }
+
+   if (image->vk.image_type == VK_IMAGE_TYPE_3D) {
+      if ((image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) && !(image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
+         /* Select a 2D swizzle mode for 3D CB render targets because it's optimal regardless of the
+          * access pattern (CB prefers thin tiling). This optimization isn't applied to images that
+          * can be used as storage because it mostly depends on the access pattern, and it's really
+          * just a heuristic.
+          */
+         flags |= RADEON_SURF_VIEW_3D_AS_2D_ARRAY;
+      }
+
+      if ((image->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
+          instance->drirc.performance.prefer_2d_swizzle_for_3d_storage) {
+         /* Some applications perform much better with a 2D swizzle mode for 3D storage images. */
+         flags |= RADEON_SURF_VIEW_3D_AS_2D_ARRAY;
+      }
    }
 
    /* Required for clearing/initializing a specific layer on GFX8. */
@@ -1254,7 +1274,7 @@ radv_image_create_layout(struct radv_device *device, struct radv_image_create_in
       info.width = vk_format_get_plane_width(image->vk.format, plane, info.width);
       info.height = vk_format_get_plane_height(image->vk.format, plane, info.height);
 
-      if (create_info.no_metadata_planes || plane_count > 1) {
+      if (create_info.no_metadata_planes || (pdev->info.gfx_level < GFX12 && plane_count > 1)) {
          image->planes[plane].surface.flags |= RADEON_SURF_DISABLE_DCC | RADEON_SURF_NO_FMASK | RADEON_SURF_NO_HTILE;
       }
 
@@ -1776,18 +1796,11 @@ radv_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo, const V
       return radv_image_from_gralloc(_device, pCreateInfo, gralloc_info, pAllocator, pImage);
 #endif
 
-#ifdef RADV_USE_WSI_PLATFORM
-   /* Ignore swapchain creation info on Android. Since we don't have an implementation in Mesa,
-    * we're guaranteed to access an Android object incorrectly.
-    */
    VK_FROM_HANDLE(radv_device, device, _device);
    const struct radv_physical_device *pdev = radv_device_physical(device);
-   const VkImageSwapchainCreateInfoKHR *swapchain_info =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
-   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
-      return wsi_common_create_swapchain_image(pdev->vk.wsi_device, pCreateInfo, swapchain_info->swapchain, pImage);
-   }
-#endif
+
+   if (wsi_common_is_swapchain_image(pCreateInfo))
+      return wsi_common_create_swapchain_image(pdev->vk.wsi_device, pCreateInfo, pImage);
 
    const struct wsi_image_create_info *wsi_info = vk_find_struct_const(pCreateInfo->pNext, WSI_IMAGE_CREATE_INFO_MESA);
    bool scanout = wsi_info && wsi_info->scanout;

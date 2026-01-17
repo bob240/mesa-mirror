@@ -30,7 +30,6 @@ use std::convert::TryInto;
 use std::env;
 use std::ffi::CStr;
 use std::fmt::Debug;
-use std::mem::transmute;
 use std::num::NonZeroU64;
 use std::ops::Deref;
 use std::os::raw::*;
@@ -107,9 +106,9 @@ impl DeviceCaps {
         Self {
             has_images: has_images,
             has_timestamp: cap_timestamp && timer_resolution > 0,
-            image_2d_size: has_images.then_some(image_2d_size).unwrap_or_default(),
-            max_read_images: has_images.then_some(max_read_images).unwrap_or_default(),
-            max_write_images: has_images.then_some(max_write_images).unwrap_or_default(),
+            image_2d_size: if has_images { image_2d_size } else { 0 },
+            max_read_images: if has_images { max_read_images } else { 0 },
+            max_write_images: if has_images { max_write_images } else { 0 },
             timer_resolution: timer_resolution,
             has_create_fence_fd: ctx.is_create_fence_fd_supported(),
             ..Default::default()
@@ -741,17 +740,22 @@ impl DeviceBase {
         }
 
         if self.subgroups_supported() {
-            add_cap(SpvCapability::SpvCapabilityGroupNonUniformShuffle);
-            add_cap(SpvCapability::SpvCapabilityGroupNonUniformShuffleRelative);
             add_cap(SpvCapability::SpvCapabilityGroups);
             add_cap(SpvCapability::SpvCapabilitySubgroupDispatch);
             // requires CL_DEVICE_SUB_GROUP_INDEPENDENT_FORWARD_PROGRESS
             //add_ext(1, 0, 0, "cl_khr_subgroups");
             add_feat(1, 0, 0, "__opencl_c_subgroups");
 
-            // we have lowering in `nir_lower_subgroups`, drivers can just use that
-            add_ext(1, 0, 0, "cl_khr_subgroup_shuffle");
-            add_ext(1, 0, 0, "cl_khr_subgroup_shuffle_relative");
+            if self.subgroup_shuffle_supported() {
+                add_cap(SpvCapability::SpvCapabilityGroupNonUniformShuffle);
+                add_ext(1, 0, 0, "cl_khr_subgroup_shuffle");
+            }
+
+            if self.subgroup_shuffle_relative_supported() {
+                add_cap(SpvCapability::SpvCapabilityGroupNonUniformShuffleRelative);
+                add_ext(1, 0, 0, "cl_khr_subgroup_shuffle_relative");
+            }
+
             if self.intel_subgroups_supported() {
                 // add_cap(SpvCapability::SpvCapabilitySubgroupBufferBlockIOINTEL);
                 // add_cap(SpvCapability::SpvCapabilitySubgroupImageBlockIOINTEL);
@@ -1174,6 +1178,23 @@ impl DeviceBase {
         // supported, doing it without shareable shaders isn't practical
         self.max_subgroups() > 0
             && (subgroup_sizes == 1 || (subgroup_sizes > 1 && self.shareable_shaders()))
+            && self.screen().caps().shader_subgroup_supported_features
+                & PIPE_SHADER_SUBGROUP_FEATURE_BASIC
+                != 0
+    }
+
+    pub fn subgroup_shuffle_supported(&self) -> bool {
+        self.subgroups_supported()
+            && self.screen().caps().shader_subgroup_supported_features
+                & PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE
+                != 0
+    }
+
+    pub fn subgroup_shuffle_relative_supported(&self) -> bool {
+        self.subgroups_supported()
+            && self.screen().caps().shader_subgroup_supported_features
+                & PIPE_SHADER_SUBGROUP_FEATURE_SHUFFLE_RELATIVE
+                != 0
     }
 
     pub fn system_svm_supported(&self) -> bool {
@@ -1256,8 +1277,8 @@ impl DeviceBase {
             intel_subgroups: self.intel_subgroups_supported(),
             kernel_clock: self.kernel_clock_supported(),
             subgroups: subgroups_supported,
-            subgroups_shuffle: subgroups_supported,
-            subgroups_shuffle_relative: subgroups_supported,
+            subgroups_shuffle: self.subgroup_shuffle_supported(),
+            subgroups_shuffle_relative: self.subgroup_shuffle_relative_supported(),
             ..Default::default()
         }
     }
@@ -1421,7 +1442,7 @@ pub fn get_devs_for_type(device_type: cl_device_type) -> Vec<&'static Device> {
 
 pub fn get_dev_for_uuid(uuid: [c_char; UUID_SIZE]) -> Option<&'static Device> {
     devs().iter().find(|d| {
-        let uuid: [c_uchar; UUID_SIZE] = unsafe { transmute(uuid) };
+        let uuid: [c_uchar; UUID_SIZE] = uuid.map(|val| val as c_uchar);
         uuid == d.screen().device_uuid().unwrap()
     })
 }

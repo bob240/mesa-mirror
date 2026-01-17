@@ -37,14 +37,11 @@ struct exec_list;
 typedef struct nir_builder {
    nir_cursor cursor;
 
-   /* Whether new ALU instructions will be marked "exact" */
-   bool exact;
-
    /* Whether new ALU instruction will be constanst-folded if possible. */
    bool constant_fold_alu;
 
    /* Float_controls2 bits. See nir_alu_instr for details. */
-   uint32_t fp_fast_math;
+   uint32_t fp_math_ctrl;
 
    nir_shader *shader;
    nir_function_impl *impl;
@@ -55,7 +52,7 @@ nir_builder_create(nir_function_impl *impl)
 {
    nir_builder b;
    memset(&b, 0, sizeof(b));
-   b.exact = false;
+   b.fp_math_ctrl = nir_fp_fast_math;
    b.impl = impl;
    b.shader = impl->function->shader;
    return b;
@@ -724,8 +721,7 @@ nir_mov_alu(nir_builder *build, nir_alu_src src, unsigned num_components)
    nir_alu_instr *mov = nir_alu_instr_create(build->shader, nir_op_mov);
    nir_def_init(&mov->instr, &mov->def, num_components,
                 nir_src_bit_size(src.src));
-   mov->exact = build->exact;
-   mov->fp_fast_math = build->fp_fast_math;
+   mov->fp_math_ctrl = build->fp_math_ctrl;
    mov->src[0] = src;
    nir_builder_instr_insert(build, &mov->instr);
 
@@ -2213,19 +2209,11 @@ nir_def *nir_build_tex_struct(nir_builder *build, nir_texop op,
 #define nir_tex(build, coord_, ...)                                            \
    nir_build_tex(build, nir_texop_tex, .coord = coord_, __VA_ARGS__)
 
-#define nir_txl(build, coord_, lod_, ...)                                      \
-   nir_build_tex(build, nir_texop_txl, .coord = coord_, .lod = lod_,           \
-                 __VA_ARGS__)
-
-#define nir_txb(build, coord_, bias_, ...)                                     \
-   nir_build_tex(build, nir_texop_txb, .coord = coord_, .bias = bias,          \
-                 __VA_ARGS__)
-
 #define nir_txf(build, coord_, ...)                                            \
    nir_build_tex(build, nir_texop_txf, .coord = coord_, __VA_ARGS__)
 
-#define nir_txf_ms(build, coord_, ms_index_, ...)                              \
-   nir_build_tex(build, nir_texop_txf_ms, .coord = coord_,                     \
+#define nir_txf_ms(build, coord_, ms_index_, ...)       \
+   nir_build_tex(build, nir_texop_txf, .coord = coord_, \
                  .ms_index = ms_index_, __VA_ARGS__)
 
 #define nir_txs(build, ...) nir_build_tex(build, nir_texop_txs, __VA_ARGS__)

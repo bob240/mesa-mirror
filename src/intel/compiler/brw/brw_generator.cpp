@@ -27,6 +27,9 @@
  * native instructions.
  */
 
+#include <algorithm>
+#include <vector>
+
 #include "brw_eu.h"
 #include "brw_disasm_info.h"
 #include "brw_shader.h"
@@ -108,56 +111,6 @@ brw_generator::brw_generator(const struct brw_compiler *compiler,
 
 brw_generator::~brw_generator()
 {
-}
-
-class ip_record : public brw_exec_node {
-public:
-   DECLARE_RALLOC_CXX_OPERATORS(ip_record)
-
-   ip_record(int ip)
-   {
-      this->ip = ip;
-   }
-
-   int ip;
-};
-
-bool
-brw_generator::patch_halt_jumps()
-{
-   if (this->discard_halt_patches.is_empty())
-      return false;
-
-   int scale = brw_jump_scale(p->devinfo);
-
-   /* There is a somewhat strange undocumented requirement of using
-    * HALT, according to the simulator.  If some channel has HALTed to
-    * a particular UIP, then by the end of the program, every channel
-    * must have HALTed to that UIP.  Furthermore, the tracking is a
-    * stack, so you can't do the final halt of a UIP after starting
-    * halting to a new UIP.
-    *
-    * Symptoms of not emitting this instruction on actual hardware
-    * included GPU hangs and sparkly rendering on the piglit discard
-    * tests.
-    */
-   brw_eu_inst *last_halt = brw_HALT(p);
-   brw_eu_inst_set_uip(p->devinfo, last_halt, 1 * scale);
-   brw_eu_inst_set_jip(p->devinfo, last_halt, 1 * scale);
-
-   int ip = p->nr_insn;
-
-   brw_foreach_in_list(ip_record, patch_ip, &discard_halt_patches) {
-      brw_eu_inst *patch = &p->store[patch_ip->ip];
-
-      assert(brw_eu_inst_opcode(p->isa, patch) == BRW_OPCODE_HALT);
-      /* HALT takes a half-instruction distance from the pre-incremented IP. */
-      brw_eu_inst_set_uip(p->devinfo, patch, (ip - patch_ip->ip) * scale);
-   }
-
-   this->discard_halt_patches.make_empty();
-
-   return true;
 }
 
 void
@@ -650,17 +603,6 @@ brw_generator::generate_ddy(const brw_inst *inst,
    }
 }
 
-void
-brw_generator::generate_halt(brw_inst *)
-{
-   /* This HALT will be patched up at FB write time to point UIP at the end of
-    * the program, and at brw_uip_jip() JIP will be set to the end of the
-    * current block (or the program).
-    */
-   this->discard_halt_patches.push_tail(new(mem_ctx) ip_record(p->nr_insn));
-   brw_HALT(p);
-}
-
 DEBUG_GET_ONCE_OPTION(shader_bin_override_path, "INTEL_SHADER_ASM_READ_PATH",
                       NULL);
 
@@ -755,6 +697,8 @@ brw_generator::generate_code(const brw_shader &s,
    brw_realign(p, 64);
 
    this->dispatch_width = dispatch_width;
+   this->final_halt_offset = -1;
+   this->needs_final_halt = false;
 
    int start_offset = p->next_insn_offset;
 
@@ -914,35 +858,58 @@ brw_generator::generate_code(const brw_shader &s,
             ++sync_nop_count;
 
          break;
+
       case BRW_OPCODE_MOV:
-	 brw_MOV(p, dst, src[0]);
+      case BRW_OPCODE_FRC:
+      case BRW_OPCODE_RNDD:
+      case BRW_OPCODE_RNDE:
+      case BRW_OPCODE_RNDZ:
+      case BRW_OPCODE_NOT:
+      case BRW_OPCODE_LZD:
+	 brw_alu1(p, inst->opcode, dst, src[0]);
 	 break;
+
       case BRW_OPCODE_ADD:
-	 brw_ADD(p, dst, src[0], src[1]);
-	 break;
       case BRW_OPCODE_MUL:
-	 brw_MUL(p, dst, src[0], src[1]);
-	 break;
       case BRW_OPCODE_AVG:
-	 brw_AVG(p, dst, src[0], src[1]);
-	 break;
       case BRW_OPCODE_MACH:
-	 brw_MACH(p, dst, src[0], src[1]);
+      case BRW_OPCODE_AND:
+      case BRW_OPCODE_OR:
+      case BRW_OPCODE_XOR:
+      case BRW_OPCODE_ASR:
+      case BRW_OPCODE_SHR:
+      case BRW_OPCODE_SHL:
+      case BRW_OPCODE_SEL:
+      case BRW_OPCODE_ADDC:
+      case BRW_OPCODE_SUBB:
+      case BRW_OPCODE_MAC:
+      case BRW_OPCODE_BFI1:
+      case BRW_OPCODE_PLN:
+      case BRW_OPCODE_SRND:
+      case BRW_OPCODE_ROL:
+      case BRW_OPCODE_ROR:
+         assert(inst->opcode != BRW_OPCODE_SRND || devinfo->ver >= 20);
+         assert(inst->opcode != BRW_OPCODE_ROL || devinfo->ver >= 11);
+         assert(inst->opcode != BRW_OPCODE_ROR || devinfo->ver >= 11);
+
+	 brw_alu2(p, inst->opcode, dst, src[0], src[1]);
 	 break;
 
+      case BRW_OPCODE_MAD:
+      case BRW_OPCODE_CSEL:
+      case BRW_OPCODE_BFE:
+      case BRW_OPCODE_BFI2:
       case BRW_OPCODE_DP4A:
-         assert(devinfo->ver >= 12);
-         brw_DP4A(p, dst, src[0], src[1], src[2]);
-         break;
+      case BRW_OPCODE_LRP:
+      case BRW_OPCODE_ADD3:
+         assert(inst->opcode != BRW_OPCODE_DP4A || devinfo->ver >= 12);
+         assert(inst->opcode != BRW_OPCODE_LRP  || devinfo->ver == 9);
+         assert(inst->opcode != BRW_OPCODE_ADD3 || devinfo->verx10 >= 125);
 
-      case BRW_OPCODE_SRND:
-         assert(devinfo->ver >= 20);
-         brw_SRND(p, dst, src[0], src[1]);
-         break;
-
-      case BRW_OPCODE_LINE:
-         brw_LINE(p, dst, src[0], src[1]);
-         break;
+         if (devinfo->ver == 9)
+            brw_set_default_access_mode(p, BRW_ALIGN_16);
+         brw_alu3(p, inst->opcode, dst, src[0], src[1], src[2]);
+	 break;
 
       case BRW_OPCODE_DPAS: {
          assert(devinfo->verx10 >= 125);
@@ -952,123 +919,25 @@ brw_generator::generate_code(const brw_shader &s,
          break;
       }
 
-      case BRW_OPCODE_MAD:
-         if (devinfo->ver < 10)
-            brw_set_default_access_mode(p, BRW_ALIGN_16);
-         brw_MAD(p, dst, src[0], src[1], src[2]);
-	 break;
-
-      case BRW_OPCODE_LRP:
-         assert(devinfo->ver <= 10);
-         if (devinfo->ver < 10)
-            brw_set_default_access_mode(p, BRW_ALIGN_16);
-         brw_LRP(p, dst, src[0], src[1], src[2]);
-	 break;
-
-      case BRW_OPCODE_ADD3:
-         assert(devinfo->verx10 >= 125);
-         brw_ADD3(p, dst, src[0], src[1], src[2]);
-         break;
-
-      case BRW_OPCODE_FRC:
-	 brw_FRC(p, dst, src[0]);
-	 break;
-      case BRW_OPCODE_RNDD:
-	 brw_RNDD(p, dst, src[0]);
-	 break;
-      case BRW_OPCODE_RNDE:
-	 brw_RNDE(p, dst, src[0]);
-	 break;
-      case BRW_OPCODE_RNDZ:
-	 brw_RNDZ(p, dst, src[0]);
-	 break;
-
-      case BRW_OPCODE_AND:
-	 brw_AND(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_OR:
-	 brw_OR(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_XOR:
-	 brw_XOR(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_NOT:
-	 brw_NOT(p, dst, src[0]);
-	 break;
       case BRW_OPCODE_BFN:
          brw_BFN(p, dst, src[0], src[1], src[2], src[3]);
          break;
-      case BRW_OPCODE_ASR:
-	 brw_ASR(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_SHR:
-	 brw_SHR(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_SHL:
-	 brw_SHL(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_ROL:
-	 assert(devinfo->ver >= 11);
-	 assert(src[0].type == dst.type);
-	 brw_ROL(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_ROR:
-	 assert(devinfo->ver >= 11);
-	 assert(src[0].type == dst.type);
-	 brw_ROR(p, dst, src[0], src[1]);
-	 break;
+
       case BRW_OPCODE_CMP:
          brw_CMP(p, dst, inst->conditional_mod, src[0], src[1]);
 	 break;
       case BRW_OPCODE_CMPN:
          brw_CMPN(p, dst, inst->conditional_mod, src[0], src[1]);
          break;
-      case BRW_OPCODE_SEL:
-	 brw_SEL(p, dst, src[0], src[1]);
-	 break;
-      case BRW_OPCODE_CSEL:
-         if (devinfo->ver < 10)
-            brw_set_default_access_mode(p, BRW_ALIGN_16);
-         brw_CSEL(p, dst, src[0], src[1], src[2]);
-         break;
+
       case BRW_OPCODE_BFREV:
-         brw_BFREV(p, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
+      case BRW_OPCODE_FBL:
+      case BRW_OPCODE_CBIT:
+         brw_alu1(p, inst->opcode, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
          break;
+
       case BRW_OPCODE_FBH:
          brw_FBH(p, retype(dst, src[0].type), src[0]);
-         break;
-      case BRW_OPCODE_FBL:
-         brw_FBL(p, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
-         break;
-      case BRW_OPCODE_LZD:
-         brw_LZD(p, dst, src[0]);
-         break;
-      case BRW_OPCODE_CBIT:
-         brw_CBIT(p, retype(dst, BRW_TYPE_UD), retype(src[0], BRW_TYPE_UD));
-         break;
-      case BRW_OPCODE_ADDC:
-         brw_ADDC(p, dst, src[0], src[1]);
-         break;
-      case BRW_OPCODE_SUBB:
-         brw_SUBB(p, dst, src[0], src[1]);
-         break;
-      case BRW_OPCODE_MAC:
-         brw_MAC(p, dst, src[0], src[1]);
-         break;
-
-      case BRW_OPCODE_BFE:
-         if (devinfo->ver < 10)
-            brw_set_default_access_mode(p, BRW_ALIGN_16);
-         brw_BFE(p, dst, src[0], src[1], src[2]);
-         break;
-
-      case BRW_OPCODE_BFI1:
-         brw_BFI1(p, dst, src[0], src[1]);
-         break;
-      case BRW_OPCODE_BFI2:
-         if (devinfo->ver < 10)
-            brw_set_default_access_mode(p, BRW_ALIGN_16);
-         brw_BFI2(p, dst, src[0], src[1], src[2]);
          break;
 
       case BRW_OPCODE_IF:
@@ -1128,17 +997,6 @@ brw_generator::generate_code(const brw_shader &s,
          assert(inst->conditional_mod == BRW_CONDITIONAL_NONE);
          assert(inst->opcode == SHADER_OPCODE_POW || inst->exec_size == 8);
          gfx6_math(p, dst, brw_math_function(inst->opcode), src[0], src[1]);
-	 break;
-      case BRW_OPCODE_PLN:
-         /* PLN reads:
-          *                      /   in SIMD16   \
-          *    -----------------------------------
-          *   | src1+0 | src1+1 | src1+2 | src1+3 |
-          *   |-----------------------------------|
-          *   |(x0, x1)|(y0, y1)|(x2, x3)|(y2, y3)|
-          *    -----------------------------------
-          */
-         brw_PLN(p, dst, src[0], src[1]);
 	 break;
       case FS_OPCODE_PIXEL_X:
          assert(src[0].type == BRW_TYPE_UW);
@@ -1206,7 +1064,9 @@ brw_generator::generate_code(const brw_shader &s,
          break;
 
       case BRW_OPCODE_HALT:
-         generate_halt(inst);
+         /* This HALT will be patched by brw_set_uip_jip(). */
+         this->needs_final_halt = true;
+         brw_HALT(p);
          break;
 
       case FS_OPCODE_SCHEDULING_FENCE:
@@ -1322,11 +1182,23 @@ brw_generator::generate_code(const brw_shader &s,
          /* This is the place where the final HALT needs to be inserted if
           * we've emitted any discards.  If not, this will emit no code.
           */
-         if (!patch_halt_jumps()) {
-            if (unlikely(annotate)) {
-               disasm_info->use_tail = true;
-            }
-         } else if (devinfo->ver >= 12) {
+         if (!this->needs_final_halt) {
+            disasm_info->use_tail = true;
+            break;
+         }
+
+         /* HALT temporarily disables channels, and the same instruction
+          * is used to re-enable them: once all channels are
+          * disabled, then they are re-enabled again immediately.
+          *
+          * So put a HALT right before the "epilogue" of the shader to make
+          * sure all channels get HALTed, so that this last HALT will re-enable
+          * them again.
+          */
+         final_halt_offset = p->next_insn_offset;
+         brw_HALT(p);
+
+         if (devinfo->ver >= 12) {
             /* This works around synchronization issues consequence of the
              * HALT instruction not being considered a control flow
              * instruction by the back-end -- The fact that it doesn't
@@ -1460,7 +1332,7 @@ brw_generator::generate_code(const brw_shader &s,
       }
    }
 
-   brw_set_uip_jip(p, start_offset);
+   brw_set_uip_jip(p, start_offset, final_halt_offset);
 
    /* end of program sentinel */
    disasm_new_inst_group(disasm_info, p->next_insn_offset);
@@ -1489,8 +1361,8 @@ brw_generator::generate_code(const brw_shader &s,
    int after_size = p->next_insn_offset - start_offset;
 
    bool dump_shader_bin = brw_should_dump_shader_bin();
-   unsigned char sha1[21];
-   char sha1buf[41];
+   unsigned char sha1[SHA1_DIGEST_LENGTH + 1];
+   char sha1buf[SHA1_DIGEST_STRING_LENGTH];
 
    auto override_path = debug_get_option_shader_bin_override_path();
    if (unlikely(debug_flag || dump_shader_bin || override_path != NULL ||
@@ -1667,4 +1539,182 @@ void brw_prog_data_init(struct brw_stage_prog_data *prog_data,
    prog_data->source_hash = params->source_hash;
    prog_data->total_scratch = 0;
    prog_data->total_shared = params->nir->info.shared_size;
+}
+
+/* After program generation, go back and update the UIP and JIP of
+ * BREAK, CONT, ENDIF and HALT instructions to their correct locations.
+ */
+void
+brw_set_uip_jip(struct brw_codegen *p, int start_offset, int final_halt_offset)
+{
+   const struct intel_device_info *devinfo = p->devinfo;
+   const int end_offset = p->next_insn_offset;
+   brw_eu_inst *store = p->store;
+
+   struct branch_info {
+      enum opcode opcode;
+      int offset;
+
+      /* For loop headers. */
+      int loop_end_offset;
+   };
+
+   /* Collect information about the control flow instructions and any
+    * instruction that are loop headers.  There might be multiple entries
+    * for instructions that act as loop header for multiple loops and/or that
+    * are control flow instruction themselves (e.g. IF as the loop header).
+    */
+   std::vector<branch_info> infos;
+   for (int offset = start_offset; offset < end_offset; offset += 16) {
+      brw_eu_inst *insn = store + (offset / 16);
+      assert(brw_eu_inst_cmpt_control(devinfo, insn) == 0);
+
+      const enum opcode opcode = brw_eu_inst_opcode(p->isa, insn);
+      switch (opcode) {
+      case BRW_OPCODE_IF:
+      case BRW_OPCODE_ELSE:
+      case BRW_OPCODE_ENDIF:
+      case BRW_OPCODE_HALT:
+      case BRW_OPCODE_BREAK:
+      case BRW_OPCODE_CONTINUE:
+      case BRW_OPCODE_WHILE:
+         infos.push_back({
+            .opcode = opcode,
+            .offset = offset,
+         });
+         if (opcode == BRW_OPCODE_WHILE) {
+            /* Also add an entry for the loop header. */
+            const int jip = brw_eu_inst_jip(devinfo, insn);
+            assert(jip < 0);
+            infos.push_back({
+               /* Use NOP to indicate this is a loop header entry. */
+               .opcode = BRW_OPCODE_NOP,
+               .offset = offset + jip,
+               .loop_end_offset = offset,
+            });
+         }
+         break;
+
+      default:
+         /* Nothing to do. */
+         break;
+      }
+   }
+
+   /* Sort in scope order. */
+   std::sort(infos.begin(), infos.end(), [](const auto &a, const auto &b) {
+      if (a.offset != b.offset)
+         return a.offset < b.offset;
+      /* Note the flipped comparison: want to see the largest scope first,
+       * since it contains the other.
+       */
+      return a.loop_end_offset > b.loop_end_offset;
+   });
+
+   struct scope {
+      int end_offset;
+
+      /* End of current loop if exists. */
+      int loop_end_offset;
+   };
+
+   std::vector<scope> scopes;
+   scopes.push_back({-1, -1});
+
+   /* Walk backwards keeping track of the scopes.  This make easy to
+    * get the innermost end of scope and the innermost end of loop.
+    */
+   for (int i = infos.size() - 1; i >= 0; i--) {
+      const branch_info &info = infos[i];
+
+      brw_eu_inst *insn = store + (info.offset / 16);
+
+      switch (info.opcode) {
+      case BRW_OPCODE_NOP:
+      case BRW_OPCODE_IF:
+         /* Pop the scope.  NOP here is a stand in for loop headers. */
+         scopes.pop_back();
+         break;
+
+      case BRW_OPCODE_ELSE:
+         /* For instructions before the ELSE in the conditional (i.e. the
+          * then-part of the loop), the scope ends here.
+          */
+         scopes.back().end_offset = info.offset;
+         break;
+
+      case BRW_OPCODE_ENDIF: {
+         const int innermost_end_offset = scopes.back().end_offset;
+         int jip_offset;
+
+         if (innermost_end_offset != -1)
+            jip_offset = innermost_end_offset;
+         else if (final_halt_offset != -1)
+            jip_offset = final_halt_offset + 16;
+         else
+            jip_offset = info.offset + 16;
+
+         brw_eu_inst_set_jip(devinfo, insn, jip_offset - info.offset);
+
+         scopes.push_back({
+            .end_offset      = info.offset,
+            .loop_end_offset = scopes.back().loop_end_offset,
+         });
+         break;
+      }
+
+      case BRW_OPCODE_WHILE:
+         scopes.push_back({
+            .end_offset      = info.offset,
+            .loop_end_offset = info.offset,
+         });
+         break;
+
+      case BRW_OPCODE_BREAK:
+      case BRW_OPCODE_CONTINUE: {
+         const int innermost_end_offset = scopes.back().end_offset;
+         brw_eu_inst_set_jip(devinfo, insn, innermost_end_offset - info.offset);
+
+         const int loop_end_offset = scopes.back().loop_end_offset;
+         assert(loop_end_offset != -1);
+         assert(loop_end_offset > info.offset);
+         brw_eu_inst_set_uip(devinfo, insn, loop_end_offset - info.offset);
+         break;
+      }
+
+      case BRW_OPCODE_HALT: {
+         /* From the Sandy Bridge PRM (volume 4, part 2, section 8.3.19):
+          *
+          *    "In case of the halt instruction not inside any conditional
+          *     code block, the value of <JIP> and <UIP> should be the
+          *     same. In case of the halt instruction inside conditional code
+          *     block, the <UIP> should be the end of the program, and the
+          *     <JIP> should be end of the most inner conditional code block."
+          */
+         const int innermost_end_offset = scopes.back().end_offset;
+
+         /* If present, use the final HALT to infer the "end of the program".
+          *
+          * See also SHADER_OPCODE_HALT_TARGET.
+          */
+         if (final_halt_offset != -1) {
+            if (final_halt_offset == info.offset)
+               assert(innermost_end_offset == -1);
+
+            const int uip_offset = final_halt_offset + 16;
+            brw_eu_inst_set_uip(devinfo, insn, uip_offset - info.offset);
+         }
+
+         if (innermost_end_offset != -1)
+            brw_eu_inst_set_jip(devinfo, insn, innermost_end_offset - info.offset);
+         else
+            brw_eu_inst_set_jip(devinfo, insn, brw_eu_inst_uip(devinfo, insn));
+         break;
+      }
+
+      default:
+         /* Nothing to do. */
+         break;
+      }
+   }
 }

@@ -45,15 +45,8 @@ append_logical_end(isel_context* ctx, bool append_reload_preserved)
 {
    Builder bld(ctx->program, ctx->block);
 
-   if (append_reload_preserved && ctx->program->is_callee) {
-      Operand stack_ptr_op;
-      if (ctx->program->gfx_level >= GFX9)
-         stack_ptr_op = Operand(ctx->callee_info.stack_ptr.def.getTemp());
-      else
-         stack_ptr_op = Operand(load_scratch_resource(ctx->program, bld, -1u, false));
-      bld.pseudo(aco_opcode::p_reload_preserved, bld.def(s1), bld.def(bld.lm), bld.def(s1, scc),
-                 stack_ptr_op);
-   }
+   if (append_reload_preserved && ctx->program->is_callee && ctx->block->loop_nest_depth == 0)
+      emit_reload_preserved(ctx);
 
    bld.pseudo(aco_opcode::p_logical_end);
 }
@@ -677,8 +670,10 @@ build_end_with_regs(isel_context* ctx, std::vector<Operand>& regs)
 }
 
 Instruction*
-add_startpgm(struct isel_context* ctx)
+add_startpgm(struct isel_context* ctx, bool is_callee)
 {
+   ctx->program->scratch_arg_size += ctx->callee_info.scratch_param_size;
+
    unsigned def_count = 0;
    for (unsigned i = 0; i < ctx->args->arg_count; i++) {
       if (ctx->args->args[i].skip)
@@ -690,8 +685,14 @@ add_startpgm(struct isel_context* ctx)
          def_count++;
    }
 
-   if (ctx->stage.hw == AC_HW_COMPUTE_SHADER && ctx->program->gfx_level >= GFX12)
-      def_count += 3;
+   if (is_callee) {
+      /* We do not support shader args in callees. */
+      assert(def_count == 0);
+      def_count += ctx->callee_info.reg_param_count;
+      /* Add system parameters separately - they aren't counted by reg_param_count */
+      assert(ctx->callee_info.stack_ptr.is_reg && ctx->callee_info.return_address.is_reg);
+      def_count += 2;
+   }
 
    Instruction* startpgm = create_instruction(aco_opcode::p_startpgm, Format::PSEUDO, 0, def_count);
    ctx->block->instructions.emplace_back(startpgm);
@@ -725,33 +726,20 @@ add_startpgm(struct isel_context* ctx)
       }
    }
 
-   if (ctx->program->gfx_level >= GFX12 && ctx->stage.hw == AC_HW_COMPUTE_SHADER) {
-      Temp idx = ctx->program->allocateTmp(s1);
-      Temp idy = ctx->program->allocateTmp(s1);
-      ctx->ttmp8 = ctx->program->allocateTmp(s1);
-      startpgm->definitions[def_count - 3] = Definition(idx);
-      startpgm->definitions[def_count - 3].setPrecolored(PhysReg(108 + 9 /*ttmp9*/));
-      startpgm->definitions[def_count - 2] = Definition(ctx->ttmp8);
-      startpgm->definitions[def_count - 2].setPrecolored(PhysReg(108 + 8 /*ttmp8*/));
-      startpgm->definitions[def_count - 1] = Definition(idy);
-      startpgm->definitions[def_count - 1].setPrecolored(PhysReg(108 + 7 /*ttmp7*/));
-      ctx->workgroup_id[0] = Operand(idx);
-      if (ctx->args->workgroup_ids[2].used) {
-         Builder bld(ctx->program, ctx->block);
-         ctx->workgroup_id[1] =
-            bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), idy, Operand::zero(),
-                       Operand::c32(16u), Operand::zero());
-         ctx->workgroup_id[2] =
-            bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), idy, Operand::c32(1u),
-                       Operand::c32(16u), Operand::zero());
-      } else {
-         ctx->workgroup_id[1] = Operand(idy);
-         ctx->workgroup_id[2] = Operand::zero();
+   if (is_callee) {
+      unsigned def_idx = 0;
+      if (ctx->program->gfx_level >= GFX9)
+         ctx->program->stack_ptr = ctx->callee_info.stack_ptr.def.getTemp();
+      else
+         ctx->program->static_scratch_rsrc = ctx->callee_info.stack_ptr.def.getTemp();
+      startpgm->definitions[def_idx++] = ctx->callee_info.stack_ptr.def;
+      startpgm->definitions[def_idx++] = ctx->callee_info.return_address.def;
+
+      for (auto& info : ctx->callee_info.param_infos) {
+         if (!info.is_reg)
+            continue;
+         startpgm->definitions[def_idx++] = info.def;
       }
-   } else if (ctx->stage.hw == AC_HW_COMPUTE_SHADER) {
-      const struct ac_arg* ids = ctx->args->workgroup_ids;
-      for (unsigned i = 0; i < 3; i++)
-         ctx->workgroup_id[i] = ids[i].used ? Operand(get_arg(ctx, ids[i])) : Operand::zero();
    }
 
    /* epilog has no scratch */
@@ -955,6 +943,8 @@ find_param_regs(Program* program, const ABI& abi, callee_info& info,
 
             param_demand += Temp(0, it2->rc);
 
+            it2->dst_info->needs_explicit_preservation =
+               regs == clobbered_regs && !it2->dst_info->discardable;
             it2->dst_info->def.setPrecolored(*next_reg);
             for (unsigned i = 0; i < it2->rc.size(); ++i)
                BITSET_CLEAR(regs, next_reg->reg() + i);
@@ -970,9 +960,11 @@ find_param_regs(Program* program, const ABI& abi, callee_info& info,
             next_reg = next_reg->advance(required_padding * 4);
       }
       if (next_reg) {
+         params.back().dst_info->needs_explicit_preservation =
+            regs == clobbered_regs && !params.back().dst_info->discardable;
          param_demand += Temp(0, params.back().rc);
          params.back().dst_info->def.setPrecolored(*next_reg);
-         BITSET_CLEAR_RANGE(regs, next_reg->reg(), next_reg->reg() + params.back().rc.size() - 1);
+         BITSET_CLEAR_COUNT(regs, next_reg->reg(), params.back().rc.size());
          if (!params.back().is_system_param) {
             ++info.reg_param_count;
             if (discardable)
@@ -1103,7 +1095,35 @@ get_callee_info(amd_gfx_level gfx_level, const ABI& abi, unsigned param_count,
 
    find_param_regs(program, abi, info, assignment_infos, reg_limit);
 
+   /* The call target parameters are special - they are marked as discardable to allow us
+    * to overwrite the parameter values within each callee for the divergent dispatch logic.
+    * However, we still need to explicitly write back the new values to the ABI-assigned registers
+    * when jumping to the next divergent callee/returning. Therefore, mark them as needing explicit
+    * preservation.
+    */
+   info.param_infos[ACO_NIR_CALL_SYSTEM_ARG_DIVERGENT_PC].needs_explicit_preservation = true;
+   info.param_infos[ACO_NIR_CALL_SYSTEM_ARG_UNIFORM_PC].needs_explicit_preservation = true;
+
+   /* Explicitly preserve the stack pointer. spill_preserved() can ensure correctness on its own,
+    * but it only can spill the initial stack pointer value to a linear VGPR, the inactive lanes of
+    * which would in turn need to be spilled to scratch. Explicitly preserving the stack pointer's
+    * value is more efficient.
+    */
+   info.stack_ptr.needs_explicit_preservation = true;
+
    return info;
+}
+
+void
+emit_reload_preserved(isel_context* ctx)
+{
+   Builder bld(ctx->program, ctx->block);
+   Operand stack_ptr_op;
+   if (ctx->program->gfx_level >= GFX9)
+      stack_ptr_op = Operand(ctx->program->stack_ptr);
+   else
+      stack_ptr_op = Operand(load_scratch_resource(ctx->program, bld, -1u, false));
+   bld.pseudo(aco_opcode::p_reload_preserved, bld.def(bld.lm), Operand(), stack_ptr_op);
 }
 
 } // namespace aco

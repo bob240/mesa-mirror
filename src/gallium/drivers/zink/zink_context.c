@@ -116,11 +116,13 @@ zink_context_destroy(struct pipe_context *pctx)
    struct pipe_framebuffer_state fb = {0};
    pctx->set_framebuffer_state(pctx, &fb);
 
+#if HAVE_RENDERDOC_INTEGRATION
    if (screen->base.num_contexts == 1 && screen->renderdoc_capturing) {
       screen->renderdoc_capture_all = false;
       ctx->bs->has_work = true;
       pctx->flush(pctx, NULL, 0);
    }
+#endif
 
    if (util_queue_is_initialized(&screen->flush_queue))
       util_queue_finish(&screen->flush_queue);
@@ -1129,9 +1131,11 @@ rebind_buffer_as_image(struct pipe_context *pctx, struct pipe_resource *pres, en
    whandle.modifier = 0;
 
    struct pipe_resource *import = pctx->screen->resource_from_handle(pctx->screen, &tmpl, &whandle, 0);
-   if (import)
+   if (import) {
       /* this isn't actually used cross-process, so don't emit extra sync */
       zink_resource(import)->obj->exportable = false;
+      zink_resource(import)->obj->exportable_dmabuf = false;
+   }
 #if !defined(_WIN32)
    close(whandle.handle);
 #endif
@@ -3502,6 +3506,7 @@ zink_batch_no_rp_safe(struct zink_context *ctx)
       ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS].resolveImageView = VK_NULL_HANDLE;
       ctx->dynamic_fb.attachments[PIPE_MAX_COLOR_BUFS + 1].resolveImageView = VK_NULL_HANDLE;
    }
+   ctx->rp_draw = false;
 }
 
 void
@@ -4223,7 +4228,9 @@ zink_flush(struct pipe_context *pctx,
    }
 
    if (flags & PIPE_FLUSH_END_OF_FRAME) {
+#if HAVE_RENDERDOC_INTEGRATION
       p_atomic_inc(&screen->renderdoc_frame);
+#endif
       if (ctx->needs_present && ctx->needs_present->obj->dt_idx != UINT32_MAX &&
           zink_is_swapchain(ctx->needs_present)) {
          zink_kopper_readback_update(ctx, ctx->needs_present);

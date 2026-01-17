@@ -65,8 +65,10 @@ struct radv_physical_device_cache_key {
    uint32_t use_ngg : 1;
    uint32_t use_ngg_culling : 1;
    uint32_t no_implicit_varying_subgroup_size : 1;
+   uint32_t mitigate_smem_oob : 1;
+   uint32_t rt_cps : 1;
 
-   uint32_t reserved : 9;
+   uint32_t reserved : 7;
 };
 
 enum radv_video_enc_hw_ver {
@@ -317,6 +319,8 @@ void radv_physical_device_destroy(struct vk_physical_device *vk_pdev);
 bool radv_transfer_queue_enabled(const struct radv_physical_device *pdev);
 
 bool radv_compute_queue_enabled(const struct radv_physical_device *pdev);
+
+bool radv_spm_trace_enabled(const struct radv_physical_device *pdev);
 
 static inline uint32_t
 radv_get_sampled_image_desc_size(const struct radv_physical_device *pdev)

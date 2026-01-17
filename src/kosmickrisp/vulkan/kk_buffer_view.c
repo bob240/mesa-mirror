@@ -35,8 +35,11 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
       if (format->texel_buffer.read)
          features |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
 
-      if (format->texel_buffer.write)
+      if (format->texel_buffer.write) {
          features |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT;
+         features |= VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+         features |= VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT;
+      }
 
       /* Only these formats allow atomics for texel buffers */
       if (vk_format == VK_FORMAT_R32_UINT || vk_format == VK_FORMAT_R32_SINT)
@@ -86,10 +89,10 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
       .format = {.pipe = p_format, .mtl = supported_format->mtl_pixel_format},
       .swizzle =
          {
-            .red = supported_format->swizzle.red,
-            .green = supported_format->swizzle.green,
-            .blue = supported_format->swizzle.blue,
-            .alpha = supported_format->swizzle.alpha,
+            .red = supported_format->unswizzle.red,
+            .green = supported_format->unswizzle.green,
+            .blue = supported_format->unswizzle.blue,
+            .alpha = supported_format->unswizzle.alpha,
          },
       .linear_stride_B = view->vk.range,
    };

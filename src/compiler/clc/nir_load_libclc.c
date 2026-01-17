@@ -88,7 +88,7 @@ get_libclc_file(unsigned ptr_bit_size)
 struct clc_data {
    const struct clc_file *file;
 
-   unsigned char cache_key[20];
+   unsigned char cache_key[SHA1_DIGEST_LENGTH];
 
    int fd;
    const void *data;
@@ -321,7 +321,7 @@ libclc_add_generic_variants(nir_shader *shader)
 static bool
 mark_exact(nir_builder *b, nir_alu_instr *alu, UNUSED void *_)
 {
-   alu->exact = true;
+   alu->fp_math_ctrl |= nir_fp_exact;
    return true;
 }
 

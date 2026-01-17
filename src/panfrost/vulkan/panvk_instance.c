@@ -46,7 +46,11 @@ static const struct debug_control panvk_debug_options[] = {
    {"implicit_others_inv", PANVK_DEBUG_IMPLICIT_OTHERS_INV},
    {"force_blackhole", PANVK_DEBUG_FORCE_BLACKHOLE},
    {"wsi_afbc", PANVK_DEBUG_WSI_AFBC},
-   {NULL, 0}};
+   {"no_wb_mmap", PANVK_DEBUG_NO_WB_MMAP},
+   {"no_user_mmap_sync", PANVK_DEBUG_NO_USER_MMAP_SYNC},
+   {"coherent_before_cached", PANVK_DEBUG_COHERENT_BEFORE_CACHED},
+   {NULL, 0},
+};
 
 uint64_t panvk_debug;
 
@@ -236,7 +240,7 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    }
 
    unsigned build_id_len = build_id_length(note);
-   if (build_id_len < SHA1_DIGEST_LENGTH) {
+   if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
       return panvk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
                           "build-id too short.  It needs to be a SHA");
    }
@@ -278,7 +282,7 @@ panvk_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
    STATIC_ASSERT(sizeof(instance->driver_build_sha) == SHA1_DIGEST_LENGTH);
-   memcpy(instance->driver_build_sha, build_id_data(note), SHA1_DIGEST_LENGTH);
+   copy_build_id_to_sha1(instance->driver_build_sha, note);
 
    *pInstance = panvk_instance_to_handle(instance);
 

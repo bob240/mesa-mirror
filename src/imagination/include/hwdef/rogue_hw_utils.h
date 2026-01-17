@@ -261,6 +261,28 @@ rogue_get_render_size_max(const struct pvr_device_info *dev_info)
    rogue_get_render_size_max(dev_info)
 
 static inline uint32_t
+rogue_get_render_size_max_z(const struct pvr_device_info *dev_info)
+{
+   switch (dev_info->ident.arch) {
+   case PVR_DEVICE_ARCH_ROGUE:
+      return 2048;
+   default:
+      UNREACHABLE("unexpected arch");
+   }
+}
+
+static inline uint32_t
+rogue_get_texture_extent_max(const struct pvr_device_info *dev_info)
+{
+   switch (dev_info->ident.arch) {
+   case PVR_DEVICE_ARCH_ROGUE:
+      return 16384;
+   default:
+      UNREACHABLE("unexpected arch");
+   }
+}
+
+static inline uint32_t
 rogue_max_compute_shared_registers(const struct pvr_device_info *dev_info)
 {
    if (PVR_HAS_FEATURE(dev_info, compute))
@@ -472,5 +494,17 @@ static inline uint32_t rogue_usc_indexed_pixel_output_index_scale(
       return 4;
 
    return 1;
+}
+
+static inline uint32_t
+rogue_get_total_instance_count(const struct pvr_device_info *dev_info)
+{
+   /* Number of instances calculated as such:
+    * USC_SLOTS * INSTANCES_PER_SLOT * MAX_NUM_CORES * NUM_CLUSTERS
+    */
+   /* TODO: Optimise tile buffer size to use core_count, not max_num_cores. */
+   return rogue_get_max_total_instances(dev_info) *
+          rogue_get_max_num_cores(dev_info) *
+          PVR_GET_FEATURE_VALUE(dev_info, num_clusters, 1);
 }
 #endif /* ROGUE_HW_UTILS_H */

@@ -33,9 +33,7 @@ radv_tex_wrap(VkSamplerAddressMode address_mode)
       return V_008F30_SQ_TEX_MIRROR_ONCE_LAST_TEXEL;
    default:
       UNREACHABLE("illegal tex wrap mode");
-      break;
    }
-   return 0;
 }
 
 static unsigned
@@ -60,9 +58,7 @@ radv_tex_compare(VkCompareOp op)
       return V_008F30_SQ_TEX_DEPTH_COMPARE_ALWAYS;
    default:
       UNREACHABLE("illegal compare mode");
-      break;
    }
-   return 0;
 }
 
 static unsigned
@@ -73,10 +69,8 @@ radv_tex_filter(VkFilter filter, unsigned max_ansio)
       return (max_ansio > 1 ? V_008F38_SQ_TEX_XY_FILTER_ANISO_POINT : V_008F38_SQ_TEX_XY_FILTER_POINT);
    case VK_FILTER_LINEAR:
       return (max_ansio > 1 ? V_008F38_SQ_TEX_XY_FILTER_ANISO_BILINEAR : V_008F38_SQ_TEX_XY_FILTER_BILINEAR);
-   case VK_FILTER_CUBIC_EXT:
    default:
-      fprintf(stderr, "illegal texture filter");
-      return 0;
+      UNREACHABLE("illegal texture filter");
    }
 }
 

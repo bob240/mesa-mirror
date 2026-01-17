@@ -74,7 +74,7 @@ get_mul_for_src(nir_alu_src *src, unsigned num_components,
     * value and what they don't care about is the add.  Another reason is that
     * SPIR-V explicitly requires this behaviour.
     */
-   if (!alu || alu->exact)
+   if (!alu || nir_alu_instr_is_exact(alu))
       return NULL;
 
    switch (alu->op) {
@@ -160,7 +160,7 @@ intel_nir_opt_peephole_ffma_instr(nir_builder *b,
    if (add->op != nir_op_fadd)
       return false;
 
-   if (add->exact)
+   if (nir_alu_instr_is_exact(add))
       return false;
 
 
@@ -219,7 +219,7 @@ intel_nir_opt_peephole_ffma_instr(nir_builder *b,
       mul_src[0] = nir_fneg(b, mul_src[0]);
 
    nir_alu_instr *ffma = nir_alu_instr_create(b->shader, nir_op_ffma);
-   ffma->fp_fast_math = mul->fp_fast_math | add->fp_fast_math;
+   ffma->fp_math_ctrl = mul->fp_math_ctrl | add->fp_math_ctrl;
 
    for (unsigned i = 0; i < 2; i++) {
       ffma->src[i].src = nir_src_for_ssa(mul_src[i]);

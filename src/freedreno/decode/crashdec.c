@@ -85,6 +85,8 @@ replacestr(char *line, const char *find, const char *replace)
 static char *lastline;
 static char *pushedline;
 
+static void decode_finalize(void);
+
 static const char *
 popline(void)
 {
@@ -98,8 +100,10 @@ popline(void)
    free(lastline);
 
    size_t n = 0;
-   if (getline(&r, &n, in) < 0)
+   if (getline(&r, &n, in) < 0) {
+      decode_finalize();
       exit(0);
+   }
 
    /* Handle section name typo's from earlier kernels: */
    r = replacestr(r, "CP_MEMPOOOL", "CP_MEMPOOL");
@@ -253,7 +257,7 @@ debugbus_id(const char *name)
 static uint32_t
 cluster_id(const char *name)
 {
-   if (!is_a7xx())
+   if (!is_a7xx() || !name)
       return 0;
    return enumval("a7xx_cluster", name);
 }
@@ -418,6 +422,52 @@ valid_header(uint32_t pkt)
    }
 }
 
+/**
+ * Simplified version of the parsing loop in dump_commands(), which simply
+ * looks for "IB" type packets and logs the target cmdstream buffers.
+ */
+static void
+parse_ibs(uint32_t *dwords, uint32_t sizedwords)
+{
+   int dwords_left = sizedwords;
+   uint32_t count = 0; /* dword count including packet header */
+   uint32_t val;
+
+   while (dwords_left > 0) {
+      if (pkt_is_regwrite(dwords[0], &val, &count)) {
+         /* ignore */
+      } else if (pkt_is_opcode(dwords[0], &val, &count)) {
+         const char *name = pktname(val);
+         if (!strcmp(name, "CP_INDIRECT_BUFFER")) {
+            uint64_t ibaddr;
+            uint32_t ibsize;
+
+            parse_cp_indirect(&dwords[1], count - 1, &ibaddr, &ibsize);
+
+            /* map gpuaddr back to hostptr: */
+            void *ptr = hostptr(ibaddr);
+            snapshot_ib(ibaddr, ptr, ibsize);
+         }
+         // TODO CP_SET_DRAW_STATE and others?
+      } else if (pkt_is_type2(dwords[0])) {
+         /* no-op */
+         count = 1;
+      } else {
+         printf("bad type! %08x\n", dwords[0]);
+         /* for 5xx+ we can do a passable job of looking for start of next valid
+          * packet: */
+         if (options.info->chip >= 5) {
+            count = find_next_packet(dwords, dwords_left);
+         } else {
+            return;
+         }
+      }
+
+      dwords += count;
+      dwords_left -= count;
+   }
+}
+
 static void
 dump_cmdstream(void)
 {
@@ -518,7 +568,13 @@ dump_cmdstream(void)
       options.ibs[0].size = cmdszdw;
 
       handle_prefetch(buf, cmdszdw);
-      dump_commands(buf, cmdszdw, 0);
+
+      if (snapshot) {
+         parse_ibs(buf, cmdszdw);
+      } else {
+         dump_commands(buf, cmdszdw, 0);
+      }
+
       free(buf);
    }
 }
@@ -1115,12 +1171,6 @@ decode(void)
          decode_gmu_hfi();
       } else if (startswith(line, "registers:")) {
          decode_registers();
-
-         /* after we've recorded buffer contents, and CP register values,
-          * we can take a stab at decoding the cmdstream:
-          */
-         if (!snapshot)
-            dump_cmdstream();
       } else if (startswith(line, "registers-gmu:")) {
          decode_gmu_registers();
       } else if (startswith(line, "indexed-registers:")) {
@@ -1131,9 +1181,22 @@ decode(void)
          decode_clusters();
       } else if (startswith(line, "debugbus:")) {
          decode_debugbus();
-         do_snapshot();
       }
    }
+}
+
+static void
+decode_finalize(void)
+{
+   snapshot_linux.ptbase = ptbase;
+
+   /* Dump cmdstream at the end after we know we've decoded all sections that might
+    * contain reg vals needed for locating the cmdstream:
+    */
+   dump_cmdstream();
+
+   /* If we are exporting snapshot, finalize it now: */
+   do_snapshot();
 }
 
 /*
@@ -1239,6 +1302,7 @@ main(int argc, char **argv)
 
    if (snapshot) {
       freopen("/dev/null", "w", stdout);
+      verbose = false;
    } else if (interactive) {
       pager_open();
    }

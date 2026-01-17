@@ -1131,8 +1131,9 @@ radv_enc_slice_header(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
 
       radv_enc_code_fixed_bits(cmd_buffer, ref_lists->flags.ref_pic_list_modification_flag_l0, 1);
       if (ref_lists->flags.ref_pic_list_modification_flag_l0) {
+         const StdVideoEncodeH264RefListModEntry *entry = NULL;
          for (unsigned op = 0; op < MIN2(ref_lists->refList0ModOpCount, num_active_l0_refs_minus1 + 1); op++) {
-            const StdVideoEncodeH264RefListModEntry *entry = &ref_lists->pRefList0ModOperations[op];
+            entry = &ref_lists->pRefList0ModOperations[op];
 
             radv_enc_code_ue(cmd_buffer, entry->modification_of_pic_nums_idc);
             if (entry->modification_of_pic_nums_idc ==
@@ -1142,13 +1143,17 @@ radv_enc_slice_header(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
             else if (entry->modification_of_pic_nums_idc == STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_LONG_TERM)
                radv_enc_code_ue(cmd_buffer, entry->long_term_pic_num);
          }
+
+         if (entry && entry->modification_of_pic_nums_idc != STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END)
+            radv_enc_code_ue(cmd_buffer, STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END);
       }
 
       if (pic->primary_pic_type == STD_VIDEO_H264_PICTURE_TYPE_B) {
          radv_enc_code_fixed_bits(cmd_buffer, ref_lists->flags.ref_pic_list_modification_flag_l1, 1);
          if (ref_lists->flags.ref_pic_list_modification_flag_l1) {
+            const StdVideoEncodeH264RefListModEntry *entry = NULL;
             for (unsigned op = 0; op < MIN2(ref_lists->refList1ModOpCount, /* num_active_l1_refs_minus1 + */ 1); op++) {
-               const StdVideoEncodeH264RefListModEntry *entry = &ref_lists->pRefList1ModOperations[op];
+               entry = &ref_lists->pRefList1ModOperations[op];
 
                radv_enc_code_ue(cmd_buffer, entry->modification_of_pic_nums_idc);
                if (entry->modification_of_pic_nums_idc ==
@@ -1158,6 +1163,9 @@ radv_enc_slice_header(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
                else if (entry->modification_of_pic_nums_idc == STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_LONG_TERM)
                   radv_enc_code_ue(cmd_buffer, entry->long_term_pic_num);
             }
+
+            if (entry && entry->modification_of_pic_nums_idc != STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END)
+               radv_enc_code_ue(cmd_buffer, STD_VIDEO_H264_MODIFICATION_OF_PIC_NUMS_IDC_END);
          }
       }
    }
@@ -1561,10 +1569,17 @@ radv_enc_ctx(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInfoKHR *inf
 
    uint32_t swizzle_mode = 0;
 
-   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_4)
-      swizzle_mode = RENCODE_REC_SWIZZLE_MODE_256B_D;
-   else if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_2)
-      swizzle_mode = RENCODE_REC_SWIZZLE_MODE_256B_S;
+   if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_4) {
+      if (vid->vk.luma_bit_depth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+         swizzle_mode = RENCODE_REC_SWIZZLE_MODE_8x8_1D_THIN_12_24BPP_VCN4;
+      else
+         swizzle_mode = RENCODE_REC_SWIZZLE_MODE_256B_D;
+   } else if (pdev->enc_hw_ver >= RADV_VIDEO_ENC_HW_2) {
+      if (vid->vk.luma_bit_depth == VK_VIDEO_COMPONENT_BIT_DEPTH_10_BIT_KHR)
+         swizzle_mode = RENCODE_REC_SWIZZLE_MODE_8x8_1D_THIN_12_24BPP;
+      else
+         swizzle_mode = RENCODE_REC_SWIZZLE_MODE_256B_S;
+   }
 
    RADEON_ENC_BEGIN(pdev->vcn_enc_cmds.ctx);
    RADEON_ENC_CS(va >> 32);
@@ -1674,16 +1689,10 @@ radv_enc_ctx2(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInfoKHR *in
    if (info->pSetupReferenceSlot) {
       max_ref_slot_idx = info->pSetupReferenceSlot->slotIndex;
       slots[info->pSetupReferenceSlot->slotIndex] = info->pSetupReferenceSlot->pPictureResource;
-   } else if (vid->vk.max_dpb_slots == 0) {
+   } else {
+      assert(vid->vk.max_dpb_slots == 0);
       intra_only_dpb = true;
       slots[0] = &info->srcPictureResource;
-   } else {
-      /* Workaround for CTS bug dEQP-VK.video.encode.h264.i_p_b_13_layered_src_general_layout:
-       *   VUID-vkCmdEncodeVideoKHR-pEncodeInfo-08377
-       *    pEncodeInfo->pSetupReferenceSlot must not be NULL unless the bound video session
-       *    was created with VkVideoSessionCreateInfoKHR::maxDpbSlots equal to zero
-       */
-      slots[0] = info->pReferenceSlots[0].pPictureResource;
    }
 
    for (unsigned i = 0; i < info->referenceSlotCount; i++) {
@@ -3018,27 +3027,22 @@ radv_vcn_encode_video(struct radv_cmd_buffer *cmd_buffer, const VkVideoEncodeInf
 }
 
 void
+radv_video_enc_init_ctx(struct radv_device *device, struct radv_video_session *vid)
+{
+   if (vid->enc_standard == RENCODE_ENCODE_STANDARD_AV1) {
+      uint8_t *cdfptr = radv_buffer_map(device->ws, vid->ctx.mem->bo);
+      cdfptr += vid->ctx.offset;
+      memcpy(cdfptr, rvcn_av1_cdf_default_table, VCN_ENC_AV1_DEFAULT_CDF_SIZE);
+      device->ws->buffer_unmap(device->ws, vid->ctx.mem->bo, false);
+   }
+}
+
+void
 radv_video_enc_control_video_coding(struct radv_cmd_buffer *cmd_buffer, const VkVideoCodingControlInfoKHR *control_info)
 {
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_video_session *vid = cmd_buffer->video.vid;
-
-   switch (vid->vk.op) {
-   case VK_VIDEO_CODEC_OPERATION_ENCODE_H264_BIT_KHR:
-   case VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR:
-      break;
-   case VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR:
-      if (control_info->flags & VK_VIDEO_CODING_CONTROL_RESET_BIT_KHR) {
-         uint8_t *cdfptr = radv_buffer_map(device->ws, vid->ctx.mem->bo);
-         cdfptr += vid->ctx.offset;
-         memcpy(cdfptr, rvcn_av1_cdf_default_table, VCN_ENC_AV1_DEFAULT_CDF_SIZE);
-         device->ws->buffer_unmap(device->ws, vid->ctx.mem->bo, false);
-      }
-      break;
-   default:
-      UNREACHABLE("Unsupported\n");
-   }
 
    bool session_init = false;
    bool rate_control_init = false;

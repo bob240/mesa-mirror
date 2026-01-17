@@ -280,7 +280,10 @@ hk_hash_graphics_state(struct vk_physical_device *device,
       struct hk_fs_key key;
       hk_populate_fs_key(&key, state);
       _mesa_blake3_update(&blake3_ctx, &key, sizeof(key));
+   }
 
+   if (state &&
+       (stages & (VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT))) {
       const bool is_multiview = state->rp->view_mask != 0;
       _mesa_blake3_update(&blake3_ctx, &is_multiview, sizeof(is_multiview));
    }
@@ -628,6 +631,7 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
           * Linear filtering is linear (duh), so lerping is compatible.
           */
          replaced = nir_flrp(b, clamp_to_0, clamp_to_1, border);
+         b->shader->info.flrp_lowered = false;
       } else {
          /* For integers, just select componentwise since there is no linear
           * filtering. Gathers also use this path since they are unfiltered in

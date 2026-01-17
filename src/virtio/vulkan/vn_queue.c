@@ -10,7 +10,6 @@
 
 #include "vn_queue.h"
 
-#include "util/libsync.h"
 #include "venus-protocol/vn_protocol_driver_event.h"
 #include "venus-protocol/vn_protocol_driver_fence.h"
 #include "venus-protocol/vn_protocol_driver_queue.h"
@@ -24,6 +23,7 @@
 #include "vn_physical_device.h"
 #include "vn_query_pool.h"
 #include "vn_renderer.h"
+#include "vn_wsi.h"
 
 /* queue commands */
 
@@ -1075,7 +1075,7 @@ vn_queue_submit(struct vn_queue_submission *submit)
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_QueueSubmit(VkQueue queue,
                uint32_t submitCount,
                const VkSubmitInfo *pSubmits,
@@ -1084,6 +1084,7 @@ vn_QueueSubmit(VkQueue queue,
    VN_TRACE_FUNC();
 
    vn_tls_set_async_pipeline_create();
+   vn_wsi_flush(vn_queue_from_handle(queue));
 
    struct vn_queue_submission submit = {
       .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -1206,7 +1207,13 @@ vn_queue_submit_2_to_1(struct vn_device *dev,
       .signalSemaphoreCount = submit->signalSemaphoreInfoCount,
       .pSignalSemaphores = _signal_sem_handles,
    };
-   result = vn_QueueSubmit(queue_handle, 1, &_submit, fence_handle);
+   result = vn_queue_submit(&(struct vn_queue_submission){
+      .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .queue_handle = queue_handle,
+      .batch_count = 1,
+      .submit_batches = &_submit,
+      .fence_handle = fence_handle,
+   });
 
    STACK_ARRAY_FINISH(_wait_sem_handles);
    STACK_ARRAY_FINISH(_wait_stages);
@@ -1221,7 +1228,7 @@ vn_queue_submit_2_to_1(struct vn_device *dev,
    return result;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_QueueSubmit2(VkQueue queue,
                 uint32_t submitCount,
                 const VkSubmitInfo2 *pSubmits,
@@ -1231,7 +1238,13 @@ vn_QueueSubmit2(VkQueue queue,
 
    VK_FROM_HANDLE(vk_queue, queue_vk, queue);
    struct vn_device *dev = vn_device_from_vk(queue_vk->base.device);
+
+   vn_tls_set_async_pipeline_create();
+   vn_wsi_flush(vn_queue_from_handle(queue));
+
    if (!dev->has_sync2) {
+      VN_TRACE_SCOPE("2->1");
+
       for (uint32_t i = 0; i < submitCount; i++) {
          VkResult result = vn_queue_submit_2_to_1(
             dev, queue, &pSubmits[i],
@@ -1242,8 +1255,6 @@ vn_QueueSubmit2(VkQueue queue,
 
       return VK_SUCCESS;
    }
-
-   vn_tls_set_async_pipeline_create();
 
    struct vn_queue_submission submit = {
       .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO_2,
@@ -1417,15 +1428,20 @@ vn_queue_bind_sparse_submit_batch(struct vn_queue_submission *submit,
    if (result != VK_SUCCESS)
       return result;
 
-   result = vn_QueueSubmit(submit->queue_handle, 1, &batch_submit_info,
-                           fence_handle);
+   result = vn_queue_submit(&(struct vn_queue_submission){
+      .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .queue_handle = submit->queue_handle,
+      .batch_count = 1,
+      .submit_batches = &batch_submit_info,
+      .fence_handle = fence_handle,
+   });
    if (result != VK_SUCCESS)
       return result;
 
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_QueueBindSparse(VkQueue queue,
                    uint32_t bindInfoCount,
                    const VkBindSparseInfo *pBindInfo,
@@ -1433,6 +1449,8 @@ vn_QueueBindSparse(VkQueue queue,
 {
    VN_TRACE_FUNC();
    VkResult result;
+
+   vn_wsi_flush(vn_queue_from_handle(queue));
 
    struct vn_queue_submission submit = {
       .batch_type = VK_STRUCTURE_TYPE_BIND_SPARSE_INFO,
@@ -1452,8 +1470,11 @@ vn_QueueBindSparse(VkQueue queue,
          return VK_SUCCESS;
 
       /* if empty batch, just send a vkQueueSubmit with the fence */
-      result =
-         vn_QueueSubmit(submit.queue_handle, 0, NULL, submit.fence_handle);
+      result = vn_queue_submit(&(struct vn_queue_submission){
+         .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+         .queue_handle = submit.queue_handle,
+         .fence_handle = submit.fence_handle,
+      });
       if (result != VK_SUCCESS)
          return result;
    }
@@ -1471,7 +1492,7 @@ vn_QueueBindSparse(VkQueue queue,
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_QueueWaitIdle(VkQueue _queue)
 {
    VN_TRACE_FUNC();
@@ -1479,6 +1500,8 @@ vn_QueueWaitIdle(VkQueue _queue)
    VkDevice dev_handle = vk_device_to_handle(queue->base.vk.base.device);
    struct vn_device *dev = vn_device_from_handle(dev_handle);
    VkResult result;
+
+   vn_wsi_flush(queue);
 
    /* lazily create queue wait fence for queue idle waiting */
    if (queue->wait_fence == VK_NULL_HANDLE) {
@@ -1492,7 +1515,11 @@ vn_QueueWaitIdle(VkQueue _queue)
          return result;
    }
 
-   result = vn_QueueSubmit(_queue, 0, NULL, queue->wait_fence);
+   result = vn_queue_submit(&(struct vn_queue_submission){
+      .batch_type = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+      .queue_handle = _queue,
+      .fence_handle = queue->wait_fence,
+   });
    if (result != VK_SUCCESS)
       return result;
 
@@ -1604,7 +1631,7 @@ vn_fence_feedback_fini(struct vn_device *dev,
    vk_free(alloc, fence->feedback.commands);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateFence(VkDevice device,
                const VkFenceCreateInfo *pCreateInfo,
                const VkAllocationCallbacks *pAllocator,
@@ -1652,7 +1679,7 @@ out_object_base_fini:
    return vn_error(dev->instance, result);
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyFence(VkDevice device,
                 VkFence _fence,
                 const VkAllocationCallbacks *pAllocator)
@@ -1677,7 +1704,7 @@ vn_DestroyFence(VkDevice device,
    vk_free(alloc, fence);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_ResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
 {
    VN_TRACE_FUNC();
@@ -1703,7 +1730,7 @@ vn_ResetFences(VkDevice device, uint32_t fenceCount, const VkFence *pFences)
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetFenceStatus(VkDevice device, VkFence _fence)
 {
    struct vn_device *dev = vn_device_from_handle(device);
@@ -1799,7 +1826,7 @@ vn_update_sync_result(struct vn_device *dev,
    return result;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_WaitForFences(VkDevice device,
                  uint32_t fenceCount,
                  const VkFence *pFences,
@@ -1893,7 +1920,7 @@ vn_sync_valid_fd(int fd)
    return (fd >= 0 && sync_valid_fd(fd)) || fd == -1;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_ImportFenceFdKHR(VkDevice device,
                     const VkImportFenceFdInfoKHR *pImportFenceFdInfo)
 {
@@ -1918,7 +1945,7 @@ vn_ImportFenceFdKHR(VkDevice device,
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetFenceFdKHR(VkDevice device,
                  const VkFenceGetFdInfoKHR *pGetFdInfo,
                  int *pFd)
@@ -1945,11 +1972,6 @@ vn_GetFenceFdKHR(VkDevice device,
 
       vn_sync_payload_release(dev, &fence->temporary);
       fence->payload = &fence->permanent;
-
-#ifdef VN_USE_WSI_PLATFORM
-      if (!dev->renderer->info.has_implicit_fencing)
-         sync_wait(fd, -1);
-#endif
    } else {
       assert(payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD);
 
@@ -2084,7 +2106,7 @@ vn_semaphore_feedback_fini(struct vn_device *dev, struct vn_semaphore *sem)
    vn_feedback_pool_free(&dev->feedback_pool, sem->feedback.slot);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateSemaphore(VkDevice device,
                    const VkSemaphoreCreateInfo *pCreateInfo,
                    const VkAllocationCallbacks *pAllocator,
@@ -2144,7 +2166,7 @@ out_object_base_fini:
    return vn_error(dev->instance, result);
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroySemaphore(VkDevice device,
                     VkSemaphore semaphore,
                     const VkAllocationCallbacks *pAllocator)
@@ -2170,7 +2192,7 @@ vn_DestroySemaphore(VkDevice device,
    vk_free(alloc, sem);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetSemaphoreCounterValue(VkDevice device,
                             VkSemaphore semaphore,
                             uint64_t *pValue)
@@ -2271,7 +2293,7 @@ vn_GetSemaphoreCounterValue(VkDevice device,
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
 {
    VN_TRACE_FUNC();
@@ -2338,7 +2360,7 @@ vn_remove_signaled_semaphores(VkDevice device,
    return cur ? VK_NOT_READY : VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_WaitSemaphores(VkDevice device,
                   const VkSemaphoreWaitInfo *pWaitInfo,
                   uint64_t timeout)
@@ -2384,7 +2406,7 @@ vn_WaitSemaphores(VkDevice device,
    return vn_result(dev->instance, result);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_ImportSemaphoreFdKHR(
    VkDevice device, const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
 {
@@ -2411,7 +2433,7 @@ vn_ImportSemaphoreFdKHR(
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetSemaphoreFdKHR(VkDevice device,
                      const VkSemaphoreGetFdInfoKHR *pGetFdInfo,
                      int *pFd)
@@ -2433,10 +2455,7 @@ vn_GetSemaphoreFdKHR(VkDevice device,
       if (result != VK_SUCCESS)
          return vn_error(dev->instance, result);
 
-#ifdef VN_USE_WSI_PLATFORM
-      if (!dev->renderer->info.has_implicit_fencing)
-         sync_wait(fd, -1);
-#endif
+      vn_wsi_sync_wait(dev, fd);
    } else {
       assert(payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD);
 
@@ -2502,7 +2521,7 @@ vn_event_feedback_fini(struct vn_device *dev, struct vn_event *ev)
       vn_feedback_pool_free(&dev->feedback_pool, ev->feedback_slot);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_CreateEvent(VkDevice device,
                const VkEventCreateInfo *pCreateInfo,
                const VkAllocationCallbacks *pAllocator,
@@ -2536,7 +2555,7 @@ vn_CreateEvent(VkDevice device,
    return VK_SUCCESS;
 }
 
-void
+VKAPI_ATTR void VKAPI_CALL
 vn_DestroyEvent(VkDevice device,
                 VkEvent event,
                 const VkAllocationCallbacks *pAllocator)
@@ -2558,7 +2577,7 @@ vn_DestroyEvent(VkDevice device,
    vk_free(alloc, ev);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetEventStatus(VkDevice device, VkEvent event)
 {
    VN_TRACE_FUNC();
@@ -2574,7 +2593,7 @@ vn_GetEventStatus(VkDevice device, VkEvent event)
    return vn_result(dev->instance, result);
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_SetEvent(VkDevice device, VkEvent event)
 {
    VN_TRACE_FUNC();
@@ -2593,7 +2612,7 @@ vn_SetEvent(VkDevice device, VkEvent event)
    return VK_SUCCESS;
 }
 
-VkResult
+VKAPI_ATTR VkResult VKAPI_CALL
 vn_ResetEvent(VkDevice device, VkEvent event)
 {
    VN_TRACE_FUNC();

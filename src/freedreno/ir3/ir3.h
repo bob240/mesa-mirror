@@ -418,6 +418,8 @@ typedef enum ir3_instruction_flags {
 
    /* Clamp computed LOD using the given minimum. Only for cat5. */
    IR3_INSTR_CLP = BIT(25),
+
+   IR3_INSTR_EOSTSC = BIT(26),
 } ir3_instruction_flags;
 
 struct ir3_instruction {
@@ -444,6 +446,8 @@ struct ir3_instruction {
          type_t src_type, dst_type;
          round_t round;
          reduce_op_t reduce_op;
+         bool sat;
+         uint16_t r[2];
       } cat1;
       struct {
          enum {
@@ -1295,58 +1299,6 @@ is_input(struct ir3_instruction *instr)
    }
 }
 
-/* Whether non-helper invocations can read the value of helper invocations. We
- * cannot insert (eq) before these instructions.
- */
-static inline bool
-uses_helpers(struct ir3_instruction *instr)
-{
-   switch (instr->opc) {
-   /* These require helper invocations to be present */
-   case OPC_SAMB:
-   case OPC_GETLOD:
-   case OPC_DSX:
-   case OPC_DSY:
-   case OPC_DSXPP_1:
-   case OPC_DSYPP_1:
-   case OPC_DSXPP_MACRO:
-   case OPC_DSYPP_MACRO:
-   case OPC_QUAD_SHUFFLE_BRCST:
-   case OPC_QUAD_SHUFFLE_HORIZ:
-   case OPC_QUAD_SHUFFLE_VERT:
-   case OPC_QUAD_SHUFFLE_DIAG:
-   case OPC_META_TEX_PREFETCH:
-      return true;
-
-   /* sam requires helper invocations except for dummy prefetch instructions */
-   case OPC_SAM:
-      return !has_dummy_dst(instr);
-
-   /* Subgroup operations don't require helper invocations to be present, but
-    * will use helper invocations if they are present.
-    */
-   case OPC_BALLOT_MACRO:
-   case OPC_ANY_MACRO:
-   case OPC_ALL_MACRO:
-   case OPC_READ_FIRST_MACRO:
-   case OPC_READ_COND_MACRO:
-   case OPC_MOVMSK:
-   case OPC_BRCST_ACTIVE:
-      return true;
-
-   /* Catch lowered READ_FIRST/READ_COND. For elect, don't include the getone
-    * in the preamble because it doesn't actually matter which fiber is
-    * selected.
-    */
-   case OPC_MOV:
-   case OPC_ELECT_MACRO:
-      return instr->flags & IR3_INSTR_NEEDS_HELPERS;
-
-   default:
-      return false;
-   }
-}
-
 static inline bool
 is_bool(struct ir3_instruction *instr)
 {
@@ -1735,6 +1687,41 @@ unsigned ir3_cat2_absneg(opc_t opc);
 unsigned ir3_cat3_absneg(struct ir3_compiler *compiler, opc_t opc,
                          unsigned src_n);
 
+static inline bool
+ir3_cat3_int(opc_t opc)
+{
+   switch (opc) {
+   case OPC_MAD_F16:
+   case OPC_MAD_F32:
+   case OPC_SEL_F16:
+   case OPC_SEL_F32:
+      return false;
+   case OPC_MAD_U16:
+   case OPC_MADSH_U16:
+   case OPC_MAD_S16:
+   case OPC_MADSH_M16:
+   case OPC_MAD_U24:
+   case OPC_MAD_S24:
+   case OPC_SEL_B16:
+   case OPC_SEL_B32:
+   case OPC_SEL_S16:
+   case OPC_SEL_S32:
+   case OPC_SAD_S16:
+   case OPC_SAD_S32:
+   case OPC_SHRM:
+   case OPC_SHLM:
+   case OPC_SHRG:
+   case OPC_SHLG:
+   case OPC_ANDG:
+   case OPC_DP2ACC:
+   case OPC_DP4ACC:
+   case OPC_WMM:
+   case OPC_WMM_ACCU:
+   default:
+      return true;
+   }
+}
+
 /* Return the type (float, int, or uint) the op uses when converting from the
  * internal result of the op (which is assumed to be the same size as the
  * sources) to the destination when they are not the same size. If F32 it does
@@ -1935,6 +1922,18 @@ ir3_src_is_first_in_group(struct ir3_register *src)
 
 #define foreach_src_in_alias_group(__alias, __instr, __start)                  \
    foreach_src_in_alias_group_n (__alias, __alias_n, __instr, __start)
+
+static inline unsigned
+ir3_alias_group_size(struct ir3_instruction *instr, unsigned src_n)
+{
+   unsigned size = 0;
+
+   foreach_src_in_alias_group (src, instr, src_n) {
+      size++;
+   }
+
+   return size;
+}
 
 /* iterator for an instructions's destinations (reg), also returns dst #: */
 #define foreach_dst_n(__dstreg, __n, __instr)                                  \
@@ -3215,21 +3214,21 @@ static inline bool
 __regmask_get(regmask_t *regmask, enum ir3_reg_file file, unsigned n, unsigned size)
 {
    BITSET_WORD *regs = __regmask_file(regmask, file);
-   return BITSET_TEST_RANGE(regs, n, n + size - 1);
+   return BITSET_TEST_COUNT(regs, n, size);
 }
 
 static inline void
 __regmask_set(regmask_t *regmask, enum ir3_reg_file file, unsigned n, unsigned size)
 {
    BITSET_WORD *regs = __regmask_file(regmask, file);
-   BITSET_SET_RANGE(regs, n, n + size - 1);
+   BITSET_SET_COUNT(regs, n, size);
 }
 
 static inline void
 __regmask_clear(regmask_t *regmask, enum ir3_reg_file file, unsigned n, unsigned size)
 {
    BITSET_WORD *regs = __regmask_file(regmask, file);
-   BITSET_CLEAR_RANGE(regs, n, n + size - 1);
+   BITSET_CLEAR_COUNT(regs, n, size);
 }
 
 static inline void
@@ -3263,7 +3262,8 @@ regmask_or_shared(regmask_t *dst, regmask_t *a, regmask_t *b)
 }
 
 static inline void
-regmask_set(regmask_t *regmask, struct ir3_register *reg)
+regmask_set_masked(regmask_t *regmask, struct ir3_register *reg,
+                   unsigned wrmask)
 {
    unsigned size = reg_elem_size(reg);
    enum ir3_reg_file file;
@@ -3272,10 +3272,16 @@ regmask_set(regmask_t *regmask, struct ir3_register *reg)
    if (reg->flags & IR3_REG_RELATIV) {
       __regmask_set(regmask, file, n, size * reg->size);
    } else {
-      for (unsigned mask = reg->wrmask; mask; mask >>= 1, n += size)
+      for (unsigned mask = reg->wrmask & wrmask; mask; mask >>= 1, n += size)
          if (mask & 1)
             __regmask_set(regmask, file, n, size);
    }
+}
+
+static inline void
+regmask_set(regmask_t *regmask, struct ir3_register *reg)
+{
+   regmask_set_masked(regmask, reg, ~0);
 }
 
 static inline void
@@ -3310,6 +3316,12 @@ regmask_get(regmask_t *regmask, struct ir3_register *reg)
                return true;
    }
    return false;
+}
+
+static inline bool
+regmask_get_any_shared(regmask_t *regmask)
+{
+   return BITSET_TEST_RANGE(regmask->shared, 0, 2 * SHARED_REG_SIZE);
 }
 /* ************************************************************************* */
 

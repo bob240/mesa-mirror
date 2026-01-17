@@ -173,6 +173,7 @@ static int parse_reg(const char *str)
 "(sat)"                           return TOKEN(T_SAT);
 "(eolm)"                          return TOKEN(T_EOLM);
 "(eogm)"                          return TOKEN(T_EOGM);
+"(eostsc)"                        return TOKEN(T_EOSTSC);
 "(rpt"[0-7]")"                    ir3_yylval.num = strtol(yytext+4, NULL, 10); return T_RPT;
 "(nop"[0-7]")"                    ir3_yylval.num = strtol(yytext+4, NULL, 10); return T_NOP;
 "("[x]?[y]?[z]?[w]?")"            ir3_yylval.num = parse_wrmask(yytext); return T_WRMASK;
@@ -233,6 +234,9 @@ static int parse_reg(const char *str)
 "movs"                            return TOKEN(T_OP_MOVS);
 
 ("f16"|"f32"|"u16"|"u32"|"s16"|"s32"|"u8"|"u8_32"|"u64"){2} ir3_yylval.str = yytext; return T_CAT1_TYPE_TYPE;
+
+".mul2"                           return TOKEN(T_MUL2);
+".div2"                           return TOKEN(T_DIV2);
                                   /* category 2: */
 "add.f"                           return TOKEN(T_OP_ADD_F);
 "min.f"                           return TOKEN(T_OP_MIN_F);

@@ -55,7 +55,7 @@ static int
 tu_device_get_cache_uuid(struct tu_physical_device *device, void *uuid)
 {
    struct mesa_sha1 ctx;
-   unsigned char sha1[20];
+   unsigned char sha1[SHA1_DIGEST_LENGTH];
    /* Note: IR3_SHADER_DEBUG also affects compilation, but it's not
     * initialized until after compiler creation so we have to add it to the
     * shader hash instead, since the compiler is only created with the logical
@@ -227,6 +227,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_ray_query = has_raytracing,
       .KHR_ray_tracing_maintenance1 = has_raytracing,
       .KHR_relaxed_block_layout = true,
+      .KHR_robustness2 = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
@@ -270,6 +271,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_conditional_rendering = true,
       .EXT_conservative_rasterization = device->info->chip >= 7,
       .EXT_custom_border_color = true,
+      .EXT_custom_resolve = true,
       .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clip_control = true,
       .EXT_depth_clip_enable = true,
@@ -335,6 +337,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .EXT_swapchain_maintenance1 = true,
 #endif
       .EXT_texel_buffer_alignment = true,
+      .EXT_texture_compression_astc_hdr = device->info->props.has_astc_hdr,
       .EXT_tooling_info = true,
       .EXT_transform_feedback = true,
       .EXT_vertex_attribute_divisor = true,
@@ -350,6 +353,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .IMG_filter_cubic = device->info->props.has_tex_filter_cubic,
       .NV_compute_shader_derivatives = device->info->chip >= 7,
       .QCOM_fragment_density_map_offset = true,
+      .QCOM_render_pass_shader_resolve = true,
       .VALVE_fragment_density_map_layered = true,
       .VALVE_mutable_descriptor_type = true,
    } };
@@ -503,7 +507,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->subgroupSizeControl                 = true;
    features->computeFullSubgroups                = true;
    features->synchronization2                    = true;
-   features->textureCompressionASTC_HDR          = false;
+   features->textureCompressionASTC_HDR          = pdevice->info->props.has_astc_hdr;
    features->shaderZeroInitializeWorkgroupMemory = true;
    features->dynamicRendering                    = true;
    features->shaderIntegerDotProduct             = true;
@@ -749,7 +753,7 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_KHR_ray_tracing_maintenance1 */
    features->rayTracingMaintenance1 = true;
 
-   /* VK_EXT_robustness2 */
+   /* VK_KHR_robustness2 */
    features->robustBufferAccess2 = true;
    features->robustImageAccess2 = true;
    features->nullDescriptor = true;
@@ -820,6 +824,9 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_EXT_multisampled_render_to_single_sampled */
    features->multisampledRenderToSingleSampled = true;
+
+   /* VK_EXT_custom_resolve */
+   features->customResolve = true;
 }
 
 static void
@@ -859,18 +866,18 @@ tu_get_physical_device_properties_1_1(struct tu_physical_device *pdevice,
    /* Our largest descriptors are 2 texture descriptors, or a texture and
     * sampler descriptor.
     */
-   p->maxPerSetDescriptors = MAX_SET_SIZE / (2 * A6XX_TEX_CONST_DWORDS * 4);
+   p->maxPerSetDescriptors = MAX_SET_SIZE / (2 * FDL6_TEX_CONST_DWORDS * 4);
    /* Our buffer size fields allow only this much */
    p->maxMemoryAllocationSize = 0xFFFFFFFFull;
 
 }
 
 
-static const size_t max_descriptor_set_size = MAX_SET_SIZE / (4 * A6XX_TEX_CONST_DWORDS);
+static const size_t max_descriptor_set_size = MAX_SET_SIZE / (4 * FDL6_TEX_CONST_DWORDS);
 static const VkSampleCountFlags sample_counts =
    VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
 static const VkSampleCountFlags sample_location_counts =
-   VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT;
+   VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT; /* Note: update nir_shader_compiler_options.max_samples when changing this. */
 
 static void
 tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
@@ -954,8 +961,12 @@ tu_get_physical_device_properties_1_2(struct tu_physical_device *pdevice,
    p->maxDescriptorSetUpdateAfterBindStorageImages       = max_descriptor_set_size;
    p->maxDescriptorSetUpdateAfterBindInputAttachments    = MAX_RTS;
 
-   p->supportedDepthResolveModes    = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
-   p->supportedStencilResolveModes  = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+   p->supportedDepthResolveModes    =
+      VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
+      VK_RESOLVE_MODE_CUSTOM_BIT_EXT;
+   p->supportedStencilResolveModes  =
+      VK_RESOLVE_MODE_SAMPLE_ZERO_BIT |
+      VK_RESOLVE_MODE_CUSTOM_BIT_EXT;
    p->independentResolveNone  = false;
    p->independentResolve      = false;
 
@@ -1177,7 +1188,8 @@ tu_get_properties(struct tu_physical_device *pdevice,
             VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION))
          : VK_MAKE_VERSION(1, 0, VK_HEADER_VERSION);
    props->driverVersion = vk_get_driver_version();
-   props->vendorID = 0x5143;
+   props->vendorID = pdevice->instance->force_vk_vendor != 0 ?
+                     pdevice->instance->force_vk_vendor : 0x5143;
    props->deviceID = pdevice->dev_id.chip_id;
    props->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
 
@@ -1269,7 +1281,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    /* VK_KHR_performance_query */
    props->allowCommandBufferQueryCopies = false;
 
-   /* VK_EXT_robustness2 */
+   /* VK_KHR_robustness2 */
    /* see write_buffer_descriptor() */
    props->robustStorageBufferAccessSizeAlignment = 4;
    /* see write_ubo_descriptor() */
@@ -1325,7 +1337,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->combinedImageSamplerDescriptorSingleArray = true;
    props->bufferlessPushDescriptors = true;
    props->allowSamplerImageViewPostSubmitCreation = true;
-   props->descriptorBufferOffsetAlignment = A6XX_TEX_CONST_DWORDS * 4;
+   props->descriptorBufferOffsetAlignment = FDL6_TEX_CONST_DWORDS * 4;
    props->maxDescriptorBufferBindings = pdevice->usable_sets;
    props->maxResourceDescriptorBufferBindings = pdevice->usable_sets;
    props->maxSamplerDescriptorBufferBindings = pdevice->usable_sets;
@@ -1337,29 +1349,29 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->samplerCaptureReplayDescriptorDataSize = 0;
    props->accelerationStructureCaptureReplayDescriptorDataSize = 0;
    /* Note: these sizes must match descriptor_size() */
-   props->samplerDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->combinedImageSamplerDescriptorSize = 2 * A6XX_TEX_CONST_DWORDS * 4;
-   props->sampledImageDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->storageImageDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->uniformTexelBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->robustUniformTexelBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->storageTexelBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->robustStorageTexelBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->uniformBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->robustUniformBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
-   props->storageBufferDescriptorSize = A6XX_TEX_CONST_DWORDS * 4 * (1 +
+   props->samplerDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->combinedImageSamplerDescriptorSize = 2 * FDL6_TEX_CONST_DWORDS * 4;
+   props->sampledImageDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->storageImageDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->uniformTexelBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->robustUniformTexelBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->storageTexelBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->robustStorageTexelBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->uniformBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->robustUniformBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
+   props->storageBufferDescriptorSize = FDL6_TEX_CONST_DWORDS * 4 * (1 +
       COND(pdevice->info->props.storage_16bit && !pdevice->info->props.has_isam_v, 1) +
       COND(pdevice->info->props.storage_8bit, 1));
    props->robustStorageBufferDescriptorSize =
       props->storageBufferDescriptorSize;
-   props->accelerationStructureDescriptorSize = 4 * A6XX_TEX_CONST_DWORDS;
-   props->inputAttachmentDescriptorSize = A6XX_TEX_CONST_DWORDS * 4;
+   props->accelerationStructureDescriptorSize = 4 * FDL6_TEX_CONST_DWORDS;
+   props->inputAttachmentDescriptorSize = FDL6_TEX_CONST_DWORDS * 4;
    props->maxSamplerDescriptorBufferRange = ~0ull;
    props->maxResourceDescriptorBufferRange = ~0ull;
    props->samplerDescriptorBufferAddressSpaceSize = ~0ull;
    props->resourceDescriptorBufferAddressSpaceSize = ~0ull;
    props->descriptorBufferAddressSpaceSize = ~0ull;
-   props->combinedImageSamplerDensityMapDescriptorSize = 2 * A6XX_TEX_CONST_DWORDS * 4;
+   props->combinedImageSamplerDensityMapDescriptorSize = 2 * FDL6_TEX_CONST_DWORDS * 4;
 
    /* VK_EXT_legacy_vertex_attributes */
    props->nativeUnalignedPerformance = true;
@@ -1440,7 +1452,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
 
    {
       struct mesa_sha1 sha1_ctx;
-      uint8_t sha1[20];
+      uint8_t sha1[SHA1_DIGEST_LENGTH];
 
       _mesa_sha1_init(&sha1_ctx);
 
@@ -1570,39 +1582,11 @@ tu_physical_device_init(struct tu_physical_device *device,
    case 7: {
       device->dev_info = info;
       device->info = &device->dev_info;
-      uint32_t depth_cache_size =
-         device->info->num_ccu * device->info->props.sysmem_per_ccu_depth_cache_size;
-      uint32_t color_cache_size =
-         (device->info->num_ccu *
-          device->info->props.sysmem_per_ccu_color_cache_size);
-      uint32_t color_cache_size_gmem =
-         color_cache_size /
-         (1 << device->info->props.gmem_ccu_color_cache_fraction);
 
-      device->ccu_depth_offset_bypass = 0;
-      device->ccu_offset_bypass =
-         device->ccu_depth_offset_bypass + depth_cache_size;
-
-      if (device->info->props.has_gmem_vpc_attr_buf) {
-         device->vpc_attr_buf_size_bypass =
-            device->info->props.sysmem_vpc_attr_buf_size;
-         device->vpc_attr_buf_offset_bypass =
-            device->ccu_offset_bypass + color_cache_size;
-
-         device->vpc_attr_buf_size_gmem =
-            device->info->props.gmem_vpc_attr_buf_size;
-         device->vpc_attr_buf_offset_gmem =
-            device->gmem_size -
-            (device->vpc_attr_buf_size_gmem * device->info->num_ccu);
-
-         device->ccu_offset_gmem =
-            device->vpc_attr_buf_offset_gmem - color_cache_size_gmem;
-
-         device->usable_gmem_size_gmem = device->vpc_attr_buf_offset_gmem;
-      } else {
-         device->ccu_offset_gmem = device->gmem_size - color_cache_size_gmem;
-         device->usable_gmem_size_gmem = device->gmem_size;
-      }
+      device->usable_gmem_size_gmem =
+         fd6_calc_gmem_cache_offsets(&info, device->gmem_size,
+                                     &device->config_gmem,
+                                     &device->config_sysmem);
 
       if (instance->reserve_descriptor_set) {
          device->usable_sets = device->reserved_set_idx = device->info->props.max_sets - 1;
@@ -1770,6 +1754,7 @@ static const driOptionDescription tu_dri_options[] = {
    DRI_CONF_SECTION_END
 
    DRI_CONF_SECTION_DEBUG
+      DRI_CONF_FORCE_VK_VENDOR()
       DRI_CONF_VK_WSI_FORCE_BGRA8_UNORM_FIRST(false)
       DRI_CONF_VK_WSI_FORCE_SWAPCHAIN_TO_CURRENT_EXTENT(false)
       DRI_CONF_VK_X11_IGNORE_SUBOPTIMAL(false)
@@ -1796,6 +1781,8 @@ tu_init_dri_options(struct tu_instance *instance)
                        instance->vk.app_info.app_name, instance->vk.app_info.app_version,
                        instance->vk.app_info.engine_name, instance->vk.app_info.engine_version);
 
+   instance->force_vk_vendor =
+         driQueryOptioni(&instance->dri_options, "force_vk_vendor");
    instance->dont_care_as_load =
          driQueryOptionb(&instance->dri_options, "vk_dont_care_as_load");
    instance->conservative_lrz =
@@ -2222,12 +2209,17 @@ tu_copy_buffer(struct u_trace_context *utctx, void *cmdstream,
                uint64_t size_B)
 {
    struct tu_cs *cs = (struct tu_cs *) cmdstream;
-   struct tu_suballoc_bo *bo_from = (struct tu_suballoc_bo *) ts_from;
+   uint64_t src_iova = from_offset_B;
+   if (ts_from) {
+      struct tu_suballoc_bo *bo_from = (struct tu_suballoc_bo *) ts_from;
+      src_iova = bo_from->iova + from_offset_B;
+   }
+
    struct tu_suballoc_bo *bo_to = (struct tu_suballoc_bo *) ts_to;
 
    tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
    tu_cs_emit(cs, size_B / sizeof(uint32_t));
-   tu_cs_emit_qw(cs, bo_from->iova + from_offset_B);
+   tu_cs_emit_qw(cs, src_iova);
    tu_cs_emit_qw(cs, bo_to->iova + to_offset_B);
 }
 
@@ -2240,7 +2232,8 @@ tu_trace_capture_data(struct u_trace *ut,
                         uint64_t src_offset_B,
                         uint32_t size_B)
 {
-   if (src_buffer)
+   assert(src_buffer == NULL);
+   if (src_offset_B)
       tu_copy_buffer(ut->utctx, cs, src_buffer, src_offset_B, dst_buffer,
                      dst_offset_B, size_B);
 }
@@ -2574,7 +2567,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
             .linearlocalidregid = regid(63, 0),
             .threadsize = THREAD128,
             .workitemrastorder = WORKITEMRASTORDER_TILED));
-   tu_cs_emit_regs(&sub_cs, A7XX_SP_CS_UNKNOWN_A9BE(0));
+   tu_cs_emit_regs(&sub_cs, SP_CS_HYSTERESIS(A7XX, 0));
 
    tu_cs_emit_regs(&sub_cs,
                   SP_CS_NDRANGE_0(A7XX, .kerneldim = 3,
@@ -2587,7 +2580,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
                   SP_CS_NDRANGE_4(A7XX, .globaloff_y = 0),
                   SP_CS_NDRANGE_5(A7XX, .globalsize_z = 1),
                   SP_CS_NDRANGE_6(A7XX, .globaloff_z = 0));
-   tu_cs_emit_regs(&sub_cs, A7XX_SP_CS_NDRANGE_7(
+   tu_cs_emit_regs(&sub_cs, SP_CS_NDRANGE_7(A7XX,
             .localsizex = 255,
             .localsizey = 0,
             .localsizez = 0));
@@ -2961,7 +2954,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
             goto fail_prepare_perfcntrs_pass_cs;
          }
 
-         tu_cs_emit_regs(&sub_cs, A6XX_CP_SCRATCH_REG(PERF_CNTRS_REG, 1 << i));
+         /* TODO: a8xx */
+         tu_cs_emit_regs(&sub_cs, CP_SCRATCH_REG(A6XX, PERF_CNTRS_REG, 1 << i));
          tu_cs_emit_pkt7(&sub_cs, CP_WAIT_FOR_ME, 0);
 
          device->perfcntrs_pass_cs_entries[i] =
@@ -3196,17 +3190,17 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       vk_free(&device->vk.alloc, device->trace_suballoc);
    }
 
+   if (device->msrtss_color_temporary)
+      tu_destroy_memory(device, device->msrtss_color_temporary);
+   if (device->msrtss_depth_temporary)
+      tu_destroy_memory(device, device->msrtss_depth_temporary);
+
    for (unsigned i = 0; i < TU_MAX_QUEUE_FAMILIES; i++) {
       for (unsigned q = 0; q < device->queue_count[i]; q++)
          tu_queue_finish(&device->queues[i][q]);
       if (device->queue_count[i])
          vk_free(&device->vk.alloc, device->queues[i]);
    }
-
-   if (device->msrtss_color_temporary)
-      tu_destroy_memory(device, device->msrtss_color_temporary);
-   if (device->msrtss_depth_temporary)
-      tu_destroy_memory(device, device->msrtss_depth_temporary);
 
    tu_drm_device_finish(device);
 

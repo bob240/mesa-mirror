@@ -247,10 +247,10 @@ uint32_t ac_vgt_gs_mode(unsigned gs_max_vert_out, enum amd_gfx_level gfx_level);
 unsigned ac_get_tbuffer_format(enum amd_gfx_level gfx_level, unsigned dfmt, unsigned nfmt);
 
 const struct ac_vtx_format_info *ac_get_vtx_format_info_table(enum amd_gfx_level level,
-                                                              enum radeon_family family);
+                                                              bool has_alpha_adjust_bug);
 
 const struct ac_vtx_format_info *ac_get_vtx_format_info(enum amd_gfx_level level,
-                                                        enum radeon_family family,
+                                                        bool has_alpha_adjust_bug,
                                                         enum pipe_format fmt);
 
 unsigned ac_get_safe_fetch_size(const enum amd_gfx_level gfx_level, const struct ac_vtx_format_info* vtx_info,
@@ -336,9 +336,11 @@ typedef struct {
 
 bool
 ac_ngg_compute_subgroup_info(enum amd_gfx_level gfx_level, mesa_shader_stage es_stage, bool is_gs,
-                             enum mesa_prim input_prim, unsigned gs_vertices_out, unsigned gs_invocations,
-                             unsigned max_workgroup_size, unsigned wave_size, unsigned esgs_vertex_stride,
-                             unsigned ngg_lds_vertex_size, unsigned ngg_lds_scratch_size, bool tess_turns_off_ngg,
+                             enum mesa_prim input_prim, unsigned gs_vertices_out,
+                             unsigned gs_invocations, unsigned target_workgroup_size,
+                             unsigned max_workgroup_size, unsigned wave_size,
+                             unsigned esgs_vertex_stride, unsigned ngg_lds_vertex_size,
+                             unsigned ngg_lds_scratch_size, bool tess_turns_off_ngg,
                              unsigned max_esgs_lds_padding, ac_ngg_subgroup_info *out);
 
 static unsigned inline

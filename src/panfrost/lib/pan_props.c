@@ -19,15 +19,11 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * Authors:
- *   Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
  */
 
 #include "util/macros.h"
 
 #include "kmod/pan_kmod.h"
-#include "panfrost/util/pan_ir.h"
 #include "pan_props.h"
 
 #include <genxml/gen_macros.h>

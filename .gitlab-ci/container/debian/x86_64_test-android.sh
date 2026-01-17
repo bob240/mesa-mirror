@@ -25,7 +25,6 @@ EPHEMERAL=(
     debhelper-compat
     dpkg-dev
     ninja-build
-    sudo
     unzip
 )
 
@@ -101,12 +100,12 @@ EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DAND
 
 DEQP_API=GLES \
 DEQP_TARGET="android" \
-EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
+EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_ANDROID_EXE_LOGCAT=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
 . .gitlab-ci/container/build-deqp.sh
 
 DEQP_API=VK \
 DEQP_TARGET="android" \
-EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
+EXTRA_CMAKE_ARGS="-DDEQP_ANDROID_EXE=ON -DDEQP_ANDROID_EXE_LOGCAT=ON -DDEQP_TARGET_TOOLCHAIN=ndk-modern -DANDROID_NDK_PATH=/$ndk -DANDROID_ABI=x86_64 -DDE_ANDROID_API=$ANDROID_SDK_VERSION" \
 . .gitlab-ci/container/build-deqp.sh
 
 rm -rf /VK-GL-CTS
@@ -130,11 +129,6 @@ curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
 tar --zst -xvf cvd-host_package-x86_64.tar.zst
 rm cvd-host_package-x86_64.tar.zst
 
-curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -O "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${AOSP_KERNEL_PROJECT_PATH}/aosp-kernel-common-${AOSP_KERNEL_BUILD_VERSION_TAGS}.${AOSP_KERNEL_BUILD_NUMBER}/bzImage"
-curl -L --retry 4 -f --retry-all-errors --retry-delay 60 \
-  -O "https://${S3_HOST}/${S3_ANDROID_BUCKET}/${AOSP_KERNEL_PROJECT_PATH}/aosp-kernel-common-${AOSP_KERNEL_BUILD_VERSION_TAGS}.${AOSP_KERNEL_BUILD_NUMBER}/initramfs.img"
-
 popd
 
 addgroup --system kvm
@@ -152,7 +146,6 @@ section_switch debian_cleanup "Cleaning up base Debian system"
 
 rm -rf "/${ndk:?}"
 
-export SUDO_FORCE_REMOVE=yes
 apt-get purge -y "${EPHEMERAL[@]}"
 
 . .gitlab-ci/container/container_post_build.sh

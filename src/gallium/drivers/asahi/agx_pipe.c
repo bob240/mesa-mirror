@@ -1374,8 +1374,7 @@ agx_cmdbuf(struct agx_device *dev, struct drm_asahi_cmd_render *c,
    c->partial_bg.usc = pipeline_load.usc | 4;
    c->partial_eot.usc = pipeline_store.usc | 4;
 
-   c->utile_width_px = tib->tile_size.width;
-   c->utile_height_px = tib->tile_size.height;
+   agx_tilebuffer_set_drm_cmd(c, tib);
 
    c->samples = tib->nr_samples;
    c->layers = MAX2(util_framebuffer_get_num_layers(framebuffer), 1);
@@ -1965,6 +1964,7 @@ agx_init_screen_caps(struct pipe_screen *pscreen)
    u_init_pipe_screen_caps(pscreen, 1);
 
    caps->clip_halfz = true;
+   caps->prefer_real_buffer_in_constbuf0 = true;
    caps->npot_textures = true;
    caps->shader_stencil_export = true;
    caps->mixed_color_depth_bits = true;

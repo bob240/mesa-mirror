@@ -206,6 +206,9 @@ struct panfrost_context {
    struct panfrost_sampler_view
       *sampler_views[MESA_SHADER_STAGES][PIPE_MAX_SHADER_SAMPLER_VIEWS];
    unsigned sampler_view_count[MESA_SHADER_STAGES];
+   struct {
+      BITSET_DECLARE(mask, PIPE_MAX_SHADER_SAMPLER_VIEWS);
+   } texture_buffer[MESA_SHADER_STAGES];
 
    struct blitter_context *blitter;
 
@@ -413,7 +416,7 @@ struct panfrost_uncompiled_shader {
    const nir_shader *nir;
 
    /* A SHA1 of the serialized NIR for the disk cache. */
-   unsigned char nir_sha1[20];
+   unsigned char nir_sha1[SHA1_DIGEST_LENGTH];
 
    /* Stream output information */
    struct pipe_stream_output_info stream_output;

@@ -35,6 +35,18 @@
 #include "brw_analysis.h"
 #include "brw_thread_payload.h"
 
+/* UBO_START is a pseudo-register number that must be greater than the maximum
+ * number of physical hardware registers.
+ * It is used in earlier compiler stages as a source for instructions where
+ * nir_intrinsic_load_ubo has been promoted to push constants.
+ * At those stages, the exact location of the push constant data in the thread
+ * payload is not yet known.
+ *
+ * Later, in brw_shader::assign_curb_setup(), once this location is determined,
+ * the compiler checks if a register number is greater than or equal to UBO_START.
+ * If it is, the compiler calculates the actual hardware register where the push
+ * constant data will be loaded and update the instruction.
+ */
 #define UBO_START ((1 << 16) - 4)
 
 struct brw_shader_stats {
@@ -144,8 +156,11 @@ public:
    brw_analysis<brw_def_analysis, brw_shader> def_analysis;
    brw_analysis<brw_ip_ranges, brw_shader> ip_ranges_analysis;
 
-   /** Number of uniform variable components visited. */
-   unsigned uniforms;
+   /** Amount data push constant data delivered to the shader
+    *
+    * Aligned to native GRF registers
+    */
+   unsigned push_data_size;
 
    /** Byte-offset for the next available spot in the scratch space buffer. */
    unsigned last_scratch;
@@ -273,13 +288,19 @@ sample_mask_flag_subreg(const brw_shader &s)
 inline brw_reg
 brw_dynamic_msaa_flags(const struct brw_wm_prog_data *wm_prog_data)
 {
-   return brw_uniform_reg(wm_prog_data->msaa_flags_param, BRW_TYPE_UD);
+   return byte_offset(
+      brw_uniform_reg(
+         wm_prog_data->msaa_flags_param / REG_SIZE, BRW_TYPE_UD),
+      wm_prog_data->msaa_flags_param % REG_SIZE);
 }
 
 inline brw_reg
 brw_dynamic_per_primitive_remap(const struct brw_wm_prog_data *wm_prog_data)
 {
-   return brw_uniform_reg(wm_prog_data->per_primitive_remap_param, BRW_TYPE_UD);
+   return byte_offset(
+      brw_uniform_reg(
+         wm_prog_data->per_primitive_remap_param / REG_SIZE, BRW_TYPE_UD),
+      wm_prog_data->per_primitive_remap_param % REG_SIZE);
 }
 
 enum intel_barycentric_mode brw_barycentric_mode(const struct brw_wm_prog_key *key,
@@ -289,9 +310,6 @@ uint32_t brw_fb_write_msg_control(const brw_inst *inst,
                                   const struct brw_wm_prog_data *prog_data);
 
 void brw_compute_urb_setup_index(struct brw_wm_prog_data *wm_prog_data);
-
-int brw_get_subgroup_id_param_index(const intel_device_info *devinfo,
-                                    const brw_stage_prog_data *prog_data);
 
 void brw_from_nir(brw_shader *s);
 

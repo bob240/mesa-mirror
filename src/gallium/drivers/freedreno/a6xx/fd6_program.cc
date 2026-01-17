@@ -7,8 +7,6 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#define FD_BO_NO_HARDPIN 1
-
 #include <initializer_list>
 
 #include "pipe/p_state.h"
@@ -24,6 +22,7 @@
 #include "fd6_emit.h"
 #include "fd6_pack.h"
 #include "fd6_program.h"
+#include "fd6_screen.h"
 #include "fd6_texture.h"
 
 /**
@@ -46,7 +45,7 @@ template <chip CHIP>
 static void
 emit_shader_regs(struct fd_context *ctx, fd_cs &cs, const struct ir3_shader_variant *so)
 {
-   fd_crb crb(cs, 11);
+   fd_crb crb(cs, 12);
 
    mesa_shader_stage type = so->type;
    if (type == MESA_SHADER_KERNEL)
@@ -170,6 +169,12 @@ emit_shader_regs(struct fd_context *ctx, fd_cs &cs, const struct ir3_shader_vari
          .earlypreamble = so->early_preamble,
          .mergedregs = so->mergedregs,
       ));
+      if (CHIP >= A8XX) {
+         crb.add(RB_PS_CNTL(CHIP,
+            .pixlodenable = so->need_pixlod,
+            .lodpixmask = so->need_full_quad,
+         ));
+      }
       crb.add(A6XX_SP_PS_INSTR_SIZE(so->instrlen));
       crb.add(A6XX_SP_PS_PROGRAM_COUNTER_OFFSET());
       crb.add(A6XX_SP_PS_BASE(so->bo));
@@ -228,7 +233,7 @@ fd6_emit_shader(struct fd_context *ctx, fd_cs &cs, const struct ir3_shader_varia
    /* Name should generally match what you get with MESA_SHADER_CAPTURE_PATH: */
    const char *name = so->name;
    if (name)
-      fd_emit_string5(cs.ring(), name, strlen(name));
+      fd_emit_string5(cs, name, strlen(name));
 #endif
 
    emit_shader_regs<CHIP>(ctx, cs, so);
@@ -273,7 +278,7 @@ setup_stream_out_disable(struct fd_context *ctx)
       crb.add(PC_DGEN_SO_CNTL(CHIP));
    }
 
-   fd6_context(ctx)->streamout_disable_stateobj = crb.ring();
+   fd6_context(ctx)->streamout_disable_stateobj = crb;
 }
 
 template <chip CHIP>
@@ -371,7 +376,7 @@ setup_stream_out(struct fd_context *ctx, struct fd6_program_state *state,
       crb.add(PC_DGEN_SO_CNTL(CHIP, .stream_enable = true));
    }
 
-   state->streamout_stateobj = crb.ring();
+   state->streamout_stateobj = crb;
 }
 
 static uint32_t
@@ -434,7 +439,7 @@ setup_config_stateobj(struct fd_context *ctx, struct fd6_program_state *state)
 
    crb.add(SP_GFX_USIZE(CHIP, ir3_shader_num_uavs(state->fs)));
 
-   state->config_stateobj = crb.ring();
+   state->config_stateobj = crb;
 }
 
 static inline uint32_t
@@ -463,6 +468,7 @@ primitive_to_tess(enum mesa_prim primitive)
 
 #define MAX_VERTEX_ATTRIBS 32
 
+template <chip CHIP>
 static void
 emit_vfd_dest(fd_crb &crb, const struct ir3_shader_variant *vs)
 {
@@ -476,6 +482,26 @@ emit_vfd_dest(fd_crb &crb, const struct ir3_shader_variant *vs)
       .fetch_cnt = attr_count, /* decode_cnt for binning pass ? */
       .decode_cnt = attr_count
    ));
+
+   if (CHIP >= A8XX) {
+      const uint32_t vertexid_regid =
+            ir3_find_sysval_regid(vs, SYSTEM_VALUE_VERTEX_ID);
+      const uint32_t instanceid_regid =
+            ir3_find_sysval_regid(vs, SYSTEM_VALUE_INSTANCE_ID);
+      /* Note: we currently don't support multiview.
+       */
+      const uint32_t viewid_regid = INVALID_REG;
+
+      unsigned sideband_count =
+         (vertexid_regid != INVALID_REG) +
+         (instanceid_regid != INVALID_REG) +
+         (viewid_regid != INVALID_REG);
+
+      crb.add(PC_VS_INPUT_CNTL(CHIP,
+         .instr_cnt = attr_count,
+         .sideband_cnt = sideband_count,
+      ));
+   }
 
    for (uint32_t i = 0; i < attr_count; i++) {
       assert(!vs->inputs[i].sysval);
@@ -856,12 +882,9 @@ emit_vpc(fd_crb &crb, const struct program_builder *b)
       }
    }
 
-   /* if vertex_flags somehow gets optimized out, your gonna have a bad time: */
-   assert(flags_regid != INVALID_REG);
-
    switch (last_shader->type) {
    case MESA_SHADER_VERTEX:
-      crb.add(A6XX_SP_VS_OUTPUT_CNTL(.out = linkage.cnt, .flags_regid = flags_regid));
+      crb.add(A6XX_SP_VS_OUTPUT_CNTL(.out = linkage.cnt));
       crb.add(VPC_VS_SIV_CNTL(CHIP,
          .layerloc = layer_loc,
          .viewloc = view_loc,
@@ -880,7 +903,7 @@ emit_vpc(fd_crb &crb, const struct program_builder *b)
       ));
       break;
    case MESA_SHADER_TESS_EVAL:
-      crb.add(A6XX_SP_DS_OUTPUT_CNTL(.out = linkage.cnt, .flags_regid = flags_regid));
+      crb.add(A6XX_SP_DS_OUTPUT_CNTL(.out = linkage.cnt));
       crb.add(VPC_DS_SIV_CNTL(CHIP,
          .layerloc = layer_loc,
          .viewloc = view_loc,
@@ -899,6 +922,9 @@ emit_vpc(fd_crb &crb, const struct program_builder *b)
       ));
       break;
    case MESA_SHADER_GEOMETRY:
+      /* if vertex_flags somehow gets optimized out, your gonna have a bad time: */
+      assert(flags_regid != INVALID_REG);
+
       crb.add(A6XX_SP_GS_OUTPUT_CNTL(.out = linkage.cnt, .flags_regid = flags_regid));
       crb.add(VPC_GS_SIV_CNTL(CHIP,
          .layerloc = layer_loc,
@@ -1045,7 +1071,7 @@ emit_fs_inputs(fd_crb &crb, const struct program_builder *b)
       ));
    }
 
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
       for (int i = 0; i < fs->num_sampler_prefetch; i++) {
          const struct ir3_sampler_prefetch *prefetch = &fs->sampler_prefetch[i];
          crb.add(A6XX_SP_PS_INITIAL_TEX_INDEX_CMD(i,
@@ -1056,6 +1082,10 @@ emit_fs_inputs(fd_crb &crb, const struct program_builder *b)
    }
 
    crb.add(SP_LB_PARAM_LIMIT(CHIP, b->ctx->screen->info->props.prim_alloc_threshold));
+
+   if (CHIP == A8XX)
+      crb.add(RB_LB_PARAM_LIMIT(CHIP, b->ctx->screen->info->props.prim_alloc_threshold));
+
    crb.add(SP_REG_PROG_ID_0(CHIP,
       .faceregid = face_regid,
       .sampleid = samp_id_regid,
@@ -1139,7 +1169,7 @@ emit_fs_inputs(fd_crb &crb, const struct program_builder *b)
       .ij_linear_centroid    = VALIDREG(ij_regid[IJ_LINEAR_CENTROID]),
       .ij_linear_sample      = VALIDREG(ij_regid[IJ_LINEAR_SAMPLE]) || need_size_persamp,
       .coord_mask            = fs->fragcoord_compmask,
-      .unk10                 = enable_varyings,
+      .interp_en             = enable_varyings,
    ));
    crb.add(A6XX_RB_PS_INPUT_CNTL(
       .samplemask            = VALIDREG(smask_in_regid),
@@ -1245,7 +1275,7 @@ setup_stateobj(fd_cs &cs, const struct program_builder *b)
 
    crb.add(PC_STEREO_RENDERING_CNTL(CHIP));
 
-   emit_vfd_dest(crb, b->vs);
+   emit_vfd_dest<CHIP>(crb, b->vs);
    emit_vpc<CHIP>(crb, b);
 
    emit_fs_inputs<CHIP>(crb, b);
@@ -1317,7 +1347,7 @@ create_interp_stateobj(struct fd_context *ctx, struct fd6_program_state *state)
 
    emit_interp_state<CHIP>(crb, state, false, false, 0);
 
-   return crb.ring();
+   return crb;
 }
 
 /* build the program streaming state which is not part of the pre-
@@ -1339,7 +1369,7 @@ fd6_program_interp_state(struct fd6_emit *emit)
       emit_interp_state<CHIP>(crb, state, emit->rasterflat,
                               emit->sprite_coord_mode, emit->sprite_coord_enable);
 
-      return crb.ring();
+      return crb;
    }
 }
 FD_GENX(fd6_program_interp_state);
@@ -1464,7 +1494,7 @@ fd6_program_create(void *data, const struct ir3_shader_variant *bs,
       fd_screen_lock(screen);
       if (!screen->tess_bo)
          screen->tess_bo =
-            fd_bo_new(screen->dev, FD6_TESS_BO_SIZE, FD_BO_NOMAP, "tessfactor");
+            fd_bo_new(screen->dev, FD6_TESS<CHIP>::BO_SIZE, FD_BO_NOMAP, "tessfactor");
       fd_screen_unlock(screen);
    }
 
@@ -1555,7 +1585,7 @@ fd6_program_create(void *data, const struct ir3_shader_variant *bs,
    if (ds && ds->need_driver_params)
       num_ubo_dp++;
 
-   if (!(CHIP == A7XX && vs->compiler->load_inline_uniforms_via_preamble_ldgk)) {
+   if (!fd6_load_inline_uniforms_via_preamble_ldgk<CHIP>(vs)) {
       /* On a6xx all shader stages use driver params pushed in cmdstream: */
       num_dp += num_ubo_dp;
       num_ubo_dp = 0;

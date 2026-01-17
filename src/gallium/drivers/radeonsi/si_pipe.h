@@ -447,8 +447,8 @@ struct si_surface {
    struct pipe_surface base;
 
    /* These can vary with block-compressed textures. */
-   uint16_t width0;
-   uint16_t height0;
+   unsigned width0;
+   unsigned height0;
 
    bool color_initialized : 1;
    bool depth_initialized : 1;
@@ -1324,7 +1324,7 @@ struct si_context {
       bool with_db;
    } force_shader_coherency;
 
-   struct si_tracked_regs tracked_regs;
+   struct ac_tracked_regs tracked_regs;
 
    /* Resources that need to be flushed, but will not get an explicit
     * flush_resource from the frontend and that will need to get flushed during
@@ -1621,7 +1621,6 @@ bool si_sdma_copy_image(struct si_context *ctx, struct si_texture *dst, struct s
 /* si_gfx_cs.c */
 void si_reset_debug_log_buffer(struct si_context *sctx);
 void si_flush_gfx_cs(struct si_context *ctx, unsigned flags, struct pipe_fence_handle **fence);
-void si_set_tracked_regs_to_clear_state(struct si_context *ctx);
 void si_begin_new_gfx_cs(struct si_context *ctx, bool first_cs);
 void si_trace_emit(struct si_context *sctx);
 void si_emit_ts(struct si_context *sctx, struct si_resource* buffer, unsigned int offset);

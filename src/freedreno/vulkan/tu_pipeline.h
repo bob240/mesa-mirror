@@ -301,15 +301,18 @@ struct tu_pvtmem_config {
    bool per_wave;
 };
 
-template <chip CHIP>
-void
-tu6_emit_xs_config(struct tu_cs *cs,
-                   mesa_shader_stage stage,
-                   const struct ir3_shader_variant *xs);
+struct tu_shader_stages {
+   const struct ir3_shader_variant *vs, *hs, *ds, *gs, *fs, *cs;
+};
 
 template <chip CHIP>
 void
-tu6_emit_shared_consts_enable(struct tu_cs *cs, bool shared_consts_enable);
+tu6_emit_xs_config(struct tu_crb &crb,
+                   struct tu_shader_stages stages);
+
+template <chip CHIP>
+void
+tu6_emit_shared_consts_enable(struct tu_crb &crb, bool shared_consts_enable);
 
 template <chip CHIP>
 void

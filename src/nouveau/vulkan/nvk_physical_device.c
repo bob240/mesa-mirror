@@ -171,6 +171,7 @@ nvk_get_device_extensions(const struct nvk_instance *instance,
 #endif
       .KHR_push_descriptor = true,
       .KHR_relaxed_block_layout = true,
+      .KHR_robustness2 = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
       .KHR_sampler_ycbcr_conversion = true,
       .KHR_separate_depth_stencil_layouts = true,
@@ -701,7 +702,7 @@ nvk_get_device_features(const struct nv_device_info *info,
       .provokingVertexLast = true,
       .transformFeedbackPreservesProvokingVertex = true,
 
-      /* VK_EXT_robustness2 */
+      /* VK_KHR_robustness2 */
       .robustBufferAccess2 = true,
       .robustImageAccess2 = true,
       .nullDescriptor = true,
@@ -762,6 +763,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
                           const struct nv_device_info *info,
                           struct vk_properties *properties)
 {
+   /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlagBits sample_counts = VK_SAMPLE_COUNT_1_BIT |
                                                VK_SAMPLE_COUNT_2_BIT |
                                                VK_SAMPLE_COUNT_4_BIT |
@@ -790,7 +792,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .maxImageArrayLayers = 2048,
       .maxTexelBufferElements = 128 * 1024 * 1024,
       .maxUniformBufferRange = 65536,
-      .maxStorageBufferRange = UINT32_MAX,
+      .maxStorageBufferRange = 1ull << 31,
       .maxPushConstantsSize = NVK_MAX_PUSH_SIZE,
       .maxMemoryAllocationCount = 4096,
       .maxSamplerAllocationCount = 4000,
@@ -1174,7 +1176,7 @@ nvk_get_device_properties(const struct nvk_instance *instance,
       .provokingVertexModePerPipeline = true,
       .transformFeedbackPreservesTriangleFanProvokingVertex = true,
 
-      /* VK_EXT_robustness2 */
+      /* VK_KHR_robustness2 */
       .robustStorageBufferAccessSizeAlignment = NVK_SSBO_BOUNDS_CHECK_ALIGNMENT,
       .robustUniformBufferAccessSizeAlignment = nvk_min_cbuf_alignment(info),
 
@@ -1328,7 +1330,7 @@ nvk_physical_device_init_pipeline_cache(struct nvk_physical_device *pdev)
                                pdev->info.chipset);
    assert(len == sizeof(renderer) - 2);
 
-   char timestamp[41];
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
    _mesa_sha1_format(timestamp, instance->driver_build_sha);
 
    const uint64_t driver_flags = nvk_physical_device_compiler_flags(pdev);
@@ -1579,6 +1581,13 @@ nvk_create_drm_physical_device(struct vk_instance *_instance,
                      VK_QUEUE_SPARSE_BINDING_BIT,
       .queue_count = 1,
    };
+   if (pdev->info.has_transfer_queue) {
+      pdev->queue_families[pdev->queue_family_count++] = (struct nvk_queue_family) {
+         .queue_flags = VK_QUEUE_TRANSFER_BIT |
+                        VK_QUEUE_SPARSE_BINDING_BIT,
+         .queue_count = 2,
+      };
+   }
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));
 
    pdev->vk.supported_sync_types = nvkmd->sync_types;

@@ -142,11 +142,12 @@ gather_intrinsic_store_output_info(const nir_shader *nir, const nir_intrinsic_in
    switch (nir->info.stage) {
    case MESA_SHADER_FRAGMENT:
       if (location >= FRAG_RESULT_DATA0) {
-         const unsigned fs_semantic = location + io_sem.dual_source_blend_index;
-         info->ps.colors_written |= 0xfu << (4 * (fs_semantic - FRAG_RESULT_DATA0));
+         int index = mesa_frag_result_get_color_index(location);
 
-         if (fs_semantic == FRAG_RESULT_DATA0)
-            info->ps.color0_written = write_mask;
+         info->ps.colors_written |= 0xfu << (4 * index);
+
+         if (location == FRAG_RESULT_DATA0)
+            info->ps.color0_written |= write_mask << component;
       }
       break;
    default:
@@ -1276,8 +1277,8 @@ gfx10_get_ngg_info(const struct radv_device *device, struct radv_shader_info *es
    ac_ngg_subgroup_info info;
 
    ac_ngg_compute_subgroup_info(gfx_level, es_info->stage, !!gs_info, input_prim, gs_vertices_out, gs_num_invocations,
-                                128, stage_info->wave_size, es_info->esgs_itemsize, stage_info->ngg_lds_vertex_size,
-                                stage_info->ngg_lds_scratch_size, false, 0, &info);
+                                128, 256, stage_info->wave_size, es_info->esgs_itemsize,
+                                stage_info->ngg_lds_vertex_size, stage_info->ngg_lds_scratch_size, false, 0, &info);
 
    out->hw_max_esverts = info.hw_max_esverts;
    out->max_gsprims = info.max_gsprims;

@@ -26,7 +26,12 @@
 typedef struct content {
    slice name;
    slice fullname;
-   slice data;
+
+   /* Position offset and size inside the archive.  Don't store
+    * a slice here since the archive is loaded on demand.
+    */
+   int offset;
+   int len;
 } content;
 
 typedef struct object {
@@ -46,8 +51,10 @@ typedef struct mesa_archive {
    int     objects_count;
    object *objects;
 
-   const char *info;
+   slice info;
    slice detected_mda_prefix;
+
+   char *contents_ptr;
 } mesa_archive;
 
 enum diff_mode {
@@ -89,6 +96,12 @@ failf(const char *fmt, ...)
    vfprintf(stderr, fmt, args);
    va_end(args);
    exit(1);
+}
+
+static slice
+ralloc_slice_dup(void *mem_ctx, slice s)
+{
+   return (slice){ ralloc_memdup(mem_ctx, s.data, s.len), s.len };
 }
 
 typedef struct {
@@ -175,6 +188,50 @@ print_separator(int count)
    putchar('\n');
 }
 
+static slice
+get_archive_contents(context *ctx, mesa_archive *ma)
+{
+   /* Load the contents of archive on-demand.  This is done
+    * so the metadata can be processed without keeping the
+    * entire contents of all archives loaded.  Once there's
+    * a need to peek at individual objects, the archives are
+    * loaded.
+    */
+   if (ma->contents_ptr == NULL) {
+      const char *filepath = slice_to_cstr(ctx, ma->filename);
+      size_t size;
+      ma->contents_ptr = os_read_file(filepath, &size);
+
+      if (!ma->contents_ptr) {
+         fprintf(stderr, "mda: failed to load %s: %s\n",
+                 filepath, strerror(errno));
+         return (slice){NULL, 0};
+      }
+
+      ma->contents = (slice){ma->contents_ptr, size};
+   }
+
+   return ma->contents;
+}
+
+static void
+unload_archive_contents(context *ctx, mesa_archive *ma)
+{
+   if (ma->contents_ptr != NULL) {
+      /* These are loaded via os_read_file(). */
+      free(ma->contents_ptr);
+      ma->contents_ptr = NULL;
+      ma->contents = (slice){};
+   }
+}
+
+static slice
+get_content_data(context *ctx, mesa_archive *ma, const content *c)
+{
+   return slice_substr(get_archive_contents(ctx, ma),
+                       c->offset, c->offset + c->len);
+}
+
 static mesa_archive *
 parse_mesa_archive(void *mem_ctx, const char *filename)
 {
@@ -187,11 +244,9 @@ parse_mesa_archive(void *mem_ctx, const char *filename)
 
    mesa_archive *ma = rzalloc(mem_ctx, mesa_archive);
    ma->filename = slice_from_cstr(ralloc_strdup(ma, filename));
-   ma->contents = (slice) { ralloc_memdup(ma, (const char *)contents, size), size };
-   free(contents);
 
    tar_reader tr = {0};
-   tar_reader_init_from_bytes(&tr, ma->contents.data, ma->contents.len);
+   tar_reader_init_from_bytes(&tr, contents, size);
 
    tar_reader_entry entry = {0};
 
@@ -213,9 +268,10 @@ parse_mesa_archive(void *mem_ctx, const char *filename)
       if (slice_ends_with(fullpath, mda_mesa_txt)) {
          slice_cut_result cut = slice_cut(fullpath, '/');
          if (cut.found && slice_equal_cstr(cut.after, "mesa.txt")) {
-            /* Cut was succesful, so can extend to include the separator. */
-            ma->detected_mda_prefix = (slice){ cut.before.data, cut.before.len+1 };
-            ma->info = slice_to_cstr(ma, entry.contents);
+            /* Cut was successful, so can extend to include the separator. */
+            slice prefix_slice = (slice){ cut.before.data, cut.before.len+1 };
+            ma->detected_mda_prefix = ralloc_slice_dup(ma, prefix_slice);
+            ma->info = ralloc_slice_dup(ma, entry.contents);
             found_mesa_txt = true;
             break;
          }
@@ -223,12 +279,13 @@ parse_mesa_archive(void *mem_ctx, const char *filename)
    }
 
    if (!found_mesa_txt) {
+      free(contents);
       fprintf(stderr, "mda: wrong archive, missing mesa.txt\n");
       return NULL;
    }
 
-   /* Now that we found mesa. Reset header. */
-   tar_reader_init_from_bytes(&tr, ma->contents.data, ma->contents.len);
+   /* Now that we found mesa.txt, reset reader. */
+   tar_reader_init_from_bytes(&tr, contents, size);
 
    struct hash_table *lookup = slice_hash_table_create(ma);
 
@@ -240,7 +297,7 @@ parse_mesa_archive(void *mem_ctx, const char *filename)
                                               SLICE_FMT(entry.name));
          fullpath = slice_from_cstr(fullpath_str);
       } else {
-         fullpath = entry.name;
+         fullpath = ralloc_slice_dup(ma, entry.name);
       }
 
       /* Ignore directory entries. */
@@ -316,12 +373,15 @@ parse_mesa_archive(void *mem_ctx, const char *filename)
                                obj->versions_count, obj->versions_count + 1);
       int s = obj->versions_count++;
 
-      obj->versions[s].name = version_name;
-      obj->versions[s].data = entry.contents;
+      obj->versions[s].name = ralloc_slice_dup(ma, version_name);
       char *version_fullname_str = ralloc_asprintf(ma, "%.*s/%.*s", SLICE_FMT(obj->fullname), SLICE_FMT(version_name));
       obj->versions[s].fullname = slice_from_cstr(version_fullname_str);
+
+      obj->versions[s].offset = entry.contents.data - contents;
+      obj->versions[s].len = entry.contents.len;
    }
 
+   free(contents);
    return ma;
 }
 
@@ -484,7 +544,7 @@ cmd_info(context *ctx)
 
       mesa_archive *ma = ctx->archives[i];
       printf("# From %.*s\n", SLICE_FMT(ma->filename));
-      printf("%s\n", ma->info);
+      printf("%.*s\n", SLICE_FMT(ma->info));
    }
 
    return 0;
@@ -592,7 +652,9 @@ cmd_diff(context *ctx)
    print_separator(MAX2(x, y));
    printf("\n");
 
-   diff(ctx, a.content->data, b.content->data);
+   slice a_data = get_content_data(ctx, a.object->ma, a.content);
+   slice b_data = get_content_data(ctx, b.object->ma, b.content);
+   diff(ctx, a_data, b_data);
    printf("\n");
 
    return 0;
@@ -654,7 +716,8 @@ cmd_log(context *ctx)
          print_separator(MAX2(x, y));
          printf("\n");
 
-         printf("%.*s\n", SLICE_FMT(c->data));
+         slice data = get_content_data(ctx, obj->ma, c);
+         printf("%.*s\n", SLICE_FMT(data));
       }
 
    } else {
@@ -666,7 +729,9 @@ cmd_log(context *ctx)
          print_separator(MAX2(x, y));
          printf("\n");
 
-         diff(ctx, c->data, next->data);
+         slice curr_data = get_content_data(ctx, obj->ma, c);
+         slice next_data = get_content_data(ctx, obj->ma, next);
+         diff(ctx, curr_data, next_data);
          printf("\n");
       }
    }
@@ -676,12 +741,14 @@ cmd_log(context *ctx)
 }
 
 static slice
-get_spirv_disassembly(void *mem_ctx, object *obj)
+get_spirv_disassembly(context *ctx, object *obj)
 {
    assert(slice_equal_cstr(obj->name, "SPV"));
    assert(obj->versions_count == 1);
 
    content *c = &obj->versions[0];
+
+   slice data = get_content_data(ctx, obj->ma, c);
 
    int stdin_pipe[2], stdout_pipe[2];
    if (pipe(stdin_pipe) < 0 || pipe(stdout_pipe) < 0)
@@ -716,13 +783,13 @@ get_spirv_disassembly(void *mem_ctx, object *obj)
    close(stdin_pipe[0]);
    close(stdout_pipe[1]);
 
-   ssize_t written = write(stdin_pipe[1], c->data.data, c->data.len);
+   ssize_t written = write(stdin_pipe[1], data.data, data.len);
    close(stdin_pipe[1]);
 
    struct util_dynarray output;
-   util_dynarray_init(&output, mem_ctx);
+   util_dynarray_init(&output, ctx);
 
-   if (written != (ssize_t)c->data.len)
+   if (written != (ssize_t)data.len)
       goto wait_and_fail;
 
    char read_buffer[1024];
@@ -756,9 +823,9 @@ fail:
 }
 
 static int
-print_disassembled_spirv(void *mem_ctx, object *obj)
+print_disassembled_spirv(context *ctx, object *obj)
 {
-   slice disassembly = get_spirv_disassembly(mem_ctx, obj);
+   slice disassembly = get_spirv_disassembly(ctx, obj);
    if (slice_is_empty(disassembly)) {
       fprintf(stderr, "mda: failed to disassemble SPIR-V\n");
       return 1;
@@ -796,7 +863,8 @@ cmd_print(context *ctx)
       printf("\n");
    }
 
-   printf("%.*s", SLICE_FMT(m.content->data));
+   slice data = get_content_data(ctx, m.object->ma, m.content);
+   printf("%.*s", SLICE_FMT(data));
 
    if (!raw)
       printf("\n");
@@ -896,8 +964,20 @@ cmd_search(context *ctx)
    find_all_result matches = find_all(ctx, pattern);
    int found_count = 0;
 
+   mesa_archive *prev = NULL;
+
    for (int i = 0; i < matches.matches_count; i++) {
       match *m = &matches.matches[i];
+
+      /* Matches are mostly grouped by archive, so once we stop seeing
+       * an archive unload its contents.  It will be reloaded later if
+       * needed.
+       */
+      if (prev != m->object->ma) {
+         if (prev)
+            unload_archive_contents(ctx, prev);
+         prev = m->object->ma;
+      }
 
       /* SPIR-V object has only one version.  We probably could clean up
        * handling of it here and elsewhere to something more general
@@ -906,17 +986,19 @@ cmd_search(context *ctx)
       const bool is_spirv = slice_equal_cstr(m->object->name, "SPV");
 
       if (search_all && !is_spirv) {
-         foreach_version(c, m->object)
-            found_count += print_search_matches(c->data, search_string, c->fullname);
+         foreach_version(c, m->object) {
+            slice data = get_content_data(ctx, m->object->ma, c);
+            found_count += print_search_matches(data, search_string, c->fullname);
+         }
 
       } else {
          content *latest = last_version(m->object);
 
          slice search_data;
          if (is_spirv)
-            search_data = get_spirv_disassembly(m->object->ma, m->object);
+            search_data = get_spirv_disassembly(ctx, m->object);
          else
-            search_data = latest->data;
+            search_data = get_content_data(ctx, m->object->ma, latest);
 
          found_count += print_search_matches(search_data, search_string, latest->fullname);
       }
@@ -1296,6 +1378,10 @@ main(int argc, char *argv[])
    pid_t pid = cmd->skip_pager ? -1 : setup_pager();
 
    int r = cmd->func(ctx);
+
+   for (int i = 0; i < ctx->archives_count; i++)
+      unload_archive_contents(ctx, ctx->archives[i]);
+
    ralloc_free(ctx);
 
    if (pid > 0) {

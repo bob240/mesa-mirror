@@ -94,6 +94,19 @@ static const char *conditions_str[] = {
    "le", "gt", "eq", "ne", "lt", "ge", "always",
 };
 
+#if PAN_ARCH >= 11
+static const char *defer_modes_str[] = {
+   ".defer_immediate",
+   ".defer_indirect",
+};
+
+#define defer_mode_str(I)                                                      \
+   I.defer_mode < ARRAY_SIZE(defer_modes_str) ? defer_modes_str[I.defer_mode]  \
+                                              : ".defer_mode_invalid"
+#else
+#define defer_mode_str(I) ""
+#endif
+
 static void
 print_cs_instr(FILE *fp, const uint64_t *instr)
 {
@@ -134,10 +147,17 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
       /* Print the instruction. Ignore the selects and the flags override
        * since we'll print them implicitly later.
        */
+#if PAN_ARCH >= 12
+      fprintf(fp, "RUN_COMPUTE%s.%s.srt%d.spd%d.tsd%d.fau%d #%u, #%u",
+              I.progress_increment ? ".progress_inc" : "", axes[I.task_axis],
+              I.srt_select, I.spd_select, I.tsd_select, I.fau_select,
+              I.task_increment, I.ep_limit);
+#else
       fprintf(fp, "RUN_COMPUTE%s.%s.srt%d.spd%d.tsd%d.fau%d #%u",
               I.progress_increment ? ".progress_inc" : "", axes[I.task_axis],
               I.srt_select, I.spd_select, I.tsd_select, I.fau_select,
               I.task_increment);
+#endif
       break;
    }
 
@@ -321,14 +341,9 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
          ".increment",
       };
 
-      const char *defer_mode_name[] = {
-         ".defer_immediate",
-         ".defer_indirect",
-      };
-
       fprintf(fp, "SHARED_SB_INC%s%s #%u, #%u",
               progress_increment_name[I.progress_increment],
-              defer_mode_name[I.defer_mode], I.sb_mask, I.shared_entry);
+              defer_mode_str(I), I.sb_mask, I.shared_entry);
       break;
    }
 
@@ -379,8 +394,9 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
 
    case MALI_CS_OPCODE_FINISH_FRAGMENT: {
       cs_unpack(instr, CS_FINISH_FRAGMENT, I);
-      fprintf(fp, "FINISH_FRAGMENT%s d%u, d%u, #%x, #%u",
+      fprintf(fp, "FINISH_FRAGMENT%s%s d%u, d%u, #%x, #%u",
               I.increment_fragment_completed ? ".frag_end" : "",
+              defer_mode_str(I),
               I.last_heap_chunk, I.first_heap_chunk, I.wait_mask,
               I.signal_slot);
       break;
@@ -493,28 +509,29 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
          "INVALID",
       };
 
-      fprintf(fp, "FLUSH_CACHE2.%s_l2.%s_lsc.%s r%u, #%x, #%u",
+      fprintf(fp, "FLUSH_CACHE2.%s_l2.%s_lsc.%s%s r%u, #%x, #%u",
               mode[I.l2_flush_mode], mode[I.lsc_flush_mode],
-              other_mode[I.other_flush_mode], I.latest_flush_id, I.wait_mask,
-              I.signal_slot);
+              other_mode[I.other_flush_mode], defer_mode_str(I),
+              I.latest_flush_id, I.wait_mask, I.signal_slot);
       break;
    }
 
    case MALI_CS_OPCODE_SYNC_ADD32: {
       cs_unpack(instr, CS_SYNC_ADD32, I);
-      fprintf(fp, "SYNC_ADD32%s%s [d%u], r%u, #%x, #%u",
+      fprintf(fp, "SYNC_ADD32%s%s%s [d%u], r%u, #%x, #%u",
               I.error_propagate ? ".error_propagate" : "",
-              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system", I.address,
+              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system",
+              defer_mode_str(I), I.address,
               I.data, I.wait_mask, I.signal_slot);
       break;
    }
 
    case MALI_CS_OPCODE_SYNC_SET32: {
       cs_unpack(instr, CS_SYNC_SET32, I);
-      fprintf(fp, "SYNC_SET32%s%s [d%u], r%u, #%x, #%u",
+      fprintf(fp, "SYNC_SET32%s%s%s [d%u], r%u, #%x, #%u",
               I.error_propagate ? ".error_propagate" : "",
-              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system", I.address,
-              I.data, I.wait_mask, I.signal_slot);
+              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system",
+              defer_mode_str(I), I.address, I.data, I.wait_mask, I.signal_slot);
       break;
    }
 
@@ -534,9 +551,10 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
       };
 
       cs_unpack(instr, CS_STORE_STATE, I);
-      fprintf(fp, "STORE_STATE.%s d%u, #%i, #%x, #%u",
+      fprintf(fp, "STORE_STATE.%s%s d%u, #%i, #%x, #%u",
               I.state >= ARRAY_SIZE(states_str) ? "UNKNOWN_STATE"
                                                 : states_str[I.state],
+              defer_mode_str(I),
               I.address, I.offset, I.wait_mask, I.signal_slot);
       break;
    }
@@ -561,9 +579,16 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
 
    case MALI_CS_OPCODE_RUN_COMPUTE_INDIRECT: {
       cs_unpack(instr, CS_RUN_COMPUTE_INDIRECT, I);
+#if PAN_ARCH >= 12
+      fprintf(fp, "RUN_COMPUTE_INDIRECT%s.srt%d.spd%d.tsd%d.fau%d #%u, #%u",
+              I.progress_increment ? ".progress_inc" : "", I.srt_select,
+              I.spd_select, I.tsd_select, I.fau_select, I.workgroups_per_task,
+              I.ep_limit);
+#else
       fprintf(fp, "RUN_COMPUTE_INDIRECT%s.srt%d.spd%d.tsd%d.fau%d #%u",
               I.progress_increment ? ".progress_inc" : "", I.srt_select,
               I.spd_select, I.tsd_select, I.fau_select, I.workgroups_per_task);
+#endif
 
       break;
    }
@@ -590,27 +615,27 @@ print_cs_instr(FILE *fp, const uint64_t *instr)
 
    case MALI_CS_OPCODE_TRACE_POINT: {
       cs_unpack(instr, CS_TRACE_POINT, I);
-      fprintf(fp, "TRACE_POINT r%d:r%d, #%x, #%u", I.base_register,
-              I.base_register + I.register_count - 1, I.wait_mask,
-              I.signal_slot);
+      fprintf(fp, "TRACE_POINT%s r%d:r%d, #%x, #%u", defer_mode_str(I),
+              I.base_register, I.base_register + I.register_count - 1,
+              I.wait_mask, I.signal_slot);
       break;
    }
 
    case MALI_CS_OPCODE_SYNC_ADD64: {
       cs_unpack(instr, CS_SYNC_ADD64, I);
-      fprintf(fp, "SYNC_ADD64%s%s [d%u], d%u, #%x, #%u",
+      fprintf(fp, "SYNC_ADD64%s%s%s [d%u], d%u, #%x, #%u",
               I.error_propagate ? ".error_propagate" : "",
-              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system", I.address,
-              I.data, I.wait_mask, I.signal_slot);
+              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system",
+              defer_mode_str(I), I.address, I.data, I.wait_mask, I.signal_slot);
       break;
    }
 
    case MALI_CS_OPCODE_SYNC_SET64: {
       cs_unpack(instr, CS_SYNC_SET64, I);
-      fprintf(fp, "SYNC_SET64.%s%s [d%u], d%u, #%x, #%u",
+      fprintf(fp, "SYNC_SET64.%s%s%s [d%u], d%u, #%x, #%u",
               I.error_propagate ? ".error_propagate" : "",
-              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system", I.address,
-              I.data, I.wait_mask, I.signal_slot);
+              I.scope == MALI_CS_SYNC_SCOPE_CSG ? ".csg" : ".system",
+              defer_mode_str(I), I.address, I.data, I.wait_mask, I.signal_slot);
       break;
    }
 
@@ -760,8 +785,9 @@ pandecode_run_tiling(struct pandecode_context *ctx, FILE *fp,
       GENX(pandecode_fau)(ctx, lo, hi, "Fragment FAU");
    }
 
+   uint64_t fs_bin_addr = 0;
    if (spd) {
-      GENX(pandecode_shader)
+      fs_bin_addr = GENX(pandecode_shader)
       (ctx, spd, "Fragment shader", qctx->gpu_id);
    }
 
@@ -791,7 +817,8 @@ pandecode_run_tiling(struct pandecode_context *ctx, FILE *fp,
                  cs_get_u64(qctx, 48));
 
    uint64_t blend = cs_get_u64(qctx, 50);
-   GENX(pandecode_blend_descs)(ctx, blend & ~15, blend & 15, 0, qctx->gpu_id);
+   GENX(pandecode_blend_descs)(ctx, blend & ~15, blend & 15,
+                               fs_bin_addr, qctx->gpu_id);
 
    DUMP_ADDR(ctx, DEPTH_STENCIL, cs_get_u64(qctx, 52), "Depth/stencil");
 
@@ -872,8 +899,9 @@ pandecode_run_idvs2(struct pandecode_context *ctx, FILE *fp,
       (ctx, vertex_spd, "Vertex shader", qctx->gpu_id);
    }
 
+   uint64_t fs_bin_addr = 0;
    if (fragment_spd) {
-      GENX(pandecode_shader)
+      fs_bin_addr = GENX(pandecode_shader)
       (ctx, fragment_spd, "Fragment shader", qctx->gpu_id);
    }
 
@@ -912,7 +940,8 @@ pandecode_run_idvs2(struct pandecode_context *ctx, FILE *fp,
 
    DUMP_ADDR(ctx, DEPTH_STENCIL, zsd_pointer, "Depth/stencil");
 
-   GENX(pandecode_blend_descs)(ctx, blend & ~15, blend & 15, 0, qctx->gpu_id);
+   GENX(pandecode_blend_descs)(ctx, blend & ~15, blend & 15,
+                               fs_bin_addr, qctx->gpu_id);
 
    if (tiler_flags.index_type) {
       pandecode_log(ctx, "Indices: %" PRIx64 "\n", vertex_index_array_pointer);
@@ -1012,8 +1041,9 @@ pandecode_run_idvs(struct pandecode_context *ctx, FILE *fp,
       GENX(pandecode_shader)(ctx, ptr, "Varying shader", qctx->gpu_id);
    }
 
+   uint64_t fs_bin_addr = 0;
    if (cs_get_u64(qctx, MALI_IDVS_SR_FRAGMENT_SPD)) {
-      GENX(pandecode_shader)
+      fs_bin_addr = GENX(pandecode_shader)
       (ctx, cs_get_u64(qctx, MALI_IDVS_SR_FRAGMENT_SPD), "Fragment shader",
        qctx->gpu_id);
    }
@@ -1066,7 +1096,8 @@ pandecode_run_idvs(struct pandecode_context *ctx, FILE *fp,
                     cs_get_u32(qctx, MALI_IDVS_SR_VARY_SIZE));
 
    uint64_t blend = cs_get_u64(qctx, MALI_IDVS_SR_BLEND_DESC);
-   GENX(pandecode_blend_descs)(ctx, blend & ~15, blend & 15, 0, qctx->gpu_id);
+   GENX(pandecode_blend_descs)(ctx, blend & ~15, blend & 15,
+                               fs_bin_addr, qctx->gpu_id);
 
    DUMP_ADDR(ctx, DEPTH_STENCIL, cs_get_u64(qctx, MALI_IDVS_SR_ZSD),
              "Depth/stencil");
@@ -2419,6 +2450,7 @@ print_cs_binary(struct pandecode_context *ctx, uint64_t bin,
       case MALI_CS_OPCODE_RUN_IDVS:
 #endif
       case MALI_CS_OPCODE_RUN_FRAGMENT:
+      case MALI_CS_OPCODE_RUN_FULLSCREEN:
       case MALI_CS_OPCODE_RUN_COMPUTE:
       case MALI_CS_OPCODE_RUN_COMPUTE_INDIRECT:
          fprintf(ctx->dump_stream, " // tracepoint_%" PRIx64,
@@ -2496,7 +2528,7 @@ GENX(pandecode_cs_trace)(struct pandecode_context *ctx, uint64_t trace,
       case MALI_CS_OPCODE_RUN_IDVS2: {
          struct cs_run_idvs2_trace *idvs_trace = trace_data;
 
-         assert(trace_size >= sizeof(idvs_trace));
+         assert(trace_size >= sizeof(*idvs_trace));
          cs_unpack(instr, CS_RUN_IDVS2, I);
          memcpy(regs, idvs_trace->sr, sizeof(idvs_trace->sr));
 
@@ -2512,7 +2544,7 @@ GENX(pandecode_cs_trace)(struct pandecode_context *ctx, uint64_t trace,
       case MALI_CS_OPCODE_RUN_IDVS: {
          struct cs_run_idvs_trace *idvs_trace = trace_data;
 
-         assert(trace_size >= sizeof(idvs_trace));
+         assert(trace_size >= sizeof(*idvs_trace));
          cs_unpack(instr, CS_RUN_IDVS, I);
          memcpy(regs, idvs_trace->sr, sizeof(idvs_trace->sr));
 
@@ -2529,7 +2561,7 @@ GENX(pandecode_cs_trace)(struct pandecode_context *ctx, uint64_t trace,
       case MALI_CS_OPCODE_RUN_FRAGMENT: {
          struct cs_run_fragment_trace *frag_trace = trace_data;
 
-         assert(trace_size >= sizeof(frag_trace));
+         assert(trace_size >= sizeof(*frag_trace));
          cs_unpack(instr, CS_RUN_FRAGMENT, I);
          memcpy(&regs[40], frag_trace->sr, sizeof(frag_trace->sr));
          pandecode_run_fragment(ctx, ctx->dump_stream, &qctx, &I);
@@ -2538,10 +2570,26 @@ GENX(pandecode_cs_trace)(struct pandecode_context *ctx, uint64_t trace,
          break;
       }
 
+      case MALI_CS_OPCODE_RUN_FULLSCREEN: {
+         struct cs_run_fullscreen_trace *fs_trace = trace_data;
+
+         assert(trace_size >= sizeof(*fs_trace));
+         cs_unpack(instr, CS_RUN_FULLSCREEN, I);
+         regs[I.dcd + 0] = (uint32_t)(fs_trace->dcd);
+         regs[I.dcd + 1] = (uint32_t)(fs_trace->dcd >> 32);
+         uint32_t sr_idx = 0;
+         u_foreach_bit64(b, CS_RUN_FULLSCREEN_SR_MASK)
+            regs[b] = fs_trace->sr[sr_idx++];
+         pandecode_run_fullscreen(ctx, ctx->dump_stream, &qctx, &I);
+         trace_data = fs_trace + 1;
+         trace_size -= sizeof(*fs_trace);
+         break;
+      }
+
       case MALI_CS_OPCODE_RUN_COMPUTE: {
          struct cs_run_compute_trace *comp_trace = trace_data;
 
-         assert(trace_size >= sizeof(comp_trace));
+         assert(trace_size >= sizeof(*comp_trace));
          cs_unpack(instr, CS_RUN_COMPUTE, I);
          memcpy(regs, comp_trace->sr, sizeof(comp_trace->sr));
          pandecode_run_compute(ctx, ctx->dump_stream, &qctx, &I);
@@ -2553,7 +2601,7 @@ GENX(pandecode_cs_trace)(struct pandecode_context *ctx, uint64_t trace,
       case MALI_CS_OPCODE_RUN_COMPUTE_INDIRECT: {
          struct cs_run_compute_trace *comp_trace = trace_data;
 
-         assert(trace_size >= sizeof(comp_trace));
+         assert(trace_size >= sizeof(*comp_trace));
          cs_unpack(instr, CS_RUN_COMPUTE_INDIRECT, I);
          memcpy(regs, comp_trace->sr, sizeof(comp_trace->sr));
          pandecode_run_compute_indirect(ctx, ctx->dump_stream, &qctx, &I);

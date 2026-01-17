@@ -36,6 +36,30 @@ struct vn_queue {
 
    /* for vn_queue_submission storage */
    struct vn_cached_storage storage;
+
+   /* for async queue present */
+   struct {
+      /* Protects VkQueue host access except async present states. */
+      simple_mtx_t queue_mutex;
+      /* Protects state transitions: initialized, pending and join. */
+      mtx_t mutex;
+      /* Wake up async present thread upon presentation. */
+      cnd_t cond;
+      /* This is the async present thread. */
+      thrd_t thread;
+      /* Avoid extra locking on async present thread. */
+      pid_t tid;
+      /* Track whether the async present thread has been initialized. */
+      bool initialized;
+      /* Track whether the present is still pending acquired. */
+      bool pending;
+      /* Track whether to join the async present thread. */
+      bool join;
+      /* This is a deep copy of the requested presentation. */
+      VkPresentInfoKHR *info;
+      /* Track the result of the presentation. */
+      VkResult result;
+   } async_present;
 };
 VK_DEFINE_HANDLE_CASTS(vn_queue, base.vk.base, VkQueue, VK_OBJECT_TYPE_QUEUE)
 

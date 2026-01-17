@@ -74,12 +74,43 @@ alloc_transfer_temp_bo(struct radv_cmd_buffer *cmd_buffer)
    return true;
 }
 
+static void gfx_or_compute_copy_memory_to_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr,
+                                                uint64_t buffer_size, enum radv_copy_flags src_copy_flags,
+                                                struct radv_image *image, VkImageLayout layout,
+                                                const VkBufferImageCopy2 *region, const bool use_compute);
+
+static void compute_copy_image_to_memory(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_addr, uint64_t buffer_size,
+                                         enum radv_copy_flags dst_copy_flags, struct radv_image *image,
+                                         VkImageLayout layout, const VkBufferImageCopy2 *region);
 static void
-transfer_copy_memory_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_va, struct radv_image *image,
+transfer_copy_memory_image(struct radv_cmd_buffer *cmd_buffer, uint64_t buffer_va, uint64_t buffer_size,
+                           enum radv_copy_flags buffer_flags, struct radv_image *image, const VkImageLayout layout,
                            const VkBufferImageCopy2 *region, bool to_image)
 {
    const struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
+
+   if (!radv_sdma_supports_image(device, image)) {
+      if (!radv_gang_init(cmd_buffer))
+         return;
+
+      if (radv_flush_gang_leader_semaphore(cmd_buffer))
+         radv_wait_gang_leader(cmd_buffer);
+
+      radv_gang_cache_flush(cmd_buffer);
+
+      if (to_image) {
+         gfx_or_compute_copy_memory_to_image(cmd_buffer, buffer_va, buffer_size, buffer_flags, image, layout, region,
+                                             true);
+      } else {
+         compute_copy_image_to_memory(cmd_buffer, buffer_va, buffer_size, buffer_flags, image, layout, region);
+      }
+
+      return;
+   }
+
+   if (cmd_buffer->gang.cs && radv_flush_gang_follower_semaphore(cmd_buffer))
+      radv_wait_gang_follower(cmd_buffer);
 
    struct radv_sdma_surf buf = radv_sdma_get_buf_surf(buffer_va, image, region);
    const struct radv_sdma_surf img = radv_sdma_get_surf(device, image, region->imageSubresource, region->imageOffset);
@@ -218,7 +249,8 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
       radv_cs_add_buffer(device->ws, cs->b, dst_image->bindings[bind_idx].bo);
 
       if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
-         transfer_copy_memory_image(cmd_buffer, src_buffer->vk.device_address, dst_image, region, true);
+         transfer_copy_memory_image(cmd_buffer, src_buffer->vk.device_address, src_buffer->vk.size, src_copy_flags,
+                                    dst_image, pCopyBufferToImageInfo->dstImageLayout, region, true);
       } else {
          const bool use_compute = cmd_buffer->qf == RADV_QUEUE_COMPUTE || !radv_image_is_renderable(device, dst_image);
          gfx_or_compute_copy_memory_to_image(cmd_buffer, src_buffer->vk.device_address, src_buffer->vk.size,
@@ -363,7 +395,8 @@ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuf
       radv_cs_add_buffer(device->ws, cs->b, src_image->bindings[bind_idx].bo);
 
       if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
-         transfer_copy_memory_image(cmd_buffer, dst_buffer->vk.device_address, src_image, region, false);
+         transfer_copy_memory_image(cmd_buffer, dst_buffer->vk.device_address, dst_buffer->vk.size, dst_copy_flags,
+                                    src_image, pCopyImageToBufferInfo->srcImageLayout, region, false);
       } else {
          compute_copy_image_to_memory(cmd_buffer, dst_buffer->vk.device_address, dst_buffer->vk.size, dst_copy_flags,
                                       src_image, pCopyImageToBufferInfo->srcImageLayout, region);
@@ -373,6 +406,11 @@ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuf
    radv_resume_conditional_rendering(cmd_buffer);
 }
 
+static void gfx_or_compute_copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image,
+                                      VkImageLayout src_image_layout, struct radv_image *dst_image,
+                                      VkImageLayout dst_image_layout, const VkImageCopy2 *region,
+                                      const bool use_compute);
+
 static void
 transfer_copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_image, VkImageLayout src_image_layout,
                     struct radv_image *dst_image, VkImageLayout dst_image_layout, const VkImageCopy2 *region)
@@ -380,6 +418,23 @@ transfer_copy_image(struct radv_cmd_buffer *cmd_buffer, struct radv_image *src_i
    struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
    struct radv_cmd_stream *cs = cmd_buffer->cs;
    unsigned int dst_aspect_mask_remaining = region->dstSubresource.aspectMask;
+
+   if (!radv_sdma_supports_image(device, src_image) || !radv_sdma_supports_image(device, dst_image)) {
+      if (!radv_gang_init(cmd_buffer))
+         return;
+
+      if (radv_flush_gang_leader_semaphore(cmd_buffer))
+         radv_wait_gang_leader(cmd_buffer);
+
+      radv_gang_cache_flush(cmd_buffer);
+
+      gfx_or_compute_copy_image(cmd_buffer, src_image, src_image_layout, dst_image, dst_image_layout, region, true);
+
+      return;
+   }
+
+   if (cmd_buffer->gang.cs && radv_flush_gang_follower_semaphore(cmd_buffer))
+      radv_wait_gang_follower(cmd_buffer);
 
    VkImageSubresourceLayers src_subresource = region->srcSubresource;
    VkImageSubresourceLayers dst_subresource = region->dstSubresource;

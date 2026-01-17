@@ -135,9 +135,6 @@ if freedreno_kmds.contains('virtio')
   tu_deps += dep_libdrm
 endif
 
-# Temporarily quiet deprecated warnings until turnip is converted:
-tu_flags += '-DFD_NO_DEPRECATED_PACK'
-
 tu_tracepoints = custom_target(
   'tu_tracepoints.[ch]',
   input: 'tu_tracepoints.py',
@@ -260,5 +257,3 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
-# Deprecated: replaced by VK_DRIVER_FILES above
-devenv.append('VK_ICD_FILENAMES', _dev_icd.full_path())

@@ -135,7 +135,13 @@ add_bvh_dump(struct anv_cmd_buffer *cmd_buffer,
 
    struct anv_address dst_addr = { .bo = bvh_dump->bo, .offset = 0 };
    struct anv_address src_addr = anv_address_from_u64(src);
+
+   vk_barrier_compute_w_to_compute_r(vk_command_buffer_to_handle(&cmd_buffer->vk));
    anv_cmd_copy_addr(cmd_buffer, src_addr, dst_addr, bvh_dump->dump_size);
+
+   /* Add host barrier to read BVH data. */
+   vk_barrier_compute_w_to_host_r(vk_command_buffer_to_handle(&cmd_buffer->vk));
+   genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
 
    pthread_mutex_lock(&device->mutex);
    list_addtail(&bvh_dump->link, &device->bvh_dumps);
@@ -284,7 +290,20 @@ anv_get_as_size(VkDevice device, const struct vk_acceleration_structure_build_st
 static void
 anv_get_build_config(VkDevice device, struct vk_acceleration_structure_build_state *state)
 {
-   state->config.encode_key[1] = (state->build_info->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) ? 1 : 0;
+   VkBuildAccelerationStructureFlagsKHR flags = state->build_info->flags;
+
+   /* TODO: ANV does not yet have support for AS updates without doing a full
+    * rebuild, this means that AS updates can cause their size to increase.
+    *
+    * The Vulkan spec says that the maximum size required for updating a
+    * compacted AS will be the "compacted size" that can be queried from it
+    * after the initial build, so in order for apps to behave we must report
+    * the compacted size of an updatable AS as the maximum possible size for
+    * any AS that could also be built from the same number of leaf nodes.
+    */
+   state->config.encode_key[1] =
+      ((flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR) &&
+      !(flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)) ? 1 : 0;
 }
 
 static void
@@ -437,7 +456,10 @@ anv_init_header(VkCommandBuffer commandBuffer, const struct vk_acceleration_stru
        * dispatch size paramters) is not L3 coherent.
        */
       if (!ANV_DEVINFO_HAS_COHERENT_L3_CS(cmd_buffer->device->info)) {
-         anv_add_pending_pipe_bits(cmd_buffer, ANV_PIPE_DATA_CACHE_FLUSH_BIT,
+         anv_add_pending_pipe_bits(cmd_buffer,
+                                   VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                                   VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT_KHR,
+                                   ANV_PIPE_DATA_CACHE_FLUSH_BIT,
                                    "copy dispatch size for dispatch");
          genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
       }
@@ -482,12 +504,6 @@ anv_init_header(VkCommandBuffer commandBuffer, const struct vk_acceleration_stru
    }
 
    if (INTEL_DEBUG_BVH_ANY) {
-      genx_batch_emit_pipe_control(&cmd_buffer->batch, cmd_buffer->device->info,
-                                   cmd_buffer->state.current_pipeline,
-                                   ANV_PIPE_END_OF_PIPE_SYNC_BIT |
-                                   ANV_PIPE_DATA_CACHE_FLUSH_BIT |
-                                   ANV_PIPE_HDC_PIPELINE_FLUSH_BIT |
-                                   ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT);
       debug_record_as_to_bvh_dump(cmd_buffer, header_addr, bvh_layout.size,
                                   intermediate_header_addr, intermediate_bvh_addr,
                                   state->leaf_node_count, geometry_type);
@@ -670,7 +686,10 @@ genX(CmdCopyAccelerationStructureKHR)(
     * dispatch paramters) is not L3 coherent.
     */
    if (!ANV_DEVINFO_HAS_COHERENT_L3_CS(cmd_buffer->device->info)) {
-      anv_add_pending_pipe_bits(cmd_buffer, ANV_PIPE_DATA_CACHE_FLUSH_BIT,
+      anv_add_pending_pipe_bits(cmd_buffer,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                ANV_PIPE_DATA_CACHE_FLUSH_BIT,
                                 "bvh size read for dispatch");
    }
 
@@ -720,6 +739,8 @@ genX(CmdCopyAccelerationStructureToMemoryKHR)(
     */
    if (!ANV_DEVINFO_HAS_COHERENT_L3_CS(cmd_buffer->device->info)) {
       anv_add_pending_pipe_bits(cmd_buffer,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                                 ANV_PIPE_DATA_CACHE_FLUSH_BIT,
                                 "bvh size read for dispatch");
    }

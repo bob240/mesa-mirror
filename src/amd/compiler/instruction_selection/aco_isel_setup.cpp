@@ -6,6 +6,7 @@
 
 #include "aco_instruction_selection.h"
 #include "aco_interface.h"
+#include "aco_nir_call_attribs.h"
 
 #include "nir_builder.h"
 #include "nir_control_flow.h"
@@ -238,8 +239,11 @@ setup_nir(isel_context* ctx, nir_shader* nir)
       nir_opt_dce(nir);
    }
 
-   nir_function_impl* func = nir_shader_get_entrypoint(nir);
-   nir_index_ssa_defs(func);
+   /* nir_shader_get_entrypoint returns NULL for RT shaders, but there should only be
+    * one impl at this stage.
+    */
+   nir_foreach_function_impl (func, nir)
+      nir_index_ssa_defs(func);
 }
 
 /* Returns true if we can skip uniformization of a merge phi. This makes the destination divergent,
@@ -348,6 +352,13 @@ void
 init_context(isel_context* ctx, nir_shader* shader)
 {
    nir_function_impl* impl = nir_shader_get_entrypoint(shader);
+   if (!impl) {
+      /* RT shaders have no NIR entrypoint, but only one function impl exists at this stage */
+      nir_foreach_function_impl (func, shader) {
+         impl = func;
+         break;
+      }
+   }
    ctx->shader = shader;
 
    assert(shader->info.max_subgroup_size >= ctx->program->wave_size);
@@ -453,7 +464,9 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_op_sdot_2x16_iadd_sat:
                case nir_op_bfdot2_bfadd:
                case nir_op_byte_perm_amd:
-               case nir_op_alignbyte_amd: type = RegType::vgpr; break;
+               case nir_op_alignbyte_amd:
+               case nir_op_f2f16_ru:
+               case nir_op_f2f16_rd: type = RegType::vgpr; break;
                case nir_op_fmul:
                case nir_op_ffma:
                case nir_op_fadd:
@@ -534,7 +547,6 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_load_push_constant:
                case nir_intrinsic_load_workgroup_id:
                case nir_intrinsic_load_num_workgroups:
-               case nir_intrinsic_load_sbt_base_amd:
                case nir_intrinsic_load_subgroup_id:
                case nir_intrinsic_load_num_subgroups:
                case nir_intrinsic_vote_all:
@@ -547,7 +559,7 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_ballot_relaxed:
                case nir_intrinsic_bindless_image_samples:
                case nir_intrinsic_load_scalar_arg_amd:
-               case nir_intrinsic_unit_test_uniform_amd: type = RegType::sgpr; break;
+               case nir_intrinsic_unit_test_uniform_input: type = RegType::sgpr; break;
                case nir_intrinsic_load_input:
                case nir_intrinsic_load_per_primitive_input:
                case nir_intrinsic_load_output:
@@ -578,7 +590,7 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_load_vector_arg_amd:
                case nir_intrinsic_ordered_xfb_counter_add_gfx11_amd:
                case nir_intrinsic_cmat_muladd_amd:
-               case nir_intrinsic_unit_test_divergent_amd: type = RegType::vgpr; break;
+               case nir_intrinsic_unit_test_divergent_input: type = RegType::vgpr; break;
                case nir_intrinsic_load_shared:
                case nir_intrinsic_load_shared2_amd:
                   /* When the result of these loads is only used by cross-lane instructions,
@@ -611,7 +623,17 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_ddx_fine:
                case nir_intrinsic_ddy_fine:
                case nir_intrinsic_ddx_coarse:
-               case nir_intrinsic_ddy_coarse: type = RegType::vgpr; break;
+               case nir_intrinsic_ddy_coarse:
+               case nir_intrinsic_load_return_param_amd: {
+                  type = RegType::vgpr;
+                  break;
+               }
+               case nir_intrinsic_load_param: {
+                  nir_parameter* param =
+                     &impl->function->params[nir_intrinsic_param_idx(intrinsic)];
+                  type = param->is_uniform ? RegType::sgpr : RegType::vgpr;
+                  break;
+               }
                default:
                   for (unsigned i = 0; i < nir_intrinsic_infos[intrinsic->intrinsic].num_srcs;
                        i++) {
@@ -740,8 +762,7 @@ setup_isel_context(Program* program, unsigned shader_count, struct nir_shader* c
       }
    }
 
-   init_program(program, Stage{info->hw_stage, sw_stage}, info, options->gfx_level, options->family,
-                options->wgp_mode, config);
+   init_program(program, Stage{info->hw_stage, sw_stage}, info, options, config);
 
    isel_context ctx = {};
    ctx.program = program;
@@ -772,8 +793,17 @@ setup_isel_context(Program* program, unsigned shader_count, struct nir_shader* c
    assert(ctx.program->config->lds_size <= ctx.program->dev.lds_limit);
 
    unsigned nir_num_blocks = 0;
-   for (unsigned i = 0; i < shader_count; i++)
-      nir_num_blocks += nir_shader_get_entrypoint(shaders[i])->num_blocks;
+   for (unsigned i = 0; i < shader_count; i++) {
+      nir_function_impl* entrypoint = nir_shader_get_entrypoint(shaders[i]);
+      if (!entrypoint) {
+         /* RT shaders have no NIR entrypoint, but only one function impl exists at this stage */
+         nir_foreach_function_impl (func, shaders[i]) {
+            entrypoint = func;
+            break;
+         }
+      }
+      nir_num_blocks += entrypoint->num_blocks;
+   }
    ctx.program->blocks.reserve(nir_num_blocks * 2);
    ctx.block = ctx.program->create_and_insert_block();
    ctx.block->kind = block_kind_top_level;

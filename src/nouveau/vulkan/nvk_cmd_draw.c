@@ -1854,17 +1854,37 @@ nvk_flush_vi_state(struct nvk_cmd_buffer *cmd)
       P_MTHD(p, NV9097, SET_VERTEX_ATTRIBUTE_A(0));
       for (uint32_t a = 0; a < 32; a++) {
          if (dyn->vi->attributes_valid & BITFIELD_BIT(a)) {
+            const struct vk_vertex_attribute_state *att =
+               &dyn->vi->attributes[a];
             const struct nvk_va_format *fmt =
-               nvk_get_va_format(pdev, dyn->vi->attributes[a].format);
+               nvk_get_va_format(pdev, att->format);
 
             P_NV9097_SET_VERTEX_ATTRIBUTE_A(p, a, {
-               .stream                 = dyn->vi->attributes[a].binding,
+               .stream                 = att->binding,
                .source                 = SOURCE_ACTIVE,
-               .offset                 = dyn->vi->attributes[a].offset,
+               .offset                 = att->offset,
                .component_bit_widths   = fmt->bit_widths,
                .numerical_type         = fmt->type,
                .swap_r_and_b           = fmt->swap_rb,
             });
+
+            if (fmt->bit_widths_high != NVK_VA_BIT_WIDTH_NONE) {
+               /* 64-bit vec3 and vec4 formats consume two attributes */
+               a++;
+               assert(a < 32);
+               assert(!(dyn->vi->attributes_valid & BITFIELD_BIT(a)));
+
+               /* There are no BGRA 64-bit formats */
+               assert(!fmt->swap_rb);
+
+               P_NV9097_SET_VERTEX_ATTRIBUTE_A(p, a, {
+                  .stream                 = att->binding,
+                  .source                 = SOURCE_ACTIVE,
+                  .offset                 = att->offset + 16,
+                  .component_bit_widths   = fmt->bit_widths_high,
+                  .numerical_type         = fmt->type,
+               });
+            }
          } else {
             P_NV9097_SET_VERTEX_ATTRIBUTE_A(p, a, {
                .source                 = SOURCE_INACTIVE,
@@ -3459,7 +3479,7 @@ nvk_flush_cb_state(struct nvk_cmd_buffer *cmd)
       int8_t loc_att[NVK_MAX_RTS] = { -1, -1, -1, -1, -1, -1, -1, -1};
       uint8_t max_loc = 0;
       uint32_t att_used = 0;
-      for (uint8_t a = 0; a < MESA_VK_MAX_COLOR_ATTACHMENTS; a++) {
+      for (uint8_t a = 0; a < render->color_att_count; a++) {
          if (dyn->cal.color_map[a] == MESA_VK_ATTACHMENT_UNUSED)
             continue;
 

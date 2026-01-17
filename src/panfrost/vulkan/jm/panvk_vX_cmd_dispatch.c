@@ -50,9 +50,9 @@ panvk_per_arch(cmd_dispatch_prepare_tls)(
    if (batch->tlsinfo.wls.size) {
       unsigned core_id_range;
 
-      pan_query_core_count(&phys_dev->kmod.props, &core_id_range);
+      pan_query_core_count(&phys_dev->kmod.dev->props, &core_id_range);
       batch->tlsinfo.wls.instances = pan_calc_wls_instances(
-         &cs->cs.local_size, &phys_dev->kmod.props, indirect ? NULL : dim);
+         &cs->cs.local_size, &phys_dev->kmod.dev->props, indirect ? NULL : dim);
       batch->wls_total_size = pan_calc_total_wls_size(
          batch->tlsinfo.wls.size, batch->tlsinfo.wls.instances, core_id_range);
    }
@@ -68,7 +68,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    VkResult result;
 
    /* If there's no compute shader, we can skip the dispatch. */
-   if (!panvk_priv_mem_dev_addr(cs->rsd))
+   if (!panvk_priv_mem_check_alloc(cs->rsd))
       return;
 
    panvk_per_arch(cmd_close_batch)(cmdbuf);

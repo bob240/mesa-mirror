@@ -923,6 +923,29 @@ vtn_handle_non_semantic_debug_info(struct vtn_builder *b, SpvOp ext_opcode,
    return true;
 }
 
+static bool
+vtn_handle_mesa_internal(struct vtn_builder *b, SpvOp ext_opcode,
+                         const uint32_t *w, unsigned count)
+{
+   uint32_t instr = w[4];
+
+   switch (instr) {
+   case SpvOpFConvertRUMesa: {
+      struct vtn_ssa_value *arg = vtn_ssa_value(b, w[5]);
+      vtn_push_nir_ssa(b, w[2], nir_f2f16_ru(&b->nb, arg->def));
+      break;
+   }
+   case SpvOpFConvertRDMesa: {
+      struct vtn_ssa_value *arg = vtn_ssa_value(b, w[5]);
+      vtn_push_nir_ssa(b, w[2], nir_f2f16_rd(&b->nb, arg->def));
+      break;
+   }
+   }
+
+   return true;
+}
+
+
 static void
 vtn_handle_extension(struct vtn_builder *b, SpvOp opcode,
                      const uint32_t *w, unsigned count)
@@ -958,6 +981,8 @@ vtn_handle_extension(struct vtn_builder *b, SpvOp opcode,
          val->ext_handler = vtn_handle_debug_printf;
       } else if (strstr(ext, "NonSemantic.") == ext) {
          val->ext_handler = vtn_handle_non_semantic_instruction;
+      } else if (strstr(ext, "MesaInternal") == ext) {
+         val->ext_handler = vtn_handle_mesa_internal;
       } else {
          vtn_fail("Unsupported extension: %s", ext);
       }
@@ -2928,7 +2953,7 @@ vtn_handle_constant(struct vtn_builder *b, SpvOp opcode,
          nir_const_value *srcs[3] = {
             src[0], src[1], src[2],
          };
-         nir_eval_const_opcode(op, val->constant->values,
+         nir_eval_const_opcode(op, val->constant->values, NULL,
                                num_components, bit_size, srcs,
                                b->shader->info.float_controls_execution_mode);
 
@@ -5689,9 +5714,9 @@ vtn_handle_execution_mode(struct vtn_builder *b, struct vtn_value *entry_point,
          break;
       case SpvExecutionModeSignedZeroInfNanPreserve:
          switch (mode->operands[0]) {
-         case 16: execution_mode = FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP16; break;
-         case 32: execution_mode = FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP32; break;
-         case 64: execution_mode = FLOAT_CONTROLS_SIGNED_ZERO_INF_NAN_PRESERVE_FP64; break;
+         case 16: b->fp_math_ctrl_fp16 |= nir_fp_preserve_sz_inf_nan; break;
+         case 32: b->fp_math_ctrl_fp32 |= nir_fp_preserve_sz_inf_nan; break;
+         case 64: b->fp_math_ctrl_fp64 |= nir_fp_preserve_sz_inf_nan; break;
          default: vtn_fail("Floating point type not supported");
          }
          break;
@@ -5863,29 +5888,27 @@ vtn_handle_execution_mode_id(struct vtn_builder *b, struct vtn_value *entry_poin
       if ((flags & can_fast_math) != can_fast_math)
          b->exact = true;
 
-      unsigned execution_mode = 0;
       if (!(flags & SpvFPFastMathModeNotNaNMask)) {
          switch (glsl_get_bit_size(type->type)) {
-         case 16: execution_mode |= FLOAT_CONTROLS_NAN_PRESERVE_FP16; break;
-         case 32: execution_mode |= FLOAT_CONTROLS_NAN_PRESERVE_FP32; break;
-         case 64: execution_mode |= FLOAT_CONTROLS_NAN_PRESERVE_FP64; break;
+         case 16: b->fp_math_ctrl_fp16 |= nir_fp_preserve_nan; break;
+         case 32: b->fp_math_ctrl_fp32 |= nir_fp_preserve_nan; break;
+         case 64: b->fp_math_ctrl_fp64 |= nir_fp_preserve_nan; break;
          }
       }
       if (!(flags & SpvFPFastMathModeNotInfMask)) {
          switch (glsl_get_bit_size(type->type)) {
-         case 16: execution_mode |= FLOAT_CONTROLS_INF_PRESERVE_FP16; break;
-         case 32: execution_mode |= FLOAT_CONTROLS_INF_PRESERVE_FP32; break;
-         case 64: execution_mode |= FLOAT_CONTROLS_INF_PRESERVE_FP64; break;
+         case 16: b->fp_math_ctrl_fp16 |= nir_fp_preserve_inf; break;
+         case 32: b->fp_math_ctrl_fp32 |= nir_fp_preserve_inf; break;
+         case 64: b->fp_math_ctrl_fp64 |= nir_fp_preserve_inf; break;
          }
       }
       if (!(flags & SpvFPFastMathModeNSZMask)) {
          switch (glsl_get_bit_size(type->type)) {
-         case 16: execution_mode |= FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE_FP16; break;
-         case 32: execution_mode |= FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE_FP32; break;
-         case 64: execution_mode |= FLOAT_CONTROLS_SIGNED_ZERO_PRESERVE_FP64; break;
+         case 16: b->fp_math_ctrl_fp16 |= nir_fp_preserve_signed_zero; break;
+         case 32: b->fp_math_ctrl_fp32 |= nir_fp_preserve_signed_zero; break;
+         case 64: b->fp_math_ctrl_fp64 |= nir_fp_preserve_signed_zero; break;
          }
       }
-      b->shader->info.float_controls_execution_mode |= execution_mode;
       break;
    }
 

@@ -856,18 +856,6 @@ memory_modes_to_msl(struct nir_to_msl_ctx *ctx, nir_variable_mode modes)
       P(ctx, "mem_flags::mem_none");
 }
 
-static uint32_t
-get_input_num_components(struct nir_to_msl_ctx *ctx, uint32_t location)
-{
-   return ctx->inputs_info[location].num_components;
-}
-
-static uint32_t
-get_output_num_components(struct nir_to_msl_ctx *ctx, uint32_t location)
-{
-   return ctx->outputs_info[location].num_components;
-}
-
 static void
 intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
 {
@@ -1001,8 +989,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       nir_io_semantics io = nir_intrinsic_io_semantics(instr);
       uint32_t component = nir_intrinsic_component(instr);
       uint32_t location = io.location + idx;
-      P(ctx, "in.%s", msl_input_name(ctx, location));
-      if (instr->num_components < get_input_num_components(ctx, location)) {
+
+      msl_input_name(ctx, location, component);
+      if (instr->num_components < msl_input_num_components(ctx, location)) {
          P(ctx, ".");
          for (unsigned i = 0; i < instr->num_components; i++)
             P(ctx, "%c", "xyzw"[component + i]);
@@ -1015,8 +1004,9 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       nir_io_semantics io = nir_intrinsic_io_semantics(instr);
       uint32_t component = nir_intrinsic_component(instr);
       uint32_t location = io.location + idx;
-      P(ctx, "in.%s", msl_input_name(ctx, location));
-      if (instr->num_components < get_input_num_components(ctx, location)) {
+
+      msl_input_name(ctx, location, component);
+      if (instr->num_components < msl_input_num_components(ctx, location)) {
          P(ctx, ".");
          for (unsigned i = 0; i < instr->num_components; i++)
             P(ctx, "%c", "xyzw"[component + i]);
@@ -1027,7 +1017,8 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_output: {
       unsigned idx = nir_src_as_uint(instr->src[0]);
       nir_io_semantics io = nir_intrinsic_io_semantics(instr);
-      P(ctx, "out.%s;\n", msl_output_name(ctx, io.location + idx));
+      msl_output_name(ctx, io.location + idx, 0);
+      P(ctx, ";\n");
       break;
    }
    case nir_intrinsic_store_output: {
@@ -1036,10 +1027,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       uint32_t location = io.location + idx;
       uint32_t write_mask = nir_intrinsic_write_mask(instr);
       uint32_t component = nir_intrinsic_component(instr);
-      uint32_t dst_num_components = get_output_num_components(ctx, location);
+      uint32_t dst_num_components = msl_output_num_components(ctx, location);
       uint32_t num_components = instr->num_components;
 
-      P_IND(ctx, "out.%s", msl_output_name(ctx, location));
+      P_IND(ctx, "%s", "");
+      msl_output_name(ctx, location, component);
       if (dst_num_components > 1u) {
          P(ctx, ".");
          for (unsigned i = 0; i < num_components; i++)
@@ -1071,8 +1063,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    case nir_intrinsic_load_global: {
       enum gl_access_qualifier access = nir_intrinsic_access(instr);
       const char *type = msl_type_for_def(ctx->types, &instr->def);
-      const char *addressing =
-         access & ACCESS_COHERENT ? "coherent device" : "device";
+      const bool apply_workaround =
+         !(ctx->disabled_workarounds & BITFIELD64_BIT(6));
+      const char *addressing = apply_workaround || (access & ACCESS_COHERENT)
+                                  ? "coherent device"
+                                  : "device";
       if (access & ACCESS_ATOMIC) {
          assert(instr->num_components == 1u &&
                 "We can only do single component with atomics");
@@ -1141,8 +1136,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
    case nir_intrinsic_store_global: {
       enum gl_access_qualifier access = nir_intrinsic_access(instr);
       const char *type = msl_type_for_src(ctx->types, &instr->src[0]);
-      const char *addressing =
-         access & ACCESS_COHERENT ? "coherent device" : "device";
+      const bool apply_workaround =
+         !(ctx->disabled_workarounds & BITFIELD64_BIT(6));
+      const char *addressing = apply_workaround || (access & ACCESS_COHERENT)
+                                  ? "coherent device"
+                                  : "device";
       if (access & ACCESS_ATOMIC) {
          assert(instr->num_components == 1u &&
                 "We can only do single component with atomics");
@@ -1518,6 +1516,11 @@ intrinsic_to_msl(struct nir_to_msl_ctx *ctx, nir_intrinsic_instr *instr)
       src_to_msl(ctx, &instr->src[0]);
       P(ctx, ");\n");
       break;
+   case nir_intrinsic_store_clip_distance_kk:
+      P_IND(ctx, "out.gl_ClipDistance[%d] = ", nir_intrinsic_base(instr));
+      src_to_msl(ctx, &instr->src[0]);
+      P(ctx, ";\n");
+      break;
    default:
       P_IND(ctx, "Unknown intrinsic %s\n", info->name);
    }
@@ -1683,11 +1686,16 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
          P(ctx, ", ");
          src_to_msl(ctx, comparator);
       }
-      P(ctx, ", ");
-      if (offset)
+
+      /* SPIR-V does not allow offsets for cube samplers (neither does MSL).
+       * nir_opt_constant_folding will remove offsets that are 0, so we need to
+       * add them here. */
+      if (offset) {
+         P(ctx, ", ");
          src_to_msl(ctx, offset);
-      else
-         P(ctx, "int2(0)");
+      } else if (tex->sampler_dim != GLSL_SAMPLER_DIM_CUBE) {
+         P(ctx, ", int2(0)");
+      }
 
       /* Non-depth textures require component */
       if (!comparator) {
@@ -1707,9 +1715,11 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       nir_src *bias = nir_tex_get_src(tex, nir_tex_src_bias);
       nir_src *min = nir_tex_get_src(tex, nir_tex_src_min_lod);
       nir_src *max = nir_tex_get_src(tex, nir_tex_src_max_lod_kk);
-      P(ctx, "float2(round(clamp(")
+      /* Delegate the mip layer clamping to Metal, then apply bias and clamp
+       * again to ensure we are within expected LOD. */
+      P(ctx, "float2(clamp(")
       src_to_msl(ctx, texhandle);
-      P(ctx, ".calculate_unclamped_lod(");
+      P(ctx, ".calculate_clamped_lod(");
       src_to_msl(ctx, sampler);
       P(ctx, ", ");
       src_to_msl(ctx, coord);
@@ -1719,7 +1729,7 @@ tex_to_msl(struct nir_to_msl_ctx *ctx, nir_tex_instr *tex)
       src_to_msl(ctx, min);
       P(ctx, ", ");
       src_to_msl(ctx, max);
-      P(ctx, ")), ");
+      P(ctx, "), ");
       src_to_msl(ctx, texhandle);
       P(ctx, ".calculate_unclamped_lod(");
       src_to_msl(ctx, sampler);
@@ -1910,10 +1920,8 @@ msl_preprocess_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_lower_system_values);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
-      nir_input_attachment_options input_attachment_options = { };
+      nir_input_attachment_options input_attachment_options = {};
       NIR_PASS(_, nir, nir_lower_input_attachments, &input_attachment_options);
-      /* KK_WORKAROUND_4 */
-      NIR_PASS(_, nir, nir_lower_is_helper_invocation);
    }
    NIR_PASS(_, nir, nir_opt_combine_barriers, NULL, NULL);
    NIR_PASS(_, nir, nir_lower_var_copies);
@@ -1925,7 +1933,7 @@ msl_preprocess_nir(struct nir_shader *nir)
 
    NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
             nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
-   NIR_PASS(_, nir, nir_lower_vars_to_scratch, nir_var_function_temp, 0,
+   NIR_PASS(_, nir, nir_lower_vars_to_scratch, 0,
             glsl_get_natural_size_align_bytes,
             glsl_get_natural_size_align_bytes);
 
@@ -1977,6 +1985,26 @@ msl_optimize_nir(struct nir_shader *nir)
    NIR_PASS(_, nir, nir_opt_copy_prop);
 
    return progress;
+}
+
+/* Scalarize stores to CLIP_DIST* varyings */
+static bool
+scalarize_clip_distance_filter(const nir_intrinsic_instr *intrin,
+                               UNUSED const void *_data)
+{
+   if (intrin->intrinsic != nir_intrinsic_store_output)
+      return false;
+   nir_io_semantics semantics = nir_intrinsic_io_semantics(intrin);
+   return semantics.location == VARYING_SLOT_CLIP_DIST0 ||
+          semantics.location == VARYING_SLOT_CLIP_DIST1;
+}
+
+void
+msl_lower_nir_late(nir_shader *nir)
+{
+   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out,
+            scalarize_clip_distance_filter, NULL);
+   NIR_PASS(_, nir, msl_nir_lower_clip_distance);
 }
 
 static void

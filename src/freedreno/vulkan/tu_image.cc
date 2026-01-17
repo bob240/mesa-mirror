@@ -141,28 +141,10 @@ tu_layer_address(const struct fdl6_view *iview, uint32_t layer)
    return iview->base_addr + iview->layer_size * layer;
 }
 
-void
-tu_cs_image_ref(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer)
+uint64_t
+tu_layer_flag_address(const struct fdl6_view *iview, uint32_t layer)
 {
-   tu_cs_emit(cs, A6XX_RB_MRT_PITCH(0, iview->pitch).value);
-   tu_cs_emit(cs, iview->layer_size >> 6);
-   tu_cs_emit_qw(cs, tu_layer_address(iview, layer));
-}
-
-void
-tu_cs_image_stencil_ref(struct tu_cs *cs, const struct tu_image_view *iview, uint32_t layer)
-{
-   tu_cs_emit(cs, A6XX_RB_STENCIL_BUFFER_PITCH(iview->stencil_pitch).value);
-   tu_cs_emit(cs, iview->stencil_layer_size >> 6);
-   tu_cs_emit_qw(cs, iview->stencil_base_addr + iview->stencil_layer_size * layer);
-}
-
-void
-tu_cs_image_depth_ref(struct tu_cs *cs, const struct tu_image_view *iview, uint32_t layer)
-{
-   tu_cs_emit(cs, A6XX_RB_DEPTH_BUFFER_PITCH(iview->depth_pitch).value);
-   tu_cs_emit(cs, iview->depth_layer_size >> 6);
-   tu_cs_emit_qw(cs, iview->depth_base_addr + iview->depth_layer_size * layer);
+   return iview->ubwc_addr + iview->ubwc_layer_size * layer;
 }
 
 template <chip CHIP>
@@ -181,7 +163,7 @@ TU_GENX(tu_cs_image_ref_2d);
 void
 tu_cs_image_flag_ref(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer)
 {
-   tu_cs_emit_qw(cs, iview->ubwc_addr + iview->ubwc_layer_size * layer);
+   tu_cs_emit_qw(cs, tu_layer_flag_address(iview, layer));
    tu_cs_emit(cs, iview->FLAG_BUFFER_PITCH);
 }
 
@@ -834,20 +816,11 @@ tu_CreateImage(VkDevice _device,
 
    VK_FROM_HANDLE(tu_device, device, _device);
 
-#ifdef TU_USE_WSI_PLATFORM
-   /* Ignore swapchain creation info on Android. Since we don't have an
-    * implementation in Mesa, we're guaranteed to access an Android object
-    * incorrectly.
-    */
-   const VkImageSwapchainCreateInfoKHR *swapchain_info =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
-   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
+   if (wsi_common_is_swapchain_image(pCreateInfo)) {
       return wsi_common_create_swapchain_image(device->physical_device->vk.wsi_device,
                                                pCreateInfo,
-                                               swapchain_info->swapchain,
                                                pImage);
    }
-#endif
 
    struct tu_image *image = (struct tu_image *)
       vk_image_create(&device->vk, pCreateInfo, alloc, sizeof(*image));

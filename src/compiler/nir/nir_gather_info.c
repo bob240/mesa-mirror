@@ -687,11 +687,6 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader)
          shader->info.fs.accesses_pixel_local_storage = true;
       break;
 
-   case nir_intrinsic_load_color0:
-   case nir_intrinsic_load_color1:
-      shader->info.inputs_read |=
-         BITFIELD64_BIT(VARYING_SLOT_COL0 << (instr->intrinsic == nir_intrinsic_load_color1));
-      FALLTHROUGH;
    case nir_intrinsic_load_subgroup_size:
    case nir_intrinsic_load_subgroup_invocation:
    case nir_intrinsic_load_subgroup_eq_mask:
@@ -1139,5 +1134,20 @@ nir_shader_gather_info(nir_shader *shader, nir_function_impl *entrypoint)
 
          shader->info.ray_queries += MAX2(glsl_get_aoa_size(var->type), 1);
       }
+   }
+
+   /* Clip distance varyings might have been eliminated because they only
+    * contained out-of-bounds writes. Clear clip/cull distance array sizes
+    * in shader_info if they no longer exist. The array sizes refer to
+    * outputs except FS where they refer to inputs.
+    */
+   uint64_t clipdist_io_mask = shader->info.stage == MESA_SHADER_FRAGMENT ?
+                                  shader->info.inputs_read :
+                                  shader->info.outputs_written;
+   if (!(clipdist_io_mask &
+         (BITFIELD64_RANGE(VARYING_SLOT_CLIP_DIST0, 2) |
+          BITFIELD64_RANGE(VARYING_SLOT_CULL_DIST0, 2)))) {
+      shader->info.clip_distance_array_size = 0;
+      shader->info.cull_distance_array_size = 0;
    }
 }

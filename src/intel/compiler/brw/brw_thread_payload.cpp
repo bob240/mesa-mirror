@@ -100,7 +100,6 @@ brw_tes_thread_payload::brw_tes_thread_payload(const brw_shader &v)
 
 brw_gs_thread_payload::brw_gs_thread_payload(brw_shader &v)
 {
-   struct brw_vue_prog_data *vue_prog_data = brw_vue_prog_data(v.prog_data);
    struct brw_gs_prog_data *gs_prog_data = brw_gs_prog_data(v.prog_data);
    const brw_builder bld = brw_builder(&v);
 
@@ -136,21 +135,6 @@ brw_gs_thread_payload::brw_gs_thread_payload(brw_shader &v)
    r += v.nir->info.gs.vertices_in * reg_unit(v.devinfo);
 
    num_regs = r;
-
-   /* Use a maximum of 24 registers for push-model inputs. */
-   const unsigned max_push_components = 24;
-
-   /* If pushing our inputs would take too many registers, reduce the URB read
-    * length (which is in HWords, or 8 registers), and resort to pulling.
-    *
-    * Note that the GS reads <URB Read Length> HWords for every vertex - so we
-    * have to multiply by VerticesIn to obtain the total storage requirement.
-    */
-   if (8 * vue_prog_data->urb_read_length * v.nir->info.gs.vertices_in >
-       max_push_components) {
-      vue_prog_data->urb_read_length =
-         ROUND_DOWN_TO(max_push_components / v.nir->info.gs.vertices_in, 8) / 8;
-   }
 }
 
 static inline void
@@ -396,19 +380,9 @@ void
 brw_cs_thread_payload::load_subgroup_id(const brw_builder &bld,
                                     brw_reg &dest) const
 {
-   auto devinfo = bld.shader->devinfo;
+   assert(bld.shader->devinfo->verx10 >= 125);
    dest = retype(dest, BRW_TYPE_UD);
-
-   if (subgroup_id_.file != BAD_FILE) {
-      assert(devinfo->verx10 >= 125);
-      bld.AND(dest, subgroup_id_, brw_imm_ud(INTEL_MASK(7, 0)));
-   } else {
-      assert(devinfo->verx10 < 125);
-      assert(mesa_shader_stage_is_compute(bld.shader->stage));
-      int index = brw_get_subgroup_id_param_index(devinfo,
-                                                  bld.shader->prog_data);
-      bld.MOV(dest, brw_uniform_reg(index, BRW_TYPE_UD));
-   }
+   bld.AND(dest, subgroup_id_, brw_imm_ud(INTEL_MASK(7, 0)));
 }
 
 brw_task_mesh_thread_payload::brw_task_mesh_thread_payload(brw_shader &v)

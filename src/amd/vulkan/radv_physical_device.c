@@ -76,6 +76,15 @@ radv_taskmesh_enabled(const struct radv_physical_device *pdev)
 }
 
 bool
+radv_spm_trace_enabled(const struct radv_physical_device *pdev)
+{
+   const struct radv_instance *instance = radv_physical_device_instance(pdev);
+
+   return (instance->vk.trace_mode & RADV_TRACE_MODE_RGP) &&
+          debug_get_bool_option("RADV_THREAD_TRACE_CACHE_COUNTERS", pdev->info.gfx_level >= GFX10);
+}
+
+bool
 radv_sparse_enabled(const struct radv_physical_device *pdev)
 {
    const struct radv_instance *instance = radv_physical_device_instance(pdev);
@@ -92,6 +101,9 @@ radv_transfer_queue_enabled(const struct radv_physical_device *pdev)
    /* Check if the GPU has SDMA support and transfer queues are allowed. */
    if (pdev->info.sdma_ip_version == SDMA_UNKNOWN || !pdev->info.ip[AMD_IP_SDMA].num_queues ||
        !(instance->perftest_flags & RADV_PERFTEST_TRANSFER_QUEUE))
+      return false;
+
+   if (!pdev->info.has_gang_submit || !radv_compute_queue_enabled(pdev))
       return false;
 
    return pdev->info.gfx_level >= GFX9;
@@ -179,7 +191,7 @@ radv_shader_fp16_enabled(const struct radv_physical_device *pdev)
    /* GFX8 supports fp16, but not double rate packed math.  We don't enable
     * that by default because it can sometimes hurt perf.
     */
-   return pdev->info.has_packed_math_16bit ||
+   return pdev->info.cu_info.has_packed_math_16bit ||
           (pdev->info.gfx_level == GFX8 && instance->drirc.features.expose_float16_gfx8);
 }
 
@@ -193,7 +205,7 @@ radv_host_image_copy_enabled(const struct radv_physical_device *pdev)
 bool
 radv_enable_rt(const struct radv_physical_device *pdev)
 {
-   if (!pdev->info.has_image_bvh_intersect_ray && !radv_emulate_rt(pdev))
+   if (!pdev->info.cu_info.has_image_bvh_intersect_ray && !radv_emulate_rt(pdev))
       return false;
 
    if (pdev->use_llvm)
@@ -210,7 +222,7 @@ radv_emulate_rt(const struct radv_physical_device *pdev)
       return true;
 
    /* Do not force emulated RT on GPUs that have native support. */
-   return !pdev->info.has_image_bvh_intersect_ray && instance->drirc.features.emulate_rt;
+   return !pdev->info.cu_info.has_image_bvh_intersect_ray && instance->drirc.features.emulate_rt;
 }
 
 bool
@@ -289,13 +301,15 @@ radv_physical_device_init_cache_key(struct radv_physical_device *pdev)
    key->use_ngg = pdev->use_ngg;
    key->use_ngg_culling = pdev->use_ngg_culling;
    key->no_implicit_varying_subgroup_size = instance->drirc.debug.no_implicit_varying_subgroup_size;
+   key->mitigate_smem_oob = pdev->info.cu_info.has_smem_oob_access_bug && !(instance->debug_flags & RADV_DEBUG_NO_SMEM_MITIGATION);
+   key->rt_cps = !!(instance->perftest_flags & RADV_PERFTEST_RT_CPS);
 }
 
 static int
 radv_device_get_cache_uuid(struct radv_physical_device *pdev, void *uuid)
 {
    struct mesa_sha1 ctx;
-   unsigned char sha1[20];
+   unsigned char sha1[SHA1_DIGEST_LENGTH];
 
    memset(uuid, 0, VK_UUID_SIZE);
    _mesa_sha1_init(&ctx);
@@ -548,7 +562,7 @@ radv_physical_device_init_mem_types(struct radv_physical_device *pdev)
                                                    VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD;
 
             pdev->memory_domains[type_count] = pdev->memory_domains[i];
-            pdev->memory_flags[type_count] = pdev->memory_flags[i] | RADEON_FLAG_VA_UNCACHED;
+            pdev->memory_flags[type_count] = pdev->memory_flags[i] | RADEON_FLAG_GL2_BYPASS;
             pdev->memory_properties.memoryTypes[type_count++] = (VkMemoryType){
                .propertyFlags = property_flags,
                .heapIndex = mem_type.heapIndex,
@@ -830,8 +844,8 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .AMD_device_coherent_memory = pdev->info.has_l2_uncached,
       .AMD_draw_indirect_count = true,
       .AMD_gcn_shader = true,
-      .AMD_gpu_shader_half_float = pdev->info.has_packed_math_16bit,
-      .AMD_gpu_shader_int16 = pdev->info.has_packed_math_16bit,
+      .AMD_gpu_shader_half_float = pdev->info.cu_info.has_packed_math_16bit,
+      .AMD_gpu_shader_int16 = pdev->info.cu_info.has_packed_math_16bit,
       .AMD_memory_overallocation_behavior = true,
       .AMD_mixed_attachment_samples = true,
       .AMD_rasterization_order = pdev->info.has_out_of_order_rast,
@@ -931,7 +945,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .storageBuffer16BitAccess = true,
       .uniformAndStorageBuffer16BitAccess = true,
       .storagePushConstant16 = true,
-      .storageInputOutput16 = pdev->info.has_packed_math_16bit,
+      .storageInputOutput16 = pdev->info.cu_info.has_packed_math_16bit,
       .multiview = true,
       .multiviewGeometryShader = true,
       .multiviewTessellationShader = true,
@@ -1051,7 +1065,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdev, struc
       .depthClipEnable = true,
 
       /* VK_KHR_compute_shader_derivatives */
-      .computeDerivativeGroupQuads = pdev->info.gfx_level >= GFX12,
+      .computeDerivativeGroupQuads = true,
       .computeDerivativeGroupLinear = true,
 
       /* VK_EXT_ycbcr_image_arrays */
@@ -1589,7 +1603,7 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       radv_taskmesh_enabled(pdev) ? VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT : 0;
    VkShaderStageFlags rt_stages = radv_enable_rt(pdev) ? RADV_RT_STAGE_BITS : 0;
 
-   bool accel_dot = pdev->info.has_accelerated_dot_product;
+   bool accel_dot = pdev->info.cu_info.has_accelerated_dot_product;
    bool gfx11plus = pdev->info.gfx_level >= GFX11;
 
    VkExtent2D vrs_texel_extent = radv_vrs_attachment_enabled(pdev) ? (VkExtent2D){8, 8} : (VkExtent2D){0, 0};
@@ -1616,7 +1630,7 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
          MIN3(pdev->image_props.max_dims.width, pdev->image_props.max_dims.height, pdev->image_props.max_dims.depth),
       .maxImageDimensionCube = MIN2(pdev->image_props.max_dims.width, pdev->image_props.max_dims.height),
       .maxImageArrayLayers = pdev->image_props.max_array_layers,
-      .maxTexelBufferElements = UINT32_MAX,
+      .maxTexelBufferElements = 512 * 1024 * 1024,
       .maxUniformBufferRange = UINT32_MAX,
       .maxStorageBufferRange = UINT32_MAX,
       .maxPushConstantsSize = MAX_PUSH_CONSTANTS_SIZE,
@@ -1890,21 +1904,21 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .shaderEngineCount = pdev->info.max_se,
       .shaderArraysPerEngineCount = pdev->info.max_sa_per_se,
       .computeUnitsPerShaderArray = pdev->info.min_good_cu_per_sa,
-      .simdPerComputeUnit = pdev->info.num_simd_per_compute_unit,
-      .wavefrontsPerSimd = pdev->info.max_waves_per_simd,
+      .simdPerComputeUnit = pdev->info.cu_info.num_simd_per_compute_unit,
+      .wavefrontsPerSimd = pdev->info.cu_info.max_waves_per_simd,
       .wavefrontSize = 64,
 
       /* SGPR. */
-      .sgprsPerSimd = pdev->info.num_physical_sgprs_per_simd,
-      .minSgprAllocation = pdev->info.min_sgpr_alloc,
-      .maxSgprAllocation = pdev->info.max_sgpr_alloc,
-      .sgprAllocationGranularity = pdev->info.sgpr_alloc_granularity,
+      .sgprsPerSimd = pdev->info.cu_info.num_physical_sgprs_per_simd,
+      .minSgprAllocation = pdev->info.cu_info.min_sgpr_alloc,
+      .maxSgprAllocation = pdev->info.cu_info.max_sgpr_alloc,
+      .sgprAllocationGranularity = pdev->info.cu_info.sgpr_alloc_granularity,
 
       /* VGPR. */
-      .vgprsPerSimd = pdev->info.num_physical_wave64_vgprs_per_simd,
-      .minVgprAllocation = pdev->info.min_wave64_vgpr_alloc,
-      .maxVgprAllocation = pdev->info.max_vgpr_alloc,
-      .vgprAllocationGranularity = pdev->info.wave64_vgpr_alloc_granularity,
+      .vgprsPerSimd = pdev->info.cu_info.num_physical_wave64_vgprs_per_simd,
+      .minVgprAllocation = pdev->info.cu_info.min_wave64_vgpr_alloc,
+      .maxVgprAllocation = pdev->info.cu_info.max_vgpr_alloc,
+      .vgprAllocationGranularity = pdev->info.cu_info.wave64_vgpr_alloc_granularity,
 
       /* VK_AMD_shader_core_properties2 */
       .shaderCoreFeatures = 0,
@@ -1919,7 +1933,13 @@ radv_get_physical_device_properties(struct radv_physical_device *pdev)
       .degenerateTrianglesRasterized = true,
       .degenerateLinesRasterized = false,
       .fullyCoveredFragmentShaderInputVariable = true,
-      .conservativeRasterizationPostDepthCoverage = false,
+      .conservativeRasterizationPostDepthCoverage =
+         pdev->info.gfx_level >= GFX10 &&
+         /* The combination of VRS + underestimate conservative rasterization + post depth coverage
+          * seem to not behave correctly on few RDNA2 GPUs. It might be similar to
+          * has_vrs_ds_export_bug but this isn't documented anywhere. Be conservative here.
+          */
+         pdev->info.family != CHIP_NAVI21 && pdev->info.family != CHIP_NAVI22 && pdev->info.family != CHIP_VANGOGH,
 
 #ifndef _WIN32
       /* VK_EXT_pci_bus_info */
@@ -2469,16 +2489,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       if (instance->perftest_flags & RADV_PERFTEST_GE_WAVE_32)
          pdev->ge_wave_size = 32;
 
-      /* Default to 32 on RDNA1-2 as that gives better perf due to less issues with divergence.
-       * However, on RDNA3+ default to wave64 as implicit dual issuing is likely better than
-       * wave32 VOPD for VALU dependent code.
-       * (as well as the SALU count becoming more problematic with wave32)
+      /* Default to 32 on RDNA as that gives better perf due to less issues with divergence.
+       * On GFX12+, wave32 will also be required for a future dynamic VGPR allocation implementation.
        */
-      if (instance->perftest_flags & RADV_PERFTEST_RT_WAVE_32 || pdev->info.gfx_level < GFX11)
-         pdev->rt_wave_size = 32;
-
       if (radv_is_rt_wave64_enabled(instance))
          pdev->rt_wave_size = 64;
+      else
+         pdev->rt_wave_size = 32;
    }
 
    radv_probe_video_decode(pdev);
@@ -3054,6 +3071,7 @@ radv_GetPhysicalDeviceMultisamplePropertiesEXT(VkPhysicalDevice physicalDevice, 
 {
    VK_FROM_HANDLE(radv_physical_device, pdev, physicalDevice);
 
+   /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    VkSampleCountFlagBits supported_samples = VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
    if (pdev->info.gfx_level >= GFX10)
       supported_samples |= VK_SAMPLE_COUNT_1_BIT;

@@ -68,13 +68,15 @@ enum PACKED brw_reg_type {
    BRW_TYPE_Q  = 0b00111,
    /** @} */
 
-   /** Floating point types: 16 (half), 32, and 64-bit (double) @{ */
-   BRW_TYPE_HF = 0b01001,
-   BRW_TYPE_F  = 0b01010,
-   BRW_TYPE_DF = 0b01011,
+   /** Floating point types: 8, 16 (half), 32, and 64-bit (double) @{ */
+   BRW_TYPE_HF8 = 0b01000,
+   BRW_TYPE_HF  = 0b01001,
+   BRW_TYPE_F   = 0b01010,
+   BRW_TYPE_DF  = 0b01011,
    /** @} */
 
-   /** Floating point types (bfloat variants): 16-bit @{ */
+   /** Floating point types (bfloat variants): 8 and 16-bit @{ */
+   BRW_TYPE_BF8 = 0b01100,
    BRW_TYPE_BF  = 0b01101,
    /** @} */
 
@@ -167,6 +169,16 @@ brw_type_with_size(enum brw_reg_type ref_type, unsigned bit_size)
    return (enum brw_reg_type)(base_field | size_field);
 }
 
+static inline enum brw_reg_type
+brw_float_type_for_reg_type(enum brw_reg_type ref_type)
+{
+   unsigned bit_size = brw_type_size_bits(ref_type);
+   assert(bit_size == 16 || bit_size == 32 || bit_size == 64);
+   unsigned base_field = BRW_TYPE_F & BRW_TYPE_BASE_MASK;
+   unsigned size_field = ffs(bit_size) - 4;
+   return (enum brw_reg_type)(base_field | size_field);
+}
+
 /**
  * Returns the larger of two types (i.e. W and D -> D).
  *
@@ -186,6 +198,33 @@ brw_type_larger_of(enum brw_reg_type a, enum brw_reg_type b)
 
 /* -------------------------------------------------------------- */
 
+/**
+ * Enum for float data types.
+ */
+enum PACKED brw_data_type_float {
+   BRW_TYPE_FLOAT_BF8   = 0,
+   BRW_TYPE_FLOAT_HF    = 1,
+   BRW_TYPE_FLOAT_F     = 2,
+   BRW_TYPE_FLOAT_DF    = 3,
+   BRW_TYPE_FLOAT_HF8   = 4,
+   BRW_TYPE_FLOAT_BF    = 5,
+   BRW_TYPE_FLOAT_TF32  = 6,
+};
+
+/**
+ * Enum for integer data types.
+ */
+enum PACKED brw_data_type_int {
+   BRW_TYPE_INT_UB      = 0,
+   BRW_TYPE_INT_UW      = 1,
+   BRW_TYPE_INT_UD      = 2,
+   BRW_TYPE_INT_UQ      = 3,
+   BRW_TYPE_INT_B       = 4,
+   BRW_TYPE_INT_W       = 5,
+   BRW_TYPE_INT_D       = 6,
+   BRW_TYPE_INT_Q       = 7,
+};
+
 unsigned
 brw_type_encode(const struct intel_device_info *devinfo,
                 enum brw_reg_file file, enum brw_reg_type type);
@@ -201,6 +240,13 @@ brw_type_encode_for_3src(const struct intel_device_info *devinfo,
 enum brw_reg_type
 brw_type_decode_for_3src(const struct intel_device_info *devinfo,
                          unsigned hw_type, unsigned exec_type);
+
+unsigned
+brw_data_type_encode(const struct intel_device_info *devinfo,
+                     enum brw_reg_type type);
+enum brw_reg_type
+brw_data_type_decode(const struct intel_device_info *devinfo,
+                     unsigned data_type, bool exec_type);
 
 const char *
 brw_reg_type_to_letters(enum brw_reg_type type);

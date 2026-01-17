@@ -38,10 +38,6 @@
 
 #include "gallivm/lp_bld_debug.h"
 
-#define SPIR_V_MAGIC_NUMBER 0x07230203
-
-#define MAX_DYNAMIC_STATES 72
-
 typedef void (*cso_destroy_func)(struct pipe_context*, void*);
 
 static void
@@ -201,7 +197,7 @@ optimize(nir_shader *nir)
    do {
       progress = false;
 
-      NIR_PASS(progress, nir, nir_lower_flrp, 32|64, true);
+      NIR_PASS(progress, nir, nir_lower_flrp, 16|32|64, true);
       NIR_PASS(progress, nir, nir_split_array_vars, nir_var_function_temp);
       NIR_PASS(progress, nir, nir_shrink_vec_array_vars, nir_var_function_temp);
       NIR_PASS(progress, nir, nir_opt_deref);
@@ -350,6 +346,8 @@ lvp_shader_lower(struct lvp_device *pdevice, nir_shader *nir, struct lvp_pipelin
       lvp_lower_input_attachments(nir, false);
    NIR_PASS(_, nir, nir_lower_system_values);
    NIR_PASS(_, nir, nir_lower_is_helper_invocation);
+
+   NIR_PASS(_, nir, lvp_nir_lower_cooperative_matrix);
 
    const struct nir_lower_compute_system_values_options compute_system_values = {0};
    NIR_PASS(_, nir, nir_lower_compute_system_values, &compute_system_values);
@@ -1177,7 +1175,7 @@ create_shader_object(struct lvp_device *device, const VkShaderCreateInfoEXT *pCr
       if (memcmp(uuid, data, VK_UUID_SIZE))
          return VK_NULL_HANDLE;
       size_t size = pCreateInfo->codeSize - SHA1_DIGEST_LENGTH - VK_UUID_SIZE;
-      unsigned char sha1[20];
+      unsigned char sha1[SHA1_DIGEST_LENGTH];
 
       struct mesa_sha1 sctx;
       _mesa_sha1_init(&sctx);

@@ -190,7 +190,7 @@ radv_init_trace(struct radv_device *device)
 
    result = radv_bo_create(
       device, NULL, sizeof(struct radv_trace_data), 8, RADEON_DOMAIN_VRAM,
-      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM | RADEON_FLAG_VA_UNCACHED,
+      RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM | RADEON_FLAG_GL2_BYPASS,
       RADV_BO_PRIORITY_UPLOAD_BUFFER, 0, true, &device->trace_bo);
    if (result != VK_SUCCESS)
       return false;
@@ -570,8 +570,8 @@ radv_dump_shader(struct radv_device *device, struct radv_pipeline *pipeline, str
    fprintf(f, "%s:\n\n", radv_get_shader_name(&shader->info, stage));
 
    if (shader->spirv) {
-      unsigned char sha1[21];
-      char sha1buf[41];
+      unsigned char sha1[SHA1_DIGEST_LENGTH + 1];
+      char sha1buf[SHA1_DIGEST_STRING_LENGTH];
 
       _mesa_sha1_compute(shader->spirv, shader->spirv_size, sha1);
       _mesa_sha1_format(sha1buf, sha1);

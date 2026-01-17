@@ -7,8 +7,6 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#define FD_BO_NO_HARDPIN 1
-
 #include "drm-uapi/drm_fourcc.h"
 #include "pipe/p_screen.h"
 #include "util/format/u_format.h"
@@ -169,34 +167,10 @@ fd6_screen_init(struct pipe_screen *pscreen)
 
    screen->max_rts = A6XX_MAX_RENDER_TARGETS;
 
-   uint32_t depth_cache_size =
-      screen->info->num_ccu * screen->info->props.sysmem_per_ccu_depth_cache_size;
-   uint32_t color_cache_size =
-      (screen->info->num_ccu * screen->info->props.sysmem_per_ccu_color_cache_size);
-   uint32_t color_cache_size_gmem =
-      color_cache_size /
-      (1 << screen->info->props.gmem_ccu_color_cache_fraction);
-
-   struct fd6_gmem_config *gmem = &screen->config_gmem;
-   struct fd6_gmem_config *sysmem = &screen->config_sysmem;
-
-   sysmem->depth_ccu_offset = 0;
-   sysmem->color_ccu_offset = sysmem->depth_ccu_offset + depth_cache_size;
-
-   if (screen->info->props.has_gmem_vpc_attr_buf) {
-      sysmem->vpc_attr_buf_size = screen->info->props.sysmem_vpc_attr_buf_size;
-      sysmem->vpc_attr_buf_offset = sysmem->color_ccu_offset + color_cache_size;
-
-      gmem->vpc_attr_buf_size = screen->info->props.gmem_vpc_attr_buf_size;
-      gmem->vpc_attr_buf_offset = screen->gmemsize_bytes -
-         (gmem->vpc_attr_buf_size * screen->info->num_ccu);
-
-      gmem->color_ccu_offset = gmem->vpc_attr_buf_offset - color_cache_size_gmem;
-      screen->gmemsize_bytes = gmem->vpc_attr_buf_offset;
-   } else {
-      gmem->depth_ccu_offset = 0;
-      gmem->color_ccu_offset = screen->gmemsize_bytes - color_cache_size_gmem;
-   }
+   screen->gmemsize_bytes =
+      fd6_calc_gmem_cache_offsets(screen->info, screen->gmemsize_bytes,
+                                  &screen->config_gmem,
+                                  &screen->config_sysmem);
 
    /* Currently only FB_READ forces GMEM path, mostly because we'd have to
     * deal with cmdstream patching otherwise..

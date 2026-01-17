@@ -155,8 +155,8 @@ vk_clear_color_value_to_mtl_clear_color(union VkClearColorValue color,
    const struct kk_va_format *supported_format = kk_get_va_format(format);
    struct mtl_clear_color swizzled_color;
    for (uint32_t i = 0u; i < 4; ++i)
-      swizzled_color.channel[i] =
-         value.channel[supported_format->swizzle.channels[i]];
+      swizzled_color.channel[supported_format->unswizzle.channels[i]] =
+         value.channel[i];
 
    return swizzled_color;
 }
@@ -229,8 +229,13 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
       mtl_new_render_pass_descriptor();
 
    /* Framebufferless rendering, need to set pass_descriptors
-    * renderTargetWidth/Height to non-0 values and defaultRasterSampleCount */
-   if (framebuffer_extent.width == 0u && framebuffer_extent.height == 0u) {
+    * renderTargetWidth/Height to non-0 values and defaultRasterSampleCount.
+    * However, since the sample count will only be known at first pipeline bind,
+    * we need to delay the start of the pass until then since Metal will ignore
+    * bound pipeline's sample count. */
+   bool no_framebuffer =
+      framebuffer_extent.width == 0u && framebuffer_extent.height == 0u;
+   if (no_framebuffer) {
       framebuffer_extent.width = render->area.extent.width;
       framebuffer_extent.height = render->area.extent.height;
       mtl_render_pass_descriptor_set_render_target_width(
@@ -345,9 +350,10 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    // TODO_KOSMICKRISP Fragment shading rate support goes here if Metal supports
    // it
 
-   /* Start new encoder and encode sync commands from previous barriers (aka
-    * fences) */
-   kk_encoder_start_render(cmd, pass_descriptor, render->view_mask);
+   /* Rendering with no attachments requires pushing the start of the render
+    * pass to first pipeline binding to know sample count. */
+   if (!no_framebuffer)
+      kk_encoder_start_render(cmd, pass_descriptor, render->view_mask);
 
    /* Store descriptor in case we need to restart the pass at pipeline barrier,
     * but force loads */
@@ -373,6 +379,7 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
          attachment_descriptor, MTL_LOAD_ACTION_LOAD);
    }
    cmd->state.gfx.render_pass_descriptor = pass_descriptor;
+   cmd->state.gfx.need_to_start_render_pass = no_framebuffer;
 
    kk_cmd_buffer_dirty_all_gfx(cmd);
 
@@ -786,7 +793,10 @@ kk_flush_draw_state(struct kk_cmd_buffer *cmd)
       desc->root_dirty = true;
    }
 
-   if (gfx->dirty & KK_DIRTY_VB) {
+   if (BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI) ||
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDINGS_VALID) ||
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_VI_BINDING_STRIDES) ||
+       gfx->dirty & KK_DIRTY_VB) {
       unsigned slot = 0;
       cmd->state.gfx.vb.max_vertices = 0u;
       u_foreach_bit(i, cmd->state.gfx.vb.attribs_read) {
@@ -794,8 +804,6 @@ kk_flush_draw_state(struct kk_cmd_buffer *cmd)
             struct vk_vertex_attribute_state attr = dyn->vi->attributes[i];
             struct kk_addr_range vb = gfx->vb.addr_range[attr.binding];
 
-            mtl_render_use_resource(enc, gfx->vb.handles[attr.binding],
-                                    MTL_RESOURCE_USAGE_READ);
             desc->root.draw.attrib_clamps[slot] = kk_calculate_vbo_clamp(
                vb.addr, 0, vk_format_to_pipe_format(attr.format), vb.range,
                dyn->vi_binding_strides[attr.binding], attr.offset,

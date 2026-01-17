@@ -16,6 +16,7 @@
    S_0286D0_LINEAR_SAMPLE_ENA(1) |              \
    S_0286D0_LINEAR_CENTER_ENA(1) |              \
    S_0286D0_LINEAR_CENTROID_ENA(1) |            \
+   S_0286D0_LINE_STIPPLE_TEX_ENA(1) |           \
    S_0286D0_FRONT_FACE_ENA(1) |                 \
    S_0286D0_ANCILLARY_ENA(1) |                  \
    S_0286D0_SAMPLE_COVERAGE_ENA(1) |            \
@@ -123,10 +124,9 @@ nir_def *si_nir_load_internal_binding(struct si_screen *sscreen, nir_builder *b,
                                       struct si_shader_args *args, unsigned slot,
                                       unsigned num_components);
 bool si_nir_lower_abi(nir_shader *nir, struct si_shader *shader, struct si_shader_args *args);
-bool si_nir_lower_color_inputs_to_sysvals(nir_shader *nir);
+bool si_nir_lower_intrinsics_early(nir_shader *nir);
 bool si_nir_lower_polygon_stipple(nir_shader *nir);
-bool si_nir_lower_ps_color_inputs(nir_shader *nir, const union si_shader_key *key,
-                                  const struct si_shader_info *info);
+bool si_nir_lower_color_flatshade_twoside(nir_shader *nir, struct si_shader *shader);
 bool si_nir_lower_resource(nir_shader *nir, struct si_shader *shader,
                            struct si_shader_args *args);
 bool si_nir_lower_vs_inputs(nir_shader *nir, struct si_shader *shader,

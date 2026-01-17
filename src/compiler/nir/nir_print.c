@@ -110,7 +110,7 @@ print_annotation(print_state *state, void *obj)
    const char *note = entry->data;
    _mesa_hash_table_remove(state->annotations, entry);
 
-   fprintf(fp, "%s\n\n", note);
+   fprintf(fp, " %s", note);
 }
 
 /* For 1 element, the size is intentionally omitted. */
@@ -489,7 +489,7 @@ print_alu_instr(nir_alu_instr *instr, print_state *state)
    print_def(&instr->def, state);
 
    fprintf(fp, " = %s", nir_op_infos[instr->op].name);
-   if (instr->exact)
+   if (nir_alu_instr_is_exact(instr))
       fprintf(fp, "!");
    if (instr->no_signed_wrap)
       fprintf(fp, ".nsw");
@@ -1002,8 +1002,9 @@ print_var_decl(nir_variable *var, print_state *state)
    if (var->pointer_initializer)
       fprintf(fp, " = &%s", get_var_name(var->pointer_initializer, state));
 
-   fprintf(fp, "\n");
    print_annotation(state, var);
+
+   fprintf(fp, "\n");
 }
 
 static void
@@ -1144,8 +1145,7 @@ print_deref_instr(nir_deref_instr *instr, print_state *state)
               instr->cast.align_mul, instr->cast.align_offset);
    }
 
-   if (instr->deref_type == nir_deref_type_array ||
-       instr->deref_type == nir_deref_type_ptr_as_array) {
+   if (nir_deref_instr_is_arr(instr)) {
       if (instr->arr.in_bounds)
          fprintf(fp, "  (in bounds)");
    }
@@ -1221,6 +1221,18 @@ print_alu_type(nir_alu_type type, print_state *state)
    else
       fprintf(fp, "%s", name);
 }
+
+static const char *sampler_dim_name[] = {
+   [GLSL_SAMPLER_DIM_1D] = "1D",
+   [GLSL_SAMPLER_DIM_2D] = "2D",
+   [GLSL_SAMPLER_DIM_3D] = "3D",
+   [GLSL_SAMPLER_DIM_CUBE] = "Cube",
+   [GLSL_SAMPLER_DIM_RECT] = "Rect",
+   [GLSL_SAMPLER_DIM_BUF] = "Buf",
+   [GLSL_SAMPLER_DIM_MS] = "2D-MSAA",
+   [GLSL_SAMPLER_DIM_SUBPASS] = "Subpass",
+   [GLSL_SAMPLER_DIM_SUBPASS_MS] = "Subpass-MSAA",
+};
 
 static void
 print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
@@ -1343,20 +1355,9 @@ print_intrinsic_instr(nir_intrinsic_instr *instr, print_state *state)
       }
 
       case NIR_INTRINSIC_IMAGE_DIM: {
-         static const char *dim_name[] = {
-            [GLSL_SAMPLER_DIM_1D] = "1D",
-            [GLSL_SAMPLER_DIM_2D] = "2D",
-            [GLSL_SAMPLER_DIM_3D] = "3D",
-            [GLSL_SAMPLER_DIM_CUBE] = "Cube",
-            [GLSL_SAMPLER_DIM_RECT] = "Rect",
-            [GLSL_SAMPLER_DIM_BUF] = "Buf",
-            [GLSL_SAMPLER_DIM_MS] = "2D-MSAA",
-            [GLSL_SAMPLER_DIM_SUBPASS] = "Subpass",
-            [GLSL_SAMPLER_DIM_SUBPASS_MS] = "Subpass-MSAA",
-         };
          enum glsl_sampler_dim dim = nir_intrinsic_image_dim(instr);
-         assert(dim < ARRAY_SIZE(dim_name) && dim_name[dim]);
-         fprintf(fp, "image_dim=%s", dim_name[dim]);
+         assert(dim < ARRAY_SIZE(sampler_dim_name) && sampler_dim_name[dim]);
+         fprintf(fp, "image_dim=%s", sampler_dim_name[dim]);
          break;
       }
 
@@ -2038,6 +2039,12 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
    if (instr->skip_helpers) {
       fprintf(fp, ", skip_helpers");
    }
+
+   if (instr->backend_flags) {
+      fprintf(fp, ", backend_flags=0x%X", instr->backend_flags);
+   }
+
+   fprintf(fp, ", %s", sampler_dim_name[instr->sampler_dim]);
 }
 
 static void
@@ -2350,8 +2357,8 @@ print_block(nir_block *block, print_state *state, unsigned tabs)
 
    nir_foreach_instr(instr, block) {
       print_instr(instr, state, tabs);
-      fprintf(fp, "\n");
       print_annotation(state, instr);
+      fprintf(fp, "\n");
    }
 
    print_indentation(tabs, fp);
@@ -2884,21 +2891,6 @@ print_shader_info(const struct shader_info *info, FILE *fp)
       print_nz_bool(fp, "untyped_color_outputs", info->fs.untyped_color_outputs);
 
       print_nz_unsigned(fp, "depth_layout", info->fs.depth_layout);
-
-      if (info->fs.color0_interp != INTERP_MODE_NONE) {
-         fprintf(fp, "color0_interp: %s\n",
-                 glsl_interp_mode_name(info->fs.color0_interp));
-      }
-      print_nz_bool(fp, "color0_sample", info->fs.color0_sample);
-      print_nz_bool(fp, "color0_centroid", info->fs.color0_centroid);
-
-      if (info->fs.color1_interp != INTERP_MODE_NONE) {
-         fprintf(fp, "color1_interp: %s\n",
-                 glsl_interp_mode_name(info->fs.color1_interp));
-      }
-      print_nz_bool(fp, "color1_sample", info->fs.color1_sample);
-      print_nz_bool(fp, "color1_centroid", info->fs.color1_centroid);
-
       print_nz_x32(fp, "advanced_blend_modes", info->fs.advanced_blend_modes);
       break;
 

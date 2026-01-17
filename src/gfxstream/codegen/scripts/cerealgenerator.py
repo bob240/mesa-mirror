@@ -149,6 +149,7 @@ SUPPORTED_FEATURES = [
     # Used by guest ANGLE
     "VK_EXT_vertex_attribute_divisor",
     # QNX
+    "VK_QNX_screen_surface",
     "VK_QNX_external_memory_screen_buffer",
     # b/320855472 Chrome
     "VK_EXT_fragment_density_map",
@@ -180,6 +181,7 @@ SUPPORTED_MODULES = {
     "VK_MVK_macos_surface" : ["goldfish_vk_dispatch"],
     # Host dispatch for Linux hosts + and entrypoint for guests
     "VK_KHR_external_memory_fd": ["goldfish_vk_dispatch", "func_table"],
+    "VK_QNX_screen_surface": ["goldfish_vk_dispatch"],
     "VK_QNX_external_memory_screen_buffer": ["goldfish_vk_dispatch"],
     "VK_ANDROID_external_memory_android_hardware_buffer": ["goldfish_vk_dispatch", "func_table"],
     "VK_KHR_android_surface": ["func_table"],
@@ -285,13 +287,7 @@ def banner_command(argv):
        Return a string corresponding to the command, with platform-specific
        paths removed."""
 
-    def makePosixRelative(someArg):
-        # Do not use relative for /tmp/ to avoid effects of checkout location
-        if os.path.exists(someArg) and someArg != "/tmp/":
-            return str(PurePosixPath(Path(os.path.relpath(someArg))))
-        return someArg
-
-    return ' '.join(map(makePosixRelative, argv))
+    return os.path.basename(argv[0])
 
 def envGetOrDefault(key, default=None):
     if key in os.environ:
@@ -560,7 +556,7 @@ using DlSymFunc = void* (void*, const char*);
 
         decoderHeaderIncludes = f"""
 #include "vk_decoder_context.h"
-#include "gfxstream/host/ProcessResources.h"
+#include "gfxstream/host/process_resources.h"
 
 #include <memory>
 

@@ -2,9 +2,7 @@ KHR-GL46.shader_image_load_store.basic-allTargets-store,Fail
 KHR-GL46.shader_subroutine.control_flow_and_returned_subroutine_values_used_as_subroutine_input,Fail
 
 #glcts update
-dEQP-GLES2.functional.texture.mipmap.cube.projected.nearest_linear,Fail
 KHR-GLES3.framebuffer_blit.framebuffer_blit_functionality_multisampled_to_singlesampled_blit,Fail
-KHR-GL46.texture_lod_basic.lod_selection,Fail
 KHR-GL46.texture_lod_bias.texture_lod_bias_all,Fail
 
 # New failures with ES CTS 3.2.12.0
@@ -44,6 +42,26 @@ gmem-dEQP-VK.pipeline.fast_linked_library.vertex_input.misc.unused_binding_dynam
 gmem-dEQP-VK.transform_feedback.simple.draw_indirect_multiview_counter_offset_16,Fail
 gmem-dEQP-VK.transform_feedback.simple.draw_indirect_multiview_counter_offset_244,Fail
 nobin-dEQP-VK.transform_feedback.simple.draw_indirect_multiview_counter_offset_16,Fail
+
+# New failures with VKCTS 1.4.4.0
+dEQP-VK.binding_model.descriptor_buffer.traditional_buffer.capture_replay.sparse_buffer_descriptor_data_consistency_and_usage,Fail
+dEQP-VK.binding_model.descriptor_buffer.traditional_buffer.capture_replay.sparse_buffer_descriptor_data_consistency,Fail
+dEQP-VK.pipeline.monolithic.misc.identically_defined_layout,Fail
+dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,Fail
+dEQP-VK.tessellation.misc_draw.tess_factor_barrier_bug,Crash
+bypass-dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,Fail
+gmem-dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,Fail
+gmem-dEQP-VK.transform_feedback.simple.draw_indirect_counter_offset_16,Fail
+gmem-dEQP-VK.transform_feedback.simple.draw_indirect_multiview_counter_offset_508,Fail
+gmem-dEQP-VK.transform_feedback.simple_fast_gpl.draw_indirect_counter_offset_244,Fail
+gmem-dEQP-VK.transform_feedback.simple_fast_gpl.draw_indirect_counter_offset_508,Fail
+gmem-dEQP-VK.transform_feedback.simple_optimized_gpl.draw_indirect_multiview_counter_offset_508,Fail
+nobin-dEQP-VK.transform_feedback.simple.draw_indirect_counter_offset_16,Fail
+nobin-dEQP-VK.transform_feedback.simple.draw_indirect_multiview_counter_offset_508,Fail
+nobin-dEQP-VK.transform_feedback.simple_fast_gpl.draw_indirect_counter_offset_244,Fail
+nobin-dEQP-VK.transform_feedback.simple_fast_gpl.draw_indirect_counter_offset_508,Fail
+nobin-dEQP-VK.transform_feedback.simple_optimized_gpl.draw_indirect_multiview_counter_offset_508,Fail
+
 
 # Bad assumptions in piglit about layout of multiplanar formats,
 # it should use separate buffers per plane:
@@ -116,4 +134,3 @@ program@execute@vector-conversion,Fail
 
 # Initial ANGLE failures
 angle-dEQP-GLES2.functional.shaders.algorithm.rgb_to_hsl_vertex,Fail
-angle-dEQP-GLES2.functional.texture.mipmap.cube.projected.nearest_linear,Fail

@@ -144,7 +144,6 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
    case nir_intrinsic_load_work_dim:
    case nir_intrinsic_load_num_workgroups:
    case nir_intrinsic_load_ray_launch_size:
-   case nir_intrinsic_load_sbt_base_amd:
    case nir_intrinsic_load_is_indexed_draw:
    case nir_intrinsic_load_viewport_scale:
    case nir_intrinsic_load_user_clip_plane:
@@ -180,6 +179,7 @@ can_move_intrinsic(nir_intrinsic_instr *instr, opt_preamble_ctx *ctx)
    case nir_intrinsic_load_cull_any_enabled_amd:
    case nir_intrinsic_load_cull_small_triangle_precision_amd:
    case nir_intrinsic_load_vbo_base_agx:
+   case nir_intrinsic_load_push_data_intel:
       return true;
 
    /* Intrinsics which can be moved depending on hardware */

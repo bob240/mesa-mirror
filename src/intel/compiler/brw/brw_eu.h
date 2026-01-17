@@ -177,6 +177,13 @@ void brw_add_reloc(struct brw_codegen *p, uint32_t id,
 void brw_set_dest(struct brw_codegen *p, brw_eu_inst *insn, struct brw_reg dest);
 void brw_set_src0(struct brw_codegen *p, brw_eu_inst *insn, struct brw_reg reg);
 
+brw_eu_inst *brw_alu1(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
+                      struct brw_reg src);
+brw_eu_inst *brw_alu2(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
+                      struct brw_reg src0, struct brw_reg src1);
+brw_eu_inst *brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
+                      struct brw_reg src0, struct brw_reg src1, struct brw_reg src2);
+
 /* Helpers for regular instructions:
  */
 #define ALU1(OP)				\
@@ -1582,7 +1589,7 @@ brw_set_desc(struct brw_codegen *p, brw_eu_inst *insn, unsigned desc, bool gathe
    brw_set_desc_ex(p, insn, desc, 0, gather);
 }
 
-void brw_set_uip_jip(struct brw_codegen *p, int start_offset);
+void brw_set_uip_jip(struct brw_codegen *p, int start_offset, int final_halt_offset);
 
 enum brw_conditional_mod brw_negate_cmod(enum brw_conditional_mod cmod);
 enum brw_conditional_mod brw_swap_cmod(enum brw_conditional_mod cmod);

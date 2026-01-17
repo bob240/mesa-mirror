@@ -26,7 +26,6 @@
 #include "pan_props.h"
 
 #define MAX_VBS 16
-#define MAX_RTS 8
 
 struct panvk_cmd_buffer;
 
@@ -49,6 +48,8 @@ struct panvk_rendering_state {
    enum vk_rp_attachment_flags bound_attachments;
    struct {
       struct panvk_image_view *iviews[MAX_RTS];
+      /* If non-null, preload_iviews[i] overrides iviews[i] for preloads. */
+      struct panvk_image_view *preload_iviews[MAX_RTS];
       VkFormat fmts[MAX_RTS];
       uint8_t samples[MAX_RTS];
       struct panvk_resolve_attachment resolve[MAX_RTS];
@@ -59,6 +60,8 @@ struct panvk_rendering_state {
 
    struct {
       struct panvk_image_view *iview;
+      /* If non-null, preload_iview overrides iview for preloads. */
+      struct panvk_image_view *preload_iview;
       VkFormat fmt;
       struct panvk_resolve_attachment resolve;
    } z_attachment, s_attachment;
@@ -135,6 +138,7 @@ struct panvk_cmd_graphics_state {
    struct {
       const struct panvk_shader *shader;
       struct panvk_shader_desc_state desc;
+      uint64_t blend_descs[MAX_RTS];
       uint64_t push_uniforms;
       bool required;
 #if PAN_ARCH < 9
@@ -247,7 +251,7 @@ panvk_select_tiler_hierarchy_mask(const struct panvk_physical_device *phys_dev,
                                   unsigned bin_ptr_mem_budget)
 {
    struct pan_tiler_features tiler_features =
-      pan_query_tiler_features(&phys_dev->kmod.props);
+      pan_query_tiler_features(&phys_dev->kmod.dev->props);
 
    uint32_t hierarchy_mask = GENX(pan_select_tiler_hierarchy_mask)(
       state->render.fb.info.width, state->render.fb.info.height,
@@ -369,7 +373,6 @@ void
 panvk_per_arch(cmd_preload_render_area_border)(struct panvk_cmd_buffer *cmdbuf,
                                                const VkRenderingInfo *render_info);
 
-void panvk_per_arch(cmd_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf);
 void panvk_per_arch(cmd_select_tile_size)(struct panvk_cmd_buffer *cmdbuf);
 
 struct panvk_draw_info {

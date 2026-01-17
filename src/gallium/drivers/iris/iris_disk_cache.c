@@ -102,7 +102,7 @@ iris_disk_cache_store(struct disk_cache *cache,
    iris_disk_cache_compute_key(cache, ish, prog_key, prog_key_size, cache_key);
 
    if (debug) {
-      char sha1[41];
+      char sha1[SHA1_DIGEST_STRING_LENGTH];
       _mesa_sha1_format(sha1, cache_key);
       fprintf(stderr, "[mesa disk cache] storing %s\n", sha1);
    }
@@ -128,7 +128,6 @@ iris_disk_cache_store(struct disk_cache *cache,
       union brw_any_prog_data serializable;
       assert(prog_data_s <= sizeof(serializable));
       memcpy(&serializable, shader->brw_prog_data, prog_data_s);
-      serializable.base.param = NULL;
       serializable.base.relocs = NULL;
       blob_write_bytes(&blob, &serializable, prog_data_s);
    } else {
@@ -152,8 +151,7 @@ iris_disk_cache_store(struct disk_cache *cache,
    if (brw) {
       blob_write_bytes(&blob, brw->relocs,
                        brw->num_relocs * sizeof(struct intel_shader_reloc));
-      blob_write_bytes(&blob, brw->param,
-                       brw->nr_params * sizeof(uint32_t));
+      blob_write_bytes(&blob, shader->ubo_ranges, sizeof(shader->ubo_ranges));
    } else {
 #ifdef INTEL_USE_ELK
       blob_write_bytes(&blob, elk->relocs,
@@ -203,7 +201,7 @@ iris_disk_cache_retrieve(struct iris_screen *screen,
    iris_disk_cache_compute_key(cache, ish, prog_key, key_size, cache_key);
 
    if (debug) {
-      char sha1[41];
+      char sha1[SHA1_DIGEST_STRING_LENGTH];
       _mesa_sha1_format(sha1, cache_key);
       fprintf(stderr, "[mesa disk cache] retrieving %s: ", sha1);
    }
@@ -265,12 +263,7 @@ iris_disk_cache_retrieve(struct iris_screen *screen,
                          brw->num_relocs * sizeof(struct intel_shader_reloc));
          brw->relocs = relocs;
       }
-
-      brw->param = NULL;
-      if (brw->nr_params) {
-         brw->param = ralloc_array(NULL, uint32_t, brw->nr_params);
-         blob_copy_bytes(&blob, brw->param, brw->nr_params * sizeof(uint32_t));
-      }
+      blob_copy_bytes(&blob, shader->ubo_ranges, sizeof(shader->ubo_ranges));
    } else {
 #ifdef INTEL_USE_ELK
       elk->relocs = NULL;
@@ -320,7 +313,7 @@ iris_disk_cache_retrieve(struct iris_screen *screen,
       num_cbufs++;
 
    if (brw)
-      iris_apply_brw_prog_data(shader, brw);
+      iris_apply_brw_prog_data(shader, brw, NULL);
    else
 #ifdef INTEL_USE_ELK
       iris_apply_elk_prog_data(shader, elk);
@@ -361,7 +354,7 @@ iris_disk_cache_init(struct iris_screen *screen)
    char renderer[5 + 40 + 1] = {0};
 
    if (screen->brw) {
-      char device_info_sha[41];
+      char device_info_sha[SHA1_DIGEST_STRING_LENGTH];
       brw_device_sha1(device_info_sha, screen->devinfo);
       memcpy(renderer, "iris_", 5);
       memcpy(renderer + 5, device_info_sha, 40);
@@ -374,12 +367,12 @@ iris_disk_cache_init(struct iris_screen *screen)
 
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(iris_disk_cache_init);
-   assert(note && build_id_length(note) == 20); /* sha1 */
+   assert(note && build_id_length(note) == BUILD_ID_EXPECTED_HASH_LENGTH); /* sha1 */
 
    const uint8_t *id_sha1 = build_id_data(note);
    assert(id_sha1);
 
-   char timestamp[41];
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
    _mesa_sha1_format(timestamp, id_sha1);
 
    const uint64_t driver_flags =

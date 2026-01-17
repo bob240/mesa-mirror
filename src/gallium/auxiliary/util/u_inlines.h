@@ -356,7 +356,7 @@ pipe_surface_init(struct pipe_context *ctx, struct pipe_surface* ps,
 static inline unsigned
 pipe_surface_width(const struct pipe_surface *ps)
 {
-   unsigned width = (uint16_t)u_minify(ps->texture->width0, ps->level);
+   unsigned width = u_minify(ps->texture->width0, ps->level);
 
    /* adjust texture view size to get full blocksize on compressed formats */
    if (!util_format_is_depth_or_stencil(ps->texture->format) && ps->format != ps->texture->format) {
@@ -395,13 +395,13 @@ pipe_surface_height(const struct pipe_surface *ps)
 }
 
 static inline void
-pipe_surface_size(const struct pipe_surface *ps, uint16_t *width, uint16_t *height)
+pipe_surface_size(const struct pipe_surface *ps, unsigned *width, unsigned *height)
 {
    if (width)
-      *width = (uint16_t)pipe_surface_width(ps);
+      *width = pipe_surface_width(ps);
 
    if (height)
-      *height = (uint16_t)pipe_surface_height(ps);
+      *height = pipe_surface_height(ps);
 }
 
 /* Return true if the surfaces are equal. */
@@ -706,23 +706,23 @@ pipe_set_constant_buffer(struct pipe_context *pipe,
 }
 
 static inline void
-pipe_upload_constant_buffer0(struct pipe_context *pipe, mesa_shader_stage stage, struct pipe_constant_buffer *cb)
+pipe_upload_constant_buffer0(struct pipe_context *pipe, mesa_shader_stage stage,
+                             struct pipe_constant_buffer *cb,
+                             struct pipe_resource **releasebuf)
 {
    struct pipe_constant_buffer cbuf = *cb;
    cbuf.buffer = NULL;
    const unsigned alignment = MAX2(pipe->screen->caps.constant_buffer_offset_alignment, 64);
    void *ptr;
-   struct pipe_resource *releasebuf = NULL;
 
    if (pipe->screen->caps.prefer_real_buffer_in_constbuf0) {
       u_upload_alloc(pipe->const_uploader, 0, cbuf.buffer_size,
-         alignment, &cbuf.buffer_offset, &cbuf.buffer, &releasebuf, (void**)&ptr);
+         alignment, &cbuf.buffer_offset, &cbuf.buffer, releasebuf, (void**)&ptr);
       memcpy(ptr, cbuf.user_buffer, cbuf.buffer_size);
       cbuf.user_buffer = NULL;
 
       u_upload_unmap(pipe->const_uploader);
       pipe->set_constant_buffer(pipe, stage, 0, &cbuf);
-      pipe_resource_release(pipe, releasebuf);
    } else {
       pipe->set_constant_buffer(pipe, stage, 0, cb);
    }

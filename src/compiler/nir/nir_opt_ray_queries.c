@@ -151,7 +151,7 @@ nir_opt_ray_queries(nir_shader *shader)
  *
  * 1. Store all the ray queries we will consider into an array for
  *    convenient access. Ignore arrays since it would be really complex
- *    to handle and will be rare in praxis.
+ *    to handle and will be rare in practise.
  *
  * 2. Count the number of ray query ranges and allocate the required ranges.
  *
@@ -300,6 +300,19 @@ nir_opt_ray_query_ranges(nir_shader *shader)
 
          struct hash_entry *index_entry =
             _mesa_hash_table_search(range_indices, ray_query_deref->var);
+         if (!index_entry) {
+            /* The range doesn't exist yet which means that the first instruction
+             * isn't the initialize. Ignore it.
+             */
+            for (uint32_t i = 0; i < ray_query_count; i++) {
+               if (ray_queries[i] == ray_query_deref->var) {
+                  ray_queries[i] = NULL;
+                  break;
+               }
+            }
+            continue;
+         }
+
          struct rq_range *range = ranges + (uintptr_t)index_entry->data;
 
          if (intrinsic->intrinsic != nir_intrinsic_rq_initialize) {

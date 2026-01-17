@@ -39,7 +39,6 @@
 #include "av1_tables.h"
 
 #define ANV_OFFSET_IMPLICIT UINT64_MAX
-#define ANV_MAX_PLANES 4
 
 static const enum isl_surf_dim
 vk_to_isl_surf_dim[] = {
@@ -506,8 +505,7 @@ anv_formats_ccs_e_compatible(const struct anv_physical_device *physical_device,
          return false;
    }
 
-   if ((vk_usage & VK_IMAGE_USAGE_STORAGE_BIT) &&
-       vk_tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
+   if (vk_usage & VK_IMAGE_USAGE_STORAGE_BIT) {
       /* Only color */
       assert((vk_format_aspects(vk_format) & ~VK_IMAGE_ASPECT_ANY_COLOR_BIT_ANV) == 0);
       if (devinfo->ver == 12) {
@@ -523,8 +521,13 @@ anv_formats_ccs_e_compatible(const struct anv_physical_device *physical_device,
           * On gfx12.0, compression is not supported with atomic
           * operations. On gfx12.5, the support is there, but it's slow
           * (see HSD 1406337848).
+          *
+          * We only care about the non-modifier case. Modifier capabilities
+          * are exposed via the standard interfaces and unlike prior
+          * platforms, we don't enable compression for uncompressed modifiers.
           */
-         if (image_may_use_r32_view(create_flags, vk_format, fmt_list))
+         if (vk_tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+             image_may_use_r32_view(create_flags, vk_format, fmt_list))
             return false;
 
       } else if (devinfo->ver <= 11) {
@@ -1719,7 +1722,7 @@ anv_image_init_sparse_bindings(struct anv_image *image,
                         b->memory_range.offset + b->memory_range.size);
    }
 
-   struct anv_address base_address;
+   struct anv_address base_address = ANV_NULL_ADDRESS;
    VkResult result = anv_init_sparse_bindings(
       device, total_size, &image->sparse_data, alloc_flags,
       explicit_addresses != NULL ? explicit_addresses->main_binding : 0,
@@ -1940,6 +1943,12 @@ anv_image_init(struct anv_device *device, struct anv_image *image,
           */
          isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
       }
+
+      /* Workaround to disable XE2 CCS modifiers from drirc. */
+      if (device->info->ver == 20 &&
+          image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT &&
+          device->physical->instance->disable_xe2_drm_ccs_modifiers)
+         isl_extra_usage_flags |= ISL_SURF_USAGE_DISABLE_AUX_BIT;
    }
 
    /* Fill out the list of view formats. */
@@ -2265,20 +2274,11 @@ VkResult anv_CreateImage(
       mesa_logi("=== %s %s:%d flags:0x%08x\n", __func__, __FILE__,
                 __LINE__, pCreateInfo->flags);
 
-#ifndef VK_USE_PLATFORM_ANDROID_KHR
-   /* Skip the WSI common swapchain creation here on Android. Similar to ahb,
-    * this case is handled by a partial image init and then resolved when the
-    * image is bound and gralloc info is passed.
-    */
-   const VkImageSwapchainCreateInfoKHR *swapchain_info =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
-   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
+   if (wsi_common_is_swapchain_image(pCreateInfo)) {
       return wsi_common_create_swapchain_image(&device->physical->wsi_device,
                                                pCreateInfo,
-                                               swapchain_info->swapchain,
                                                pImage);
    }
-#endif
 
    struct anv_image *image =
       vk_object_zalloc(&device->vk, pAllocator, sizeof(*image),
@@ -2350,11 +2350,11 @@ resolve_ahb_image(struct anv_device *device,
    VkResult result;
 
    VkImageDrmFormatModifierExplicitCreateInfoEXT mod_explicit_info;
-   VkSubresourceLayout layouts[ANV_MAX_PLANES];
+   VkSubresourceLayout layouts[ISL_MODIFIER_MAX_PLANES];
    result = vk_android_get_ahb_layout(mem->vk.ahardware_buffer,
                                       &mod_explicit_info,
                                       layouts,
-                                      ANV_MAX_PLANES);
+                                      ISL_MODIFIER_MAX_PLANES);
    if (result == VK_SUCCESS &&
        mod_explicit_info.drmFormatModifier != DRM_FORMAT_MOD_INVALID) {
       const struct isl_drm_modifier_info *isl_mod_info =
@@ -2398,11 +2398,14 @@ resolve_anb_image(struct anv_device *device,
 #if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 29
    VkResult result;
 
-   /* Do not close the gralloc handle's dma_buf. The lifetime of the dma_buf
-    * must exceed that of the gralloc handle, and we do not own the gralloc
-    * handle.
-    */
-   int dma_buf = gralloc_info->handle->data[0];
+   /* Query DRM modifier. */
+   VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info;
+   VkSubresourceLayout layouts[ISL_MODIFIER_MAX_PLANES];
+   result = vk_android_get_ahb_layout(gralloc_info->ahb,
+                                      &mod_info, layouts,
+                                      ISL_MODIFIER_MAX_PLANES);
+   if (result != VK_SUCCESS)
+      return result;
 
    /* If this function fails and if the imported bo was resident in the cache,
     * we should avoid updating the bo's flags. Therefore, we defer updating
@@ -2410,32 +2413,25 @@ resolve_anb_image(struct anv_device *device,
     *
     */
    struct anv_bo *bo = NULL;
-   result = anv_device_import_bo(device, dma_buf,
-                                 ANV_BO_ALLOC_EXTERNAL,
-                                 0 /* client_address */,
-                                 &bo);
+   result = anv_android_import_from_handle(device,
+                                           gralloc_info->handle,
+                                           mod_info.drmFormatModifier,
+                                           &bo);
    if (result != VK_SUCCESS) {
       return vk_errorf(device, result,
                        "failed to import dma-buf from VkNativeBufferANDROID");
    }
 
    /* Check tiling. */
-   enum isl_tiling tiling;
-   struct u_gralloc_buffer_handle gr_handle = {
-      .handle = gralloc_info->handle,
-      .hal_format = gralloc_info->format,
-      .pixel_stride = gralloc_info->stride,
-   };
-   result = anv_android_get_tiling(device, &gr_handle, &tiling);
-   assert(result == VK_SUCCESS);
-
-   isl_tiling_flags_t isl_tiling_flags = (1u << tiling);
+   const struct isl_drm_modifier_info *isl_mod_info =
+      isl_drm_modifier_get_info(mod_info.drmFormatModifier);
+   assert(isl_mod_info);
 
    /* Now we are able to fill anv_image fields properly and create
     * isl_surface for it.
     */
    result = add_all_surfaces_implicit_layout(device, image, NULL, gralloc_info->stride,
-                                             isl_tiling_flags,
+                                             1u << isl_mod_info->tiling,
                                              ISL_SURF_USAGE_DISABLE_AUX_BIT);
    if (result != VK_SUCCESS) {
       anv_device_release_bo(device, bo);

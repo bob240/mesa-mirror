@@ -13,6 +13,7 @@
 #include "drm-shim/amdgpu_noop_drm_shim.h"
 #include <llvm-c/Target.h>
 
+#include "ac_gpu_info.h"
 #include <mutex>
 #include <stdio.h>
 
@@ -62,15 +63,46 @@ static std::mutex create_device_mutex;
 FUNCTION_LIST
 #undef ITEM
 
+enum radeon_family
+get_family(enum amd_gfx_level gfx_level, enum radeon_family family)
+{
+   if (family == CHIP_UNKNOWN) {
+      switch (gfx_level) {
+      case GFX6: return CHIP_TAHITI;
+      case GFX7: return CHIP_BONAIRE;
+      case GFX8: return CHIP_POLARIS10;
+      case GFX9: return CHIP_VEGA10;
+      case GFX10: return CHIP_NAVI10;
+      case GFX10_3: return CHIP_NAVI21;
+      case GFX11: return CHIP_NAVI31;
+      case GFX11_5: return CHIP_STRIX_HALO;
+      case GFX12: return CHIP_GFX1201;
+      default: return CHIP_UNKNOWN;
+      }
+   }
+
+   return family;
+}
+
 void
 create_program(enum amd_gfx_level gfx_level, Stage stage, unsigned wave_size,
                enum radeon_family family)
 {
+   family = get_family(gfx_level, family);
+   assert(family != CHIP_UNKNOWN);
+
    memset(&config, 0, sizeof(config));
    info.wave_size = wave_size;
-
    program.reset(new Program);
-   aco::init_program(program.get(), stage, &info, gfx_level, family, false, &config);
+   rad_info.gfx_level = gfx_level;
+   rad_info.family = family;
+   ac_fill_cu_info(&rad_info, NULL);
+   struct aco_compiler_options options = {
+      .cu_info = &rad_info.cu_info,
+      .family = family,
+      .gfx_level = gfx_level,
+   };
+   aco::init_program(program.get(), stage, &info, &options, &config);
    program->workgroup_size = UINT_MAX;
    calc_min_waves(program.get());
 
@@ -135,22 +167,13 @@ setup_nir_cs(enum amd_gfx_level gfx_level, mesa_shader_stage stage, enum radeon_
    if (!set_variant(gfx_level, subvariant))
       return false;
 
-   if (family == CHIP_UNKNOWN) {
-      switch (gfx_level) {
-      case GFX6: family = CHIP_TAHITI; break;
-      case GFX7: family = CHIP_BONAIRE; break;
-      case GFX8: family = CHIP_POLARIS10; break;
-      case GFX9: family = CHIP_VEGA10; break;
-      case GFX10: family = CHIP_NAVI10; break;
-      case GFX10_3: family = CHIP_NAVI21; break;
-      case GFX11: family = CHIP_NAVI31; break;
-      default: family = CHIP_UNKNOWN; break;
-      }
-   }
+   family = get_family(gfx_level, family);
+   assert(family != CHIP_UNKNOWN);
 
    memset(&rad_info, 0, sizeof(rad_info));
    rad_info.gfx_level = gfx_level;
    rad_info.family = family;
+   ac_fill_cu_info(&rad_info, NULL);
 
    memset(&nir_options, 0, sizeof(nir_options));
    ac_nir_set_options(&rad_info, false, &nir_options);
@@ -368,7 +391,7 @@ finish_assembler_test()
    /* we could use CLRX for disassembly but that would require it to be
     * installed */
    if (program->gfx_level >= GFX8) {
-      print_asm(program.get(), binary, exec_size / 4u, output);
+      print_asm(program.get(), rad_info.family, binary, exec_size / 4u, output);
    } else {
       // TODO: maybe we should use CLRX and skip this test if it's not available?
       for (uint32_t dword : binary)
@@ -397,6 +420,7 @@ finish_isel_test(enum ac_hw_stage hw_stage, unsigned wave_size)
    aco_compiler_options options = {};
    options.family = rad_info.family;
    options.gfx_level = rad_info.gfx_level;
+   options.cu_info = &rad_info.cu_info;
 
    memset(&info, 0, sizeof(info));
    info.hw_stage = hw_stage;
@@ -727,8 +751,10 @@ get_vk_device(enum radeon_family family)
 static struct DestroyDevices {
    ~DestroyDevices()
    {
-      DestroyDevice(vk_device, NULL);
-      DestroyInstance(vk_instance, NULL);
+      if (vk_device)
+         DestroyDevice(vk_device, NULL);
+      if (vk_instance)
+         DestroyInstance(vk_instance, NULL);
    }
 } destroy_devices;
 

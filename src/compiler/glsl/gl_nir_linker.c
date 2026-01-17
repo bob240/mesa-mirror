@@ -102,23 +102,6 @@ gl_nir_opts(nir_shader *nir)
       NIR_PASS(progress, nir, nir_opt_algebraic);
       NIR_PASS(progress, nir, nir_opt_constant_folding);
 
-      if (!nir->info.flrp_lowered) {
-         unsigned lower_flrp =
-            (nir->options->lower_flrp16 ? 16 : 0) |
-            (nir->options->lower_flrp32 ? 32 : 0) |
-            (nir->options->lower_flrp64 ? 64 : 0);
-
-         if (lower_flrp) {
-            NIR_PASS(progress, nir, nir_lower_flrp,
-                     lower_flrp, false /* always_precise */);
-         }
-
-         /* Nothing should rematerialize any flrps, so we only need to do this
-          * lowering once.
-          */
-         nir->info.flrp_lowered = true;
-      }
-
       NIR_PASS(progress, nir, nir_opt_undef);
 
       peephole_select_options = (nir_opt_peephole_select_options){
@@ -132,6 +115,16 @@ gl_nir_opts(nir_shader *nir)
          NIR_PASS(progress, nir, nir_opt_loop_unroll);
       }
    } while (progress);
+
+   unsigned lower_flrp =
+      (nir->options->lower_flrp16 ? 16 : 0) |
+      (nir->options->lower_flrp32 ? 32 : 0) |
+      (nir->options->lower_flrp64 ? 64 : 0);
+
+   if (lower_flrp) {
+      NIR_PASS(progress, nir, nir_lower_flrp,
+               lower_flrp, false /* always_precise */);
+   }
 
    NIR_PASS(_, nir, nir_lower_var_copies);
 }
@@ -1435,16 +1428,16 @@ prelink_lowering(const struct pipe_screen *screen,
       opt_access_options.is_vulkan = false;
       NIR_PASS(_, nir, nir_opt_access, &opt_access_options);
 
+      /* This must be done before calling nir_lower_clip_cull_distance_to_vec4s. */
+      nir_gather_clip_cull_distance_sizes_from_vars(nir);
+
       if (!nir->options->compact_arrays) {
          NIR_PASS(_, nir, nir_lower_clip_cull_distance_to_vec4s);
          NIR_PASS(_, nir, nir_lower_tess_level_array_vars_to_vec);
       }
 
-      /* Combine clip and cull outputs into one array and set:
-       * - shader_info::clip_distance_array_size
-       * - shader_info::cull_distance_array_size
-       */
-      NIR_PASS(_, nir, nir_lower_clip_cull_distance_array_vars);
+      /* Combine clip and cull outputs into one array. */
+      NIR_PASS(_, nir, nir_merge_clip_cull_distance_vars);
    }
 
    return true;

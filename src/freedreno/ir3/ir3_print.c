@@ -82,6 +82,14 @@ print_instr_name(struct log_stream *stream, struct ir3_instruction *instr,
          mesa_log_stream_printf(stream, "(ul)");
       if (instr->flags & IR3_INSTR_SAT)
          mesa_log_stream_printf(stream, "(sat)");
+      if (instr->flags & IR3_INSTR_EQ)
+         mesa_log_stream_printf(stream, "(eq)");
+      if (instr->flags & IR3_INSTR_NEEDS_HELPERS)
+         mesa_log_stream_printf(stream, "(needs_helpers)");
+      if (instr->flags & IR3_INSTR_EOLM)
+         mesa_log_stream_printf(stream, "(eolm)");
+      if (instr->flags & IR3_INSTR_EOGM)
+         mesa_log_stream_printf(stream, "(eogm)");
    } else {
       mesa_log_stream_printf(stream, " ");
    }
@@ -441,6 +449,8 @@ print_instr(struct log_stream *stream, struct ir3_instruction *instr, int lvl)
    }
 
    if (opc_cat(instr->opc) == 1) {
+      if (instr->cat1.sat)
+         mesa_log_stream_printf(stream, "(sat)");
       switch (instr->cat1.round) {
       case ROUND_ZERO:
          break;
@@ -481,6 +491,11 @@ print_instr(struct log_stream *stream, struct ir3_instruction *instr, int lvl)
       if (instr->opc == OPC_END || instr->opc == OPC_CHMASK)
          mesa_log_stream_printf(stream, " (%u)", instr->end.outidxs[n]);
       first = false;
+   }
+
+   if ((opc_cat(instr->opc) == 1) && (instr->cat1.r[0] || instr->cat1.r[1])) {
+      mesa_log_stream_printf(stream, ", %u, %u",
+                             instr->cat1.r[0], instr->cat1.r[1]);
    }
 
    if (is_tex(instr) && !(instr->flags & IR3_INSTR_S2EN) &&

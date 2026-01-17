@@ -30,24 +30,22 @@
 #include "pvr_device.h"
 #include "pvr_dump_info.h"
 #include "pvr_entrypoints.h"
+#include "pvr_instance.h"
+#include "pvr_macros.h"
 #include "pvr_winsys.h"
 #include "pvr_wsi.h"
 
 #define VK_VENDOR_ID_IMAGINATION 0x1010
 
-void
-pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
-                              char *const *comp_display,
-                              char *const *comp_render)
+void pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
+                                   char *const *comp_display,
+                                   char *const *comp_render)
 {
    drmVersionPtr version_display = NULL, version_render;
    struct pvr_device_dump_info info = { 0 };
 
    if (pdevice->ws->display_fd >= 0)
       version_display = drmGetVersion(pdevice->ws->display_fd);
-
-   if (!version_display)
-      return;
 
    version_render = drmGetVersion(pdevice->ws->render_fd);
    if (!version_render) {
@@ -78,8 +76,7 @@ pvr_physical_device_dump_info(const struct pvr_physical_device *pdevice,
    drmFreeVersion(version_render);
 }
 
-void
-pvr_physical_device_destroy(struct vk_physical_device *vk_pdevice)
+void pvr_physical_device_destroy(struct vk_physical_device *vk_pdevice)
 {
    struct pvr_physical_device *pdevice =
       container_of(vk_pdevice, struct pvr_physical_device, vk);
@@ -107,8 +104,8 @@ pvr_physical_device_destroy(struct vk_physical_device *vk_pdevice)
    vk_free(&pdevice->vk.instance->alloc, pdevice);
 }
 
-void
-pvr_physical_device_free_pipeline_cache(struct pvr_physical_device *const pdevice)
+void pvr_physical_device_free_pipeline_cache(
+   struct pvr_physical_device *const pdevice)
 {
 #ifdef ENABLE_SHADER_CACHE
    if (!pdevice->vk.disk_cache)
@@ -134,6 +131,7 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_descriptor_update_template = true,
       .KHR_device_group = true,
       .KHR_driver_properties = true,
+      .KHR_dynamic_rendering = true,
       .KHR_external_fence = true,
       .KHR_external_fence_fd = true,
       .KHR_external_memory = true,
@@ -142,6 +140,7 @@ static void pvr_physical_device_get_supported_extensions(
       .KHR_external_semaphore_fd = PVR_USE_WSI_PLATFORM,
       .KHR_format_feature_flags2 = false,
       .KHR_get_memory_requirements2 = true,
+      .KHR_incremental_present = PVR_USE_WSI_PLATFORM,
       .KHR_image_format_list = true,
       .KHR_imageless_framebuffer = true,
       .KHR_index_type_uint8 = false,
@@ -464,6 +463,9 @@ static void pvr_physical_device_get_supported_features(
 
       /* VK_EXT_zero_initialize_device_memory */
       .zeroInitializeDeviceMemory = true,
+
+      /* Vulkan 1.2 / VK_KHR_dynamic_rendering */
+      .dynamicRendering = true,
    };
 }
 
@@ -658,6 +660,7 @@ static bool pvr_physical_device_get_properties(
       .maxFramebufferHeight = 4096U,
       .maxFramebufferLayers = 256U,
 
+      /* Note: update nir_shader_compiler_options.max_samples when changing this. */
       .framebufferColorSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
       .framebufferStencilSampleCounts = VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT,
@@ -958,6 +961,9 @@ static uint64_t pvr_compute_heap_size(void)
    return MAX2(available_ram, PVR_MAX_MEMORY_ALLOCATION_SIZE);
 }
 
+static void
+pvr_physical_device_setup_formats(struct pvr_physical_device *const pdevice);
+
 VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                                   struct pvr_instance *instance,
                                   drmDevicePtr drm_render_device,
@@ -1085,6 +1091,8 @@ VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
    if (result != VK_SUCCESS)
       goto err_pvr_winsys_destroy;
 
+   pvr_physical_device_setup_formats(pdevice);
+
    pvr_physical_device_setup_uuids(pdevice);
 
    if (!pvr_physical_device_setup_pipeline_cache(pdevice)) {
@@ -1177,13 +1185,38 @@ void pvr_GetPhysicalDeviceMemoryProperties2(
    }
 }
 
+#define PER_ARCH_FUNCS(arch)                                                  \
+   VkResult pvr_##arch##_create_device(                                       \
+      struct pvr_physical_device *physical_device,                            \
+      const VkDeviceCreateInfo *pCreateInfo,                                  \
+      const VkAllocationCallbacks *pAllocator,                                \
+      VkDevice *pDevice);                                                     \
+                                                                              \
+   void pvr_##arch##_destroy_device(struct pvr_device *device,                \
+                                    const VkAllocationCallbacks *pAllocator); \
+                                                                              \
+   struct pvr_format_table pvr_##arch##_get_format_table(void)
+
+PER_ARCH_FUNCS(rogue);
+
 VkResult pvr_CreateDevice(VkPhysicalDevice physicalDevice,
                           const VkDeviceCreateInfo *pCreateInfo,
                           const VkAllocationCallbacks *pAllocator,
                           VkDevice *pDevice)
 {
    VK_FROM_HANDLE(pvr_physical_device, pdevice, physicalDevice);
-   return pvr_create_device(pdevice, pCreateInfo, pAllocator, pDevice);
+
+   enum pvr_device_arch arch = pdevice->dev_info.ident.arch;
+   VkResult result = VK_ERROR_INITIALIZATION_FAILED;
+   PVR_ARCH_DISPATCH_RET(create_device,
+                         arch,
+                         result,
+                         pdevice,
+                         pCreateInfo,
+                         pAllocator,
+                         pDevice);
+
+   return result;
 }
 
 void pvr_DestroyDevice(VkDevice _device,
@@ -1191,10 +1224,19 @@ void pvr_DestroyDevice(VkDevice _device,
 {
    VK_FROM_HANDLE(pvr_device, device, _device);
 
-   pvr_destroy_device(device, pAllocator);
+   enum pvr_device_arch arch = device->pdevice->dev_info.ident.arch;
+   PVR_ARCH_DISPATCH(destroy_device, arch, device, pAllocator);
+}
+
+static void
+pvr_physical_device_setup_formats(struct pvr_physical_device *const pdevice)
+{
+   enum pvr_device_arch arch = pdevice->dev_info.ident.arch;
+   PVR_ARCH_DISPATCH_RET(get_format_table, arch, pdevice->formats);
 }
 
 /* Leave this at the very end, to avoid leakage of HW-defs here */
+#define PVR_BUILD_ARCH_ROGUE
 #include "pvr_border.h"
 
 static unsigned

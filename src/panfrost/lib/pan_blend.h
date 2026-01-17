@@ -31,12 +31,11 @@
 #include "util/blend.h"
 #include "util/format/u_format.h"
 
-#include "panfrost/util/pan_ir.h"
-
 struct MALI_BLEND_EQUATION;
 
 struct pan_blend_equation {
    unsigned blend_enable                  : 1;
+   unsigned is_float                      : 1;
    enum pipe_blend_func rgb_func          : 3;
    enum pipe_blendfactor rgb_src_factor   : 5;
    enum pipe_blendfactor rgb_dst_factor   : 5;
@@ -44,7 +43,6 @@ struct pan_blend_equation {
    enum pipe_blendfactor alpha_src_factor : 5;
    enum pipe_blendfactor alpha_dst_factor : 5;
    unsigned color_mask                    : 4;
-   unsigned padding                       : 1;
 };
 
 struct pan_blend_rt_state {
@@ -91,6 +89,10 @@ bool pan_blend_alpha_one_store(const struct pan_blend_equation eq);
 
 unsigned pan_blend_constant_mask(const struct pan_blend_equation eq);
 
+void pan_blend_optimize_equation(struct pan_blend_equation *eq,
+                                 enum pipe_format format,
+                                 const float *constants);
+
 /* Fixed-function blending only supports a single constant, so if multiple bits
  * are set in constant_mask, the constants must match. Therefore we may pick
  * just the first constant. */
@@ -121,6 +123,8 @@ pan_blend_supports_2src(unsigned arch)
 
 bool pan_blend_is_homogenous_constant(unsigned mask, const float *constants);
 
+uint16_t pan_pack_blend_constant(enum pipe_format format, float cons);
+
 void pan_blend_to_fixed_function_equation(const struct pan_blend_equation eq,
                                           struct MALI_BLEND_EQUATION *equation);
 
@@ -136,8 +140,6 @@ nir_shader *GENX(pan_blend_create_shader)(const struct pan_blend_state *state,
 #if PAN_ARCH >= 6
 uint64_t GENX(pan_blend_get_internal_desc)(enum pipe_format fmt, unsigned rt,
                                            unsigned force_size, bool dithered);
-
-bool GENX(pan_inline_rt_conversion)(nir_shader *s, enum pipe_format *formats);
 
 #if PAN_ARCH < 9
 enum mali_register_file_format

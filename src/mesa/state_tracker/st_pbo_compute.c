@@ -1004,7 +1004,8 @@ download_texture_compute(struct st_context *st,
    assert(cs);
    struct cso_context *cso = st->cso_context;
 
-   pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_COMPUTE, &cb);
+   struct pipe_resource *releasebuf = NULL;
+   pipe_upload_constant_buffer0(st->pipe, MESA_SHADER_COMPUTE, &cb, &releasebuf);
 
    cso_save_compute_state(cso, CSO_BIT_COMPUTE_SHADER | CSO_BIT_COMPUTE_SAMPLERS);
    cso_set_compute_shader_handle(cso, cs);
@@ -1126,7 +1127,7 @@ download_texture_compute(struct st_context *st,
                          src->target == PIPE_TEXTURE_CUBE_ARRAY ?
                          /* only use image stride for 3d images to avoid pulling in IMAGE_HEIGHT pixelstore */
                          _mesa_image_image_stride(pack, width, height, format, type) :
-                         _mesa_image_row_stride(pack, width, format, type) * height;
+                         (size_t)_mesa_image_row_stride(pack, width, format, type) * height;
    intptr_t buffer_size = (depth + (dim == 3 ? pack->SkipImages : 0)) * img_stride;
    assert(buffer_size <= UINT32_MAX);
    {
@@ -1173,6 +1174,8 @@ fail:
 
    ST_SET_STATE3(st->ctx->NewDriverState, ST_NEW_CS_CONSTANTS,
                  ST_NEW_CS_SSBOS, ST_NEW_CS_SAMPLER_VIEWS);
+
+   pipe_resource_release(pipe, releasebuf);
 
    return dst;
 }
@@ -1304,11 +1307,12 @@ st_GetTexSubImage_shader(struct gl_context * ctx,
       return false;
 
    view_target = get_target_from_texture(src);
-   /* I don't know why this works
-    * only for the texture rects
-    * but that's how it is
-    */
-   if ((src->target != PIPE_TEXTURE_RECT &&
+
+   /* 64K x 64K aren't supported by the shader (pbo_data::width/height have 16 bits) */
+   if (width >= UINT16_MAX || height >= UINT16_MAX ||
+       /* I don't know why this works only for the texture rects
+        * but that's how it is. */
+       (src->target != PIPE_TEXTURE_RECT &&
        /* this would need multiple samplerviews */
        ((util_format_is_depth_and_stencil(src_format) && util_format_is_depth_and_stencil(dst_format)) ||
        /* these format just doesn't work and science can't explain why */

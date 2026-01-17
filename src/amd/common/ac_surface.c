@@ -1276,7 +1276,7 @@ static int gfx6_surface_settings(struct ac_addrlib *addrlib, const struct radeon
 static void ac_compute_cmask(const struct radeon_info *info, const struct ac_surf_config *config,
                              struct radeon_surf *surf)
 {
-   unsigned pipe_interleave_bytes = info->pipe_interleave_bytes;
+   unsigned pipe_interleave_bytes = AMD_MEMCHANNEL_INTERLEAVE_BYTES;
    unsigned num_pipes = info->num_tile_pipes;
    unsigned cl_width, cl_height;
 
@@ -1531,6 +1531,9 @@ static int gfx6_compute_surface(struct ac_addrlib *addrlib, const struct radeon_
 
             for (unsigned i = 0; i < ARRAY_SIZE(modes); i++) {
                if (!modes[i].supported)
+                  continue;
+
+               if (modes[i].align_depth > 1 && surf->flags & RADEON_SURF_VIEW_3D_AS_2D_ARRAY)
                   continue;
 
                uint64_t size = ac_estimate_size(config, surf->blk_w, surf->blk_h, surf->bpe * 8,
@@ -2700,6 +2703,9 @@ static int gfx9_compute_surface(struct ac_addrlib *addrlib, const struct radeon_
    AddrSurfInfoIn.flags.prt = (surf->flags & RADEON_SURF_PRT) != 0 &&
                               (config->info.samples <= 1 || info->gfx_level < GFX10) &&
                               is_color_surface;
+   /* Only compatible with non-sparse because 3D sparse requires 3D tiling. */
+   AddrSurfInfoIn.flags.view3dAs2dArray = !AddrSurfInfoIn.flags.prt &&
+                                          (surf->flags & RADEON_SURF_VIEW_3D_AS_2D_ARRAY) != 0;
 
    AddrSurfInfoIn.numMipLevels = config->info.levels;
    AddrSurfInfoIn.numSamples = MAX2(1, config->info.samples);
@@ -3491,6 +3497,9 @@ static bool gfx12_compute_surface(struct ac_addrlib *addrlib, const struct radeo
    AddrSurfInfoIn.flags.blockCompressed = compressed;
    AddrSurfInfoIn.flags.isVrsImage = !!(surf->flags & RADEON_SURF_VRS_RATE);
    AddrSurfInfoIn.flags.standardPrt = !!(surf->flags & RADEON_SURF_PRT);
+   /* Only compatible with non-sparse because 3D sparse requires 3D tiling. */
+   AddrSurfInfoIn.flags.view3dAs2dArray = !AddrSurfInfoIn.flags.standardPrt &&
+                                          (surf->flags & RADEON_SURF_VIEW_3D_AS_2D_ARRAY) != 0;
 
    if (config->is_3d)
       AddrSurfInfoIn.resourceType = ADDR_RSRC_TEX_3D;
@@ -3797,7 +3806,7 @@ int ac_compute_surface(struct ac_addrlib *addrlib, const struct radeon_info *inf
    /* 0 offsets mean disabled. */
    surf->meta_offset = surf->fmask_offset = surf->cmask_offset = surf->display_dcc_offset = 0;
 
-   if (info->family_id >= FAMILY_GFX12) {
+   if (info->family_id >= FAMILY_NV4) {
       if (!gfx12_compute_surface(addrlib, info, config, mode, surf))
          return ADDR_ERROR;
 

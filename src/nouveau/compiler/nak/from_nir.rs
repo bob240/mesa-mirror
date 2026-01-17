@@ -318,7 +318,7 @@ enum SyncType {
 
 struct ShaderFromNir<'a> {
     nir: &'a nir_shader,
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
     info: ShaderInfo,
     float_ctl: ShaderFloatControls,
     cfg: CFGBuilder<u32, BasicBlock, FxBuildHasher>,
@@ -338,7 +338,7 @@ impl<'a> ShaderFromNir<'a> {
     fn new(
         nak: &nak_compiler,
         nir: &'a nir_shader,
-        sm: &'a dyn ShaderModel,
+        sm: &'a ShaderModelInfo,
     ) -> Self {
         Self {
             nir: nir,
@@ -1368,7 +1368,7 @@ impl<'a> ShaderFromNir<'a> {
                 let src = srcs(0).to_ssa();
                 if src_bits == 64 {
                     if dst_bits == 64 {
-                        src.into()
+                        src
                     } else {
                         b.prmt(src[0].into(), src[1].into(), prmt_lo).into()
                     }
@@ -2889,14 +2889,14 @@ impl<'a> ShaderFromNir<'a> {
                 };
 
                 for i in 0..32 {
-                    if !self.fs_out_regs[i].is_none() {
+                    if self.fs_out_regs[i].is_some() {
                         info.writes_color |= 1 << i;
                     }
                 }
                 let mask_idx = (NAK_FS_OUT_SAMPLE_MASK / 4) as usize;
-                info.writes_sample_mask = !self.fs_out_regs[mask_idx].is_none();
+                info.writes_sample_mask = self.fs_out_regs[mask_idx].is_some();
                 let depth_idx = (NAK_FS_OUT_DEPTH / 4) as usize;
-                info.writes_depth = !self.fs_out_regs[depth_idx].is_none();
+                info.writes_depth = self.fs_out_regs[depth_idx].is_some();
 
                 let mut srcs = Vec::new();
                 for i in 0..8 {
@@ -3251,7 +3251,7 @@ impl<'a> ShaderFromNir<'a> {
 
                 b.push_op(OpLdSharedLock {
                     dst: dst.clone().into(),
-                    locked: locked.clone().into(),
+                    locked: locked.into(),
                     addr,
                     offset,
                     mem_type,
@@ -3261,7 +3261,7 @@ impl<'a> ShaderFromNir<'a> {
                 // for 32-bit we have 2x32 return type,
                 // for 64-bit we need 2x64, so is_locked must be a 64-bit val.
                 // we can fill the remaining SSAValue with a copy of is_locked
-                let locked_dst = std::iter::repeat(locked_gpr).take(dst.len());
+                let locked_dst = std::iter::repeat_n(locked_gpr, dst.len());
                 let nir_dst: Vec<_> =
                     dst.iter().copied().chain(locked_dst).collect();
                 self.set_ssa(intrin.def.as_def(), nir_dst);
@@ -3675,7 +3675,7 @@ impl<'a> ShaderFromNir<'a> {
                 let locked = b.alloc_ssa(RegFile::Pred);
 
                 b.push_op(OpStSCheckUnlock {
-                    locked: locked.clone().into(),
+                    locked: locked.into(),
                     addr,
                     data,
                     offset,
@@ -3787,7 +3787,7 @@ impl<'a> ShaderFromNir<'a> {
                 let dst = b.alloc_ssa(RegFile::GPR);
                 let src = self.get_src(&srcs[0]);
                 b.push_op(OpMovm {
-                    dst: dst.clone().into(),
+                    dst: dst.into(),
                     src,
                 });
                 self.set_dst(&intrin.def, dst.into());
@@ -3822,7 +3822,7 @@ impl<'a> ShaderFromNir<'a> {
                             dst_type: dst_type,
                             src_type: FloatType::F16,
                             mat_size: mat_size,
-                            srcs: [cmat_a.into(), cmat_b.into(), cmat_c.into()],
+                            srcs: [cmat_a, cmat_b, cmat_c],
                         });
                     }
                     NAK_CMAT_TYPE_M8N8K16_INT
@@ -3849,7 +3849,7 @@ impl<'a> ShaderFromNir<'a> {
                         b.push_op(OpImma {
                             dst: dst.clone().into(),
                             mat_size,
-                            srcs: [cmat_a.into(), cmat_b.into(), cmat_c.into()],
+                            srcs: [cmat_a, cmat_b, cmat_c],
                             src_types: [a_type, b_type],
                             saturate: flags.sat(),
                         });
@@ -3857,7 +3857,7 @@ impl<'a> ShaderFromNir<'a> {
                     val => unreachable!("Unknown cmat_type {val}"),
                 }
 
-                self.set_dst(&intrin.def, dst.into());
+                self.set_dst(&intrin.def, dst);
             }
             _ => panic!(
                 "Unsupported intrinsic instruction: {}",
@@ -4381,7 +4381,7 @@ impl<'a> ShaderFromNir<'a> {
 pub fn nak_shader_from_nir<'a>(
     nak: &nak_compiler,
     ns: &'a nir_shader,
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
 ) -> Shader<'a> {
     ShaderFromNir::new(nak, ns, sm).parse_shader()
 }

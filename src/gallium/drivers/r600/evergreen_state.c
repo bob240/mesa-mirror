@@ -8,6 +8,7 @@
 #include "r600_query.h"
 #include "r600d_common.h"
 #include "evergreend.h"
+#include "r600_inline.h"
 
 #include "pipe/p_shader_tokens.h"
 #include "util/u_endian.h"
@@ -1075,7 +1076,7 @@ static void evergreen_set_color_surface_buffer(struct r600_context *rctx,
 	const struct util_format_description *desc;
 	unsigned block_size = util_format_get_blocksize(res->b.b.format);
 	unsigned pitch_alignment =
-		MAX2(64, rctx->screen->b.info.pipe_interleave_bytes / block_size);
+		MAX2(64, rctx->screen->b.info.r600_pipe_interleave_bytes / block_size);
 	unsigned pitch = align(res->b.b.width0, pitch_alignment);
 	int i;
 	unsigned width_elements;
@@ -2063,8 +2064,22 @@ static void evergreen_emit_framebuffer_state(struct r600_context *rctx, struct r
 		radeon_emit(cs, S_028044_FORMAT(V_028044_STENCIL_INVALID)); /* R_028044_DB_STENCIL_INFO */
 	}
 
-	/* Framebuffer dimensions. */
-	evergreen_get_scissor_rect(rctx, 0, 0, state->width, state->height, &tl, &br);
+	if (unlikely(rctx->b.gfx_level == CAYMAN &&
+		     state->width == 1 && state->height == 1 &&
+		     !rctx->b.window_rectangles.number)) {
+		tl = S_028240_TL_X(0) | S_028240_TL_Y(0);
+		br = S_028244_BR_X(2) | S_028244_BR_Y(1);
+		cayman_apply_scissor_workaround_1x1(&rctx->b, cs);
+		rctx->b.window_rectangles.fbo_cayman_workaround = true;
+	} else {
+		if (unlikely(rctx->b.window_rectangles.fbo_cayman_workaround &&
+			     !rctx->b.window_rectangles.number)) {
+			r600_disable_cliprect_rule(cs);
+			rctx->b.window_rectangles.fbo_cayman_workaround = false;
+		}
+		/* Framebuffer dimensions. */
+		evergreen_get_scissor_rect(rctx, 0, 0, state->width, state->height, &tl, &br);
+	}
 
 	radeon_set_context_reg_seq(cs, R_028204_PA_SC_WINDOW_SCISSOR_TL, 2);
 	radeon_emit(cs, tl); /* R_028204_PA_SC_WINDOW_SCISSOR_TL */

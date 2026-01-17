@@ -479,6 +479,10 @@ radv_emit_compute_scratch(struct radv_device *device, struct radv_cmd_stream *cs
    uint64_t scratch_va;
    uint32_t rsrc1;
 
+   /* Ensure there is always a mapped BO in s[0:1] for the SMEM OOB mitigation */
+   if (!compute_scratch_bo && pdev->cache_key.mitigate_smem_oob)
+      compute_scratch_bo = device->zero_bo;
+
    if (!compute_scratch_bo)
       return;
 
@@ -537,6 +541,10 @@ radv_emit_graphics_shader_pointers(struct radv_device *device, struct radv_cmd_s
 {
    const struct radv_physical_device *pdev = radv_device_physical(device);
    uint64_t va;
+
+   /* Ensure there is always a mapped BO in s[0:1] for the SMEM OOB mitigation */
+   if (!descriptor_bo && pdev->cache_key.mitigate_smem_oob)
+      descriptor_bo = device->zero_bo;
 
    if (!descriptor_bo)
       return;
@@ -824,7 +832,7 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
       ac_pm4_set_reg(pm4, R_028000_DB_RENDER_CONTROL, 0);
    }
 
-   if (pdev->info.family >= CHIP_NAVI31 && pdev->info.family <= CHIP_GFX1150) {
+   if (pdev->info.family >= CHIP_NAVI31 && pdev->info.family <= CHIP_STRIX1) {
       /* Disable SINGLE clear codes on GFX11 (including first GFX11.5 rev) to workaround a hw bug
        * with DCC. */
       ac_pm4_set_reg(pm4, R_028424_CB_FDCC_CONTROL, S_028424_DISABLE_CONSTANT_ENCODE_SINGLE(1));
@@ -1341,13 +1349,36 @@ radv_create_gang_wait_preambles_postambles(struct radv_queue *queue)
    VkResult r = VK_SUCCESS;
    struct radeon_winsys *ws = device->ws;
    struct radeon_winsys_bo *gang_sem_bo = NULL;
+   enum radeon_bo_flag gang_sem_bo_flags = RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM;
+
+   /* When the "gang leader" is SDMA, we need to ensure that the gang semaphores BO
+    * is coherent between SDMA and CP. To achieve this, we need bypass the L2 cache
+    * when either SDMA or CP are connected to L2.
+    *
+    * GFX6-8:
+    *   neither CP nor SDMA are connected to L2
+    * GFX9:
+    *   CP is connected to L2, SDMA isn't connected to L2
+    * GFX10:
+    *   CP is connected to L2
+    *   SDMA is connected to L2 but there are possible hw bugs with
+    *   cache_policy=BYPASS which is currently the default configuration set by SDMA0_UTCL1_PAGE
+    * GFX10.3-11.5:
+    *   CP is connected to L2
+    *   SDMA is connected to L2, and an alternative solution would be to
+    *   configure the cache policy in SDMA packets (ie. with CVP=1) directly to overwrite the
+    *   default behavior, but it doesn't seem worth it.
+    * GFX12:
+    *   neither CP nor SDMA are connected to L2
+    */
+   if (ip == AMD_IP_SDMA && pdev->info.gfx_level >= GFX9 && pdev->info.gfx_level < GFX12)
+      gang_sem_bo_flags |= RADEON_FLAG_GL2_BYPASS;
 
    /* Gang semaphores BO.
     * DWORD 0: used in preambles, gang leader writes, gang members wait.
     * DWORD 1: used in postambles, gang leader waits, gang members write.
     */
-   r = radv_bo_create(device, NULL, 8, 4, RADEON_DOMAIN_VRAM,
-                      RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_ZERO_VRAM, RADV_BO_PRIORITY_SCRATCH, 0, true,
+   r = radv_bo_create(device, NULL, 8, 4, RADEON_DOMAIN_VRAM, gang_sem_bo_flags, RADV_BO_PRIORITY_SCRATCH, 0, true,
                       &gang_sem_bo);
    if (r != VK_SUCCESS)
       return r;

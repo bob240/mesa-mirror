@@ -20,16 +20,12 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/syscall.h>
 #include <vulkan/vulkan.h>
 
-#include "c11/threads.h"
-#include "drm-uapi/drm_fourcc.h"
 #include "util/bitscan.h"
 #include "util/bitset.h"
 #include "util/compiler.h"
 #include "util/detect_os.h"
-#include "util/libsync.h"
 #include "util/list.h"
 #include "util/macros.h"
 #include "util/os_time.h"
@@ -37,6 +33,7 @@
 #include "util/simple_mtx.h"
 #include "util/u_atomic.h"
 #include "util/u_math.h"
+#include "util/u_thread.h"
 #include "util/xmlconfig.h"
 #include "vk_alloc.h"
 #include "vk_command_buffer.h"
@@ -50,6 +47,15 @@
 #include "vk_physical_device.h"
 #include "vk_queue.h"
 #include "vk_util.h"
+
+#if DETECT_OS_WINDOWS
+#include <processthreadsapi.h>
+#else
+#include <sys/syscall.h>
+
+#include "drm-uapi/drm_fourcc.h"
+#include "util/libsync.h"
+#endif
 
 #include "vn_entrypoints.h"
 
@@ -66,6 +72,10 @@
 
 #define VN_TRACE_SCOPE(name) MESA_TRACE_SCOPE(name)
 #define VN_TRACE_FUNC()      MESA_TRACE_SCOPE(__func__)
+
+#define VN_MAKE_NVIDIA_VERSION(major, minor, sub_minor, patch)               \
+   ((((uint32_t)(major)) << 22U) | (((uint32_t)(minor)) << 14U) |            \
+    (((uint32_t)(sub_minor)) << 6U) | ((uint32_t)(patch)))
 
 struct vn_instance;
 struct vn_physical_device;
@@ -133,6 +143,7 @@ enum vn_perf {
    VN_PERF_NO_MULTI_RING = 1ull << 11,
    VN_PERF_NO_ASYNC_IMAGE_CREATE = 1ull << 12,
    VN_PERF_NO_ASYNC_IMAGE_FORMAT = 1ull << 13,
+   VN_PERF_NO_ASYNC_PRESENT = 1ull << 14,
 };
 
 typedef uint64_t vn_object_id;
@@ -614,8 +625,10 @@ vn_gettid(void)
 {
 #if DETECT_OS_ANDROID
    return gettid();
-#elif defined(__FreeBSD__)
+#elif DETECT_OS_FREEBSD
    return syscall(SYS_thr_self);
+#elif DETECT_OS_WINDOWS
+   return GetCurrentThreadId();
 #else
    return syscall(SYS_gettid);
 #endif

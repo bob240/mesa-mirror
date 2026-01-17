@@ -121,16 +121,16 @@ rra_validate_node_gfx12(struct hash_table_u64 *accel_struct_vas, uint8_t *data, 
          } else {
             uint32_t pair_index = (child_type & 0x3) | ((child_type & 0x8) >> 1);
 
-            if (BITSET_EXTRACT(node, 1024 - 29 * (pair_index + 1) + 17, 12)) {
-               uint32_t geometry_id = get_geometry_id(node, pair_index * 2 + 0);
+            if (BITSET_EXTRACT(child_node, 1024 - 29 * (pair_index + 1) + 17, 12)) {
+               uint32_t geometry_id = get_geometry_id(child_node, pair_index * 2 + 0);
                if (geometry_id >= geometry_count) {
                   rra_validation_fail(&child_ctx, "Invalid geometry_id(%u) >= geometry_count(%u)", geometry_id,
                                       geometry_count);
                }
             }
 
-            if (BITSET_EXTRACT(node, 1024 - 29 * (pair_index + 1) + 3, 12)) {
-               uint32_t geometry_id = get_geometry_id(node, pair_index * 2 + 1);
+            if (BITSET_EXTRACT(child_node, 1024 - 29 * (pair_index + 1) + 3, 12)) {
+               uint32_t geometry_id = get_geometry_id(child_node, pair_index * 2 + 1);
                if (geometry_id >= geometry_count) {
                   rra_validation_fail(&child_ctx, "Invalid geometry_id(%u) >= geometry_count(%u)", geometry_id,
                                       geometry_count);
@@ -153,6 +153,7 @@ rra_gather_bvh_info_gfx12(const uint8_t *bvh, uint32_t node_id, struct rra_bvh_i
    switch (node_type) {
    case radv_bvh_node_box32:
       dst->internal_nodes_size += sizeof(struct radv_gfx12_box_node);
+      dst->box32_count++;
       break;
    case radv_bvh_node_instance:
       dst->leaf_nodes_size += sizeof(struct radv_gfx12_instance_node);

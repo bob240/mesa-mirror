@@ -728,7 +728,7 @@ pub trait SSABuilder: Builder {
                 op: RroOp::SinCos,
                 src,
             });
-            tmp.into()
+            tmp
         };
         self.mufu(MuFuOp::Sin, tmp.into())
     }
@@ -744,7 +744,7 @@ pub trait SSABuilder: Builder {
                 op: RroOp::SinCos,
                 src,
             });
-            tmp.into()
+            tmp
         };
         self.mufu(MuFuOp::Cos, tmp.into())
     }
@@ -861,7 +861,7 @@ pub trait SSABuilder: Builder {
             self.alloc_ssa(RegFile::GPR)
         };
         self.copy_to(dst.into(), src);
-        dst.into()
+        dst
     }
 
     fn bmov_to_bar(&mut self, src: Src) -> SSAValue {
@@ -889,11 +889,11 @@ pub trait SSABuilder: Builder {
 
 pub struct InstrBuilder<'a> {
     instrs: MappedInstrs,
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
 }
 
 impl<'a> InstrBuilder<'a> {
-    pub fn new(sm: &'a dyn ShaderModel) -> Self {
+    pub fn new(sm: &'a ShaderModelInfo) -> Self {
         Self {
             instrs: MappedInstrs::None,
             sm,
@@ -933,7 +933,7 @@ pub struct SSAInstrBuilder<'a> {
 
 impl<'a> SSAInstrBuilder<'a> {
     pub fn new(
-        sm: &'a dyn ShaderModel,
+        sm: &'a ShaderModelInfo,
         alloc: &'a mut SSAValueAllocator,
     ) -> Self {
         Self {
@@ -948,7 +948,6 @@ impl SSAInstrBuilder<'_> {
         self.b.into_vec()
     }
 
-    #[allow(dead_code)]
     pub fn into_mapped_instrs(self) -> MappedInstrs {
         self.b.into_mapped_instrs()
     }

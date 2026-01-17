@@ -475,7 +475,7 @@ lower_mem_store(nir_builder *b, nir_intrinsic_instr *intrin,
                            align_mul, chunk_align_offset, packed,
                            requested.num_components, requested.bit_size);
       }
-      BITSET_CLEAR_RANGE(mask, chunk_start, (chunk_start + chunk_bytes - 1));
+      BITSET_CLEAR_COUNT(mask, chunk_start, chunk_bytes);
    }
 
    nir_instr_remove(&intrin->instr);
@@ -496,6 +496,7 @@ intrin_to_variable_mode(nir_intrinsic_op intrin)
       return nir_var_mem_ubo;
 
    case nir_intrinsic_load_push_constant:
+   case nir_intrinsic_load_push_data_intel:
       return nir_var_mem_push_const;
 
    case nir_intrinsic_load_global:

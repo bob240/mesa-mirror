@@ -30,6 +30,9 @@
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_android.h"
 
+#define V3D_VERSION 42
+#include "v3dv_format_table.h"
+
 /**
  * Computes the HW's UIFblock padding for a given height/cpp.
  *
@@ -533,16 +536,11 @@ create_image(struct v3dv_device *device,
              const VkAllocationCallbacks *pAllocator,
              VkImage *pImage)
 {
-#if !DETECT_OS_ANDROID
-   const VkImageSwapchainCreateInfoKHR *swapchain_info =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
-   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
+   if (wsi_common_is_swapchain_image(pCreateInfo)) {
       return wsi_common_create_swapchain_image(&device->pdevice->wsi_device,
                                                pCreateInfo,
-                                               swapchain_info->swapchain,
                                                pImage);
    }
-#endif
 
    VkResult result;
    struct v3dv_image *image = NULL;

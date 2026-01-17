@@ -302,14 +302,16 @@ lower_rq_initialize(nir_builder *b, nir_intrinsic_instr *instr, struct ray_query
    rq_store(b, rq, trav_bvh_base, bvh_base);
 
    if (vars->shared_stack) {
+      nir_def *stack_idx = nir_load_local_invocation_index(b);
       if (radv_use_bvh_stack_rtn(pdev)) {
          uint32_t workgroup_size =
             b->shader->info.workgroup_size[0] * b->shader->info.workgroup_size[1] * b->shader->info.workgroup_size[2];
-         nir_def *addr = radv_build_bvh_stack_rtn_addr(b, pdev, workgroup_size, vars->shared_base, vars->stack_entries);
+         nir_def *addr =
+            radv_build_bvh_stack_rtn_addr(b, stack_idx, pdev, workgroup_size, vars->shared_base, vars->stack_entries);
          rq_store(b, rq, trav_stack, addr);
          rq_store(b, rq, trav_stack_low_watermark, addr);
       } else {
-         nir_def *base_offset = nir_imul_imm(b, nir_load_local_invocation_index(b), sizeof(uint32_t));
+         nir_def *base_offset = nir_imul_imm(b, stack_idx, sizeof(uint32_t));
          base_offset = nir_iadd_imm(b, base_offset, vars->shared_base);
          rq_store(b, rq, trav_stack, base_offset);
          rq_store(b, rq, trav_stack_low_watermark, base_offset);
@@ -508,7 +510,7 @@ lower_rq_proceed(nir_builder *b, nir_intrinsic_instr *instr, struct ray_query_va
    nir_metadata_require(nir_cf_node_get_function(&instr->instr.block->cf_node), nir_metadata_dominance);
 
    bool ignore_cull_mask = false;
-   if (nir_block_dominates(vars->initialize->instr.block, instr->instr.block)) {
+   if (vars->initialize && nir_block_dominates(vars->initialize->instr.block, instr->instr.block)) {
       nir_src cull_mask = vars->initialize->src[3];
       if (nir_src_is_const(cull_mask) && nir_src_as_uint(cull_mask) == 0xFF)
          ignore_cull_mask = true;

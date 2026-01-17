@@ -117,10 +117,10 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
    if (batch->tlsinfo.tls.size) {
       unsigned thread_tls_alloc =
-         pan_query_thread_tls_alloc(&phys_dev->kmod.props);
+         pan_query_thread_tls_alloc(&phys_dev->kmod.dev->props);
       unsigned core_id_range;
 
-      pan_query_core_count(&phys_dev->kmod.props, &core_id_range);
+      pan_query_core_count(&phys_dev->kmod.dev->props, &core_id_range);
 
       unsigned size = pan_get_total_stack_size(batch->tlsinfo.tls.size,
                                                thread_tls_alloc, core_id_range);
@@ -319,6 +319,8 @@ panvk_per_arch(EndCommandBuffer)(VkCommandBuffer commandBuffer)
 
    panvk_per_arch(cmd_close_batch)(cmdbuf);
 
+   panvk_pool_flush_maps(&cmdbuf->desc_pool);
+
    return vk_command_buffer_end(&cmdbuf->vk);
 }
 
@@ -434,7 +436,8 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
       &cmdbuf->state.gfx.dynamic.sl;
 
    struct panvk_pool_properties desc_pool_props = {
-      .create_flags = 0,
+      .create_flags =
+         panvk_device_adjust_bo_flags(device, PAN_KMOD_BO_FLAG_WB_MMAP),
       .slab_size = 64 * 1024,
       .label = "Command buffer descriptor pool",
       .prealloc = true,

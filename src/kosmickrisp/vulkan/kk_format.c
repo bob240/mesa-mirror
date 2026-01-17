@@ -105,7 +105,7 @@
    }
 
 #define MTL_SWIZZLE_IDENTITY                                                   \
-   .swizzle = {                                                                \
+   .unswizzle = {                                                              \
       .red = PIPE_SWIZZLE_X,                                                   \
       .green = PIPE_SWIZZLE_Y,                                                 \
       .blue = PIPE_SWIZZLE_Z,                                                  \
@@ -113,15 +113,23 @@
    }
 
 #define MTL_SWIZZLE_ABGR                                                       \
-   .swizzle = {                                                                \
+   .unswizzle = {                                                              \
       .red = PIPE_SWIZZLE_W,                                                   \
       .green = PIPE_SWIZZLE_Z,                                                 \
       .blue = PIPE_SWIZZLE_Y,                                                  \
       .alpha = PIPE_SWIZZLE_X,                                                 \
    }
 
+#define MTL_SWIZZLE_GBAR                                                       \
+   .unswizzle = {                                                              \
+      .red = PIPE_SWIZZLE_Y,                                                   \
+      .green = PIPE_SWIZZLE_Z,                                                 \
+      .blue = PIPE_SWIZZLE_W,                                                  \
+      .alpha = PIPE_SWIZZLE_X,                                                 \
+   }
+
 #define MTL_SWIZZLE_BGRA                                                       \
-   .swizzle = {                                                                \
+   .unswizzle = {                                                              \
       .red = PIPE_SWIZZLE_Z,                                                   \
       .green = PIPE_SWIZZLE_Y,                                                 \
       .blue = PIPE_SWIZZLE_X,                                                  \
@@ -129,7 +137,7 @@
    }
 
 #define MTL_SWIZZLE_RGB1                                                       \
-   .swizzle = {                                                                \
+   .unswizzle = {                                                              \
       .red = PIPE_SWIZZLE_X,                                                   \
       .green = PIPE_SWIZZLE_Y,                                                 \
       .blue = PIPE_SWIZZLE_Z,                                                  \
@@ -176,9 +184,9 @@ static const struct kk_va_format kk_vf_formats[] = {
    // 32-bit formats
    MTL_FMT_NATIVE(R32_UINT, MTL_FMT_WCSA(32), MTL_FMT_TB_ALL),
    MTL_FMT_NATIVE(R32_SINT, MTL_FMT_WCSA(32), MTL_FMT_TB_ALL),
-   MTL_FMT_NATIVE(R32_FLOAT, MTL_FMT_WCBMS(32), MTL_FMT_TB_ALL),
-   MTL_FMT_NATIVE(R16G16_UNORM, MTL_FMT_FWCBMS(32), MTL_FMT_TB_WR),
-   MTL_FMT_NATIVE(R16G16_SNORM, MTL_FMT_FWCBMS(32), MTL_FMT_TB_WR),
+   MTL_FMT_NATIVE(R32_FLOAT, MTL_FMT_ALL_NO_ATOMIC(32), MTL_FMT_TB_ALL),
+   MTL_FMT_NATIVE(R16G16_UNORM, MTL_FMT_ALL_NO_ATOMIC(32), MTL_FMT_TB_WR),
+   MTL_FMT_NATIVE(R16G16_SNORM, MTL_FMT_ALL_NO_ATOMIC(32), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R16G16_UINT, MTL_FMT_WCMS(32), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R16G16_SINT, MTL_FMT_WCMS(32), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R16G16_FLOAT, MTL_FMT_ALL_NO_ATOMIC(32), MTL_FMT_TB_WR),
@@ -193,9 +201,9 @@ static const struct kk_va_format kk_vf_formats[] = {
    // 64-bit formats
    MTL_FMT_NATIVE(R32G32_UINT, MTL_FMT_WCMS(64), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R32G32_SINT, MTL_FMT_WCMS(64), MTL_FMT_TB_WR),
-   MTL_FMT_NATIVE(R32G32_FLOAT, MTL_FMT_WCBMS(64), MTL_FMT_TB_WR),
-   MTL_FMT_NATIVE(R16G16B16A16_UNORM, MTL_FMT_FWCBMS(64), MTL_FMT_TB_WR),
-   MTL_FMT_NATIVE(R16G16B16A16_SNORM, MTL_FMT_FWCBMS(64), MTL_FMT_TB_WR),
+   MTL_FMT_NATIVE(R32G32_FLOAT, MTL_FMT_ALL_NO_ATOMIC(64), MTL_FMT_TB_WR),
+   MTL_FMT_NATIVE(R16G16B16A16_UNORM, MTL_FMT_ALL_NO_ATOMIC(64), MTL_FMT_TB_WR),
+   MTL_FMT_NATIVE(R16G16B16A16_SNORM, MTL_FMT_ALL_NO_ATOMIC(64), MTL_FMT_TB_WR),
    MTL_FMT_NATIVE(R16G16B16A16_UINT, MTL_FMT_WCMS(64), MTL_FMT_TB_ALL),
    MTL_FMT_NATIVE(R16G16B16A16_SINT, MTL_FMT_WCMS(64), MTL_FMT_TB_ALL),
    MTL_FMT_NATIVE(R16G16B16A16_FLOAT, MTL_FMT_ALL_NO_ATOMIC(64),
@@ -204,7 +212,8 @@ static const struct kk_va_format kk_vf_formats[] = {
    // 128-bit formats
    MTL_FMT_NATIVE(R32G32B32A32_UINT, MTL_FMT_WCS(128), MTL_FMT_TB_ALL),
    MTL_FMT_NATIVE(R32G32B32A32_SINT, MTL_FMT_WCS(128), MTL_FMT_TB_ALL),
-   MTL_FMT_NATIVE(R32G32B32A32_FLOAT, MTL_FMT_WCMS(128), MTL_FMT_TB_ALL),
+   MTL_FMT_NATIVE(R32G32B32A32_FLOAT, MTL_FMT_ALL_NO_ATOMIC(128),
+                  MTL_FMT_TB_ALL),
 
    // 16-bit packed formats
    MTL_FMT_NATIVE(B5G6R5_UNORM, MTL_FMT_FCBMRS(16), MTL_FMT_TB_NONE),
@@ -212,12 +221,14 @@ static const struct kk_va_format kk_vf_formats[] = {
     * required by Vulkan, we can just disable it.
     */
    /* MTL_FMT_NATIVE(A1B5G5R5_UNORM, MTL_FMT_FCBMRS(16), MTL_FMT_TB_NONE), */
+   MTL_FMT_NATIVE(B5G5R5A1_UNORM, MTL_FMT_FCBMRS(16), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(A4B4G4R4_UNORM, MTL_FMT_FCBMRS(16), MTL_FMT_TB_NONE),
    MTL_FMT(R4G4B4A4_UNORM, A4B4G4R4_UNORM, MTL_SWIZZLE_ABGR, MTL_FMT_FCBMRS(16),
            MTL_FMT_TB_NONE, false),
    MTL_FMT(A4R4G4B4_UNORM, A4B4G4R4_UNORM, MTL_SWIZZLE_BGRA, MTL_FMT_FCBMRS(16),
            MTL_FMT_TB_NONE, false),
-   MTL_FMT_NATIVE(B5G5R5A1_UNORM, MTL_FMT_FCBMRS(16), MTL_FMT_TB_NONE),
+   MTL_FMT(B4G4R4A4_UNORM, A4B4G4R4_UNORM, MTL_SWIZZLE_GBAR, MTL_FMT_FCBMRS(16),
+           MTL_FMT_TB_NONE, false),
 
    // 32-bit packed formats
    MTL_FMT_NATIVE(R10G10B10A2_UNORM, MTL_FMT_ALL_NO_ATOMIC(32), MTL_FMT_TB_WR),
@@ -258,6 +269,21 @@ static const struct kk_va_format kk_vf_formats[] = {
    MTL_FMT_NATIVE(ASTC_12x10_SRGB, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(ASTC_12x12_SRGB, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
 
+   MTL_FMT_NATIVE(ASTC_4x4_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_5x4_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_5x5_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_6x5_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_6x6_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_8x5_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_8x6_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_8x8_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_10x5_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_10x6_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_10x8_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_10x10_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_12x10_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(ASTC_12x12_FLOAT, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
+
    // EAC/ETC formats
    MTL_FMT_NATIVE(ETC2_R11_UNORM, MTL_FMT_FS(64), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(ETC2_R11_SNORM, MTL_FMT_FS(64), MTL_FMT_TB_NONE),
@@ -272,8 +298,10 @@ static const struct kk_va_format kk_vf_formats[] = {
    MTL_FMT_NATIVE(ETC2_SRGB8A1, MTL_FMT_FS(64), MTL_FMT_TB_NONE),
 
    // BC/DXT formats
-   MTL_FMT(DXT1_RGB, DXT1_RGBA, MTL_SWIZZLE_RGB1, MTL_FMT_FS(64), MTL_FMT_TB_NONE, true),
-   MTL_FMT(DXT1_SRGB, DXT1_SRGBA, MTL_SWIZZLE_RGB1, MTL_FMT_FS(64), MTL_FMT_TB_NONE, true),
+   MTL_FMT(DXT1_RGB, DXT1_RGBA, MTL_SWIZZLE_RGB1, MTL_FMT_FS(64),
+           MTL_FMT_TB_NONE, true),
+   MTL_FMT(DXT1_SRGB, DXT1_SRGBA, MTL_SWIZZLE_RGB1, MTL_FMT_FS(64),
+           MTL_FMT_TB_NONE, true),
    MTL_FMT_NATIVE(DXT1_RGBA, MTL_FMT_FS(64), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(DXT1_SRGBA, MTL_FMT_FS(64), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(DXT3_RGBA, MTL_FMT_FS(128), MTL_FMT_TB_NONE),
@@ -299,9 +327,9 @@ static const struct kk_va_format kk_vf_formats[] = {
 
    // Depth and stencil formats
    MTL_FMT_NATIVE(Z16_UNORM, MTL_FMT_FMR(16), MTL_FMT_TB_NONE),
-   MTL_FMT_NATIVE(Z32_FLOAT, MTL_FMT_MR(32), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(Z32_FLOAT, MTL_FMT_FMR(32), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(S8_UINT, MTL_FMT_M(8), MTL_FMT_TB_NONE),
-   MTL_FMT_NATIVE(Z32_FLOAT_S8X24_UINT, MTL_FMT_MR(64), MTL_FMT_TB_NONE),
+   MTL_FMT_NATIVE(Z32_FLOAT_S8X24_UINT, MTL_FMT_FMR(64), MTL_FMT_TB_NONE),
    MTL_FMT_NATIVE(X32_S8X24_UINT, MTL_FMT_MR(64), MTL_FMT_TB_NONE),
 };
 

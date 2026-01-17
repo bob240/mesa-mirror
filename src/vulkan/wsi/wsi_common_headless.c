@@ -100,6 +100,9 @@ wsi_headless_surface_get_capabilities2(VkIcdSurfaceBase *surface,
 {
    assert(caps->sType == VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR);
 
+   const VkSurfacePresentModeKHR *present_mode =
+      vk_find_struct_const(info_next, SURFACE_PRESENT_MODE_EXT);
+
    VkResult result =
       wsi_headless_surface_get_capabilities(surface, wsi_device,
                                       &caps->surfaceCapabilities);
@@ -109,6 +112,33 @@ wsi_headless_surface_get_capabilities2(VkIcdSurfaceBase *surface,
       case VK_STRUCTURE_TYPE_SURFACE_PROTECTED_CAPABILITIES_KHR: {
          VkSurfaceProtectedCapabilitiesKHR *protected = (void *)ext;
          protected->supportsProtected = VK_FALSE;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_SCALING_CAPABILITIES_KHR: {
+         /* Unsupported */
+         VkSurfacePresentScalingCapabilitiesKHR *scaling = (void *)ext;
+         scaling->supportedPresentScaling = 0;
+         scaling->supportedPresentGravityX = 0;
+         scaling->supportedPresentGravityY = 0;
+         scaling->minScaledImageExtent = caps->surfaceCapabilities.minImageExtent;
+         scaling->maxScaledImageExtent = caps->surfaceCapabilities.maxImageExtent;
+         break;
+      }
+      case VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_COMPATIBILITY_KHR: {
+         /* Unsupported */
+         VkSurfacePresentModeCompatibilityKHR *compat = (void *)ext;
+         if (compat->pPresentModes == NULL) {
+            if (!present_mode) {
+               wsi_common_vk_warn_once("Use of VkSurfacePresentModeCompatibilityKHR "
+                                       "without a VkSurfacePresentModeKHR set. This is an "
+                                       "application bug.\n");
+            }
+            compat->presentModeCount = 1;
+         } else if (compat->presentModeCount) {
+            assert(present_mode);
+            compat->presentModeCount = 1;
+            compat->pPresentModes[0] = present_mode->presentMode;
+         }
          break;
       }
 
@@ -256,6 +286,23 @@ wsi_headless_swapchain_get_wsi_image(struct wsi_swapchain *wsi_chain,
 }
 
 static VkResult
+wsi_headless_swapchain_release_images(struct wsi_swapchain *wsi_chain,
+                                      uint32_t count, const uint32_t *indices)
+{
+   struct wsi_headless_swapchain *chain =
+      (struct wsi_headless_swapchain *)wsi_chain;
+
+   for (uint32_t i = 0; i < count; i++) {
+      uint32_t index = indices[i];
+      assert(index < chain->base.image_count);
+      chain->images[index].busy_on_device = false;
+      chain->images[index].busy_on_host = false;
+   }
+
+   return VK_SUCCESS;
+}
+
+static VkResult
 wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
                                           const VkAcquireNextImageInfoKHR *info,
                                           uint32_t *image_index)
@@ -399,6 +446,7 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    chain->base.destroy = wsi_headless_swapchain_destroy;
    chain->base.get_wsi_image = wsi_headless_swapchain_get_wsi_image;
    chain->base.acquire_next_image = wsi_headless_swapchain_acquire_next_image;
+   chain->base.release_images = wsi_headless_swapchain_release_images;
    chain->base.queue_present = wsi_headless_swapchain_queue_present;
    chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, pCreateInfo);
    chain->base.image_count = num_images;
@@ -406,8 +454,11 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
    for (uint32_t i = 0; i < chain->base.image_count; i++) {
       result = wsi_create_image(&chain->base, &chain->base.image_info,
                                 &chain->images[i].base);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         /* Record how many images need to be torn down */
+         chain->base.image_count = i;
          goto fail;
+      }
 
       chain->images[i].busy_on_host = false;
       chain->images[i].busy_on_device = false;

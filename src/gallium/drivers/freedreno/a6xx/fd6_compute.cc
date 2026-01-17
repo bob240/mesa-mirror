@@ -7,7 +7,6 @@
  */
 
 #include "drm/freedreno_ringbuffer.h"
-#define FD_BO_NO_HARDPIN 1
 
 #include "pipe/p_state.h"
 #include "util/u_dump.h"
@@ -38,7 +37,7 @@ cs_program_emit_local_size(struct fd_context *ctx, fd_crb &crb,
    enum a6xx_threadsize thrsz_cs = ctx->screen->info->props
       .supports_double_threadsize ? thrsz : THREAD128;
 
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
       unsigned tile_height = (local_size[1] % 8 == 0)   ? 3
                              : (local_size[1] % 4 == 0) ? 5
                              : (local_size[1] % 2 == 0) ? 9
@@ -144,7 +143,7 @@ cs_program_emit(struct fd_context *ctx, fd_crb &crb, struct ir3_shader_variant *
             v->cs.force_linear_dispatch ? WORKITEMRASTORDER_LINEAR
                                           : WORKITEMRASTORDER_TILED,
       ));
-      crb.add(SP_CS_UNKNOWN_A9BE(CHIP, 0)); // Sometimes is 0x08000000
+      crb.add(SP_CS_HYSTERESIS(CHIP, 0)); // Sometimes is 0x08000000
    }
 
    if (!v->local_size_variable)
@@ -156,7 +155,6 @@ static void
 fd6_launch_grid(struct fd_context *ctx, const struct pipe_grid_info *info) in_dt
 {
    struct fd6_compute_state *cp = (struct fd6_compute_state *)ctx->compute;
-   fd_cs cs(ctx->batch->draw);
 
    if (unlikely(!cp->v)) {
       struct ir3_shader_state *hwcso = (struct ir3_shader_state *)cp->hwcso;
@@ -173,7 +171,11 @@ fd6_launch_grid(struct fd_context *ctx, const struct pipe_grid_info *info) in_dt
       fd6_emit_shader<CHIP>(ctx, cs, cp->v);
    }
 
-   trace_start_compute(&ctx->batch->trace, cs.ring(), !!info->indirect, info->work_dim,
+   fd_cs cs(ctx->batch->draw);
+
+   fd6_set_render_mode<CHIP>(cs, {RM6_COMPUTE});
+
+   trace_start_compute(&ctx->batch->trace, cs, !!info->indirect, info->work_dim,
                        info->block[0], info->block[1], info->block[2],
                        info->grid[0],  info->grid[1],  info->grid[2],
                        cp->v->shader_id);
@@ -212,9 +214,6 @@ fd6_launch_grid(struct fd_context *ctx, const struct pipe_grid_info *info) in_dt
 
    if (cp->v->need_driver_params)
       fd6_emit_cs_driver_params<CHIP>(ctx, cs, cp->v, info);
-
-   fd_pkt7(cs, CP_SET_MARKER, 1)
-      .add(A6XX_CP_SET_MARKER_0_MODE(RM6_COMPUTE));
 
    const unsigned *local_size =
       info->block; // v->shader->nir->info->workgroup_size;
@@ -289,7 +288,7 @@ fd6_launch_grid(struct fd_context *ctx, const struct pipe_grid_info *info) in_dt
          .add(CP_EXEC_CS_3(info->grid[2]));
    }
 
-   trace_end_compute(&ctx->batch->trace, cs.ring());
+   trace_end_compute(&ctx->batch->trace, cs);
 
    fd_context_all_clean(ctx);
 }

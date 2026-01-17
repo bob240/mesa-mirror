@@ -42,6 +42,7 @@ struct ntv_context {
    bool have_spirv16;
 
    bool explicit_lod; //whether to set lod=0 for texture()
+   bool have_sparse;
 
    struct spirv_builder builder;
    nir_shader *nir;
@@ -53,7 +54,7 @@ struct ntv_context {
    SpvId GLSL_std_450;
 
    mesa_shader_stage stage;
-   const struct zink_shader_info *sinfo;
+   const struct ntv_info *sinfo;
 
    SpvId ubos[PIPE_MAX_CONSTANT_BUFFERS][5]; //8, 16, 32, unused, 64
    nir_variable *ubo_vars[PIPE_MAX_CONSTANT_BUFFERS];
@@ -2234,7 +2235,7 @@ emit_alu(struct ntv_context *ctx, nir_alu_instr *alu)
       UNREACHABLE("unsupported opcode");
       return;
    }
-   if (alu->exact)
+   if (nir_alu_instr_is_exact(alu))
       spirv_builder_emit_decoration(&ctx->builder, result, SpvDecorationNoContraction);
 
    store_alu_result(ctx, alu, result, atype);
@@ -3568,6 +3569,22 @@ emit_launch_mesh_workgroups(struct ntv_context *ctx, nir_intrinsic_instr *intr)
 }
 
 static void
+init_sparse_resident(struct ntv_context *ctx)
+{
+   if (ctx->have_sparse)
+      return;
+
+   spirv_builder_emit_cap(&ctx->builder, SpvCapabilitySparseResidency);
+   /* this could be huge, so only alloc if needed since it's extremely unlikely to
+      * ever be used by anything except cts
+      */
+   ctx->resident_defs = rzalloc_array_size(ctx->mem_ctx,
+                                           sizeof(SpvId),
+                                           nir_shader_get_entrypoint(ctx->nir)->ssa_alloc);
+   ctx->have_sparse = true;
+}
+
+static void
 emit_intrinsic(struct ntv_context *ctx, nir_intrinsic_instr *intr)
 {
    switch (intr->intrinsic) {
@@ -3731,6 +3748,8 @@ emit_intrinsic(struct ntv_context *ctx, nir_intrinsic_instr *intr)
       break;
 
    case nir_intrinsic_image_deref_sparse_load:
+      init_sparse_resident(ctx);
+      FALLTHROUGH;
    case nir_intrinsic_image_deref_load:
       emit_image_deref_load(ctx, intr);
       break;
@@ -3827,6 +3846,7 @@ emit_intrinsic(struct ntv_context *ctx, nir_intrinsic_instr *intr)
       break;
 
    case nir_intrinsic_is_sparse_resident_zink:
+      init_sparse_resident(ctx);
       emit_is_sparse_texels_resident(ctx, intr);
       break;
 
@@ -4209,6 +4229,9 @@ emit_tex(struct ntv_context *ctx, nir_tex_instr *tex)
           tex->op == nir_texop_tg4 ||
           tex->op == nir_texop_texture_samples ||
           tex->op == nir_texop_query_levels);
+
+   if (tex->is_sparse)
+      init_sparse_resident(ctx);
 
    struct spriv_tex_src tex_src = {0};
    unsigned coord_components = 0;
@@ -4756,18 +4779,17 @@ get_spacing(enum gl_tess_spacing spacing)
 }
 
 struct spirv_shader *
-nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const struct zink_screen *screen)
+nir_to_spirv(struct nir_shader *s, const struct ntv_info *sinfo)
 {
-   const uint32_t spirv_version = screen->spirv_version;
    struct spirv_shader *ret = NULL;
 
    struct ntv_context ctx = {0};
    ctx.mem_ctx = ralloc_context(NULL);
    ctx.nir = s;
    ctx.builder.mem_ctx = ctx.mem_ctx;
-   assert(spirv_version >= SPIRV_VERSION(1, 0));
-   ctx.spirv_1_4_interfaces = spirv_version >= SPIRV_VERSION(1, 4);
-   ctx.have_spirv16 = spirv_version >= SPIRV_VERSION(1, 6);
+   assert(sinfo->spirv_version >= SPIRV_VERSION(1, 0));
+   ctx.spirv_1_4_interfaces = sinfo->spirv_version >= SPIRV_VERSION(1, 4);
+   ctx.have_spirv16 = sinfo->spirv_version >= SPIRV_VERSION(1, 6);
 
    ctx.bindless_set_idx = sinfo->bindless_set_idx;
    ctx.glsl_types[0] = _mesa_pointer_hash_table_create(ctx.mem_ctx);
@@ -4786,14 +4808,14 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
       if (s->info.fs.uses_sample_shading)
          spirv_builder_emit_cap(&ctx.builder, SpvCapabilitySampleRateShading);
 
-      if (s->info.fs.uses_discard && screen->info.have_EXT_shader_demote_to_helper_invocation) {
+      if (s->info.fs.uses_discard && sinfo->has_demote_to_helper) {
          if (!ctx.have_spirv16)
             spirv_builder_emit_extension(&ctx.builder, "SPV_EXT_demote_to_helper_invocation");
          spirv_builder_emit_cap(&ctx.builder, SpvCapabilityDemoteToHelperInvocation);
       }
 
       if (BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_HELPER_INVOCATION) &&
-          screen->info.have_EXT_shader_demote_to_helper_invocation && !ctx.have_spirv16) {
+          sinfo->has_demote_to_helper && !ctx.have_spirv16) {
          spirv_builder_emit_extension(&ctx.builder, "SPV_EXT_demote_to_helper_invocation");
          spirv_builder_emit_cap(&ctx.builder, SpvCapabilityDemoteToHelperInvocation);
       }
@@ -4805,7 +4827,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
           BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_DRAW_ID) ||
           BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_BASE_INSTANCE) ||
           BITSET_TEST(s->info.system_values_read, SYSTEM_VALUE_BASE_VERTEX)) {
-         if (spirv_version < SPIRV_VERSION(1, 3))
+         if (sinfo->spirv_version < SPIRV_VERSION(1, 3))
             spirv_builder_emit_extension(&ctx.builder, "SPV_KHR_shader_draw_parameters");
          spirv_builder_emit_cap(&ctx.builder, SpvCapabilityDrawParameters);
       }
@@ -4831,7 +4853,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
    if (s->info.stage < MESA_SHADER_GEOMETRY) {
       if (s->info.outputs_written & VARYING_BIT_LAYER ||
           s->info.inputs_read & VARYING_BIT_LAYER) {
-         if (spirv_version >= SPIRV_VERSION(1, 5))
+         if (sinfo->spirv_version >= SPIRV_VERSION(1, 5))
             spirv_builder_emit_cap(&ctx.builder, SpvCapabilityShaderLayer);
          else {
             spirv_builder_emit_extension(&ctx.builder, "SPV_EXT_shader_viewport_index_layer");
@@ -4847,7 +4869,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
          spirv_builder_emit_cap(&ctx.builder, SpvCapabilityGeometry);
    }
 
-   if (s->info.num_ssbos && spirv_version < SPIRV_VERSION(1, 1))
+   if (s->info.num_ssbos && sinfo->spirv_version < SPIRV_VERSION(1, 1))
       spirv_builder_emit_extension(&ctx.builder, "SPV_KHR_storage_buffer_storage_class");
 
    if (s->info.stage < MESA_SHADER_FRAGMENT &&
@@ -5148,7 +5170,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
          spirv_builder_emit_name(&ctx.builder, ctx.local_group_size_var, "gl_LocalGroupSizeARB");
 
          /* WorkgroupSize is deprecated in SPIR-V 1.6 */
-         if (spirv_version >= SPIRV_VERSION(1, 6)) {
+         if (sinfo->spirv_version >= SPIRV_VERSION(1, 6)) {
             spirv_builder_emit_exec_mode_id3(&ctx.builder, entry_point,
                                                   SpvExecutionModeLocalSizeId,
                                                   sizes);
@@ -5221,7 +5243,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
       spirv_builder_label(&ctx.builder, label);
 
       /* kill is deprecated in SPIR-V 1.6, use terminate instead */
-      if (spirv_version >= SPIRV_VERSION(1, 6))
+      if (sinfo->spirv_version >= SPIRV_VERSION(1, 6))
          spirv_builder_emit_terminate(&ctx.builder);
       else
          spirv_builder_emit_kill(&ctx.builder);
@@ -5242,16 +5264,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
                                      sizeof(nir_alu_type), entry->ssa_alloc);
    if (!ctx.defs || !ctx.def_types)
       goto fail;
-   if (sinfo->have_sparse) {
-      spirv_builder_emit_cap(&ctx.builder, SpvCapabilitySparseResidency);
-      /* this could be huge, so only alloc if needed since it's extremely unlikely to
-       * ever be used by anything except cts
-       */
-      ctx.resident_defs = rzalloc_array_size(ctx.mem_ctx,
-                                            sizeof(SpvId), entry->ssa_alloc);
-      if (!ctx.resident_defs)
-         goto fail;
-   }
+
    ctx.num_defs = entry->ssa_alloc;
 
    SpvId *block_ids = ralloc_array_size(ctx.mem_ctx,
@@ -5304,7 +5317,7 @@ nir_to_spirv(struct nir_shader *s, const struct zink_shader_info *sinfo, const s
    if (!ret->words)
       goto fail;
 
-   ret->num_words = spirv_builder_get_words(&ctx.builder, ret->words, num_words, spirv_version, &tcs_vertices_out_word);
+   ret->num_words = spirv_builder_get_words(&ctx.builder, ret->words, num_words, sinfo->spirv_version, &tcs_vertices_out_word);
    ret->tcs_vertices_out_word = tcs_vertices_out_word;
    assert(ret->num_words == num_words);
 

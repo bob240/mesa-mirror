@@ -904,13 +904,13 @@ static void virgl_disk_cache_create(struct virgl_screen *screen)
    struct mesa_sha1 sha1_ctx;
    _mesa_sha1_init(&sha1_ctx);
 
-#ifdef HAVE_BUILD_ID
+#if HAVE_BUILD_ID
    const struct build_id_note *note =
       build_id_find_nhdr_for_addr(virgl_disk_cache_create);
    assert(note);
 
    unsigned build_id_len = build_id_length(note);
-   assert(build_id_len == 20); /* sha1 */
+   assert(build_id_len == BUILD_ID_EXPECTED_HASH_LENGTH); /* sha1 */
 
    const uint8_t *id_sha1 = build_id_data(note);
    assert(id_sha1);
@@ -922,9 +922,9 @@ static void virgl_disk_cache_create(struct virgl_screen *screen)
     * apply different lowering. */
    _mesa_sha1_update(&sha1_ctx, &screen->caps, sizeof(screen->caps));
 
-   uint8_t sha1[20];
+   uint8_t sha1[SHA1_DIGEST_LENGTH];
    _mesa_sha1_final(&sha1_ctx, sha1);
-   char timestamp[41];
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
    _mesa_sha1_format(timestamp, sha1);
 
    screen->disk_cache = disk_cache_create("virgl", timestamp, 0);

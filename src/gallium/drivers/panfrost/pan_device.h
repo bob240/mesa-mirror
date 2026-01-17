@@ -38,7 +38,7 @@
 #include "util/timespec.h"
 #include "util/u_dynarray.h"
 
-#include "panfrost/util/pan_ir.h"
+#include "panfrost/compiler/pan_compiler.h"
 #include "pan_blend_cso.h"
 #include "pan_fb_preload.h"
 #include "pan_pool.h"
@@ -63,8 +63,11 @@ extern "C" {
 #define PAN_MAX_CONST_BUFFERS 16
 
 /* TODO: Mali hardware can texture up to 64k textures, but the
- * Gallium interface limits us to 32k at the moment */
-#define PAN_MAX_MIP_LEVELS 16
+ * Gallium interface limits us to 32k at the moment
+ * Also dEQP-GLES31.functional.fbo.no_attachments.maximums.all crashes with
+ * 32k textures.
+ */
+#define PAN_MAX_MIP_LEVELS 15
 
 /* How many power-of-two levels in the BO cache do we want? 2^12
  * minimum chosen as it is the page size that all allocations are
@@ -86,9 +89,6 @@ struct panfrost_device {
    struct {
       /* The pan_kmod_dev object backing this device. */
       struct pan_kmod_dev *dev;
-
-      /* Cached pan_kmod_dev_props properties queried at device create time. */
-      struct pan_kmod_dev_props props;
 
       /* VM attached to this device. */
       struct pan_kmod_vm *vm;
@@ -191,19 +191,19 @@ panfrost_device_fd(const struct panfrost_device *dev)
 static inline uint32_t
 panfrost_device_gpu_id(const struct panfrost_device *dev)
 {
-   return dev->kmod.props.gpu_id;
+   return dev->kmod.dev->props.gpu_id;
 }
 
 static inline uint32_t
 panfrost_device_gpu_prod_id(const struct panfrost_device *dev)
 {
-   return dev->kmod.props.gpu_id >> 16;
+   return dev->kmod.dev->props.gpu_id >> 16;
 }
 
 static inline uint32_t
 panfrost_device_gpu_rev(const struct panfrost_device *dev)
 {
-   return dev->kmod.props.gpu_id & BITFIELD_MASK(16);
+   return dev->kmod.dev->props.gpu_id & BITFIELD_MASK(16);
 }
 
 static inline int
@@ -240,8 +240,8 @@ pan_is_bifrost(const struct panfrost_device *dev)
 static inline uint64_t
 pan_gpu_time_to_ns(struct panfrost_device *dev, uint64_t gpu_time)
 {
-   assert(dev->kmod.props.timestamp_frequency > 0);
-   return (gpu_time * NSEC_PER_SEC) / dev->kmod.props.timestamp_frequency;
+   assert(dev->kmod.dev->props.timestamp_frequency > 0);
+   return (gpu_time * NSEC_PER_SEC) / dev->kmod.dev->props.timestamp_frequency;
 }
 
 static inline uint32_t
@@ -251,7 +251,7 @@ pan_get_max_texel_buffer_elements(unsigned arch)
       /* TODO 1<<27 can be made larger for v11+ with a refactor of the buffer
        * path away from using image logic. */
       return 1 << 27;
-   else if (arch >= 9)
+   else if (arch >= 6)
       return 1 << 27;
    else
       return 65536;

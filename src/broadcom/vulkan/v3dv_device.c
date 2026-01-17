@@ -51,6 +51,7 @@
 #include "git_sha1.h"
 
 #include "util/build_id.h"
+#include "util/driconf.h"
 #include "util/os_file.h"
 #include "util/u_debug.h"
 #include "util/format/u_format.h"
@@ -70,6 +71,9 @@
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
 #include <wayland-client.h>
 #endif
+
+#define V3D_VERSION 42
+#include "v3dv_format_table.h"
 
 #define V3DV_API_VERSION VK_MAKE_VERSION(1, 3, VK_HEADER_VERSION)
 
@@ -542,6 +546,25 @@ static VkResult enumerate_devices(struct vk_instance *vk_instance);
 
 static void destroy_physical_device(struct vk_physical_device *device);
 
+static const driOptionDescription v3dv_dri_options[] = {
+   DRI_CONF_SECTION_PERFORMANCE
+      DRI_CONF_VK_X11_OVERRIDE_MIN_IMAGE_COUNT(0)
+      DRI_CONF_VK_X11_STRICT_IMAGE_COUNT(false)
+      DRI_CONF_VK_X11_ENSURE_MIN_IMAGE_COUNT(false)
+      DRI_CONF_VK_XWAYLAND_WAIT_READY(true)
+   DRI_CONF_SECTION_END
+};
+
+static void
+v3dv_init_dri_options(struct v3dv_instance *instance)
+{
+   driParseOptionInfo(&instance->available_dri_options, v3dv_dri_options,
+                      ARRAY_SIZE(v3dv_dri_options));
+   driParseConfigFiles(&instance->dri_options, &instance->available_dri_options, 0, "v3dv", NULL, NULL,
+                       instance->vk.app_info.app_name, instance->vk.app_info.app_version,
+                       instance->vk.app_info.engine_name, instance->vk.app_info.engine_version);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 v3dv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
@@ -622,6 +645,8 @@ v3dv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
+   v3dv_init_dri_options(instance);
+
    *pInstance = v3dv_instance_to_handle(instance);
 
    return VK_SUCCESS;
@@ -681,6 +706,9 @@ v3dv_DestroyInstance(VkInstance _instance,
       return;
 
    VG(VALGRIND_DESTROY_MEMPOOL(instance));
+
+   driDestroyOptionCache(&instance->dri_options);
+   driDestroyOptionInfo(&instance->available_dri_options);
 
    vk_instance_finish(&instance->vk);
    vk_free(&instance->vk.alloc, instance);
@@ -767,19 +795,19 @@ init_uuids(struct v3dv_physical_device *device)
    }
 
    unsigned build_id_len = build_id_length(note);
-   if (build_id_len < 20) {
+   if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
       return vk_errorf(device->vk.instance,
                        VK_ERROR_INITIALIZATION_FAILED,
                        "build-id too short.  It needs to be a SHA");
    }
 
-   memcpy(device->driver_build_sha1, build_id_data(note), 20);
+   copy_build_id_to_sha1(device->driver_build_sha1, note);
 
    uint32_t vendor_id = v3dv_physical_device_vendor_id(device);
    uint32_t device_id = v3dv_physical_device_device_id(device);
 
    struct mesa_sha1 sha1_ctx;
-   uint8_t sha1[20];
+   uint8_t sha1[SHA1_DIGEST_LENGTH];
    STATIC_ASSERT(VK_UUID_SIZE <= sizeof(sha1));
 
    /* The pipeline cache UUID is used for determining when a pipeline cache is
@@ -815,7 +843,7 @@ static void
 v3dv_physical_device_init_disk_cache(struct v3dv_physical_device *device)
 {
 #ifdef ENABLE_SHADER_CACHE
-   char timestamp[41];
+   char timestamp[SHA1_DIGEST_STRING_LENGTH];
    _mesa_sha1_format(timestamp, device->driver_build_sha1);
 
    assert(device->name);
@@ -844,6 +872,7 @@ get_device_properties(const struct v3dv_physical_device *device,
    const float v3d_point_line_granularity = 2.0f / (1 << V3D_COORD_SHIFT);
    const uint32_t max_fb_size = V3D_MAX_IMAGE_DIMENSION;
 
+   /* Note: update nir_shader_compiler_options.max_samples when changing this. */
    const VkSampleCountFlags supported_sample_counts =
       VK_SAMPLE_COUNT_1_BIT | VK_SAMPLE_COUNT_4_BIT;
 

@@ -165,9 +165,8 @@ iris_apply_brw_cs_prog_data(struct iris_compiled_shader *shader,
    iris->uses_sampler      = brw->uses_sampler;
    iris->prog_mask         = brw->prog_mask;
 
-   iris->first_param_is_builtin_subgroup_id =
-      brw->base.nr_params > 0 &&
-      brw->base.param[0] == BRW_PARAM_BUILTIN_SUBGROUP_ID;
+   /* The pushed constants only contain the subgroup_id */
+   iris->first_param_is_builtin_subgroup_id = brw->base.push_sizes[0] > 0;
 }
 
 static void
@@ -249,16 +248,20 @@ iris_apply_brw_gs_prog_data(struct iris_compiled_shader *shader,
 
 void
 iris_apply_brw_prog_data(struct iris_compiled_shader *shader,
-                         struct brw_stage_prog_data *brw)
+                         struct brw_stage_prog_data *brw,
+                         struct brw_ubo_range *ubo_ranges)
 {
-   STATIC_ASSERT(ARRAY_SIZE(brw->ubo_ranges) == ARRAY_SIZE(shader->ubo_ranges));
-   for (int i = 0; i < ARRAY_SIZE(shader->ubo_ranges); i++) {
-      shader->ubo_ranges[i].block  = brw->ubo_ranges[i].block;
-      shader->ubo_ranges[i].start  = brw->ubo_ranges[i].start;
-      shader->ubo_ranges[i].length = brw->ubo_ranges[i].length;
+   if (ubo_ranges != NULL) {
+      for (int i = 0; i < ARRAY_SIZE(shader->ubo_ranges); i++) {
+         shader->ubo_ranges[i].block  = ubo_ranges[i].block;
+         shader->ubo_ranges[i].start  = ubo_ranges[i].start;
+         shader->ubo_ranges[i].length = ubo_ranges[i].length;
+      }
    }
 
-   shader->nr_params              = brw->nr_params;
+   for (int i = 0; i < ARRAY_SIZE(shader->push_sizes); i++)
+      shader->push_sizes[i] = brw->push_sizes[i];
+
    shader->total_scratch          = brw->total_scratch;
    shader->total_shared           = brw->total_shared;
    shader->program_size           = brw->program_size;
@@ -294,7 +297,6 @@ iris_apply_brw_prog_data(struct iris_compiled_shader *shader,
 
    ralloc_steal(shader, shader->brw_prog_data);
    ralloc_steal(shader->brw_prog_data, (void *)brw->relocs);
-   ralloc_steal(shader->brw_prog_data, brw->param);
 }
 
 #ifdef INTEL_USE_ELK
@@ -580,10 +582,7 @@ iris_to_brw_fs_key(const struct iris_screen *screen,
       .persample_interp = key->persample_interp ? INTEL_ALWAYS : INTEL_NEVER,
       .multisample_fbo = key->multisample_fbo ? INTEL_ALWAYS : INTEL_NEVER,
       .force_dual_color_blend = key->force_dual_color_blend,
-      .color_outputs_valid = key->color_outputs_valid,
       .ignore_sample_mask_out = !key->multisample_fbo,
-      .null_push_constant_tbimr_workaround =
-         screen->devinfo->needs_null_push_constant_tbimr_workaround,
    };
 }
 
@@ -1213,12 +1212,16 @@ iris_setup_uniforms(ASSERTED const struct intel_device_info *devinfo,
    assert(num_cbufs < PIPE_MAX_CONSTANT_BUFFERS);
    nir_validate_shader(nir, "after remap");
 
+#ifdef INTEL_USE_ELK
    /* We don't use params[] but gallium leaves num_uniforms set.  We use this
     * to detect when cbuf0 exists but we don't need it anymore when we get
     * here.  Instead, zero it out so that the back-end doesn't get confused
     * when nr_params * 4 != num_uniforms != nr_params * 4.
+    *
+    * Elk still depends on this behavior.
     */
    nir->num_uniforms = 0;
+#endif
 
    *out_system_values = system_values;
    *out_num_system_values = num_system_values;
@@ -1246,9 +1249,9 @@ iris_print_binding_table(FILE *fp, const char *name,
    uint32_t compacted = 0;
 
    for (int i = 0; i < IRIS_SURFACE_GROUP_COUNT; i++) {
-      uint32_t size = bt->sizes[i];
-      total += size;
-      if (size)
+      uint32_t surf_count = bt->surf_count[i];
+      total += surf_count;
+      if (surf_count)
          compacted += util_bitcount64(bt->used_mask[i]);
    }
 
@@ -1290,7 +1293,7 @@ uint32_t
 iris_group_index_to_bti(const struct iris_binding_table *bt,
                         enum iris_surface_group group, uint32_t index)
 {
-   assert(index < bt->sizes[group]);
+   assert(index < bt->surf_count[group]);
    uint64_t mask = bt->used_mask[group];
    uint64_t bit = 1ull << index;
    if (bit & mask) {
@@ -1328,7 +1331,7 @@ rewrite_src_with_bti(nir_builder *b, struct iris_binding_table *bt,
                      nir_instr *instr, nir_src *src,
                      enum iris_surface_group group)
 {
-   assert(bt->sizes[group] > 0);
+   assert(bt->surf_count[group] > 0);
 
    b->cursor = nir_before_instr(instr);
    nir_def *bti;
@@ -1340,7 +1343,7 @@ rewrite_src_with_bti(nir_builder *b, struct iris_binding_table *bt,
       /* Indirect usage makes all the surfaces of the group to be available,
        * so we can just add the base.
        */
-      assert(bt->used_mask[group] == BITFIELD64_MASK(bt->sizes[group]));
+      assert(bt->used_mask[group] == BITFIELD64_MASK(bt->surf_count[group]));
       bti = nir_iadd_imm(b, src->ssa, bt->offsets[group]);
    }
    nir_src_rewrite(src, bti);
@@ -1350,15 +1353,15 @@ static void
 mark_used_with_src(struct iris_binding_table *bt, nir_src *src,
                    enum iris_surface_group group)
 {
-   assert(bt->sizes[group] > 0);
+   assert(bt->surf_count[group] > 0);
 
    if (nir_src_is_const(*src)) {
       uint64_t index = nir_src_as_uint(*src);
-      assert(index < bt->sizes[group]);
+      assert(index < bt->surf_count[group]);
       bt->used_mask[group] |= 1ull << index;
    } else {
       /* There's an indirect usage, we need all the surfaces. */
-      bt->used_mask[group] = BITFIELD64_MASK(bt->sizes[group]);
+      bt->used_mask[group] = BITFIELD64_MASK(bt->surf_count[group]);
    }
 }
 
@@ -1391,7 +1394,7 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
     * upfront how many will be used, so mark them.
     */
    if (info->stage == MESA_SHADER_FRAGMENT) {
-      bt->sizes[IRIS_SURFACE_GROUP_RENDER_TARGET] = num_render_targets;
+      bt->surf_count[IRIS_SURFACE_GROUP_RENDER_TARGET] = num_render_targets;
       /* All render targets used. */
       bt->used_mask[IRIS_SURFACE_GROUP_RENDER_TARGET] =
          BITFIELD64_MASK(num_render_targets);
@@ -1400,28 +1403,28 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
        * framebuffer fetch on Gfx8
        */
       if (devinfo->ver == 8 && info->outputs_read) {
-         bt->sizes[IRIS_SURFACE_GROUP_RENDER_TARGET_READ] = num_render_targets;
+         bt->surf_count[IRIS_SURFACE_GROUP_RENDER_TARGET_READ] = num_render_targets;
          bt->used_mask[IRIS_SURFACE_GROUP_RENDER_TARGET_READ] =
             BITFIELD64_MASK(num_render_targets);
       }
 
       bt->use_null_rt = use_null_rt;
    } else if (info->stage == MESA_SHADER_COMPUTE) {
-      bt->sizes[IRIS_SURFACE_GROUP_CS_WORK_GROUPS] = 1;
+      bt->surf_count[IRIS_SURFACE_GROUP_CS_WORK_GROUPS] = 1;
    }
 
    assert(ARRAY_SIZE(info->textures_used) >= 4);
    int max_tex = BITSET_LAST_BIT(info->textures_used);
    assert(max_tex <= 128);
-   bt->sizes[IRIS_SURFACE_GROUP_TEXTURE_LOW64] = MIN2(64, max_tex);
-   bt->sizes[IRIS_SURFACE_GROUP_TEXTURE_HIGH64] = MAX2(0, max_tex - 64);
+   bt->surf_count[IRIS_SURFACE_GROUP_TEXTURE_LOW64] = MIN2(64, max_tex);
+   bt->surf_count[IRIS_SURFACE_GROUP_TEXTURE_HIGH64] = MAX2(0, max_tex - 64);
    bt->used_mask[IRIS_SURFACE_GROUP_TEXTURE_LOW64] =
       info->textures_used[0] | ((uint64_t)info->textures_used[1]) << 32;
    bt->used_mask[IRIS_SURFACE_GROUP_TEXTURE_HIGH64] =
       info->textures_used[2] | ((uint64_t)info->textures_used[3]) << 32;
    bt->samplers_used_mask = info->samplers_used[0];
 
-   bt->sizes[IRIS_SURFACE_GROUP_IMAGE] = BITSET_LAST_BIT(info->images_used);
+   bt->surf_count[IRIS_SURFACE_GROUP_IMAGE] = BITSET_LAST_BIT(info->images_used);
 
    /* Allocate an extra slot in the UBO section for NIR constants.
     * Binding table compaction will remove it if unnecessary.
@@ -1430,12 +1433,12 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
     * they are uploaded separately from shs->constbuf[], but from a shader
     * point of view, they're another UBO (at the end of the section).
     */
-   bt->sizes[IRIS_SURFACE_GROUP_UBO] = num_cbufs + 1;
+   bt->surf_count[IRIS_SURFACE_GROUP_UBO] = num_cbufs + 1;
 
-   bt->sizes[IRIS_SURFACE_GROUP_SSBO] = info->num_ssbos;
+   bt->surf_count[IRIS_SURFACE_GROUP_SSBO] = info->num_ssbos;
 
    for (int i = 0; i < IRIS_SURFACE_GROUP_COUNT; i++)
-      assert(bt->sizes[i] <= SURFACE_GROUP_MAX_ELEMENTS);
+      assert(bt->surf_count[i] <= SURFACE_GROUP_MAX_ELEMENTS);
 
    /* Mark surfaces used for the cases we don't have the information available
     * upfront.
@@ -1493,7 +1496,7 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
    /* When disable we just mark everything as used. */
    if (unlikely(skip_compacting_binding_tables())) {
       for (int i = 0; i < IRIS_SURFACE_GROUP_COUNT; i++)
-         bt->used_mask[i] = BITFIELD64_MASK(bt->sizes[i]);
+         bt->used_mask[i] = BITFIELD64_MASK(bt->surf_count[i]);
    }
 
    /* Calculate the offsets and the binding table size based on the used
@@ -1520,7 +1523,7 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
    nir_builder b = nir_builder_create(impl);
 
    nir_foreach_block (block, impl) {
-      nir_foreach_instr (instr, block) {
+      nir_foreach_instr_safe (instr, block) {
          if (instr->type == nir_instr_type_tex) {
             nir_tex_instr *tex = nir_instr_as_tex(instr);
             if (tex->texture_index < 64) {
@@ -1581,6 +1584,21 @@ iris_setup_binding_table(const struct intel_device_info *devinfo,
          case nir_intrinsic_load_ssbo:
             rewrite_src_with_bti(&b, bt, instr, &intrin->src[0],
                                  IRIS_SURFACE_GROUP_SSBO);
+            break;
+
+         case nir_intrinsic_load_num_workgroups:
+            b.cursor = nir_before_instr(instr);
+            nir_def_replace(
+               &intrin->def,
+               nir_load_ubo(&b,
+                            intrin->def.num_components,
+                            intrin->def.bit_size,
+                            nir_imm_int(&b, bt->offsets[
+                                           IRIS_SURFACE_GROUP_CS_WORK_GROUPS]),
+                            nir_imm_int(&b, 0),
+                            .range_base = 0,
+                            .range = intrin->def.num_components *
+                                     intrin->def.bit_size / 8));
             break;
 
          default:
@@ -1868,6 +1886,29 @@ iris_debug_archiver_open(void *tmp_ctx, struct iris_screen *screen,
    return debug_archiver;
 }
 
+static void
+brw_apply_ubo_ranges(struct brw_compiler *compiler,
+                     nir_shader *nir,
+                     struct brw_ubo_range ubo_ranges[4],
+                     struct brw_stage_prog_data *prog_data)
+{
+   brw_nir_analyze_ubo_ranges(compiler, nir, ubo_ranges);
+   NIR_PASS(_, nir, brw_nir_lower_ubo_ranges, ubo_ranges);
+
+   if (ubo_ranges[0].length == 0 &&
+       nir->info.stage == MESA_SHADER_FRAGMENT &&
+       compiler->devinfo->needs_null_push_constant_tbimr_workaround) {
+      ubo_ranges[0] = (struct brw_ubo_range) {
+         .block = IRIS_SURFACE_NULL_PUSH_TBIMR_WA,
+         .start = 0,
+         .length = 1,
+      };
+   }
+
+   for (uint32_t i = 0; i < 4; i++)
+      prog_data->push_sizes[i] = ubo_ranges[i].length * 32;
+}
+
 /**
  * Compile a vertex shader, and upload the assembly.
  */
@@ -1917,7 +1958,8 @@ iris_compile_vs(struct iris_screen *screen,
 
       brw_prog_data->base.base.use_alt_mode = nir->info.use_legacy_math_rules;
 
-      brw_nir_analyze_ubo_ranges(screen->brw, nir, brw_prog_data->base.base.ubo_ranges);
+      struct brw_ubo_range ubo_ranges[4] = {};
+      brw_apply_ubo_ranges(screen->brw, nir, ubo_ranges, &brw_prog_data->base.base);
 
       struct brw_vs_prog_key brw_key = iris_to_brw_vs_key(screen, key);
 
@@ -1936,7 +1978,7 @@ iris_compile_vs(struct iris_screen *screen,
       program = brw_compile_vs(screen->brw, &params);
       error = params.base.error_str;
       if (program) {
-         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base);
+         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base, ubo_ranges);
          iris_debug_recompile_brw(screen, dbg, ish, &brw_key.base);
       }
    } else {
@@ -2159,7 +2201,9 @@ iris_compile_tcs(struct iris_screen *screen,
    if (screen->brw) {
       struct brw_tcs_prog_data *brw_prog_data =
          rzalloc(mem_ctx, struct brw_tcs_prog_data);
-      brw_nir_analyze_ubo_ranges(screen->brw, nir, brw_prog_data->base.base.ubo_ranges);
+
+      struct brw_ubo_range ubo_ranges[4] = {};
+      brw_apply_ubo_ranges(screen->brw, nir, ubo_ranges, &brw_prog_data->base.base);
 
       struct brw_compile_tcs_params params = {
          .base = {
@@ -2177,7 +2221,7 @@ iris_compile_tcs(struct iris_screen *screen,
       error = params.base.error_str;
 
       if (program) {
-         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base);
+         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base, ubo_ranges);
          iris_debug_recompile_brw(screen, dbg, ish, &brw_key.base);
       }
    } else {
@@ -2362,7 +2406,8 @@ iris_compile_tes(struct iris_screen *screen,
       struct brw_tes_prog_data *brw_prog_data =
          rzalloc(mem_ctx, struct brw_tes_prog_data);
 
-      brw_nir_analyze_ubo_ranges(screen->brw, nir, brw_prog_data->base.base.ubo_ranges);
+      struct brw_ubo_range ubo_ranges[4] = {};
+      brw_apply_ubo_ranges(screen->brw, nir, ubo_ranges, &brw_prog_data->base.base);
 
       struct intel_vue_map input_vue_map;
       brw_compute_tess_vue_map(&input_vue_map, key->inputs_read,
@@ -2388,7 +2433,7 @@ iris_compile_tes(struct iris_screen *screen,
 
       if (program) {
          iris_debug_recompile_brw(screen, dbg, ish, &brw_key.base);
-         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base);
+         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base, ubo_ranges);
       }
    } else {
 #ifdef INTEL_USE_ELK
@@ -2556,7 +2601,8 @@ iris_compile_gs(struct iris_screen *screen,
       struct brw_gs_prog_data *brw_prog_data =
          rzalloc(mem_ctx, struct brw_gs_prog_data);
 
-      brw_nir_analyze_ubo_ranges(screen->brw, nir, brw_prog_data->base.base.ubo_ranges);
+      struct brw_ubo_range ubo_ranges[4] = {};
+      brw_apply_ubo_ranges(screen->brw, nir, ubo_ranges, &brw_prog_data->base.base);
 
       brw_compute_vue_map(devinfo,
                           &brw_prog_data->base.vue_map, nir->info.outputs_written,
@@ -2580,7 +2626,7 @@ iris_compile_gs(struct iris_screen *screen,
       error = params.base.error_str;
       if (program) {
          iris_debug_recompile_brw(screen, dbg, ish, &brw_key.base);
-         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base);
+         iris_apply_brw_prog_data(shader, &brw_prog_data->base.base, ubo_ranges);
       }
    } else {
 #ifdef INTEL_USE_ELK
@@ -2749,7 +2795,8 @@ iris_compile_fs(struct iris_screen *screen,
 
       brw_prog_data->base.use_alt_mode = nir->info.use_legacy_math_rules;
 
-      brw_nir_analyze_ubo_ranges(screen->brw, nir, brw_prog_data->base.ubo_ranges);
+      struct brw_ubo_range ubo_ranges[4] = {};
+      brw_apply_ubo_ranges(screen->brw, nir, ubo_ranges, &brw_prog_data->base);
 
       struct brw_wm_prog_key brw_key = iris_to_brw_fs_key(screen, key);
 
@@ -2773,7 +2820,7 @@ iris_compile_fs(struct iris_screen *screen,
       error = params.base.error_str;
       if (program) {
          iris_debug_recompile_brw(screen, dbg, ish, &brw_key.base);
-         iris_apply_brw_prog_data(shader, &brw_prog_data->base);
+         iris_apply_brw_prog_data(shader, &brw_prog_data->base, ubo_ranges);
       }
    } else {
 #ifdef INTEL_USE_ELK
@@ -3096,6 +3143,15 @@ iris_compile_cs(struct iris_screen *screen,
       struct brw_cs_prog_data *brw_prog_data =
          rzalloc(mem_ctx, struct brw_cs_prog_data);
 
+      bool subgroup_id_lowered = false;
+      NIR_PASS(subgroup_id_lowered, nir, brw_nir_lower_cs_subgroup_id, devinfo, 0);
+      if (subgroup_id_lowered) {
+         brw_prog_data->base.push_sizes[0] = 4;
+         brw_cs_fill_push_const_info(devinfo, brw_prog_data, 0);
+      } else {
+         brw_cs_fill_push_const_info(devinfo, brw_prog_data, -1);
+      }
+
       struct brw_compile_cs_params params = {
          .base = {
             .mem_ctx = mem_ctx,
@@ -3112,7 +3168,7 @@ iris_compile_cs(struct iris_screen *screen,
       error = params.base.error_str;
       if (program) {
          iris_debug_recompile_brw(screen, dbg, ish, &brw_key.base);
-         iris_apply_brw_prog_data(shader, &brw_prog_data->base);
+         iris_apply_brw_prog_data(shader, &brw_prog_data->base, NULL);
       }
    } else {
 #ifdef INTEL_USE_ELK

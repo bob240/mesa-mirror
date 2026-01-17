@@ -179,7 +179,7 @@ anv_shader_init_uuid(struct anv_physical_device *device)
       device->instance->large_workgroup_non_coherent_image_workaround;
    _mesa_sha1_update(&ctx, &large_wg_wa, sizeof(large_wg_wa));
 
-   uint8_t sha1[20];
+   uint8_t sha1[SHA1_DIGEST_LENGTH];
    _mesa_sha1_final(&ctx, sha1);
    memcpy(device->shader_binary_uuid, sha1, sizeof(device->shader_binary_uuid));
 }
@@ -480,8 +480,7 @@ populate_wm_prog_key(struct brw_wm_prog_key *key,
    populate_base_gfx_prog_key(&key->base, device, rs, state, link_stages);
 
    /* Consider all inputs as valid until look at the NIR variables. */
-   key->color_outputs_valid = rp_color_mask(state);
-   key->nr_color_regions = util_last_bit(key->color_outputs_valid);
+   key->nr_color_regions = util_last_bit(rp_color_mask(state));
 
    /* To reduce possible shader recompilations we would need to know if
     * there is a SampleMask output variable to compute if we should emit
@@ -522,7 +521,6 @@ populate_wm_prog_key(struct brw_wm_prog_key *key,
          key->ignore_sample_mask_out = !key->multisample_fbo;
    } else {
       /* Consider all inputs as valid until we look at the NIR variables. */
-      key->color_outputs_valid = BITFIELD_MASK(MAX_RTS);
       key->nr_color_regions = MAX_RTS;
 
       key->alpha_to_coverage = INTEL_SOMETIMES;
@@ -558,16 +556,12 @@ populate_wm_prog_key(struct brw_wm_prog_key *key,
    }
 
    key->coarse_pixel = pipeline_has_coarse_pixel(state);
-
-   key->null_push_constant_tbimr_workaround =
-      pdevice->info.needs_null_push_constant_tbimr_workaround;
 }
 
 static void
 populate_cs_prog_key(struct brw_cs_prog_key *key,
                      const struct vk_physical_device *device,
-                     const struct vk_pipeline_robustness_state *rs,
-                     bool lower_unaligned_dispatch)
+                     const struct vk_pipeline_robustness_state *rs)
 {
    const struct anv_physical_device *pdevice =
       container_of(device, const struct anv_physical_device, vk);
@@ -575,7 +569,6 @@ populate_cs_prog_key(struct brw_cs_prog_key *key,
    populate_base_prog_key(&key->base, device, rs);
 
    key->base.uses_inline_push_addr = pdevice->info.verx10 >= 125;
-   key->lower_unaligned_dispatch = lower_unaligned_dispatch;
 }
 
 static void
@@ -644,7 +637,7 @@ anv_shader_hash_state(struct vk_physical_device *device,
          _mesa_blake3_update(&blake3_ctx, &key.wm, sizeof(key.wm));
          break;
       case VK_SHADER_STAGE_COMPUTE_BIT:
-         populate_cs_prog_key(&key.cs, device, NULL, false);
+         populate_cs_prog_key(&key.cs, device, NULL);
          _mesa_blake3_update(&blake3_ctx, &key.cs, sizeof(key.cs));
          break;
       default:
@@ -1205,9 +1198,8 @@ anv_shader_compute_fragment_rts(const struct brw_compiler *compiler,
    const unsigned num_rts = util_last_bit64(rt_mask);
    struct anv_pipeline_binding rt_bindings[MAX_RTS];
 
-   shader_data->key.wm.color_outputs_valid = rt_mask & rp_color_mask(state);
    shader_data->key.wm.nr_color_regions =
-      util_last_bit(shader_data->key.wm.color_outputs_valid);
+      util_last_bit(rt_mask & rp_color_mask(state));
 
    if (num_rts > 0) {
       for (unsigned rt = 0; rt < num_rts; rt++) {
@@ -1362,7 +1354,7 @@ anv_shader_lower_nir(struct anv_device *device,
    }
 
    if (nir->info.stage == MESA_SHADER_COMPUTE &&
-       shader_data->key.cs.lower_unaligned_dispatch) {
+       (shader_data->info->flags & VK_SHADER_CREATE_UNALIGNED_DISPATCH_BIT_MESA)) {
       NIR_PASS(_, nir, anv_nir_lower_unaligned_dispatch);
       /* anv_nir_lower_unaligned_dispatch pass uses nir_jump_return that we
        * need to lower it.
@@ -1457,8 +1449,13 @@ anv_shader_lower_nir(struct anv_device *device,
    uint32_t dynamic_descriptors_offsets[MAX_SETS] = {};
    for (uint32_t i = 0; i < set_layout_count; i++) {
       dynamic_descriptors_offsets[i] = dynamic_descriptors_offset;
-      dynamic_descriptors_offset += set_layouts[i] != NULL ?
-         set_layouts[i]->vk.dynamic_descriptor_count : 0;
+      if (set_layouts[i] != NULL) {
+         shader_data->bind_map.binding_mask |= ANV_PIPELINE_BIND_MASK_SET(i);
+         const uint32_t dyn_desc_count =
+            set_layouts[i]->vk.dynamic_descriptor_count;
+         shader_data->bind_map.dynamic_descriptors[i] = dyn_desc_count;
+         dynamic_descriptors_offset += dyn_desc_count;
+      }
    }
 
    /* Apply the actual pipeline layout to UBOs, SSBOs, and textures */
@@ -1469,8 +1466,6 @@ anv_shader_lower_nir(struct anv_device *device,
                 VK_SHADER_CREATE_INDEPENDENT_SETS_BIT_MESA) ? NULL:
                dynamic_descriptors_offsets,
                &shader_data->bind_map, &shader_data->push_map, mem_ctx);
-
-   NIR_PASS(_, nir, anv_nir_lower_driver_values, pdevice);
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             anv_nir_ubo_addr_format(pdevice, shader_data->key.base.robust_flags));
@@ -1542,28 +1537,6 @@ anv_shader_lower_nir(struct anv_device *device,
       NIR_PASS(_, nir, nir_opt_dce);
    }
 
-   NIR_PASS(_, nir, anv_nir_update_resource_intel_block);
-
-   NIR_PASS(_, nir, anv_nir_compute_push_layout,
-               pdevice, shader_data->key.base.robust_flags,
-               &(struct anv_nir_push_layout_info) {
-                  .separate_tessellation = (nir->info.stage == MESA_SHADER_TESS_CTRL &&
-                                            shader_data->key.tcs.separate_tess_vue_layout) ||
-                                           (nir->info.stage == MESA_SHADER_TESS_EVAL &&
-                                            shader_data->key.tes.separate_tess_vue_layout),
-                  .fragment_dynamic      = nir->info.stage == MESA_SHADER_FRAGMENT &&
-                                           brw_wm_prog_key_is_dynamic(&shader_data->key.wm),
-                  .mesh_dynamic          = nir->info.stage == MESA_SHADER_FRAGMENT &&
-                                           shader_data->key.wm.mesh_input == INTEL_SOMETIMES,
-               },
-               &shader_data->key.base,
-               &shader_data->prog_data.base,
-               &shader_data->bind_map, &shader_data->push_map,
-               mem_ctx);
-
-   NIR_PASS(_, nir, anv_nir_lower_resource_intel, pdevice,
-               shader_data->bind_map.layout_type);
-
    if (mesa_shader_stage_uses_workgroup(nir->info.stage)) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types,
                nir_var_mem_shared, shared_type_info);
@@ -1593,6 +1566,30 @@ anv_shader_lower_nir(struct anv_device *device,
       NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics, compiler->devinfo,
                &shader_data->prog_data.cs);
    }
+
+   NIR_PASS(_, nir, anv_nir_lower_driver_values, pdevice);
+
+   NIR_PASS(_, nir, anv_nir_update_resource_intel_block);
+
+   NIR_PASS(_, nir, anv_nir_compute_push_layout,
+               pdevice, shader_data->key.base.robust_flags,
+               &(struct anv_nir_push_layout_info) {
+                  .separate_tessellation = (nir->info.stage == MESA_SHADER_TESS_CTRL &&
+                                            shader_data->key.tcs.separate_tess_vue_layout) ||
+                                           (nir->info.stage == MESA_SHADER_TESS_EVAL &&
+                                            shader_data->key.tes.separate_tess_vue_layout),
+                  .fragment_dynamic      = nir->info.stage == MESA_SHADER_FRAGMENT &&
+                                           brw_wm_prog_key_is_dynamic(&shader_data->key.wm),
+                  .mesh_dynamic          = nir->info.stage == MESA_SHADER_FRAGMENT &&
+                                           shader_data->key.wm.mesh_input == INTEL_SOMETIMES,
+               },
+               &shader_data->key.base,
+               &shader_data->prog_data.base,
+               &shader_data->bind_map, &shader_data->push_map,
+               mem_ctx);
+
+   NIR_PASS(_, nir, anv_nir_lower_resource_intel, pdevice,
+               shader_data->bind_map.layout_type);
 
    shader_data->push_desc_info.push_set_buffer =
       anv_nir_loads_push_desc_buffer(
@@ -1964,8 +1961,7 @@ anv_shader_compile(struct vk_device *vk_device,
          break;
       case MESA_SHADER_COMPUTE:
          populate_cs_prog_key(&shader_data->key.cs, vk_device->physical,
-                              info->robustness,
-                              info->flags & VK_SHADER_CREATE_UNALIGNED_DISPATCH_BIT_MESA);
+                              info->robustness);
          break;
       case MESA_SHADER_RAYGEN:
       case MESA_SHADER_ANY_HIT:

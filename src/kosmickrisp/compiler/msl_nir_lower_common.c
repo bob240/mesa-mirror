@@ -3,6 +3,7 @@
  * Copyright 2025 Google LLC
  * SPDX-License-Identifier: MIT
  */
+#include "msl_private.h"
 #include "nir_to_msl.h"
 
 #include "nir.h"
@@ -279,5 +280,58 @@ msl_nir_vs_io_types(nir_shader *nir)
 {
    assert(nir->info.stage == MESA_SHADER_VERTEX);
    return nir_shader_intrinsics_pass(nir, msl_vs_io_types, nir_metadata_all,
+                                     NULL);
+}
+
+static bool
+fake_guard_for_discards(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
+{
+   if (intrin->intrinsic != nir_intrinsic_demote)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *helper = nir_is_helper_invocation(b, 1);
+   nir_demote_if(b, nir_inot(b, helper));
+   nir_instr_remove(&intrin->instr);
+   return true;
+}
+
+bool
+msl_nir_fake_guard_for_discards(struct nir_shader *nir)
+{
+   assert(nir->info.stage == MESA_SHADER_FRAGMENT);
+
+   /* No side effects, no lowering needed */
+   if (!nir->info.writes_memory)
+      return false;
+
+   return nir_shader_intrinsics_pass(nir, fake_guard_for_discards,
+                                     nir_metadata_control_flow, NULL);
+}
+
+static bool
+lower_clip_distance(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics io = nir_intrinsic_io_semantics(intr);
+   unsigned component = nir_intrinsic_component(intr);
+   if (io.location != VARYING_SLOT_CLIP_DIST0 &&
+       io.location != VARYING_SLOT_CLIP_DIST1)
+      return false;
+
+   unsigned base = (io.location - VARYING_SLOT_CLIP_DIST0) * 4 + component;
+   if (intr->intrinsic == nir_intrinsic_store_output) {
+      b->cursor = nir_after_instr(&intr->instr);
+      nir_store_clip_distance_kk(b, intr->src[0].ssa, .base = base);
+   }
+   return true;
+}
+
+bool
+msl_nir_lower_clip_distance(nir_shader *nir)
+{
+   return nir_shader_intrinsics_pass(nir, lower_clip_distance, nir_metadata_all,
                                      NULL);
 }

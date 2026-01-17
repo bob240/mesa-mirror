@@ -26,6 +26,7 @@
 #define RADV_BUILD_FLAG_PAIR_COMPRESS_TRIANGLES        (1u << (VK_BUILD_FLAG_COUNT + 5))
 #define RADV_BUILD_FLAG_BATCH_COMPRESS_TRIANGLES       (1u << (VK_BUILD_FLAG_COUNT + 6))
 #define RADV_BUILD_FLAG_BATCH_COMPRESS_TRIANGLES_RETRY (1u << (VK_BUILD_FLAG_COUNT + 7))
+#define RADV_BUILD_FLAG_USE_BOX16                      (1u << (VK_BUILD_FLAG_COUNT + 8))
 
 #define RADV_COPY_MODE_COPY        0
 #define RADV_COPY_MODE_SERIALIZE   1
@@ -76,7 +77,6 @@ struct header_args {
 struct update_args {
    REF(radv_accel_struct_header) src;
    REF(radv_accel_struct_header) dst;
-   REF(vk_aabb) leaf_bounds;
    REF(uint32_t) internal_ready_count;
    uint32_t leaf_node_count;
 

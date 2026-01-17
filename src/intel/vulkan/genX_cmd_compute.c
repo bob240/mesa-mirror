@@ -37,6 +37,7 @@
 #include "ds/intel_tracepoints.h"
 
 #include "genX_mi_builder.h"
+#include "nir_builder.h"
 
 void
 genX(cmd_buffer_ensure_cfe_state)(struct anv_cmd_buffer *cmd_buffer,
@@ -136,8 +137,10 @@ cmd_buffer_flush_compute_state(struct anv_cmd_buffer *cmd_buffer)
        *    sufficient."
        */
       anv_add_pending_pipe_bits(cmd_buffer,
-                              ANV_PIPE_CS_STALL_BIT,
-                              "flush compute state");
+                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                ANV_PIPE_CS_STALL_BIT,
+                                "flush compute state");
       genX(cmd_buffer_apply_pipe_flushes)(cmd_buffer);
 #endif
 
@@ -256,7 +259,7 @@ genX(cmd_buffer_flush_compute_state)(struct anv_cmd_buffer *cmd_buffer)
 
 static void
 anv_cmd_buffer_push_workgroups(struct anv_cmd_buffer *cmd_buffer,
-                               const struct brw_cs_prog_data *prog_data,
+                               const struct anv_pipeline_bind_map *bind_map,
                                uint32_t baseGroupX,
                                uint32_t baseGroupY,
                                uint32_t baseGroupZ,
@@ -281,7 +284,8 @@ anv_cmd_buffer_push_workgroups(struct anv_cmd_buffer *cmd_buffer,
    }
 
    /* On Gfx12.5+ this value goes into the inline parameter register */
-   if (GFX_VERx10 < 125 && prog_data->uses_num_work_groups) {
+   if (GFX_VERx10 < 125 &&
+       (bind_map->binding_mask & ANV_PIPELINE_BIND_MASK_USES_NUM_WORKGROUP)) {
       if (anv_address_is_null(indirect_group)) {
          if (push->cs.num_work_groups[0] != groupCountX ||
              push->cs.num_work_groups[1] != groupCountY ||
@@ -639,6 +643,7 @@ void genX(CmdDispatchBase)(
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    struct anv_cmd_compute_state *comp_state = &cmd_buffer->state.compute;
+   const struct anv_pipeline_bind_map *bind_map = &comp_state->shader->bind_map;
    const struct brw_cs_prog_data *prog_data = get_cs_prog_data(comp_state);
    struct intel_cs_dispatch_info dispatch =
       brw_cs_get_dispatch_info(cmd_buffer->device->info, prog_data, NULL);
@@ -646,7 +651,7 @@ void genX(CmdDispatchBase)(
    if (anv_batch_has_error(&cmd_buffer->batch))
       return;
 
-   anv_cmd_buffer_push_workgroups(cmd_buffer, prog_data,
+   anv_cmd_buffer_push_workgroups(cmd_buffer, bind_map,
                                   baseGroupX, baseGroupY, baseGroupZ,
                                   groupCountX, groupCountY, groupCountZ,
                                   ANV_NULL_ADDRESS);
@@ -699,6 +704,7 @@ genX(cmd_dispatch_unaligned)(
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    struct anv_cmd_compute_state *comp_state = &cmd_buffer->state.compute;
+   const struct anv_pipeline_bind_map *bind_map = &comp_state->shader->bind_map;
    const struct brw_cs_prog_data *prog_data = get_cs_prog_data(comp_state);
    if (anv_batch_has_error(&cmd_buffer->batch))
       return;
@@ -711,7 +717,7 @@ genX(cmd_dispatch_unaligned)(
    struct intel_cs_dispatch_info dispatch =
       brw_cs_get_dispatch_info(cmd_buffer->device->info, prog_data, NULL);
 
-   anv_cmd_buffer_push_workgroups(cmd_buffer, prog_data, 0, 0, 0, groupCountX,
+   anv_cmd_buffer_push_workgroups(cmd_buffer, bind_map, 0, 0, 0, groupCountX,
                                   groupCountY, groupCountZ, ANV_NULL_ADDRESS);
 
    /* RT shaders have Y and Z local size set to 1 always. */
@@ -728,7 +734,8 @@ genX(cmd_dispatch_unaligned)(
 
    trace_intel_begin_compute(&cmd_buffer->trace);
 
-   assert(!prog_data->uses_num_work_groups);
+   assert((bind_map->binding_mask &
+           ANV_PIPELINE_BIND_MASK_USES_NUM_WORKGROUP) == 0);
    genX(cmd_buffer_flush_compute_state)(cmd_buffer);
    if (cmd_buffer->state.conditional_render_enabled)
       genX(cmd_emit_conditional_render_predicate)(cmd_buffer);
@@ -757,6 +764,7 @@ genX(cmd_buffer_dispatch_indirect)(struct anv_cmd_buffer *cmd_buffer,
                                    bool is_unaligned_size_x)
 {
    struct anv_cmd_compute_state *comp_state = &cmd_buffer->state.compute;
+   const struct anv_pipeline_bind_map *bind_map = &comp_state->shader->bind_map;
    const struct brw_cs_prog_data *prog_data = get_cs_prog_data(comp_state);
    UNUSED struct anv_batch *batch = &cmd_buffer->batch;
    struct intel_cs_dispatch_info dispatch =
@@ -765,7 +773,7 @@ genX(cmd_buffer_dispatch_indirect)(struct anv_cmd_buffer *cmd_buffer,
    if (anv_batch_has_error(&cmd_buffer->batch))
       return;
 
-   anv_cmd_buffer_push_workgroups(cmd_buffer, prog_data,
+   anv_cmd_buffer_push_workgroups(cmd_buffer, bind_map,
                                   0, 0, 0, 0, 0, 0, indirect_addr);
 
    anv_measure_snapshot(cmd_buffer,
@@ -804,43 +812,36 @@ void genX(CmdDispatchIndirect)(
    genX(cmd_buffer_dispatch_indirect)(cmd_buffer, addr, false);
 }
 
-struct anv_address
-genX(cmd_buffer_ray_query_globals)(struct anv_cmd_buffer *cmd_buffer)
+void
+genX(setup_ray_query_globals)(struct anv_device *device,
+                              struct anv_bo* bo,
+                              uint64_t offset,
+                              void* map,
+                              uint32_t num_queries)
 {
 #if GFX_VERx10 >= 125
-   struct anv_device *device = cmd_buffer->device;
-
-   struct anv_state state =
-      anv_cmd_buffer_alloc_temporary_state(cmd_buffer,
-                                           BRW_RT_DISPATCH_GLOBALS_SIZE, 64);
-   struct brw_rt_scratch_layout layout;
-   uint32_t stack_ids_per_dss = 2048; /* TODO: can we use a lower value in
-                                       * some cases?
-                                       */
-   brw_rt_compute_scratch_layout(&layout, device->info,
-                                 stack_ids_per_dss, 1 << 10);
-
-   uint8_t idx = anv_get_ray_query_bo_index(cmd_buffer);
-
-   const struct GENX(RT_DISPATCH_GLOBALS) rtdg = {
-      .MemBaseAddress = (struct anv_address) {
-         /* The ray query HW computes offsets from the top of the buffer, so
-          * let the address at the end of the buffer.
-          */
-         .bo = device->ray_query_bo[idx],
-         .offset = device->ray_query_bo[idx]->size
-      },
-      .AsyncRTStackSize = layout.ray_stack_stride / 64,
-      .NumDSSRTStacks = layout.stack_ids_per_dss,
-      .MaxBVHLevels = BRW_RT_MAX_BVH_LEVELS,
-      .Flags = RT_DEPTH_TEST_LESS_EQUAL,
-      .ResumeShaderTable = (struct anv_address) {
-         .bo = cmd_buffer->state.ray_query_shadow_bo,
-      },
-   };
-   GENX(RT_DISPATCH_GLOBALS_pack)(NULL, state.map, &rtdg);
-
-   return anv_cmd_buffer_temporary_state_address(cmd_buffer, state);
+   assert(num_queries > 0);
+   uint64_t stack_stride = brw_rt_ray_queries_stacks_stride(device->info);
+   uint32_t ids_per_dss = brw_rt_ray_queries_stack_ids_per_dss(device->info);
+   for (uint32_t i = 0; i < num_queries; ++i)
+      for (uint32_t j = 0; j < 2; j++)
+         GENX(RT_DISPATCH_GLOBALS_pack)(NULL,
+            (char*) map +
+               i * BRW_RT_DISPATCH_GLOBALS_ALIGN +
+               j * align(4 * GENX(RT_DISPATCH_GLOBALS_length), 64),
+            &(struct GENX(RT_DISPATCH_GLOBALS)) {
+               .MemBaseAddress = (struct anv_address) {
+                  /* The ray query HW computes offsets from the top of the
+                   * buffer, so set the address at the end of the buffer.
+                   */
+                  .bo = bo,
+                  .offset = offset - i * stack_stride - j * stack_stride / 2,
+               },
+               .AsyncRTStackSize = BRW_RT_SIZEOF_RAY_QUERY / 64,
+               .NumDSSRTStacks = ids_per_dss,
+               .MaxBVHLevels = BRW_RT_MAX_BVH_LEVELS,
+               .Flags = RT_DEPTH_TEST_LESS_EQUAL,
+            });
 #else
    UNREACHABLE("Not supported");
 #endif

@@ -21,10 +21,6 @@
 #include <sys/utsname.h>
 #include <stdlib.h>
 
-#if AMD_LLVM_AVAILABLE
-#include <llvm-c/TargetMachine.h>
-#endif
-
 struct r600_multi_fence {
 	struct pipe_reference reference;
 	struct pipe_fence_handle *gfx;
@@ -670,7 +666,6 @@ void r600_common_context_cleanup(struct r600_common_context *rctx)
 static const struct debug_named_value common_debug_options[] = {
 	/* logging */
 	{ "tex", DBG_TEX, "Print texture info" },
-	{ "nir", DBG_NIR, "Enable experimental NIR shaders" },
 	{ "compute", DBG_COMPUTE, "Print compute info" },
 	{ "vm", DBG_VM, "Print virtual addresses when creating resources" },
 	{ "info", DBG_INFO, "Print driver information" },
@@ -683,7 +678,7 @@ static const struct debug_named_value common_debug_options[] = {
 	{ "cs", DBG_CS, "Print compute shaders" },
 	{ "tcs", DBG_TCS, "Print tessellation control shaders" },
 	{ "tes", DBG_TES, "Print tessellation evaluation shaders" },
-	{ "preoptir", DBG_PREOPT_IR, "Print the LLVM IR before initial optimizations" },
+	{ "preoptir", DBG_PREOPT_IR, "Print the NIR before initial optimizations" },
 	{ "checkir", DBG_CHECK_IR, "Enable additional sanity checks on shader IR" },
 
 	{ "testdma", DBG_TEST_DMA, "Invoke SDMA tests and exit." },
@@ -759,8 +754,8 @@ static void r600_disk_cache_create(struct r600_common_screen *rscreen)
 		return;
 
 	struct mesa_sha1 ctx;
-	unsigned char sha1[20];
-	char cache_id[20 * 2 + 1];
+	unsigned char sha1[SHA1_DIGEST_LENGTH];
+	char cache_id[SHA1_DIGEST_STRING_LENGTH];
 
 	_mesa_sha1_init(&ctx);
 	if (!disk_cache_get_function_identifier(r600_disk_cache_create,
@@ -768,7 +763,7 @@ static void r600_disk_cache_create(struct r600_common_screen *rscreen)
 		return;
 
 	_mesa_sha1_final(&ctx, sha1);
-	mesa_bytes_to_hex(cache_id, sha1, 20);
+	mesa_bytes_to_hex(cache_id, sha1, SHA1_DIGEST_LENGTH);
 
 	/* These flags affect shader compilation. */
 	rscreen->disk_shader_cache =
@@ -990,11 +985,7 @@ bool r600_common_screen_init(struct r600_common_screen *rscreen,
 			 " / %s", uname_data.release);
 
 	snprintf(rscreen->renderer_string, sizeof(rscreen->renderer_string),
-		 "%s (%sDRM %i.%i.%i%s"
-#if AMD_LLVM_AVAILABLE
-		 ", LLVM " MESA_LLVM_VERSION_STRING
-#endif
-		 ")",
+		 "%s (%sDRM %i.%i.%i%s)",
 		 chip_name, family_name, rscreen->info.drm_major,
 		 rscreen->info.drm_minor, rscreen->info.drm_patchlevel,
 		 kernel_version);
@@ -1087,7 +1078,7 @@ bool r600_common_screen_init(struct r600_common_screen *rscreen,
 		printf("r600_num_banks = %i\n", rscreen->info.r600_num_banks);
 		printf("num_render_backends = %i\n", rscreen->info.max_render_backends);
 		printf("num_tile_pipes = %i\n", rscreen->info.num_tile_pipes);
-		printf("pipe_interleave_bytes = %i\n", rscreen->info.pipe_interleave_bytes);
+		printf("pipe_interleave_bytes = %i\n", rscreen->info.r600_pipe_interleave_bytes);
 		printf("enabled_rb_mask = 0x%" PRIx64 "\n", rscreen->info.enabled_rb_mask);
 		printf("max_alignment = %u\n", (unsigned)rscreen->info.max_alignment);
 	}

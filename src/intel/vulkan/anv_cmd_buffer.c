@@ -442,58 +442,84 @@ anv_cmd_buffer_set_rt_query_buffer(struct anv_cmd_buffer *cmd_buffer,
                                    uint32_t ray_queries,
                                    VkShaderStageFlags stages)
 {
-   struct anv_device *device = cmd_buffer->device;
-   uint8_t idx = anv_get_ray_query_bo_index(cmd_buffer);
+   if (ray_queries > cmd_buffer->state.num_ray_query_globals) {
+      struct anv_device *device = cmd_buffer->device;
+      uint8_t wa_idx = anv_get_ray_query_bo_index(cmd_buffer);
 
-   uint64_t ray_shadow_size =
-      align64(brw_rt_ray_queries_shadow_stacks_size(device->info, ray_queries),
-              4096);
-   if (ray_shadow_size > 0 &&
-       (!cmd_buffer->state.ray_query_shadow_bo ||
-        cmd_buffer->state.ray_query_shadow_bo->size < ray_shadow_size)) {
-      unsigned shadow_size_log2 = MAX2(util_logbase2_ceil(ray_shadow_size), 16);
-      unsigned bucket = shadow_size_log2 - 16;
-      assert(bucket < ARRAY_SIZE(device->ray_query_shadow_bos[0]));
+      unsigned bucket = util_logbase2_ceil(ray_queries);
+      assert(bucket < ARRAY_SIZE(device->ray_query_bos[0]));
 
-      struct anv_bo *bo = p_atomic_read(&device->ray_query_shadow_bos[idx][bucket]);
+      uint64_t offset = brw_rt_ray_queries_stacks_offset(1 << bucket);
+      uint64_t stride = brw_rt_ray_queries_stacks_stride(device->info);
+
+      struct anv_bo *bo = p_atomic_read(&device->ray_query_bos[wa_idx][bucket]);
       if (bo == NULL) {
          struct anv_bo *new_bo;
-         VkResult result = anv_device_alloc_bo(device, "RT queries shadow",
-                                               1 << shadow_size_log2,
-                                               ANV_BO_ALLOC_INTERNAL, /* alloc_flags */
-                                               0, /* explicit_address */
-                                               &new_bo);
+         VkResult result =
+            anv_device_alloc_bo(device, "RT queries scratch",
+                                offset + (stride << bucket), /* size */
+                                ANV_BO_ALLOC_INTERNAL |
+                                ANV_BO_ALLOC_LOCAL_MEM_CPU_VISIBLE, /* alloc_flags */
+                                0, /* explicit_address */
+                                &new_bo);
+
          ANV_DMR_BO_ALLOC(&cmd_buffer->vk.base, new_bo, result);
          if (result != VK_SUCCESS) {
             anv_batch_set_error(&cmd_buffer->batch, result);
             return;
          }
 
-         bo = p_atomic_cmpxchg(&device->ray_query_shadow_bos[idx][bucket], NULL, new_bo);
+         /* Map extra space we added at end of the buffer, we will write the
+          * array of RT_DISPATCH_GLOBALS into it so we can use only a single
+          * memory address in our shaders for all stacks and globals
+          */
+         void *map;
+         result = anv_device_map_bo(device, new_bo, stride << bucket,
+                                    offset, NULL, &map);
+
+         if (result != VK_SUCCESS) {
+            ANV_DMR_BO_FREE(&cmd_buffer->vk.base, new_bo);
+            anv_device_release_bo(device, new_bo);
+            anv_batch_set_error(&cmd_buffer->batch, result);
+            return;
+         }
+
+         anv_genX(device->info, setup_ray_query_globals)(device,
+                                                         new_bo,
+                                                         stride << bucket,
+                                                         map,
+                                                         1 << bucket);
+
+#ifdef SUPPORT_INTEL_INTEGRATED_GPUS
+         if (device->physical->memory.need_flush)
+            util_flush_inval_range(map, offset);
+#endif
+
+         anv_device_unmap_bo(device, new_bo, map, offset, false);
+
+         bo = p_atomic_cmpxchg(&device->ray_query_bos[wa_idx][bucket], NULL, new_bo);
          if (bo != NULL) {
-            ANV_DMR_BO_FREE(&device->vk.base, new_bo);
+            ANV_DMR_BO_FREE(&cmd_buffer->vk.base, new_bo);
             anv_device_release_bo(device, new_bo);
          } else {
             bo = new_bo;
          }
       }
-      cmd_buffer->state.ray_query_shadow_bo = bo;
 
-      /* Add the ray query buffers to the batch list. */
-      anv_reloc_list_add_bo(cmd_buffer->batch.relocs,
-                            cmd_buffer->state.ray_query_shadow_bo);
+      /* Add the HW buffer to the list of BO used. */
+      anv_reloc_list_add_bo(cmd_buffer->batch.relocs, bo);
+
+      cmd_buffer->state.ray_query_globals = (struct anv_address) {
+         .bo = bo,
+         .offset = (int64_t) (stride << bucket),
+      };
+
+      cmd_buffer->state.num_ray_query_globals = 1 << bucket;
    }
 
-   /* Add the HW buffer to the list of BO used. */
-   assert(device->ray_query_bo[idx]);
-   anv_reloc_list_add_bo(cmd_buffer->batch.relocs,
-                         device->ray_query_bo[idx]);
-
-   /* Fill the push constants & mark them dirty. */
-   struct anv_address ray_query_globals_addr =
-      anv_genX(device->info, cmd_buffer_ray_query_globals)(cmd_buffer);
+   /* Update the push constants & mark them dirty. */
    pipeline_state->push_constants.ray_query_globals =
-      anv_address_physical(ray_query_globals_addr);
+      anv_address_physical(cmd_buffer->state.ray_query_globals);
    cmd_buffer->state.push_constants_dirty |= stages;
    pipeline_state->push_constants_data_dirty = true;
 }
@@ -1299,13 +1325,14 @@ anv_cmd_buffer_set_stack_size(struct vk_command_buffer *vk_cmd_buffer,
    if (anv_batch_has_error(&cmd_buffer->batch))
       return;
 
-   uint32_t stack_ids_per_dss = 2048; /* TODO */
+   uint32_t stack_ids_per_dss =
+      brw_rt_ray_queries_stack_ids_per_dss(device->info);
 
    unsigned stack_size_log2 = util_logbase2_ceil(stack_size);
    if (stack_size_log2 < 10)
       stack_size_log2 = 10;
 
-   if (rt->scratch.layout.total_size == 1 << stack_size_log2)
+   if (rt->scratch.layout.sw_stack_size == 1 << stack_size_log2)
       return;
 
    brw_rt_compute_scratch_layout(&rt->scratch.layout, device->info,
@@ -1588,10 +1615,12 @@ bind_graphics_shaders(struct anv_cmd_buffer *cmd_buffer,
             set_dirty_for_bind_map(cmd_buffer, s, &shader->bind_map);
 
          for (uint32_t i = 0; i < MAX_SETS; i++) {
-            assert(dynamic_descriptors[i] == 0 ||
-                   dynamic_descriptors[i] ==
-                   shader->bind_map.dynamic_descriptors[i]);
-            dynamic_descriptors[i] = shader->bind_map.dynamic_descriptors[i];
+            if (shader->bind_map.binding_mask & ANV_PIPELINE_BIND_MASK_SET(i)) {
+               assert(dynamic_descriptors[i] == 0 ||
+                      dynamic_descriptors[i] ==
+                      shader->bind_map.dynamic_descriptors[i]);
+               dynamic_descriptors[i] = shader->bind_map.dynamic_descriptors[i];
+            }
          }
       }
 
@@ -1768,4 +1797,61 @@ anv_cmd_buffer_bind_shaders(struct vk_command_buffer *vk_cmd_buffer,
       bind_compute_shader(cmd_buffer, cs_shader);
    if (memcmp(gfx_shaders, cmd_buffer->state.gfx.shaders, sizeof(gfx_shaders)))
       bind_graphics_shaders(cmd_buffer, gfx_shaders);
+}
+
+struct anv_companion_prev_cmd_buffer_helper
+anv_begin_companion_cmd_buffer_helper(struct anv_cmd_buffer **cmd_buffer,
+                                      bool needs_companion)
+{
+   if (likely(!needs_companion))
+      return (struct anv_companion_prev_cmd_buffer_helper) { 0 };
+
+   struct anv_cmd_buffer* prev_cmd_buffer = *cmd_buffer;
+   const struct intel_device_info *info = prev_cmd_buffer->device->info;
+
+   const VkResult result = anv_cmd_buffer_ensure_rcs_companion(prev_cmd_buffer);
+   if (result != VK_SUCCESS) {
+      anv_batch_set_error(&prev_cmd_buffer->batch, result);
+      return (struct anv_companion_prev_cmd_buffer_helper) { 0 };
+   }
+
+   assert(prev_cmd_buffer->companion_rcs_cmd_buffer != NULL);
+
+   /* Re-emit the aux table register in every command buffer.  This way we're
+    * ensured that we have the table even if this command buffer doesn't
+    * initialize any images.
+    */
+   if (prev_cmd_buffer->device->info->has_aux_map) {
+      anv_add_pending_pipe_bits(prev_cmd_buffer->companion_rcs_cmd_buffer,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                 ANV_PIPE_AUX_TABLE_INVALIDATE_BIT,
+                                 "new cmd buffer with aux-tt");
+   }
+
+   struct anv_state syncpoint =
+      anv_genX(info, cmd_buffer_begin_companion_rcs_syncpoint)(prev_cmd_buffer);
+
+   *cmd_buffer = prev_cmd_buffer->companion_rcs_cmd_buffer;
+
+   return (struct anv_companion_prev_cmd_buffer_helper) {
+      .prev_cmd_buffer = prev_cmd_buffer,
+      .syncpoint = syncpoint,
+   };
+}
+
+void
+anv_end_companion_cmd_buffer_helper(struct anv_cmd_buffer **cmd_buffer,
+                                    struct anv_companion_prev_cmd_buffer_helper prev_cmd_buffer)
+{
+   if (likely(!prev_cmd_buffer.prev_cmd_buffer))
+      return;
+
+   if (prev_cmd_buffer.syncpoint.alloc_size) {
+      const struct intel_device_info *info = (*cmd_buffer)->device->info;
+      anv_genX(info, cmd_buffer_end_companion_rcs_syncpoint)(prev_cmd_buffer.prev_cmd_buffer,
+                                                             prev_cmd_buffer.syncpoint);
+   }
+
+   *cmd_buffer = prev_cmd_buffer.prev_cmd_buffer;
 }

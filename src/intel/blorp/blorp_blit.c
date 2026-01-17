@@ -25,6 +25,7 @@
 #include "compiler/nir/nir_format_convert.h"
 
 #include "blorp_priv.h"
+#include "blorp_shaders.h"
 #include "dev/intel_debug.h"
 #include "dev/intel_device_info.h"
 
@@ -47,11 +48,10 @@ struct blorp_blit_vars {
 };
 
 static void
-blorp_blit_vars_init(nir_builder *b, struct blorp_blit_vars *v,
-                         const struct blorp_blit_prog_key *key)
+blorp_blit_vars_init(nir_builder *b, struct blorp_blit_vars *v)
 {
 #define LOAD_INPUT(name, type)\
-   v->v_##name = BLORP_CREATE_NIR_INPUT(b->shader, name, type);
+   v->v_##name = BLORP_CREATE_NIR_INPUT(b->shader, blit.name, type);
 
    LOAD_INPUT(bounds_rect, glsl_vec4_type())
    LOAD_INPUT(rect_grid, glsl_vec4_type())
@@ -110,7 +110,7 @@ blorp_blit_get_cs_dst_coords(nir_builder *b,
       coord = nir_isub(b, coord, nir_load_var(b, v->v_dst_offset));
 
    assert(!key->persample_msaa_dispatch);
-   return nir_trim_vector(b, coord, 2);
+   return nir_trim_vector(b, coord, key->dst_samples > 1 ? 3 : 2);
 }
 
 /**
@@ -1179,10 +1179,15 @@ convert_color(struct nir_builder *b, nir_def *color,
  */
 static nir_shader *
 blorp_build_nir_shader(struct blorp_context *blorp,
-                           struct blorp_batch *batch, void *mem_ctx,
-                           const struct blorp_blit_prog_key *key)
+                       struct blorp_batch *batch, void *mem_ctx,
+                       const struct blorp_blit_prog_key *key)
 {
    const struct intel_device_info *devinfo = blorp->isl_dev->info;
+
+   /* Compute MSAA is only available on Gfx30+ */
+   if (key->base.shader_pipeline == BLORP_SHADER_PIPELINE_COMPUTE)
+      assert(key->dst_samples == 1 || devinfo->ver >= 30);
+
    nir_def *src_pos, *dst_pos, *color;
 
    /* Sanity checks */
@@ -1200,6 +1205,7 @@ blorp_build_nir_shader(struct blorp_context *blorp,
       /* It only makes sense to do persample dispatch if the render target is
        * configured as multisampled.
        */
+      assert(key->base.shader_pipeline == BLORP_SHADER_PIPELINE_RENDER);
       assert(key->rt_samples > 0);
    }
 
@@ -1221,7 +1227,7 @@ blorp_build_nir_shader(struct blorp_context *blorp,
    blorp_nir_init_shader(&b, blorp, mem_ctx, stage, NULL);
 
    struct blorp_blit_vars v;
-   blorp_blit_vars_init(&b, &v, key);
+   blorp_blit_vars_init(&b, &v);
 
    dst_pos = compute ?
       blorp_blit_get_cs_dst_coords(&b, key, &v) :
@@ -1280,8 +1286,9 @@ blorp_build_nir_shader(struct blorp_context *blorp,
    nir_if *bounds_if = NULL;
    if (key->use_kill) {
       nir_def *bounds_rect = nir_load_var(&b, v.v_bounds_rect);
-      nir_def *in_bounds = blorp_check_in_bounds(&b, bounds_rect,
-                                                     dst_pos);
+      nir_def *in_bounds =
+         blorp_check_in_bounds(&b, bounds_rect,
+                               nir_trim_vector(&b, dst_pos, 2));
       if (!compute)
          nir_discard_if(&b, nir_inot(&b, in_bounds));
       else
@@ -1478,12 +1485,30 @@ blorp_build_nir_shader(struct blorp_context *blorp,
 
    if (compute) {
       nir_def *store_pos = nir_load_global_invocation_id(&b, 32);
+
+      /* Load sample index for MSAA image store */
+      nir_def *sample_idx = nir_imm_int(&b, 0);
+
+      if (key->dst_samples > 1) {
+         nir_def *num_layers_data =
+            nir_load_inline_data_intel(&b, 1, 32,
+               .base = BLORP_INLINE_PARAM_THREAD_GROUP_ID_Z_DIMENSION);
+
+         nir_def *z_pos = nir_umod(&b, nir_channel(&b, store_pos, 2),
+                                   num_layers_data);
+         sample_idx = nir_idiv(&b, nir_channel(&b, store_pos, 2),
+                               num_layers_data);
+
+         store_pos = nir_vector_insert_imm(&b, store_pos, z_pos, 2);
+      }
       nir_image_store(&b, nir_imm_int(&b, 0),
                       nir_pad_vector_imm_int(&b, store_pos, 0, 4),
-                      nir_imm_int(&b, 0),
+                      sample_idx,
                       nir_pad_vector_imm_int(&b, color, 0, 4),
                       nir_imm_int(&b, 0),
-                      .image_dim = GLSL_SAMPLER_DIM_2D,
+                      .image_dim = key->dst_samples > 1 ?
+                                   GLSL_SAMPLER_DIM_MS:
+                                   GLSL_SAMPLER_DIM_2D,
                       .image_array = true,
                       .access = ACCESS_NON_READABLE);
    } else if (key->dst_usage == ISL_SURF_USAGE_RENDER_TARGET_BIT) {
@@ -1528,6 +1553,8 @@ blorp_get_blit_kernel_fs(struct blorp_batch *batch,
    void *mem_ctx = ralloc_context(NULL);
 
    nir_shader *nir = blorp_build_nir_shader(blorp, batch, mem_ctx, key);
+   assert(blorp_op_type_is_blit(params->op));
+
    nir->info.name =
       ralloc_strdup(nir, blorp_shader_type_to_name(key->base.shader_type));
 
@@ -1562,10 +1589,12 @@ blorp_get_blit_kernel_cs(struct blorp_batch *batch,
 
    nir_shader *nir = blorp_build_nir_shader(blorp, batch, mem_ctx,
                                                 prog_key);
+   assert(blorp_op_type_is_blit(params->op));
+
    nir->info.name = ralloc_strdup(nir, "BLORP-gpgpu-blit");
    blorp_set_cs_dims(nir, prog_key->local_y);
 
-   assert(prog_key->rt_samples == 1);
+   assert(batch->blorp->isl_dev->info->ver >= 30 || prog_key->rt_samples == 1);
 
    const struct blorp_program p =
       blorp_compile_cs(blorp, mem_ctx, nir);
@@ -1933,16 +1962,16 @@ try_blorp_blit(struct blorp_batch *batch,
    /* Round floating point values to nearest integer to avoid "off by one texel"
     * kind of errors when blitting.
     */
-   params->x0 = params->wm_inputs.bounds_rect.x0 = round(coords->x.dst0);
-   params->y0 = params->wm_inputs.bounds_rect.y0 = round(coords->y.dst0);
-   params->x1 = params->wm_inputs.bounds_rect.x1 = round(coords->x.dst1);
-   params->y1 = params->wm_inputs.bounds_rect.y1 = round(coords->y.dst1);
+   params->x0 = params->wm_inputs.blit.bounds_rect.x0 = round(coords->x.dst0);
+   params->y0 = params->wm_inputs.blit.bounds_rect.y0 = round(coords->y.dst0);
+   params->x1 = params->wm_inputs.blit.bounds_rect.x1 = round(coords->x.dst1);
+   params->y1 = params->wm_inputs.blit.bounds_rect.y1 = round(coords->y.dst1);
 
-   blorp_setup_coord_transform(&params->wm_inputs.coord_transform[0],
+   blorp_setup_coord_transform(&params->wm_inputs.blit.coord_transform[0],
                                    coords->x.src0, coords->x.src1,
                                    coords->x.dst0, coords->x.dst1,
                                    coords->x.mirror);
-   blorp_setup_coord_transform(&params->wm_inputs.coord_transform[1],
+   blorp_setup_coord_transform(&params->wm_inputs.blit.coord_transform[1],
                                    coords->y.src0, coords->y.src1,
                                    coords->y.dst0, coords->y.dst1,
                                    coords->y.mirror);
@@ -2055,7 +2084,8 @@ try_blorp_blit(struct blorp_batch *batch,
       key->use_kill = true;
       key->need_dst_offset = true;
 
-      if (params->dst.surf.samples > 1) {
+      if (key->base.shader_pipeline == BLORP_SHADER_PIPELINE_RENDER &&
+          params->dst.surf.samples > 1) {
          /* If the destination surface is a W-tiled multisampled stencil
           * buffer that we're mapping as Y tiled, then we need to arrange for
           * the WM program to run once per sample rather than once per pixel,
@@ -2109,10 +2139,10 @@ try_blorp_blit(struct blorp_batch *batch,
        batch->blorp->isl_dev->info->ver <= 6) {
       /* Gfx4-5 don't support non-normalized texture coordinates */
       key->src_coords_normalized = true;
-      params->wm_inputs.src_inv_size[0] =
+      params->wm_inputs.blit.src_inv_size[0] =
          1.0f / u_minify(params->src.surf.logical_level0_px.width,
                          params->src.view.base_level);
-      params->wm_inputs.src_inv_size[1] =
+      params->wm_inputs.blit.src_inv_size[1] =
          1.0f / u_minify(params->src.surf.logical_level0_px.height,
                          params->src.view.base_level);
    }
@@ -2174,23 +2204,23 @@ try_blorp_blit(struct blorp_batch *batch,
    if (params->src.tile_x_sa || params->src.tile_y_sa) {
       assert(key->need_src_offset);
       surf_get_intratile_offset_px(&params->src,
-                                   &params->wm_inputs.src_offset.x,
-                                   &params->wm_inputs.src_offset.y);
+                                   &params->wm_inputs.blit.src_offset.x,
+                                   &params->wm_inputs.blit.src_offset.y);
    }
 
    if (params->dst.tile_x_sa || params->dst.tile_y_sa) {
       assert(key->need_dst_offset);
       surf_get_intratile_offset_px(&params->dst,
-                                   &params->wm_inputs.dst_offset.x,
-                                   &params->wm_inputs.dst_offset.y);
-      params->x0 += params->wm_inputs.dst_offset.x;
-      params->y0 += params->wm_inputs.dst_offset.y;
-      params->x1 += params->wm_inputs.dst_offset.x;
-      params->y1 += params->wm_inputs.dst_offset.y;
+                                   &params->wm_inputs.blit.dst_offset.x,
+                                   &params->wm_inputs.blit.dst_offset.y);
+      params->x0 += params->wm_inputs.blit.dst_offset.x;
+      params->y0 += params->wm_inputs.blit.dst_offset.y;
+      params->x1 += params->wm_inputs.blit.dst_offset.x;
+      params->y1 += params->wm_inputs.blit.dst_offset.y;
    }
 
    /* For some texture types, we need to pass the layer through the sampler. */
-   params->wm_inputs.src_z = params->src.z_offset;
+   params->wm_inputs.blit.src_z = params->src.z_offset;
 
    const bool compute =
       key->base.shader_pipeline == BLORP_SHADER_PIPELINE_COMPUTE;
@@ -2434,10 +2464,8 @@ blorp_blit_supports_compute(struct blorp_context *blorp,
                             const struct isl_surf *dst_surf,
                             enum isl_aux_usage dst_aux_usage)
 {
-   /* Our compiler doesn't currently support typed image writes with MSAA.
-    * Also, our BLORP compute shaders don't handle multisampling cases.
-    */
-   if (dst_surf->samples > 1 || src_surf->samples > 1)
+   /* Platforms < Xe3 doesn't support typed image writes with MSAA. */
+   if (blorp->isl_dev->info->ver < 30 && dst_surf->samples > 1)
       return false;
 
    if (blorp->isl_dev->info->ver >= 12) {
@@ -2557,9 +2585,9 @@ blorp_blit(struct blorp_batch *batch,
    }
 
    blorp_surface_info_init(batch, &params.src, src_surf, src_level,
-                               src_layer, src_format, false);
+                           src_layer, src_format, false);
    blorp_surface_info_init(batch, &params.dst, dst_surf, dst_level,
-                               dst_layer, dst_format, true);
+                           dst_layer, dst_format, true);
 
    params.src.view.swizzle = src_swizzle;
    params.dst.view.swizzle = dst_swizzle;
@@ -2592,10 +2620,10 @@ blorp_blit(struct blorp_batch *batch,
       key.x_scale = 2.0f;
    key.y_scale = params.src.surf.samples / key.x_scale;
 
-   params.wm_inputs.rect_grid.x1 =
+   params.wm_inputs.blit.rect_grid.x1 =
       u_minify(params.src.surf.logical_level0_px.width, src_level) *
       key.x_scale - 1.0f;
-   params.wm_inputs.rect_grid.y1 =
+   params.wm_inputs.blit.rect_grid.y1 =
       u_minify(params.src.surf.logical_level0_px.height, src_level) *
       key.y_scale - 1.0f;
 
@@ -2971,9 +2999,9 @@ blorp_copy(struct blorp_batch *batch,
    }
 
    blorp_surface_info_init(batch, &params.src, src_surf, src_level,
-                               src_layer, ISL_FORMAT_UNSUPPORTED, false);
+                           src_layer, ISL_FORMAT_UNSUPPORTED, false);
    blorp_surface_info_init(batch, &params.dst, dst_surf, dst_level,
-                               dst_layer, ISL_FORMAT_UNSUPPORTED, true);
+                           dst_layer, ISL_FORMAT_UNSUPPORTED, true);
 
    struct blorp_blit_prog_key key = {
       .base = BLORP_BASE_KEY_INIT(BLORP_SHADER_TYPE_COPY),
@@ -3067,10 +3095,10 @@ blorp_copy(struct blorp_batch *batch,
       params.x1 = dst_x + dst_width;
       params.y0 = dst_y;
       params.y1 = dst_y + dst_height;
-      params.wm_inputs.coord_transform[0].offset = dst_x - (float)src_x;
-      params.wm_inputs.coord_transform[1].offset = dst_y - (float)src_y;
-      params.wm_inputs.coord_transform[0].multiplier = 1.0f;
-      params.wm_inputs.coord_transform[1].multiplier = 1.0f;
+      params.wm_inputs.blit.coord_transform[0].offset = dst_x - (float)src_x;
+      params.wm_inputs.blit.coord_transform[1].offset = dst_y - (float)src_y;
+      params.wm_inputs.blit.coord_transform[0].multiplier = 1.0f;
+      params.wm_inputs.blit.coord_transform[1].multiplier = 1.0f;
 
       batch->blorp->exec(batch, &params);
       return;

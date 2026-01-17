@@ -23,6 +23,7 @@
 
 #include "drm-uapi/drm.h"
 
+#include "util/cache_ops.h"
 #include "util/log.h"
 #include "util/macros.h"
 #include "util/os_file.h"
@@ -31,6 +32,7 @@
 #include "util/simple_mtx.h"
 #include "util/sparse_array.h"
 #include "util/u_atomic.h"
+#include "util/u_dynarray.h"
 #include "util/perf/cpu_trace.h"
 
 #include "kmod/panthor_kmod.h"
@@ -102,6 +104,19 @@ enum pan_kmod_bo_flags {
     * is called.
     */
    PAN_KMOD_BO_FLAG_GPU_UNCACHED = BITFIELD_BIT(5),
+
+   /* CPU map the buffer object in userspace by forcing the "Write-Back
+    * Cacheable" cacheability attribute. The mapping otherwise uses the
+    * "Non-Cacheable" attribute if the ACE-Lite coherency protocol isn't
+    * supported by the GPU.
+    */
+   PAN_KMOD_BO_FLAG_WB_MMAP = BITFIELD_BIT(6),
+
+   /* Set by default when the device is IO coherent. We might want to
+    * make it optional at some point and pass a NON_COHERENT flag to
+    * the KMD to force non-coherent mappings on IO coherent setup.
+    */
+   PAN_KMOD_BO_FLAG_IO_COHERENT = BITFIELD_BIT(7),
 };
 
 /* Allowed group priority flags. */
@@ -138,6 +153,9 @@ struct pan_kmod_bo {
 
    /* Combination of pan_kmod_bo_flags flags. */
    uint32_t flags;
+
+   /* True if some deferred syncs targetting this BO are pending. */
+   bool has_pending_deferred_syncs;
 
    /* If non-NULL, the buffer object can only by mapped on this VM. Typical
     * the case for all internal/non-shareable buffers. The backend can
@@ -205,11 +223,22 @@ struct pan_kmod_dev_props {
    /* Support cycle count and timestamp propagation as job requirement */
    bool gpu_can_query_timestamp;
 
+   /* Cycle counter and timestamp device coherent propogation is enabled */
+   bool timestamp_device_coherent;
+
    /* GPU Timestamp frequency */
    uint64_t timestamp_frequency;
 
    /* A mask of flags containing the allowed group priorities. */
    enum pan_kmod_group_allow_priority_flags allowed_group_priorities_mask;
+
+   /* Mask of BO flags supported by the KMD. */
+   uint32_t supported_bo_flags;
+
+   /* GPU is IO coherent, meaning BOs can be created with WB_MMAP without
+    * requiring explicit CPU cache maintenance.
+    */
+   bool is_io_coherent;
 };
 
 /* Memory allocator for kmod internal allocations. */
@@ -339,6 +368,9 @@ enum pan_kmod_dev_flags {
     * owned by the device, iff the device creation succeeded.
     */
    PAN_KMOD_DEV_FLAG_OWNS_FD = (1 << 0),
+
+   /* Force BO syncs through the kernel. */
+   PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL = (1 << 1),
 };
 
 /* Encode a virtual address range. */
@@ -365,10 +397,6 @@ struct pan_kmod_ops {
 
    /* Destroy a pan_kmod_dev object. */
    void (*dev_destroy)(struct pan_kmod_dev *dev);
-
-   /* Query device properties. */
-   void (*dev_query_props)(const struct pan_kmod_dev *dev,
-                           struct pan_kmod_dev_props *props);
 
    /* Query the maxium user VA range.
     * Users are free to use a subset of this range if they need less VA space.
@@ -402,6 +430,9 @@ struct pan_kmod_ops {
 
    /* Get the file offset to use to mmap() a buffer object. */
    off_t (*bo_get_mmap_offset)(struct pan_kmod_bo *bo);
+
+   /* Flush the pending BO map syncs. */
+   int (*flush_bo_map_syncs)(struct pan_kmod_dev *dev);
 
    /* Wait for a buffer object to be ready for read or read/write accesses. */
    bool (*bo_wait)(struct pan_kmod_bo *bo, int64_t timeout_ns,
@@ -452,6 +483,32 @@ struct pan_kmod_driver {
    } version;
 };
 
+static inline bool
+pan_kmod_driver_version_at_least(const struct pan_kmod_driver *driver,
+                                 uint32_t major, uint32_t minor)
+{
+   if (driver->version.major < major)
+      return false;
+
+   if (driver->version.major > major)
+      return true;
+
+   return driver->version.minor >= minor;
+}
+
+enum pan_kmod_bo_sync_type {
+   PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH,
+   PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE,
+};
+
+/* Used to queue BO sync operations. */
+struct pan_kmod_deferred_bo_sync {
+   struct pan_kmod_bo *bo;
+   uint64_t start;
+   uint64_t size;
+   enum pan_kmod_bo_sync_type type;
+};
+
 /* Device object. */
 struct pan_kmod_dev {
    /* FD attached to the device. */
@@ -462,6 +519,9 @@ struct pan_kmod_dev {
 
    /* KMD backing this device. */
    struct pan_kmod_driver driver;
+
+   /* KMD-agnostic device properties. */
+   struct pan_kmod_dev_props props;
 
    /* kmod backend ops assigned at device creation. */
    const struct pan_kmod_ops *ops;
@@ -476,6 +536,13 @@ struct pan_kmod_dev {
       struct util_sparse_array array;
       simple_mtx_t lock;
    } handle_to_bo;
+
+   /* Pending BO syncs. */
+   struct {
+      bool user_cache_ops_pending;
+      struct util_dynarray array;
+      simple_mtx_t lock;
+   } pending_bo_syncs;
 
    /* Allocator attached to the device. */
    const struct pan_kmod_allocator *allocator;
@@ -496,25 +563,15 @@ pan_kmod_dev_create(int fd, uint32_t flags,
 
 void pan_kmod_dev_destroy(struct pan_kmod_dev *dev);
 
-static inline void
-pan_kmod_dev_query_props(const struct pan_kmod_dev *dev,
-                         struct pan_kmod_dev_props *props)
-{
-   dev->ops->dev_query_props(dev, props);
-}
-
 static inline struct pan_kmod_va_range
 pan_kmod_dev_query_user_va_range(const struct pan_kmod_dev *dev)
 {
    if (dev->ops->dev_query_user_va_range)
       return dev->ops->dev_query_user_va_range(dev);
 
-   struct pan_kmod_dev_props props;
-
-   pan_kmod_dev_query_props(dev, &props);
    return (struct pan_kmod_va_range){
       .start = 0,
-      .size = 1ull << MMU_FEATURES_VA_BITS(props.mmu_features),
+      .size = 1ull << MMU_FEATURES_VA_BITS(dev->props.mmu_features),
    };
 }
 
@@ -622,6 +679,10 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, off_t bo_offset, size_t size, int prot,
 {
    off_t mmap_offset;
 
+   /* Don't bother trying an mmap() if it's not allowed. */
+   if (bo->flags & PAN_KMOD_BO_FLAG_NO_MMAP)
+      return MAP_FAILED;
+
    if ((uint64_t)bo_offset + (uint64_t)size > bo->size)
       return MAP_FAILED;
 
@@ -637,6 +698,19 @@ pan_kmod_bo_mmap(struct pan_kmod_bo *bo, off_t bo_offset, size_t size, int prot,
 
    return host_addr;
 }
+
+static inline bool
+pan_kmod_can_sync_bo_map_from_userland(struct pan_kmod_dev *dev)
+{
+   return util_has_cache_ops() &&
+          !(dev->flags & PAN_KMOD_DEV_FLAG_MMAP_SYNC_THROUGH_KERNEL);
+}
+
+void pan_kmod_queue_bo_map_sync(struct pan_kmod_bo *bo, uint64_t bo_offset,
+                                void *cpu_ptr, uint64_t range,
+                                enum pan_kmod_bo_sync_type type);
+
+void pan_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev);
 
 static inline void
 pan_kmod_set_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const char *label)

@@ -6,6 +6,7 @@
 #include "nir.h"
 #include "nir_range_analysis.h"
 #include "sid.h"
+#include "si_pipe.h"
 
 void si_get_shader_variant_info(struct si_shader *shader,
                                 struct si_temp_shader_variant_info *temp_info, nir_shader *nir)
@@ -39,19 +40,54 @@ void si_get_shader_variant_info(struct si_shader *shader,
 
    nir_foreach_block(block, nir_shader_get_entrypoint(nir)) {
       nir_foreach_instr(instr, block) {
+         unsigned mask;
+
          switch (instr->type) {
          case nir_instr_type_intrinsic: {
             nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
 
             switch (intr->intrinsic) {
+            case nir_intrinsic_load_local_invocation_id:
+               mask = nir_def_components_read(&intr->def);
+               if (mask & BITFIELD_BIT(0))
+                  shader->info.uses_sysval_local_invocation_id_x = true;
+               if (mask & BITFIELD_BIT(1))
+                  shader->info.uses_sysval_local_invocation_id_y = true;
+               if (mask & BITFIELD_BIT(2))
+                  shader->info.uses_sysval_local_invocation_id_z = true;
+               break;
+            case nir_intrinsic_load_workgroup_id:
+               mask = nir_def_components_read(&intr->def);
+               if (mask & BITFIELD_BIT(0))
+                  shader->info.uses_sysval_workgroup_id_x = true;
+               if (mask & BITFIELD_BIT(1))
+                  shader->info.uses_sysval_workgroup_id_y = true;
+               if (mask & BITFIELD_BIT(2))
+                  shader->info.uses_sysval_workgroup_id_z = true;
+               break;
+            case nir_intrinsic_load_workgroup_size:
+               shader->info.uses_sysval_workgroup_size = true;
+               break;
+            case nir_intrinsic_load_num_workgroups:
+               shader->info.uses_sysval_num_workgroups = true;
+               break;
+            case nir_intrinsic_load_num_subgroups:
+               shader->info.uses_sgpr_tg_size = true;
+               break;
+            case nir_intrinsic_load_local_invocation_index:
+            case nir_intrinsic_load_subgroup_id:
+               /* GFX12 computes these using subgroup_id from ttmp8. */
+               if (shader->selector->screen->info.gfx_level < GFX12)
+                  shader->info.uses_sgpr_tg_size = true;
+               break;
             case nir_intrinsic_load_instance_id:
-               shader->info.uses_instance_id = true;
+               shader->info.uses_sysval_instance_id = true;
                break;
             case nir_intrinsic_load_base_instance:
-               shader->info.uses_base_instance = true;
+               shader->info.uses_sysval_base_instance = true;
                break;
             case nir_intrinsic_load_draw_id:
-               shader->info.uses_draw_id = true;
+               shader->info.uses_sysval_draw_id = true;
                break;
             case nir_intrinsic_load_frag_coord:
             case nir_intrinsic_load_sample_pos:
@@ -70,8 +106,8 @@ void si_get_shader_variant_info(struct si_shader *shader,
                        shader->key.ge.mono.instance_divisor_is_fetched) &
                       BITFIELD_BIT(nir_intrinsic_base(intr))) {
                      /* Instanced attribs. */
-                     shader->info.uses_instance_id = true;
-                     shader->info.uses_base_instance = true;
+                     shader->info.uses_sysval_instance_id = true;
+                     shader->info.uses_sysval_base_instance = true;
                   }
                } else if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
                   shader->info.uses_vmem_load_other = true;
@@ -96,11 +132,11 @@ void si_get_shader_variant_info(struct si_shader *shader,
                }
                break;
             }
-            case nir_intrinsic_load_color0:
+            case nir_intrinsic_load_color0_amd:
                assert(!shader->is_monolithic);
                shader->info.ps_colors_read |= nir_def_components_read(&intr->def);
                break;
-            case nir_intrinsic_load_color1:
+            case nir_intrinsic_load_color1_amd:
                assert(!shader->is_monolithic);
                shader->info.ps_colors_read |= nir_def_components_read(&intr->def) << 4;
                break;
@@ -237,8 +273,7 @@ void si_get_shader_variant_info(struct si_shader *shader,
                   shader->info.ps_inputs[index].semantic =
                      (back ? VARYING_SLOT_BFC0 : VARYING_SLOT_COL0) + i;
 
-                  enum glsl_interp_mode mode = i ? nir->info.fs.color1_interp
-                                                 : nir->info.fs.color0_interp;
+                  enum glsl_interp_mode mode = shader->selector->info.color_interpolate[i];
                   shader->info.ps_inputs[index].interpolate =
                      mode == INTERP_MODE_NONE ? INTERP_MODE_COLOR : mode;
                   index++;
@@ -302,6 +337,71 @@ void si_get_shader_variant_info(struct si_shader *shader,
          shader->info.clipdist_mask = SI_USER_CLIP_PLANE_MASK;
 
       shader->info.clipdist_mask &= ~shader->key.ge.opt.kill_clip_distances;
+   }
+
+   if (nir->info.stage == MESA_SHADER_COMPUTE ||
+       nir->info.stage == MESA_SHADER_KERNEL ||
+       nir->info.stage == MESA_SHADER_TASK) {
+      /* nir_clear_shared_memory uses local_invocation_index. */
+      if (shader->selector->screen->info.gfx_level < GFX12 &&
+          si_should_clear_lds(shader->selector->screen, nir))
+         shader->info.uses_sgpr_tg_size = true;
+
+      /* Determine user SGPRs for compute shader. This includes descriptors in user SGPRs.
+       *
+       * Variable block sizes need 10 bits (1 + log2(SI_MAX_VARIABLE_THREADS_PER_BLOCK)) per dim.
+       * We pack them into a single user SGPR.
+       */
+      unsigned num_user_sgprs = SI_NUM_RESOURCE_SGPRS + (shader->info.uses_sysval_num_workgroups ? 3 : 0) +
+                            (shader->info.uses_sysval_workgroup_size ? 1 : 0) +
+                            shader->selector->nir->info.cs.user_data_components_amd;
+
+      if (nir->info.stage == MESA_SHADER_TASK) {
+         /* task ring entry and draw id
+          * note uses_draw_id is only available after shader variant creation
+          */
+         num_user_sgprs += shader->info.uses_sysval_draw_id ? 3 : 2;
+      } else {
+         /* Compute shaders */
+         /* Fast path for compute shaders - some descriptors passed via user SGPRs. */
+         /* Shader buffers in user SGPRs. */
+         for (unsigned i = 0; i < MIN2(3, nir->info.num_ssbos) && num_user_sgprs <= 12; i++) {
+            num_user_sgprs = align(num_user_sgprs, 4);
+            if (i == 0)
+               shader->info.cs_shaderbufs_sgpr_index = num_user_sgprs;
+            num_user_sgprs += 4;
+            shader->info.cs_num_shaderbufs_in_user_sgprs++;
+         }
+
+         /* Images in user SGPRs. */
+         unsigned non_fmask_images = BITFIELD_MASK(nir->info.num_images);
+
+         /* Remove images with FMASK from the bitmask.  We only care about the first
+          * 3 anyway, so we can take msaa_images[0] and ignore the rest.
+          */
+         if (shader->selector->screen->info.gfx_level < GFX11)
+            non_fmask_images &= ~nir->info.msaa_images[0];
+
+         for (unsigned i = 0; i < 3 && non_fmask_images & (1 << i); i++) {
+            unsigned num_sgprs = BITSET_TEST(nir->info.image_buffers, i) ? 4 : 8;
+
+            if (align(num_user_sgprs, num_sgprs) + num_sgprs > 16)
+               break;
+
+            num_user_sgprs = align(num_user_sgprs, num_sgprs);
+            if (i == 0)
+               shader->info.cs_images_sgpr_index = num_user_sgprs;
+            num_user_sgprs += num_sgprs;
+            shader->info.cs_num_images_in_user_sgprs++;
+         }
+
+         shader->info.cs_images_num_sgprs = num_user_sgprs - shader->info.cs_images_sgpr_index;
+         /* Only the first few bits matter. */
+         shader->info.cs_image_buffer_mask = nir->info.image_buffers[0];
+      }
+
+      assert(num_user_sgprs <= 16);
+      shader->info.cs_num_user_sgprs = num_user_sgprs;
    }
 }
 
@@ -423,7 +523,20 @@ void si_fixup_spi_ps_input_config(struct si_shader *shader)
       shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
    }
 
-   /* At least one pair of interpolation weights must be enabled. */
-   if (!(shader->config.spi_ps_input_ena & 0x7f))
-      shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
+   /* At least one pair of barycentric coordinates or LINE_STIPPLE_TEX_ENA must be enabled.
+    * Since LINE_STIPPLE_TEX_ENA is the only one that loads only 1 VGPR, use it.
+    *
+    * We can't set LINE_STIPPLE_TEX_ENA on GFX12 because it reduces primitive throughput to only
+    * 1 SE. Other gens are fine (tested on Navi10, Navi21, Navi31).
+    * TODO: Test Strix Halo.
+    */
+   if (!(shader->config.spi_ps_input_ena & 0x7f) &&
+       !G_0286CC_LINE_STIPPLE_TEX_ENA(shader->config.spi_ps_input_ena)) {
+      /* LLVM sets PERSP_SAMPLE_ENA in this case, so we have to do the same. */
+      if (shader->selector->info.base.use_aco_amd &&
+          shader->selector->screen->info.gfx_level != GFX12)
+         shader->config.spi_ps_input_ena |= S_0286CC_LINE_STIPPLE_TEX_ENA(1);
+      else
+         shader->config.spi_ps_input_ena |= S_0286CC_PERSP_SAMPLE_ENA(1);
+   }
 }

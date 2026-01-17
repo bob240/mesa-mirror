@@ -5,26 +5,64 @@
  */
 
 #include "ac_cmdbuf.h"
+#include "ac_cmdbuf_cp.h"
 #include "ac_spm.h"
 
 #include "util/bitscan.h"
+#include "util/compiler.h"
 #include "util/u_memory.h"
 #include "ac_perfcounter.h"
 
 /* SPM counters definition. */
 /* GFX10+ */
-static struct ac_spm_counter_descr gfx10_tcp_perf_sel_req = {TCP, 0x9};
-static struct ac_spm_counter_descr gfx10_tcp_perf_sel_req_miss = {TCP, 0x12};
-static struct ac_spm_counter_descr gfx10_sqc_perf_sel_dcache_hits = {SQ, 0x14f};
-static struct ac_spm_counter_descr gfx10_sqc_perf_sel_dcache_misses = {SQ, 0x150};
-static struct ac_spm_counter_descr gfx10_sqc_perf_sel_dcache_misses_duplicate = {SQ, 0x151};
-static struct ac_spm_counter_descr gfx10_sqc_perf_sel_icache_hits = {SQ, 0x12c};
-static struct ac_spm_counter_descr gfx10_sqc_perf_sel_icache_misses = {SQ, 0x12d};
-static struct ac_spm_counter_descr gfx10_sqc_perf_sel_icache_misses_duplicate = {SQ, 0x12e};
-static struct ac_spm_counter_descr gfx10_gl1c_perf_sel_req = {GL1C, 0xe};
-static struct ac_spm_counter_descr gfx10_gl1c_perf_sel_req_miss = {GL1C, 0x12};
-static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_req = {GL2C, 0x3};
-static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_miss = {GL2C, 0x23};
+static struct ac_spm_counter_descr gfx10_tcp_perf_sel_req =
+   {AC_SPM_TCP_PERF_SEL_REQ, TCP, 0x9};
+static struct ac_spm_counter_descr gfx10_tcp_perf_sel_req_miss =
+   {AC_SPM_TCP_PERF_SEL_REQ_MISS, TCP, 0x12};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_dcache_hits =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_HITS, SQ, 0x14f};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_dcache_misses =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_MISSES, SQ, 0x150};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_dcache_misses_duplicate =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_MISSES_DUPLICATE, SQ, 0x151};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_icache_hits =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_HITS, SQ, 0x12c};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_icache_misses =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_MISSES, SQ, 0x12d};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_icache_misses_duplicate =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_MISSES_DUPLICATE, SQ, 0x12e};
+static struct ac_spm_counter_descr gfx10_gl1c_perf_sel_req =
+   {AC_SPM_GL1C_PERF_SEL_REQ, GL1C, 0xe};
+static struct ac_spm_counter_descr gfx10_gl1c_perf_sel_req_miss =
+   {AC_SPM_GL1C_PERF_SEL_REQ_MISS, GL1C, 0x12};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_req =
+   {AC_SPM_GL2C_PERF_SEL_REQ, GL2C, 0x3};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_miss =
+   {AC_SPM_GL2C_PERF_SEL_MISS, GL2C, 0x23};
+static struct ac_spm_counter_descr gfx10_cpf_perf_sel_stat_busy =
+   {AC_SPM_CPF_PERF_SEL_STAT_BUSY, CPF, 0x18};
+static struct ac_spm_counter_descr gfx10_sqc_perf_sel_lds_bank_conflict =
+   {AC_SPM_SQC_PERF_SEL_LDS_BANK_CONFLICT, SQ, 0x11d};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_ea_rdreq_32b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_32B, GL2C, 0x59};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_ea_rdreq_64b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_64B, GL2C, 0x5a};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_ea_rdreq_96b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_96B, GL2C, 0x5b};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_ea_rdreq_128b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_128B, GL2C, 0x5c};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_ea_wrreq =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ, GL2C, 0x4b};
+static struct ac_spm_counter_descr gfx10_gl2c_perf_sel_ea_wrreq_64b =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ_64B, GL2C, 0x4c};
+static struct ac_spm_counter_descr gfx10_gcea_perf_sel_sarb_dram_sized_requests =
+   {AC_SPM_GCEA_PERF_SEL_SARB_DRAM_SIZED_REQUESTS, GCEA, 0x37};
+static struct ac_spm_counter_descr gfx10_gcea_perf_sel_sarb_io_sized_requests =
+   {AC_SPM_GCEA_PERF_SEL_SARB_IO_SIZED_REQUESTS, GCEA, 0x39};
+static struct ac_spm_counter_descr gfx10_ta_perf_sel_ta_busy =
+   {AC_SPM_TA_PERF_SEL_TA_BUSY, TA, 0xf};
+static struct ac_spm_counter_descr gfx10_tcp_perf_sel_tcp_ta_req_stall =
+   {AC_SPM_TCP_PERF_SEL_TCP_TA_REQ_STALL, TCP, 0x24};
 
 static struct ac_spm_counter_create_info gfx10_spm_counters[] = {
    {&gfx10_tcp_perf_sel_req},
@@ -39,10 +77,41 @@ static struct ac_spm_counter_create_info gfx10_spm_counters[] = {
    {&gfx10_gl1c_perf_sel_req_miss},
    {&gfx10_gl2c_perf_sel_req},
    {&gfx10_gl2c_perf_sel_miss},
+   {&gfx10_cpf_perf_sel_stat_busy},
+   {&gfx10_sqc_perf_sel_lds_bank_conflict},
+   {&gfx10_gl2c_perf_sel_ea_rdreq_32b},
+   {&gfx10_gl2c_perf_sel_ea_rdreq_64b},
+   {&gfx10_gl2c_perf_sel_ea_rdreq_96b},
+   {&gfx10_gl2c_perf_sel_ea_rdreq_128b},
+   {&gfx10_gl2c_perf_sel_ea_wrreq},
+   {&gfx10_gl2c_perf_sel_ea_wrreq_64b},
+   {&gfx10_gcea_perf_sel_sarb_dram_sized_requests},
+   {&gfx10_gcea_perf_sel_sarb_io_sized_requests},
+   {&gfx10_ta_perf_sel_ta_busy},
+   {&gfx10_tcp_perf_sel_tcp_ta_req_stall},
 };
 
 /* GFX10.3+ */
-static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_miss = {GL2C, 0x2b};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_miss =
+   {AC_SPM_GL2C_PERF_SEL_MISS, GL2C, 0x2b};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_ea_rdreq_32b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_32B, GL2C, 0x63};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_ea_rdreq_64b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_64B, GL2C, 0x64};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_ea_rdreq_96b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_96B, GL2C, 0x65};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_ea_rdreq_128b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_128B, GL2C, 0x66};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_ea_wrreq =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ, GL2C, 0x53};
+static struct ac_spm_counter_descr gfx103_gl2c_perf_sel_ea_wrreq_64b =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ_64B, GL2C, 0x55};
+static struct ac_spm_counter_descr gfx103_td_perf_sel_ray_tracing_bvh4_tri_node =
+   {AC_SPM_TD_PERF_SEL_RAY_TRACING_BVH4_TRI_NODE, TD, 0x76};
+static struct ac_spm_counter_descr gfx103_td_perf_sel_ray_tracing_bvh4_fp16_box_node =
+   {AC_SPM_TD_PERF_SEL_RAY_TRACING_BVH4_FP16_BOX_NODE, TD, 0x74};
+static struct ac_spm_counter_descr gfx103_td_perf_sel_ray_tracing_bvh4_fp32_box_node =
+   {AC_SPM_TD_PERF_SEL_RAY_TRACING_BVH4_FP32_BOX_NODE, TD, 0x75};
 
 static struct ac_spm_counter_create_info gfx103_spm_counters[] = {
    {&gfx10_tcp_perf_sel_req},
@@ -57,16 +126,42 @@ static struct ac_spm_counter_create_info gfx103_spm_counters[] = {
    {&gfx10_gl1c_perf_sel_req_miss},
    {&gfx10_gl2c_perf_sel_req},
    {&gfx103_gl2c_perf_sel_miss},
+   {&gfx10_cpf_perf_sel_stat_busy},
+   {&gfx10_sqc_perf_sel_lds_bank_conflict},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_32b},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_64b},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_96b},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_128b},
+   {&gfx103_gl2c_perf_sel_ea_wrreq},
+   {&gfx103_gl2c_perf_sel_ea_wrreq_64b},
+   {&gfx10_gcea_perf_sel_sarb_dram_sized_requests},
+   {&gfx10_gcea_perf_sel_sarb_io_sized_requests},
+   {&gfx10_ta_perf_sel_ta_busy},
+   {&gfx10_tcp_perf_sel_tcp_ta_req_stall},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_tri_node},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_fp16_box_node},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_fp32_box_node},
 };
 
 /* GFX11+ */
-static struct ac_spm_counter_descr gfx11_tcp_perf_sel_req_miss = {TCP, 0x11};
-static struct ac_spm_counter_descr gfx11_sqc_perf_sel_dcache_hits = {SQ_WGP, 0x126};
-static struct ac_spm_counter_descr gfx11_sqc_perf_sel_dcache_misses = {SQ_WGP, 0x127};
-static struct ac_spm_counter_descr gfx11_sqc_perf_sel_dcache_misses_duplicate = {SQ_WGP, 0x128};
-static struct ac_spm_counter_descr gfx11_sqc_perf_sel_icache_hits = {SQ_WGP, 0x10e};
-static struct ac_spm_counter_descr gfx11_sqc_perf_sel_icache_misses = {SQ_WGP, 0x10f};
-static struct ac_spm_counter_descr gfx11_sqc_perf_sel_icache_misses_duplicate = {SQ_WGP, 0x110};
+static struct ac_spm_counter_descr gfx11_tcp_perf_sel_req_miss =
+   {AC_SPM_TCP_PERF_SEL_REQ_MISS, TCP, 0x11};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_dcache_hits =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_HITS, SQ_WGP, 0x126};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_dcache_misses =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_MISSES, SQ_WGP, 0x127};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_dcache_misses_duplicate =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_MISSES_DUPLICATE, SQ_WGP, 0x128};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_icache_hits =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_HITS, SQ_WGP, 0x10e};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_icache_misses =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_MISSES, SQ_WGP, 0x10f};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_icache_misses_duplicate =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_MISSES_DUPLICATE, SQ_WGP, 0x110};
+static struct ac_spm_counter_descr gfx11_sqc_perf_sel_lds_bank_conflict =
+   {AC_SPM_SQC_PERF_SEL_LDS_BANK_CONFLICT, SQ_WGP, 0x100};
+static struct ac_spm_counter_descr gfx11_tcp_perf_sel_tcp_ta_req_stall =
+   {AC_SPM_TCP_PERF_SEL_TCP_TA_REQ_STALL, TCP, 0x27};
 
 static struct ac_spm_counter_create_info gfx11_spm_counters[] = {
    {&gfx10_tcp_perf_sel_req},
@@ -81,16 +176,62 @@ static struct ac_spm_counter_create_info gfx11_spm_counters[] = {
    {&gfx10_gl1c_perf_sel_req_miss},
    {&gfx10_gl2c_perf_sel_req},
    {&gfx103_gl2c_perf_sel_miss},
+   {&gfx10_cpf_perf_sel_stat_busy},
+   {&gfx11_sqc_perf_sel_lds_bank_conflict},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_32b},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_64b},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_96b},
+   {&gfx103_gl2c_perf_sel_ea_rdreq_128b},
+   {&gfx103_gl2c_perf_sel_ea_wrreq},
+   {&gfx103_gl2c_perf_sel_ea_wrreq_64b},
+   {&gfx10_gcea_perf_sel_sarb_dram_sized_requests},
+   {&gfx10_gcea_perf_sel_sarb_io_sized_requests},
+   {&gfx10_ta_perf_sel_ta_busy},
+   {&gfx11_tcp_perf_sel_tcp_ta_req_stall},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_tri_node},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_fp16_box_node},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_fp32_box_node},
 };
 
 /* GFX12+ */
-static struct ac_spm_counter_descr gfx12_sqc_perf_sel_dcache_hits = {SQ_WGP, 0x146};
-static struct ac_spm_counter_descr gfx12_sqc_perf_sel_dcache_misses = {SQ_WGP, 0x147};
-static struct ac_spm_counter_descr gfx12_sqc_perf_sel_dcache_misses_duplicate = {SQ_WGP, 0x148};
-static struct ac_spm_counter_descr gfx12_sqc_perf_sel_icache_hits = {SQ_WGP, 0x12e};
-static struct ac_spm_counter_descr gfx12_sqc_perf_sel_icache_misses = {SQ_WGP, 0x12f};
-static struct ac_spm_counter_descr gfx12_sqc_perf_sel_icache_misses_duplicate = {SQ_WGP, 0x130};
-static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_miss = {GL2C, 0x2a};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_dcache_hits =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_HITS, SQ_WGP, 0x146};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_dcache_misses =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_MISSES, SQ_WGP, 0x147};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_dcache_misses_duplicate =
+   {AC_SPM_SQC_PERF_SEL_DCACHE_MISSES_DUPLICATE, SQ_WGP, 0x148};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_icache_hits =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_HITS, SQ_WGP, 0x12e};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_icache_misses =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_MISSES, SQ_WGP, 0x12f};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_icache_misses_duplicate =
+   {AC_SPM_SQC_PERF_SEL_ICACHE_MISSES_DUPLICATE, SQ_WGP, 0x130};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_miss =
+   {AC_SPM_GL2C_PERF_SEL_MISS, GL2C, 0x2a};
+static struct ac_spm_counter_descr gfx12_sqc_perf_sel_lds_bank_conflict =
+   {AC_SPM_SQC_PERF_SEL_LDS_BANK_CONFLICT, SQ_WGP, 0x120};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_rdreq_32b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_32B, GL2C, 0x92};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_rdreq_64b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_64B, GL2C, 0x93};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_rdreq_128b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_128B, GL2C, 0x94};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_rdreq_256b =
+   {AC_SPM_GL2C_PERF_SEL_EA_RDREQ_256B, GL2C, 0x95};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_wrreq =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ, GL2C, 0x6c};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_wrreq_64b =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ_64B, GL2C, 0x72};
+static struct ac_spm_counter_descr gfx12_gcea_cpwd_perf_sel_sarb_dram_rd_size_req =
+   {AC_SPM_GCEA_CPWD_PERF_SEL_SARB_DRAM_RD_SIZE_REQ, GCEA_CPWD, 0x3};
+static struct ac_spm_counter_descr gfx12_gcea_cpwd_perf_sel_sarb_dram_wr_size_req =
+   {AC_SPM_GCEA_CPWD_PERF_SEL_SARB_DRAM_WR_SIZE_REQ, GCEA_CPWD, 0x4};
+static struct ac_spm_counter_descr gfx12_gcea_se_perf_sel_sarb_io_rd_size_req =
+   {AC_SPM_GCEA_SE_PERF_SEL_SARB_IO_RD_SIZE_REQ, GCEA_SE, 0x1};
+static struct ac_spm_counter_descr gfx12_gcea_se_perf_sel_sarb_io_wr_size_req =
+   {AC_SPM_GCEA_SE_PERF_SEL_SARB_IO_WR_SIZE_REQ, GCEA_SE, 0x2};
+static struct ac_spm_counter_descr gfx12_gl2c_perf_sel_ea_wrreq_stall =
+   {AC_SPM_GL2C_PERF_SEL_EA_WRREQ_STALL, GL2C, 0x7a};
 
 static struct ac_spm_counter_create_info gfx12_spm_counters[] = {
    {&gfx10_tcp_perf_sel_req},
@@ -103,6 +244,24 @@ static struct ac_spm_counter_create_info gfx12_spm_counters[] = {
    {&gfx12_sqc_perf_sel_icache_misses_duplicate},
    {&gfx10_gl2c_perf_sel_req},
    {&gfx12_gl2c_perf_sel_miss},
+   {&gfx10_cpf_perf_sel_stat_busy},
+   {&gfx12_sqc_perf_sel_lds_bank_conflict},
+   {&gfx12_gl2c_perf_sel_ea_rdreq_32b},
+   {&gfx12_gl2c_perf_sel_ea_rdreq_64b},
+   {&gfx12_gl2c_perf_sel_ea_rdreq_128b},
+   {&gfx12_gl2c_perf_sel_ea_rdreq_256b},
+   {&gfx12_gl2c_perf_sel_ea_wrreq},
+   {&gfx12_gl2c_perf_sel_ea_wrreq_64b},
+   {&gfx12_gcea_cpwd_perf_sel_sarb_dram_rd_size_req},
+   {&gfx12_gcea_cpwd_perf_sel_sarb_dram_wr_size_req},
+   {&gfx12_gcea_se_perf_sel_sarb_io_rd_size_req},
+   {&gfx12_gcea_se_perf_sel_sarb_io_wr_size_req},
+   {&gfx10_ta_perf_sel_ta_busy},
+   {&gfx11_tcp_perf_sel_tcp_ta_req_stall},
+   {&gfx12_gl2c_perf_sel_ea_wrreq_stall},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_tri_node},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_fp16_box_node},
+   {&gfx103_td_perf_sel_ray_tracing_bvh4_fp32_box_node},
 };
 
 static struct ac_spm_block_select *
@@ -131,13 +290,13 @@ ac_spm_get_block_select(struct ac_spm *spm, const struct ac_pc_block *block)
 
    new_block_sel->b = block;
    new_block_sel->instances =
-      calloc(block->num_global_instances, sizeof(*new_block_sel->instances));
+      calloc(block->num_instances, sizeof(*new_block_sel->instances));
    if (!new_block_sel->instances)
       return NULL;
-   new_block_sel->num_instances = block->num_global_instances;
+   new_block_sel->num_instances = block->num_instances;
 
    for (unsigned i = 0; i < new_block_sel->num_instances; i++)
-      new_block_sel->instances[i].num_counters = block->b->b->num_spm_counters;
+      new_block_sel->instances[i].num_counters = block->b->b->num_spm_modules;
 
    return new_block_sel;
 }
@@ -156,29 +315,33 @@ ac_spm_init_instance_mapping(const struct radeon_info *info,
 {
    uint32_t instance_index = 0, se_index = 0, sa_index = 0;
 
-   if (block->b->b->flags & AC_PC_BLOCK_SE) {
-      if (block->b->b->gpu_block == SQ) {
-         /* Per-SE blocks. */
-         se_index = counter->instance / block->num_instances;
-         instance_index = counter->instance % block->num_instances;
-      } else {
-         /* Per-SA blocks. */
-         assert(block->b->b->gpu_block == GL1C ||
-                block->b->b->gpu_block == TCP ||
-                block->b->b->gpu_block == SQ_WGP);
-         se_index = (counter->instance / block->num_instances) / info->max_sa_per_se;
-         sa_index = (counter->instance / block->num_instances) % info->max_sa_per_se;
-         instance_index = counter->instance % block->num_instances;
-      }
-   } else {
-      /* Global blocks. */
-      assert(block->b->b->gpu_block == GL2C);
+   switch (block->b->b->distribution) {
+   case AC_PC_GLOBAL_BLOCK:
+      /* Global blocks have a one-to-one instance mapping. */
       instance_index = counter->instance;
+      break;
+   case AC_PC_PER_SHADER_ENGINE:
+      /* We want the SE index to be the outer index and the local instance to
+       * be the inner index.
+       */
+      se_index = counter->instance / block->num_scoped_instances;
+      instance_index = counter->instance % block->num_scoped_instances;
+      break;
+   case AC_PC_PER_SHADER_ARRAY:
+      /* From the outermost to the innermost, the internal indices are in the
+       * order: SE, SA, local instance.
+       */
+      se_index = (counter->instance / block->num_scoped_instances) / info->max_sa_per_se;
+      sa_index = (counter->instance / block->num_scoped_instances) % info->max_sa_per_se;
+      instance_index = counter->instance % block->num_scoped_instances;
+      break;
+   default:
+      UNREACHABLE("Invalid perf block distribution mode.");
    }
 
    if (se_index >= info->num_se ||
        sa_index >= info->max_sa_per_se ||
-       instance_index >= block->num_instances)
+       instance_index >= block->num_scoped_instances)
       return false;
 
    mapping->se_index = se_index;
@@ -221,18 +384,20 @@ ac_spm_init_grbm_gfx_index(const struct ac_pc_block *block,
    grbm_gfx_index |= S_030800_SE_INDEX(mapping->se_index) |
                      S_030800_SH_INDEX(mapping->sa_index);
 
-   switch (block->b->b->gpu_block) {
-   case GL2C:
-      /* Global blocks. */
+   switch (block->b->b->distribution) {
+   case AC_PC_GLOBAL_BLOCK:
+      /* Global block writes should broadcast to SEs and SAs. */
       grbm_gfx_index |= S_030800_SE_BROADCAST_WRITES(1);
-      break;
-   case SQ:
-      /* Per-SE blocks. */
+      FALLTHROUGH;
+   case AC_PC_PER_SHADER_ENGINE:
+      /* Per-SE block writes should broadcast to SAs. */
       grbm_gfx_index |= S_030800_SH_BROADCAST_WRITES(1);
       break;
-   default:
+   case AC_PC_PER_SHADER_ARRAY:
       /* Other blocks shouldn't broadcast. */
       break;
+   default:
+      UNREACHABLE("Invalid perf block distribution mode.");
    }
 
    if (block->b->b->gpu_block == SQ_WGP) {
@@ -353,7 +518,8 @@ ac_spm_map_counter(struct ac_spm *spm, struct ac_spm_block_select *block_sel,
                               S_037008_PERF_MODE3(0);
             break;
          default:
-            return false;
+            /*  Try to program the new counter slot. */
+            continue;
          }
 
          /* Mark this 16-bit counter as used. */
@@ -392,7 +558,7 @@ ac_spm_add_counter(const struct radeon_info *info,
    }
 
    /* Check if the number of instances is valid. */
-   if (counter_info->instance > block->num_global_instances - 1) {
+   if (counter_info->instance > block->num_instances - 1) {
       fprintf(stderr, "ac/spm: Invalid instance ID.\n");
       return false;
    }
@@ -406,6 +572,7 @@ ac_spm_add_counter(const struct radeon_info *info,
    counter = &spm->counters[spm->num_counters];
    spm->num_counters++;
 
+   counter->id = counter_info->b->id;
    counter->gpu_block = counter_info->b->gpu_block;
    counter->event_id = counter_info->b->event_id;
    counter->instance = counter_info->instance;
@@ -527,10 +694,12 @@ bool ac_init_spm(const struct radeon_info *info,
    for (unsigned i = 0; i < create_info_count; i++) {
       const struct ac_pc_block *block = ac_pc_get_block(pc, create_info[i].b->gpu_block);
 
-      if (!block)
+      if (!block) {
+         fprintf(stderr, "ac/spm: Unknown group.\n");
          return false;
+      }
 
-      num_counters += block->num_global_instances;
+      num_counters += block->num_instances;
    }
 
    spm->counters = CALLOC(num_counters, sizeof(*spm->counters));
@@ -541,7 +710,9 @@ bool ac_init_spm(const struct radeon_info *info,
       const struct ac_pc_block *block = ac_pc_get_block(pc, create_info[i].b->gpu_block);
       struct ac_spm_counter_create_info counter = create_info[i];
 
-      for (unsigned j = 0; j < block->num_global_instances; j++) {
+      assert(block->num_instances > 0);
+
+      for (unsigned j = 0; j < block->num_instances; j++) {
          counter.instance = j;
 
          if (!ac_spm_add_counter(info, pc, spm, &counter)) {
@@ -688,6 +859,915 @@ bool ac_spm_get_trace(const struct ac_spm *spm, struct ac_spm_trace *trace)
    trace->sample_size_in_bytes = ac_spm_get_sample_size(spm);
 
    return ac_spm_get_num_samples(spm, &trace->num_samples);
+}
+
+/* SPM components. */
+/* Instruction cache components. */
+static struct ac_spm_derived_component_descr gfx10_inst_cache_request_count_comp = {
+   .id = AC_SPM_COMPONENT_INST_CACHE_REQUEST_COUNT,
+   .counter_id = AC_SPM_COUNTER_INST_CACHE_HIT,
+   .name = "Requests",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_inst_cache_hit_count_comp = {
+   .id = AC_SPM_COMPONENT_INST_CACHE_HIT_COUNT,
+   .counter_id = AC_SPM_COUNTER_INST_CACHE_HIT,
+   .name = "Hits",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_inst_cache_miss_count_comp = {
+   .id = AC_SPM_COMPONENT_INST_CACHE_MISS_COUNT,
+   .counter_id = AC_SPM_COUNTER_INST_CACHE_HIT,
+   .name = "Misses",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+/* Scalar cache components. */
+static struct ac_spm_derived_component_descr gfx10_scalar_cache_request_count_comp = {
+   .id = AC_SPM_COMPONENT_SCALAR_CACHE_REQUEST_COUNT,
+   .counter_id = AC_SPM_COUNTER_SCALAR_CACHE_HIT,
+   .name = "Requests",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_scalar_cache_hit_count_comp = {
+   .id = AC_SPM_COMPONENT_SCALAR_CACHE_HIT_COUNT,
+   .counter_id = AC_SPM_COUNTER_SCALAR_CACHE_HIT,
+   .name = "Hits",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_scalar_cache_miss_count_comp = {
+   .id = AC_SPM_COMPONENT_SCALAR_CACHE_MISS_COUNT,
+   .counter_id = AC_SPM_COUNTER_SCALAR_CACHE_HIT,
+   .name = "Misses",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+/* L0 cache components. */
+static struct ac_spm_derived_component_descr gfx10_l0_cache_request_count_comp = {
+   .id = AC_SPM_COMPONENT_L0_CACHE_REQUEST_COUNT,
+   .counter_id = AC_SPM_COUNTER_L0_CACHE_HIT,
+   .name = "Requests",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_l0_cache_hit_count_comp = {
+   .id = AC_SPM_COMPONENT_L0_CACHE_HIT_COUNT,
+   .counter_id = AC_SPM_COUNTER_L0_CACHE_HIT,
+   .name = "Hits",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_l0_cache_miss_count_comp = {
+   .id = AC_SPM_COMPONENT_L0_CACHE_MISS_COUNT,
+   .counter_id = AC_SPM_COUNTER_L0_CACHE_HIT,
+   .name = "Misses",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+/* L1 cache components. */
+static struct ac_spm_derived_component_descr gfx10_l1_cache_request_count_comp = {
+   .id = AC_SPM_COMPONENT_L1_CACHE_REQUEST_COUNT,
+   .counter_id = AC_SPM_COUNTER_L1_CACHE_HIT,
+   .name = "Requests",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_l1_cache_hit_count_comp = {
+   .id = AC_SPM_COMPONENT_L1_CACHE_HIT_COUNT,
+   .counter_id = AC_SPM_COUNTER_L1_CACHE_HIT,
+   .name = "Hits",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_l1_cache_miss_count_comp = {
+   .id = AC_SPM_COMPONENT_L1_CACHE_MISS_COUNT,
+   .counter_id = AC_SPM_COUNTER_L1_CACHE_HIT,
+   .name = "Misses",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+/* L2 cache components. */
+static struct ac_spm_derived_component_descr gfx10_l2_cache_request_count_comp = {
+   .id = AC_SPM_COMPONENT_L2_CACHE_REQUEST_COUNT,
+   .counter_id = AC_SPM_COUNTER_L2_CACHE_HIT,
+   .name = "Requests",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_l2_cache_hit_count_comp = {
+   .id = AC_SPM_COMPONENT_L2_CACHE_HIT_COUNT,
+   .counter_id = AC_SPM_COUNTER_L2_CACHE_HIT,
+   .name = "Hits",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_l2_cache_miss_count_comp = {
+   .id = AC_SPM_COMPONENT_L2_CACHE_MISS_COUNT,
+   .counter_id = AC_SPM_COUNTER_L2_CACHE_HIT,
+   .name = "Misses",
+   .usage = AC_SPM_USAGE_ITEMS,
+};
+
+static struct ac_spm_derived_component_descr gfx10_gpu_busy_cycles_comp = {
+   .id = AC_SPM_COMPONENT_GPU_BUSY_CYCLES,
+   .counter_id = AC_SPM_COUNTER_CS_LDS_BANK_CONFLICT,
+   .name = "Gpu Busy Cycles",
+   .usage = AC_SPM_USAGE_CYCLES,
+};
+
+static struct ac_spm_derived_component_descr gfx10_cs_lds_bank_conflict_cycles_comp = {
+   .id = AC_SPM_COMPONENT_CS_LDS_BANK_CONFLICT_CYCLES,
+   .counter_id = AC_SPM_COUNTER_CS_LDS_BANK_CONFLICT,
+   .name = "LDS Busy Cycles",
+   .usage = AC_SPM_USAGE_CYCLES,
+};
+
+static struct ac_spm_derived_component_descr gfx10_mem_unit_busy_cycles_comp = {
+   .id = AC_SPM_COMPONENT_MEM_UNIT_BUSY_CYCLES,
+   .counter_id = AC_SPM_COUNTER_MEM_UNIT_BUSY,
+   .name = "Memory unit busy cycles",
+   .usage = AC_SPM_USAGE_CYCLES,
+};
+
+static struct ac_spm_derived_component_descr gfx10_mem_unit_stalled_cycles_comp = {
+   .id = AC_SPM_COMPONENT_MEM_UNIT_STALLED_CYCLES,
+   .counter_id = AC_SPM_COUNTER_MEM_UNIT_STALLED,
+   .name = "Memory unit stalled cycles",
+   .usage = AC_SPM_USAGE_CYCLES,
+};
+
+static struct ac_spm_derived_component_descr gfx12_write_unit_stalled_cycles_comp = {
+   .id = AC_SPM_COMPONENT_WRITE_UNIT_STALLED_CYCLES,
+   .counter_id = AC_SPM_COUNTER_WRITE_UNIT_STALLED,
+   .name = "Write unit stalled cycles",
+   .usage = AC_SPM_USAGE_CYCLES,
+};
+
+/* SPM counters. */
+static struct ac_spm_derived_counter_descr gfx10_inst_cache_hit_counter = {
+   .id = AC_SPM_COUNTER_INST_CACHE_HIT,
+   .group_id = AC_SPM_GROUP_CACHE,
+   .name = "Instruction cache hit",
+   .desc = "The percentage of read requests made that hit the data in the "
+           "Instruction cache. The Instruction cache supplies shader code to an "
+           "executing shader. Each request is 64 bytes in size. Value range: 0% "
+           "(no hit) to 100% (optimal).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 3,
+   .components = {
+      &gfx10_inst_cache_request_count_comp,
+      &gfx10_inst_cache_hit_count_comp,
+      &gfx10_inst_cache_miss_count_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_scalar_cache_hit_counter = {
+   .id = AC_SPM_COUNTER_SCALAR_CACHE_HIT,
+   .group_id = AC_SPM_GROUP_CACHE,
+   .name = "Scalar cache hit",
+   .desc = "The percentage of read requests made from executing shader code "
+           "that hit the data in the Scalar cache. The Scalar cache contains data "
+           "that does not vary in each thread across the wavefront. Each request is "
+           "64 bytes in size. Value range: 0% (no hit) to 100% (optimal).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 3,
+   .components = {
+      &gfx10_scalar_cache_request_count_comp,
+      &gfx10_scalar_cache_hit_count_comp,
+      &gfx10_scalar_cache_miss_count_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_l0_cache_hit_counter = {
+   .id = AC_SPM_COUNTER_L0_CACHE_HIT,
+   .group_id = AC_SPM_GROUP_CACHE,
+   .name = "L0 cache hit",
+   .desc = "The percentage of read requests that hit the data in the L0 cache. "
+           "The L0 cache contains vector data, which is data that may vary in each "
+           "thread across the wavefront. Each request is 128 bytes in size. Value "
+           "range: 0% (no hit) to 100% (optimal).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 3,
+   .components = {
+      &gfx10_l0_cache_request_count_comp,
+      &gfx10_l0_cache_hit_count_comp,
+      &gfx10_l0_cache_miss_count_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_l1_cache_hit_counter = {
+   .id = AC_SPM_COUNTER_L1_CACHE_HIT,
+   .group_id = AC_SPM_GROUP_CACHE,
+   .name = "L1 cache hit",
+   .desc = "The percentage of read or write requests that hit the data in the "
+           "L1 cache. The L1 cache is shared across all WGPs in a single shader "
+           "engine. Each request is 128 bytes in size. Value range: 0% (no hit) to "
+           "100% (optimal).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 3,
+   .components = {
+      &gfx10_l1_cache_request_count_comp,
+      &gfx10_l1_cache_hit_count_comp,
+      &gfx10_l1_cache_miss_count_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_l2_cache_hit_counter = {
+   .id = AC_SPM_COUNTER_L2_CACHE_HIT,
+   .group_id = AC_SPM_GROUP_CACHE,
+   .name = "L2 cache hit",
+   .desc = "The percentage of read or write requests that hit the data in the "
+           "L2 cache. The L2 cache is shared by many blocks across the GPU, "
+           "including the Command Processor, Geometry Engine, all WGPs, all Render "
+           "Backends, and others. Each request is 128 bytes in size. Value range: 0% "
+           "(no hit) to 100% (optimal).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 3,
+   .components = {
+      &gfx10_l2_cache_request_count_comp,
+      &gfx10_l2_cache_hit_count_comp,
+      &gfx10_l2_cache_miss_count_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_cs_lds_bank_conflict_counter = {
+   .id = AC_SPM_COUNTER_CS_LDS_BANK_CONFLICT,
+   .group_id = AC_SPM_GROUP_LDS,
+   .name = "LDS Bank Conflict",
+   .desc = "The percentage of GPUTime LDS is stalled by bank conflicts. Value "
+           "range: 0% (optimal) to 100% (bad).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 2,
+   .components = {
+      &gfx10_gpu_busy_cycles_comp,
+      &gfx10_cs_lds_bank_conflict_cycles_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_fetch_size_counter = {
+   .id = AC_SPM_COUNTER_FETCH_SIZE,
+   .group_id = AC_SPM_GROUP_MEMORY_BYTES,
+   .name = "Fetch size",
+   .desc = "The total bytes fetched from the video memory. This is measured "
+           "with all extra fetches and any cache or memory effects taken into "
+           "account.",
+   .usage = AC_SPM_USAGE_BYTES,
+   .num_components = 0,
+};
+
+static struct ac_spm_derived_counter_descr gfx10_write_size_counter = {
+   .id = AC_SPM_COUNTER_WRITE_SIZE,
+   .group_id = AC_SPM_GROUP_MEMORY_BYTES,
+   .name = "Write size",
+   .desc = "The total bytes written to the video memory. This is measured with "
+           "all extra fetches and any cache or memory effects taken into account.",
+   .usage = AC_SPM_USAGE_BYTES,
+   .num_components = 0,
+};
+
+static struct ac_spm_derived_counter_descr gfx10_local_vid_mem_bytes_counter = {
+   .id = AC_SPM_COUNTER_LOCAL_VID_MEM_BYTES,
+   .group_id = AC_SPM_GROUP_MEMORY_BYTES,
+   .name = "Local video memory bytes",
+   .desc = "Number of bytes read from or written to the Infinity Cache (if "
+           "available) or local video memory",
+   .usage = AC_SPM_USAGE_BYTES,
+   .num_components = 0,
+};
+
+static struct ac_spm_derived_counter_descr gfx10_pcie_bytes_counter = {
+   .id = AC_SPM_COUNTER_PCIE_BYTES,
+   .group_id = AC_SPM_GROUP_MEMORY_BYTES,
+   .name = "PCIe bytes",
+   .desc = "Number of bytes sent and received over the PCIe bus",
+   .usage = AC_SPM_USAGE_BYTES,
+   .num_components = 0,
+};
+
+static struct ac_spm_derived_counter_descr gfx10_mem_unit_busy_counter = {
+   .id = AC_SPM_COUNTER_MEM_UNIT_BUSY,
+   .group_id = AC_SPM_GROUP_MEMORY_PERCENTAGE,
+   .name = "Memory unity busy",
+   .desc = "The percentage of GPUTime the memory unit is active. The result "
+           "includes the stall time (MemUnitStalled). This is measured with all "
+           "extra fetches and writes and any cache or memory effects taken into "
+           "account. Value range: 0% to 100% (fetch-bound).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 2,
+   .components = {
+      &gfx10_gpu_busy_cycles_comp,
+      &gfx10_mem_unit_busy_cycles_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx10_mem_unit_stalled_counter = {
+   .id = AC_SPM_COUNTER_MEM_UNIT_STALLED,
+   .group_id = AC_SPM_GROUP_MEMORY_PERCENTAGE,
+   .name = "Memory unit stalled",
+   .desc = "The percentage of GPUTime the memory unit is stalled. Try reducing "
+           "the number or size of fetches and writes if possible. Value range: 0% "
+           "(optimal) to 100% (bad).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 2,
+   .components = {
+      &gfx10_gpu_busy_cycles_comp,
+      &gfx10_mem_unit_stalled_cycles_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx12_write_unit_stalled_counter = {
+   .id = AC_SPM_COUNTER_WRITE_UNIT_STALLED,
+   .group_id = AC_SPM_GROUP_MEMORY_PERCENTAGE,
+   .name = "WriteUnitStalled",
+   .desc = "The percentage of GPUTime the Write unit is stalled. Value range: "
+           "0% to 100% (bad).",
+   .usage = AC_SPM_USAGE_PERCENTAGE,
+   .num_components = 2,
+   .components = {
+      &gfx10_gpu_busy_cycles_comp,
+      &gfx12_write_unit_stalled_cycles_comp,
+   },
+};
+
+static struct ac_spm_derived_counter_descr gfx103_ray_box_tests_counter = {
+   .id = AC_SPM_COUNTER_RAY_BOX_TESTS,
+   .group_id = AC_SPM_GROUP_RT,
+   .name = "Ray-box tests",
+   .desc = "The number of ray box intersection tests.",
+   .usage = AC_SPM_USAGE_ITEMS,
+   .num_components = 0,
+};
+
+static struct ac_spm_derived_counter_descr gfx103_ray_tri_tests_counter = {
+   .id = AC_SPM_COUNTER_RAY_TRI_TESTS,
+   .group_id = AC_SPM_GROUP_RT,
+   .name = "Ray-triangle tests",
+   .desc = "iThe number of ray triangle intersection tests",
+   .usage = AC_SPM_USAGE_ITEMS,
+   .num_components = 0,
+};
+
+/* SPM groups. */
+/* GFX10+ */
+static struct ac_spm_derived_group_descr gfx10_cache_group = {
+   .id = AC_SPM_GROUP_CACHE,
+   .name = "Cache",
+   .num_counters = 5,
+   .counters = {
+      &gfx10_inst_cache_hit_counter,
+      &gfx10_scalar_cache_hit_counter,
+      &gfx10_l0_cache_hit_counter,
+      &gfx10_l1_cache_hit_counter,
+      &gfx10_l2_cache_hit_counter,
+   },
+};
+
+static struct ac_spm_derived_group_descr gfx10_lds_group = {
+   .id = AC_SPM_GROUP_LDS,
+   .name = "LDS",
+   .num_counters = 1,
+   .counters = {
+      &gfx10_cs_lds_bank_conflict_counter,
+   },
+};
+
+static struct ac_spm_derived_group_descr gfx10_memory_bytes_group = {
+   .id = AC_SPM_GROUP_MEMORY_BYTES,
+   .name = "Memory (bytes)",
+   .num_counters = 4,
+   .counters = {
+      &gfx10_fetch_size_counter,
+      &gfx10_write_size_counter,
+      &gfx10_local_vid_mem_bytes_counter,
+      &gfx10_pcie_bytes_counter,
+   },
+};
+
+static struct ac_spm_derived_group_descr gfx10_memory_percentage_group = {
+   .id = AC_SPM_GROUP_MEMORY_PERCENTAGE,
+   .name = "Memory (%)",
+   .num_counters = 2,
+   .counters = {
+      &gfx10_mem_unit_busy_counter,
+      &gfx10_mem_unit_stalled_counter,
+   },
+};
+
+static struct ac_spm_derived_group_descr gfx103_rt_group = {
+   .id = AC_SPM_GROUP_RT,
+   .name = "Ray tracing",
+   .num_counters = 2,
+   .counters = {
+      &gfx103_ray_box_tests_counter,
+      &gfx103_ray_tri_tests_counter,
+   },
+};
+
+/* GFX12+ */
+static struct ac_spm_derived_group_descr gfx12_cache_group = {
+   .id = AC_SPM_GROUP_CACHE,
+   .name = "Cache",
+   .num_counters = 4,
+   .counters = {
+      &gfx10_inst_cache_hit_counter,
+      &gfx10_scalar_cache_hit_counter,
+      &gfx10_l0_cache_hit_counter,
+      &gfx10_l2_cache_hit_counter,
+   },
+};
+
+static struct ac_spm_derived_group_descr gfx12_memory_percentage_group = {
+   .id = AC_SPM_GROUP_MEMORY_PERCENTAGE,
+   .name = "Memory (%)",
+   .num_counters = 3,
+   .counters = {
+      &gfx10_mem_unit_busy_counter,
+      &gfx10_mem_unit_stalled_counter,
+      &gfx12_write_unit_stalled_counter,
+   },
+};
+
+static struct ac_spm_derived_counter *
+ac_spm_get_counter_by_id(struct ac_spm_derived_trace *spm_derived_trace,
+                         enum ac_spm_counter_id counter_id)
+{
+   for (uint32_t i = 0; i < spm_derived_trace->num_counters; i++) {
+      struct ac_spm_derived_counter *counter = &spm_derived_trace->counters[i];
+
+      if (counter->descr->id == counter_id)
+         return counter;
+   }
+
+   return NULL;
+}
+
+static struct ac_spm_derived_component *
+ac_spm_get_component_by_id(struct ac_spm_derived_trace *spm_derived_trace,
+                           enum ac_spm_component_id component_id)
+{
+   for (uint32_t i = 0; i < spm_derived_trace->num_components; i++) {
+      struct ac_spm_derived_component *component = &spm_derived_trace->components[i];
+
+      if (component->descr->id == component_id)
+         return component;
+   }
+
+   return NULL;
+}
+
+static int
+ac_spm_get_global_component_id(struct ac_spm_derived_trace *spm_derived_trace,
+                               enum ac_spm_component_id component_id)
+{
+   for (uint32_t i = 0; i < spm_derived_trace->num_components; i++) {
+      struct ac_spm_derived_component *component = &spm_derived_trace->components[i];
+
+      if (component->descr->id == component_id)
+         return i;
+   }
+
+   return -1;
+}
+
+static void
+ac_spm_add_group(struct ac_spm_derived_trace *spm_derived_trace,
+                 const struct ac_spm_derived_group_descr *group_descr)
+{
+   struct ac_spm_derived_group *group =
+      &spm_derived_trace->groups[spm_derived_trace->num_groups];
+
+   assert(spm_derived_trace->num_groups < AC_SPM_GROUP_COUNT);
+   group->descr = group_descr;
+
+   for (uint32_t i = 0; i < group_descr->num_counters; i++) {
+      const struct ac_spm_derived_counter_descr *counter_descr =
+         group_descr->counters[i];
+      struct ac_spm_derived_counter *counter =
+         &spm_derived_trace->counters[spm_derived_trace->num_counters];
+
+      assert(spm_derived_trace->num_counters < AC_SPM_COUNTER_COUNT);
+      counter->descr = counter_descr;
+
+      for (uint32_t j = 0; j < counter_descr->num_components; j++) {
+         /* A component can be used by different counters, re-use the same ID. */
+         const int component_id =
+            ac_spm_get_global_component_id(spm_derived_trace,
+                                           counter_descr->components[j]->id);
+
+         if (component_id != -1) {
+            counter->component_ids[j] = component_id;
+         } else {
+            struct ac_spm_derived_component *component =
+               &spm_derived_trace->components[spm_derived_trace->num_components];
+
+            assert(spm_derived_trace->num_components < AC_SPM_COMPONENT_COUNT);
+            component->descr = counter_descr->components[j];
+
+            counter->component_ids[j] = spm_derived_trace->num_components;
+            spm_derived_trace->num_components++;
+         }
+      }
+
+      group->counter_ids[i] = spm_derived_trace->num_counters;
+      spm_derived_trace->num_counters++;
+   }
+
+   spm_derived_trace->num_groups++;
+}
+
+static enum ac_spm_raw_counter_op
+ac_spm_get_raw_counter_op(enum ac_spm_raw_counter_id id)
+{
+   switch (id) {
+   case AC_SPM_TCP_PERF_SEL_REQ:
+   case AC_SPM_TCP_PERF_SEL_REQ_MISS:
+   case AC_SPM_SQC_PERF_SEL_DCACHE_HITS:
+   case AC_SPM_SQC_PERF_SEL_DCACHE_MISSES:
+   case AC_SPM_SQC_PERF_SEL_DCACHE_MISSES_DUPLICATE:
+   case AC_SPM_SQC_PERF_SEL_ICACHE_HITS:
+   case AC_SPM_SQC_PERF_SEL_ICACHE_MISSES:
+   case AC_SPM_SQC_PERF_SEL_ICACHE_MISSES_DUPLICATE:
+   case AC_SPM_GL1C_PERF_SEL_REQ:
+   case AC_SPM_GL1C_PERF_SEL_REQ_MISS:
+   case AC_SPM_GL2C_PERF_SEL_REQ:
+   case AC_SPM_GL2C_PERF_SEL_MISS:
+   case AC_SPM_CPF_PERF_SEL_STAT_BUSY:
+   case AC_SPM_SQC_PERF_SEL_LDS_BANK_CONFLICT:
+   case AC_SPM_GL2C_PERF_SEL_EA_RDREQ_32B:
+   case AC_SPM_GL2C_PERF_SEL_EA_RDREQ_64B:
+   case AC_SPM_GL2C_PERF_SEL_EA_RDREQ_96B:
+   case AC_SPM_GL2C_PERF_SEL_EA_RDREQ_128B:
+   case AC_SPM_GL2C_PERF_SEL_EA_RDREQ_256B:
+   case AC_SPM_GL2C_PERF_SEL_EA_WRREQ:
+   case AC_SPM_GL2C_PERF_SEL_EA_WRREQ_64B:
+   case AC_SPM_GCEA_PERF_SEL_SARB_DRAM_SIZED_REQUESTS:
+   case AC_SPM_GCEA_CPWD_PERF_SEL_SARB_DRAM_RD_SIZE_REQ:
+   case AC_SPM_GCEA_CPWD_PERF_SEL_SARB_DRAM_WR_SIZE_REQ:
+   case AC_SPM_GCEA_PERF_SEL_SARB_IO_SIZED_REQUESTS:
+   case AC_SPM_GCEA_SE_PERF_SEL_SARB_IO_RD_SIZE_REQ:
+   case AC_SPM_GCEA_SE_PERF_SEL_SARB_IO_WR_SIZE_REQ:
+   case AC_SPM_TD_PERF_SEL_RAY_TRACING_BVH4_TRI_NODE:
+   case AC_SPM_TD_PERF_SEL_RAY_TRACING_BVH4_FP16_BOX_NODE:
+   case AC_SPM_TD_PERF_SEL_RAY_TRACING_BVH4_FP32_BOX_NODE:
+      return AC_SPM_RAW_COUNTER_OP_SUM;
+   case AC_SPM_TA_PERF_SEL_TA_BUSY:
+   case AC_SPM_TCP_PERF_SEL_TCP_TA_REQ_STALL:
+   case AC_SPM_GL2C_PERF_SEL_EA_WRREQ_STALL:
+      return AC_SPM_RAW_COUNTER_OP_MAX;
+   default:
+      UNREACHABLE("Invalid SPM raw counter ID.");
+   }
+}
+
+struct ac_spm_derived_trace *
+ac_spm_get_derived_trace(const struct radeon_info *info,
+                         const struct ac_spm_trace *spm_trace)
+{
+   uint32_t sample_size_in_bytes = spm_trace->sample_size_in_bytes;
+   uint8_t *spm_data_ptr = (uint8_t *)spm_trace->ptr;
+   struct ac_spm_derived_trace *spm_derived_trace;
+
+   spm_derived_trace = calloc(1, sizeof(*spm_derived_trace));
+   if (!spm_derived_trace)
+      return NULL;
+
+   /* Add groups to the trace. */
+   if (info->gfx_level >= GFX12) {
+      ac_spm_add_group(spm_derived_trace, &gfx12_cache_group);
+   } else {
+      ac_spm_add_group(spm_derived_trace, &gfx10_cache_group);
+   }
+   ac_spm_add_group(spm_derived_trace, &gfx10_lds_group);
+   ac_spm_add_group(spm_derived_trace, &gfx10_memory_bytes_group);
+   if (info->gfx_level >= GFX12) {
+      ac_spm_add_group(spm_derived_trace, &gfx12_memory_percentage_group);
+   } else {
+      ac_spm_add_group(spm_derived_trace, &gfx10_memory_percentage_group);
+   }
+   if (info->gfx_level >= GFX10_3)
+      ac_spm_add_group(spm_derived_trace, &gfx103_rt_group);
+
+   spm_derived_trace->timestamps = malloc(spm_trace->num_samples * sizeof(uint64_t));
+   if (!spm_derived_trace->timestamps) {
+      free(spm_derived_trace);
+      return NULL;
+   }
+
+   /* Skip the reserved 32 bytes of data at beginning. */
+   spm_data_ptr += 32;
+
+   /* Collect timestamps. */
+   uint64_t sample_size_in_qwords = sample_size_in_bytes / sizeof(uint64_t);
+   uint64_t *timestamp_ptr = (uint64_t *)spm_data_ptr;
+
+   for (uint32_t i = 0; i < spm_trace->num_samples; i++) {
+      uint64_t index = i * sample_size_in_qwords;
+      uint64_t timestamp = timestamp_ptr[index];
+
+      spm_derived_trace->timestamps[i] = timestamp;
+   }
+
+   /* Collect raw counter values. */
+   uint64_t *raw_counter_values[AC_SPM_RAW_COUNTER_ID_COUNT];
+   for (uint32_t i = 0; i < AC_SPM_RAW_COUNTER_ID_COUNT; i++) {
+      raw_counter_values[i] = calloc(spm_trace->num_samples, sizeof(uint64_t));
+   }
+
+   const uint32_t sample_size_in_hwords = sample_size_in_bytes / sizeof(uint16_t);
+   const uint16_t *counter_values_ptr = (uint16_t *)spm_data_ptr;
+
+   for (uint32_t c = 0; c < spm_trace->num_counters; c++) {
+      const uint64_t offset = spm_trace->counters[c].offset;
+      const uint32_t id = spm_trace->counters[c].id;
+      const enum ac_spm_raw_counter_op op = ac_spm_get_raw_counter_op(id);
+
+      for (uint32_t s = 0; s < spm_trace->num_samples; s++) {
+         const uint64_t index = offset + (s * sample_size_in_hwords);
+         const uint16_t value = counter_values_ptr[index];
+
+         switch (op) {
+         case AC_SPM_RAW_COUNTER_OP_SUM:
+            raw_counter_values[id][s] += value;
+            break;
+         case AC_SPM_RAW_COUNTER_OP_MAX:
+            raw_counter_values[id][s] = MAX2(raw_counter_values[id][s], value);
+            break;
+         default:
+            UNREACHABLE("Invalid SPM raw counter OP.\n");
+         }
+      }
+   }
+
+#define GET_COMPONENT(n) \
+   struct ac_spm_derived_component *_##n = \
+      ac_spm_get_component_by_id(spm_derived_trace, AC_SPM_COMPONENT_##n);
+#define GET_COUNTER(n) \
+   struct ac_spm_derived_counter *_##n = \
+      ac_spm_get_counter_by_id(spm_derived_trace, AC_SPM_COUNTER_##n);
+
+   GET_COUNTER(INST_CACHE_HIT);
+   GET_COUNTER(SCALAR_CACHE_HIT);
+   GET_COUNTER(L0_CACHE_HIT);
+   GET_COUNTER(L1_CACHE_HIT);
+   GET_COUNTER(L2_CACHE_HIT);
+   GET_COUNTER(CS_LDS_BANK_CONFLICT);
+   GET_COUNTER(FETCH_SIZE);
+   GET_COUNTER(WRITE_SIZE);
+   GET_COUNTER(LOCAL_VID_MEM_BYTES);
+   GET_COUNTER(PCIE_BYTES);
+   GET_COUNTER(MEM_UNIT_BUSY);
+   GET_COUNTER(MEM_UNIT_STALLED);
+   GET_COUNTER(WRITE_UNIT_STALLED);
+   GET_COUNTER(RAY_BOX_TESTS);
+   GET_COUNTER(RAY_TRI_TESTS);
+
+   GET_COMPONENT(INST_CACHE_REQUEST_COUNT);
+   GET_COMPONENT(INST_CACHE_HIT_COUNT);
+   GET_COMPONENT(INST_CACHE_MISS_COUNT);
+   GET_COMPONENT(SCALAR_CACHE_REQUEST_COUNT);
+   GET_COMPONENT(SCALAR_CACHE_HIT_COUNT);
+   GET_COMPONENT(SCALAR_CACHE_MISS_COUNT);
+   GET_COMPONENT(L0_CACHE_REQUEST_COUNT);
+   GET_COMPONENT(L0_CACHE_HIT_COUNT);
+   GET_COMPONENT(L0_CACHE_MISS_COUNT);
+   GET_COMPONENT(L1_CACHE_REQUEST_COUNT);
+   GET_COMPONENT(L1_CACHE_HIT_COUNT);
+   GET_COMPONENT(L1_CACHE_MISS_COUNT);
+   GET_COMPONENT(L2_CACHE_REQUEST_COUNT);
+   GET_COMPONENT(L2_CACHE_HIT_COUNT);
+   GET_COMPONENT(L2_CACHE_MISS_COUNT);
+   GET_COMPONENT(GPU_BUSY_CYCLES);
+   GET_COMPONENT(CS_LDS_BANK_CONFLICT_CYCLES);
+   GET_COMPONENT(MEM_UNIT_BUSY_CYCLES);
+   GET_COMPONENT(MEM_UNIT_STALLED_CYCLES);
+   GET_COMPONENT(WRITE_UNIT_STALLED_CYCLES);
+
+#undef GET_COMPONENT
+#undef GET_COUNTER
+
+#define ADD(id, value) \
+   util_dynarray_append(&_##id->values, (double)(value));
+
+#define OP_RAW(n) \
+   raw_counter_values[AC_SPM_##n][s]
+#define OP_SUM2(a, b) \
+   raw_counter_values[AC_SPM_##a][s] + \
+   raw_counter_values[AC_SPM_##b][s]
+#define OP_SUM3(a, b, c) \
+   raw_counter_values[AC_SPM_##a][s] + \
+   raw_counter_values[AC_SPM_##b][s] + \
+   raw_counter_values[AC_SPM_##c][s]
+#define OP_SUB2(a, b) \
+   raw_counter_values[AC_SPM_##a][s] - \
+   raw_counter_values[AC_SPM_##b][s]
+
+   const uint32_t num_simds = info->num_cu * info->cu_info.num_simd_per_compute_unit;
+
+   for (uint32_t s = 0; s < spm_trace->num_samples; s++) {
+      /* Cache group. */
+      /* Instruction cache. */
+      const double inst_cache_request_count =
+         OP_SUM3(SQC_PERF_SEL_ICACHE_HITS, SQC_PERF_SEL_ICACHE_MISSES, SQC_PERF_SEL_ICACHE_MISSES_DUPLICATE);
+      const double inst_cache_hit_count =
+         OP_RAW(SQC_PERF_SEL_ICACHE_HITS);
+      const double inst_cache_miss_count =
+         OP_SUM2(SQC_PERF_SEL_ICACHE_MISSES, SQC_PERF_SEL_ICACHE_MISSES_DUPLICATE);
+      const double inst_cache_hit =
+         inst_cache_request_count ? (inst_cache_hit_count / inst_cache_request_count) * 100.0f : 0.0f;
+
+      ADD(INST_CACHE_REQUEST_COUNT, inst_cache_request_count);
+      ADD(INST_CACHE_HIT_COUNT, inst_cache_hit_count);
+      ADD(INST_CACHE_MISS_COUNT, inst_cache_miss_count);
+      ADD(INST_CACHE_HIT, inst_cache_hit);
+
+      /* Scalar cache. */
+      const double scalar_cache_request_count =
+         OP_SUM3(SQC_PERF_SEL_DCACHE_HITS, SQC_PERF_SEL_DCACHE_MISSES, SQC_PERF_SEL_DCACHE_MISSES_DUPLICATE);
+      const double scalar_cache_hit_count =
+         OP_RAW(SQC_PERF_SEL_DCACHE_HITS);
+      const double scalar_cache_miss_count =
+         OP_SUM2(SQC_PERF_SEL_DCACHE_MISSES, SQC_PERF_SEL_DCACHE_MISSES_DUPLICATE);
+      const double scalar_cache_hit =
+         scalar_cache_request_count ? (scalar_cache_hit_count / scalar_cache_request_count) * 100.0f : 0.0f;
+
+      ADD(SCALAR_CACHE_REQUEST_COUNT, scalar_cache_request_count);
+      ADD(SCALAR_CACHE_HIT_COUNT, scalar_cache_hit_count);
+      ADD(SCALAR_CACHE_MISS_COUNT, scalar_cache_miss_count);
+      ADD(SCALAR_CACHE_HIT, scalar_cache_hit);
+
+      /* L0 cache. */
+      const double l0_cache_request_count = OP_RAW(TCP_PERF_SEL_REQ);
+      const double l0_cache_hit_count = OP_SUB2(TCP_PERF_SEL_REQ, TCP_PERF_SEL_REQ_MISS);
+      const double l0_cache_miss_count = OP_RAW(TCP_PERF_SEL_REQ_MISS);
+      const double l0_cache_hit =
+         l0_cache_request_count ? (l0_cache_hit_count / l0_cache_request_count) * 100.0f : 0.0f;
+
+      ADD(L0_CACHE_REQUEST_COUNT, l0_cache_request_count);
+      ADD(L0_CACHE_HIT_COUNT, l0_cache_hit_count);
+      ADD(L0_CACHE_MISS_COUNT, l0_cache_miss_count);
+      ADD(L0_CACHE_HIT, l0_cache_hit);
+
+      if (info->gfx_level < GFX12) {
+         /* L1 cache. */
+         const double l1_cache_request_count = OP_RAW(GL1C_PERF_SEL_REQ);
+         const double l1_cache_hit_count = OP_SUB2(GL1C_PERF_SEL_REQ, GL1C_PERF_SEL_REQ_MISS);
+         const double l1_cache_miss_count = OP_RAW(GL1C_PERF_SEL_REQ_MISS);
+         const double l1_cache_hit =
+            l1_cache_request_count ? (l1_cache_hit_count / l1_cache_request_count) * 100.0f : 0.0f;
+
+         ADD(L1_CACHE_REQUEST_COUNT, l1_cache_request_count);
+         ADD(L1_CACHE_HIT_COUNT, l1_cache_hit_count);
+         ADD(L1_CACHE_MISS_COUNT, l1_cache_miss_count);
+         ADD(L1_CACHE_HIT, l1_cache_hit);
+      }
+
+      /* L2 cache. */
+      const double l2_cache_request_count = OP_RAW(GL2C_PERF_SEL_REQ);
+      const double l2_cache_hit_count = OP_SUB2(GL2C_PERF_SEL_REQ, GL2C_PERF_SEL_MISS);
+      const double l2_cache_miss_count = OP_RAW(GL2C_PERF_SEL_MISS);
+      const double l2_cache_hit =
+         l2_cache_request_count ? (l2_cache_hit_count / l2_cache_request_count) * 100.0f : 0.0f;
+
+      ADD(L2_CACHE_REQUEST_COUNT, l2_cache_request_count);
+      ADD(L2_CACHE_HIT_COUNT, l2_cache_hit_count);
+      ADD(L2_CACHE_MISS_COUNT, l2_cache_miss_count);
+      ADD(L2_CACHE_HIT, l2_cache_hit);
+
+      /* LDS group */
+      /* CS LDS Bank Conflict. */
+      const double gpu_busy_cycles = OP_RAW(CPF_PERF_SEL_STAT_BUSY);
+      const double cs_lds_bank_conflict_cycles = OP_RAW(SQC_PERF_SEL_LDS_BANK_CONFLICT) / (double)num_simds;
+      const double cs_lds_bank_conflict =
+         gpu_busy_cycles ? (cs_lds_bank_conflict_cycles / gpu_busy_cycles) * 100.0f : 0.0f;
+
+      ADD(GPU_BUSY_CYCLES, gpu_busy_cycles);
+      ADD(CS_LDS_BANK_CONFLICT_CYCLES, cs_lds_bank_conflict_cycles);
+      ADD(CS_LDS_BANK_CONFLICT, cs_lds_bank_conflict);
+
+      /* Memmory (bytes) group. */
+      /* Fetch size. */
+      double fetch_size;
+
+      if (info->gfx_level >= GFX12) {
+         fetch_size = OP_RAW(GL2C_PERF_SEL_EA_RDREQ_32B) * 32 +
+                      OP_RAW(GL2C_PERF_SEL_EA_RDREQ_64B) * 64 +
+                      OP_RAW(GL2C_PERF_SEL_EA_RDREQ_128B) * 128 +
+                      OP_RAW(GL2C_PERF_SEL_EA_RDREQ_256B) * 256;
+      } else {
+         fetch_size = OP_RAW(GL2C_PERF_SEL_EA_RDREQ_32B) * 32 +
+                      OP_RAW(GL2C_PERF_SEL_EA_RDREQ_64B) * 64 +
+                      OP_RAW(GL2C_PERF_SEL_EA_RDREQ_96B) * 96 +
+                      OP_RAW(GL2C_PERF_SEL_EA_RDREQ_128B) * 128;
+      }
+
+      ADD(FETCH_SIZE, fetch_size);
+
+      /* Write size. */
+      const double write_size = (OP_RAW(GL2C_PERF_SEL_EA_WRREQ) * 32 +
+                                 OP_RAW(GL2C_PERF_SEL_EA_WRREQ_64B) * 64) -
+                                (OP_RAW(GL2C_PERF_SEL_EA_WRREQ_64B) * 32);
+
+      ADD(WRITE_SIZE, write_size);
+
+      /* Local video mem bytes. */
+      double local_vid_mem_bytes;
+
+      if (info->gfx_level >= GFX12) {
+         local_vid_mem_bytes = (OP_RAW(GCEA_CPWD_PERF_SEL_SARB_DRAM_RD_SIZE_REQ) +
+                                OP_RAW(GCEA_CPWD_PERF_SEL_SARB_DRAM_WR_SIZE_REQ)) * 32;
+      } else {
+         local_vid_mem_bytes = OP_RAW(GCEA_PERF_SEL_SARB_DRAM_SIZED_REQUESTS) * 32;
+      }
+
+      ADD(LOCAL_VID_MEM_BYTES, local_vid_mem_bytes);
+
+      /* PCIe bytes. */
+      double pcie_bytes;
+
+      if (info->gfx_level >= GFX12) {
+         pcie_bytes = (OP_RAW(GCEA_SE_PERF_SEL_SARB_IO_RD_SIZE_REQ) +
+                       OP_RAW(GCEA_SE_PERF_SEL_SARB_IO_WR_SIZE_REQ)) * 32;
+      } else {
+         pcie_bytes = OP_RAW(GCEA_PERF_SEL_SARB_IO_SIZED_REQUESTS) * 32;
+      }
+
+      ADD(PCIE_BYTES, pcie_bytes);
+
+      /* Memory (percentage) group. */
+      /* Memory unit busy. */
+      const double mem_unit_busy_cycles = OP_RAW(TA_PERF_SEL_TA_BUSY);
+      const double mem_unit_busy =
+         gpu_busy_cycles ? (mem_unit_busy_cycles / gpu_busy_cycles) * 100.0f : 0.0f;
+
+      ADD(MEM_UNIT_BUSY_CYCLES, mem_unit_busy_cycles);
+      ADD(MEM_UNIT_BUSY, mem_unit_busy);
+
+      /* Memory unit stalled. */
+      const double mem_unit_stalled_cycles = OP_RAW(TCP_PERF_SEL_TCP_TA_REQ_STALL);
+      const double mem_unit_stalled =
+         gpu_busy_cycles ? (mem_unit_stalled_cycles / gpu_busy_cycles) * 100.0f : 0.f;
+
+      ADD(MEM_UNIT_STALLED_CYCLES, mem_unit_stalled_cycles);
+      ADD(MEM_UNIT_STALLED, mem_unit_stalled);
+
+      if (info->gfx_level >= GFX12) {
+         /* Write unit stalled. */
+         const double write_unit_stalled_cycles = OP_RAW(GL2C_PERF_SEL_EA_WRREQ_STALL);
+         const double write_unit_stalled =
+            gpu_busy_cycles ? (write_unit_stalled_cycles / gpu_busy_cycles) * 100.0f : 0.0f;
+
+         ADD(WRITE_UNIT_STALLED_CYCLES, write_unit_stalled_cycles);
+         ADD(WRITE_UNIT_STALLED, write_unit_stalled);
+      }
+
+      if (info->gfx_level >= GFX10_3) {
+         /* Raytracing group. */
+         /* Ray box tests. */
+         const double ray_box_tests = OP_RAW(TD_PERF_SEL_RAY_TRACING_BVH4_FP16_BOX_NODE) +
+                                      OP_RAW(TD_PERF_SEL_RAY_TRACING_BVH4_FP32_BOX_NODE);
+
+         ADD(RAY_BOX_TESTS, ray_box_tests);
+
+         /* Ray triangle tests. */
+         const double ray_tri_tests = OP_RAW(TD_PERF_SEL_RAY_TRACING_BVH4_TRI_NODE);
+
+         ADD(RAY_TRI_TESTS, ray_tri_tests);
+      }
+   }
+
+#undef ADD
+#undef OP_RAW
+#undef OP_SUM2
+#undef OP_SUM3
+#undef OP_SUB2
+
+   spm_derived_trace->num_timestamps = spm_trace->num_samples;
+   spm_derived_trace->sample_interval = spm_trace->sample_interval;
+
+   for (uint32_t i = 0; i < AC_SPM_RAW_COUNTER_ID_COUNT; i++)
+      free(raw_counter_values[i]);
+
+   return spm_derived_trace;
+}
+
+void
+ac_spm_destroy_derived_trace(struct ac_spm_derived_trace *spm_derived_trace)
+{
+   for (uint32_t i = 0; i < spm_derived_trace->num_components; i++) {
+      struct ac_spm_derived_component *component = &spm_derived_trace->components[i];
+      util_dynarray_fini(&component->values);
+   }
+
+   for (uint32_t i = 0; i < spm_derived_trace->num_counters; i++) {
+      struct ac_spm_derived_counter *counter = &spm_derived_trace->counters[i];
+      util_dynarray_fini(&counter->values);
+   }
+
+   free(spm_derived_trace);
 }
 
 static void
@@ -889,42 +1969,34 @@ ac_emit_spm_setup(struct ac_cmdbuf *cs, enum amd_gfx_level gfx_level,
 }
 
 void
-ac_emit_spm_start(struct ac_cmdbuf *cs, enum amd_ip_type ip_type)
+ac_emit_spm_start(struct ac_cmdbuf *cs, enum amd_ip_type ip_type,
+                  const struct radeon_info *info)
 {
-   ac_cmdbuf_begin(cs);
-
    /* Start SPM counters. */
+   ac_cmdbuf_begin(cs);
    ac_cmdbuf_set_uconfig_reg(R_036020_CP_PERFMON_CNTL,
                              S_036020_PERFMON_STATE(V_036020_CP_PERFMON_STATE_DISABLE_AND_RESET) |
                                 S_036020_SPM_PERFMON_STATE(V_036020_STRM_PERFMON_STATE_START_COUNTING));
+   ac_cmdbuf_end();
 
    /* Start windowed performance counters. */
-   if (ip_type == AMD_IP_GFX)
-      ac_cmdbuf_event_write(V_028A90_PERFCOUNTER_START);
-   ac_cmdbuf_set_sh_reg(R_00B82C_COMPUTE_PERFCOUNT_ENABLE, S_00B82C_PERFCOUNT_ENABLE(1));
-
-   ac_cmdbuf_end();
+   ac_emit_cp_update_windowed_counters(cs, info, ip_type, true);
 }
 
 void
 ac_emit_spm_stop(struct ac_cmdbuf *cs, enum amd_ip_type ip_type,
                  const struct radeon_info *info)
 {
-   ac_cmdbuf_begin(cs);
-
    /* Stop windowed performance counters. */
-   if (ip_type == AMD_IP_GFX && !info->never_send_perfcounter_stop)
-      ac_cmdbuf_event_write(V_028A90_PERFCOUNTER_STOP);
-
-   ac_cmdbuf_set_sh_reg(R_00B82C_COMPUTE_PERFCOUNT_ENABLE, S_00B82C_PERFCOUNT_ENABLE(0));
+   ac_emit_cp_update_windowed_counters(cs, info, ip_type, false);
 
    /* Stop SPM counters. */
+   ac_cmdbuf_begin(cs);
    ac_cmdbuf_set_uconfig_reg(R_036020_CP_PERFMON_CNTL,
                              S_036020_PERFMON_STATE(V_036020_CP_PERFMON_STATE_DISABLE_AND_RESET) |
                              S_036020_SPM_PERFMON_STATE(info->never_stop_sq_perf_counters ?
                                 V_036020_STRM_PERFMON_STATE_START_COUNTING :
                                 V_036020_STRM_PERFMON_STATE_STOP_COUNTING));
-
    ac_cmdbuf_end();
 }
 

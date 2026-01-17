@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <regex.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -92,6 +93,7 @@ static int current_draw_count;
  * loaded:
  */
 static int *queryvals;
+static int nqueryvals;
 
 static bool
 quiet(int lvl)
@@ -127,6 +129,8 @@ static const char *levels[] = {
    "\t\t\t\t\t\t\t",
    "\t\t\t\t\t\t\t\t",
    "\t\t\t\t\t\t\t\t\t",
+   "\t\t\t\t\t\t\t\t\t\t",
+   "\t\t\t\t\t\t\t\t\t\t\t",
    "x",
    "x",
    "x",
@@ -791,6 +795,53 @@ static struct {
 static struct rnn *rnn;
 
 static void
+add_query_val(const char *querystr, int val)
+{
+   printf("querystr: %s -> 0x%x\n", querystr, val);
+   queryvals = realloc(queryvals, (nqueryvals + 1) * sizeof(!*queryvals));
+   queryvals[nqueryvals] = val;
+   nqueryvals++;
+}
+
+static void
+add_query(const char *querystr)
+{
+   int val = strtol(querystr, NULL, 0);
+
+   if (val) {
+      add_query_val(querystr, val);
+      return;
+   }
+
+   regex_t regex;
+   bool found = false;
+   int ret;
+
+   ret = regcomp(&regex, querystr, REG_EXTENDED);
+   if (ret) {
+      errx(-1, "Invalid regex: %s\n", querystr);
+   }
+
+   for (unsigned off = 0; off < regcnt(); off++) {
+      const char *name = rnn_regname(rnn, off, false);
+
+      if (!name)
+         continue;
+
+      ret = regexec(&regex, name, 0, NULL, 0);
+      if (ret)
+         continue;
+
+      add_query_val(name, off);
+      found = true;
+   }
+
+   if (!found) {
+      errx(-1, "no match: %s\n", querystr);
+   }
+}
+
+static void
 init_rnn(const char *gpuname)
 {
    rnn = rnn_new(!options->color);
@@ -798,17 +849,10 @@ init_rnn(const char *gpuname)
    rnn_load(rnn, gpuname);
 
    if (options->querystrs) {
-      int i;
-      queryvals = calloc(options->nquery, sizeof(queryvals[0]));
-
-      for (i = 0; i < options->nquery; i++) {
-         int val = strtol(options->querystrs[i], NULL, 0);
-
-         if (val == 0)
-            val = regbase(options->querystrs[i]);
-
-         queryvals[i] = val;
-         printf("querystr: %s -> 0x%x\n", options->querystrs[i], queryvals[i]);
+      /* If parsing multiple files, clear the old queryvals: */
+      nqueryvals = 0;
+      for (int i = 0; i < options->nquery; i++) {
+         add_query(options->querystrs[i]);
       }
    }
 
@@ -1164,7 +1208,7 @@ skip_query(void)
       /* never skip: */
       return false;
    case QUERY_WRITTEN:
-      for (int i = 0; i < options->nquery; i++) {
+      for (int i = 0; i < nqueryvals; i++) {
          uint32_t regbase = queryvals[i];
          if (!reg_written(regbase)) {
             continue;
@@ -1175,7 +1219,7 @@ skip_query(void)
       }
       return true;
    case QUERY_DELTA:
-      for (int i = 0; i < options->nquery; i++) {
+      for (int i = 0; i < nqueryvals; i++) {
          uint32_t regbase = queryvals[i];
          if (!reg_written(regbase)) {
             continue;
@@ -1205,7 +1249,7 @@ __do_query(const char *primtype, uint32_t num_indices)
       bin_y2 = scissor_br >> 16;
    }
 
-   for (int i = 0; i < options->nquery; i++) {
+   for (int i = 0; i < nqueryvals; i++) {
       uint32_t regbase = queryvals[i];
       if (!reg_written(regbase))
          continue;
@@ -1620,25 +1664,20 @@ dump_bindless_descriptors(bool is_compute, int level)
       } else {
          sprintf(reg_name, "SP_GFX_BINDLESS_BASE[%u].DESCRIPTOR", i);
       }
-      const unsigned base_reg = regbase(reg_name);
-      if (!base_reg)
+      const unsigned reg = regbase(reg_name);
+      if (!reg)
          break;
 
       printl(2, "%sset[%u]:\n", levels[level + 1], i);
 
+      if (!reg_written(reg))
+         continue;
+
       uint64_t ext_src_addr;
       if (is_64b()) {
-         const unsigned reg = base_reg + i * 2;
-         if (!reg_written(reg))
-            continue;
-
          ext_src_addr = reg_val(reg) & 0xfffffffc;
          ext_src_addr |= ((uint64_t)reg_val(reg + 1)) << 32;
       } else {
-         const unsigned reg = base_reg + i;
-         if (!reg_written(reg))
-            continue;
-
          ext_src_addr = reg_val(reg) & 0xfffffffc;
       }
 
@@ -2074,7 +2113,7 @@ cp_event_write(uint32_t *dwords, uint32_t sizedwords, int level)
    if (name && (options->info->chip > 5)) {
       char eventname[64];
       snprintf(eventname, sizeof(eventname), "EVENT:%s", name);
-      if (!strcmp(name, "BLIT") || !strcmp(name, "LRZ_CLEAR")) {
+      if (!strcmp(name, "CCU_RESOLVE") || !strcmp(name, "LRZ_CLEAR")) {
          do_query(eventname, 0);
          print_mode(level);
          dump_register_summary(level);
@@ -2813,6 +2852,7 @@ static void
 cp_exec_cs(uint32_t *dwords, uint32_t sizedwords, int level)
 {
    do_query("compute", 0);
+   print_mode(level);
    dump_bindless_descriptors(true, level);
    dump_register_summary(level);
 }
@@ -2832,6 +2872,7 @@ cp_exec_cs_indirect(uint32_t *dwords, uint32_t sizedwords, int level)
    dump_gpuaddr_size(addr, level, 0x10, 2);
 
    do_query("compute", 0);
+   print_mode(level);
    dump_bindless_descriptors(true, level);
    dump_register_summary(level);
 }
@@ -2979,24 +3020,13 @@ cp_blit(uint32_t *dwords, uint32_t sizedwords, int level)
 static void
 cp_context_reg_bunch(uint32_t *dwords, uint32_t sizedwords, int level)
 {
-   int i;
-
-   /* NOTE: seems to write same reg multiple times.. not sure if different parts
-    * of these are triggered by the FLUSH_SO_n events?? (if that is what they
-    * actually are?)
-    */
-   bool saved_summary = summary;
-   summary = false;
-
    struct regacc r = regacc(NULL);
 
-   for (i = 0; i < sizedwords; i += 2) {
+   for (int i = 0; i < sizedwords; i += 2) {
       if (regacc_push(&r, dwords[i + 0], dwords[i + 1]))
          dump_register(&r, level + 1);
       reg_set(dwords[i + 0], dwords[i + 1]);
    }
-
-   summary = saved_summary;
 }
 
 static void

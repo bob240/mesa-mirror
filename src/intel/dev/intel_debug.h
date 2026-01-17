@@ -54,6 +54,7 @@ enum intel_debug_flag {
    DEBUG_URB,
    DEBUG_CLIP,
    DEBUG_STALL,
+   DEBUG_NO_RESOURCE_BARRIER,
    DEBUG_BLORP,
    DEBUG_NO_DUAL_OBJECT_GS,
    DEBUG_OPTIMIZER,
@@ -98,7 +99,6 @@ enum intel_debug_flag {
    DEBUG_NO_VRT,
    DEBUG_RT_NO_TRACE,
    DEBUG_SHADERS_LINENO,
-   DEBUG_SHOW_SHADER_STAGE,
    /* Keep the stages grouped */
    DEBUG_VS,
    DEBUG_TCS,

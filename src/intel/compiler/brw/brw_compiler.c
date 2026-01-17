@@ -62,6 +62,7 @@ const struct nir_shader_compiler_options brw_scalar_nir_options = {
    .lower_insert_byte = true,
    .lower_insert_word = true,
    .lower_isign = true,
+   .lower_layer_fs_input_to_sysval = true,
    .lower_ldexp = true,
    .lower_pack_half_2x16 = true,
    .lower_pack_snorm_2x16 = true,
@@ -204,6 +205,7 @@ brw_compiler_create(void *mem_ctx, const struct intel_device_info *devinfo)
 
    nir_options->lower_int64_options = int64_options;
    nir_options->lower_doubles_options = fp64_options;
+   nir_options->max_samples = devinfo->ver >= 30 ? 8 : 16;
 
    if (compiler->use_tcs_multi_patch) {
       /* TCS MULTI_PATCH mode has multiple patches per subgroup */
@@ -307,7 +309,7 @@ brw_device_sha1(char *hex,
    struct mesa_sha1 ctx;
    _mesa_sha1_init(&ctx);
    brw_device_sha1_update(&ctx, devinfo);
-   unsigned char result[20];
+   unsigned char result[SHA1_DIGEST_LENGTH];
    _mesa_sha1_final(&ctx, result);
    _mesa_sha1_format(hex, result);
 }

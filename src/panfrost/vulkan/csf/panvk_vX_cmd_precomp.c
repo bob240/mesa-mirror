@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "bifrost_compile.h"
+#include "bifrost/bifrost_compile.h"
 #include "pan_desc.h"
 #include "pan_encoder.h"
 #include "panvk_cmd_alloc.h"
@@ -111,14 +111,13 @@ panvk_per_arch(dispatch_precomp)(struct panvk_precomp_ctx *ctx,
       cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_SIZE_Z), grid.count[2]);
    }
 
-   struct cs_index next_iter_sb_scratch = cs_scratch_reg_tuple(b, 0, 2);
-   panvk_per_arch(cs_next_iter_sb)(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
-                                   next_iter_sb_scratch);
+   cs_next_iter_sb(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+                   cs_scratch_reg_tuple(b, 0, 2));
 
    unsigned task_axis = MALI_TASK_AXIS_X;
    unsigned task_increment = 0;
    panvk_per_arch(calculate_task_axis_and_increment)(
-      shader, phys_dev, &task_axis, &task_increment);
+      shader, phys_dev, &dim, &task_axis, &task_increment);
    cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4),
                         task_increment, task_axis,
                         cs_shader_res_sel(0, 0, 0, 0));

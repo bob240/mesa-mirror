@@ -559,6 +559,8 @@ zink_draw(struct pipe_context *pctx,
    unsigned work_count = ctx->work_count;
    enum mesa_prim mode = (enum mesa_prim)dinfo->mode;
 
+   ctx->rp_draw = true;
+
    if (ctx->memory_barrier && !ctx->blitting)
       zink_flush_memory_barrier(ctx, false);
 
@@ -845,7 +847,7 @@ zink_draw(struct pipe_context *pctx,
          counter_buffers[i] = VK_NULL_HANDLE;
          if (t) {
             struct zink_resource *res = zink_resource(t->counter_buffer);
-            t->stride = ctx->last_vertex_stage->sinfo.stride[i];
+            t->stride = ctx->last_vertex_stage->xfb_stride[i];
             zink_batch_reference_resource_rw(ctx, res, true);
             if (!ctx->unordered_blitting)
                res->obj->unordered_read = res->obj->unordered_write = false;
@@ -1024,6 +1026,8 @@ zink_draw_mesh_tasks(struct pipe_context *pctx, const struct pipe_grid_info *inf
    struct zink_screen *screen = zink_screen(pctx->screen);
    struct zink_batch_state *bs = ctx->bs;
    unsigned work_count = ctx->work_count;
+
+   ctx->rp_draw = true;
 
    if (ctx->memory_barrier && !ctx->blitting)
       zink_flush_memory_barrier(ctx, false);

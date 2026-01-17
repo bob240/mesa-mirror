@@ -167,7 +167,7 @@ csf_oom_handler_init(struct panfrost_context *ctx)
       cs_wait_slot(&b, 0);
 
       /* Run the fragment job and wait */
-      cs_select_sb_entries_for_async_ops(&b, 3);
+      cs_select_endpoint_sb(&b, 3);
       cs_run_fragment(&b, MALI_TILE_RENDER_ORDER_Z_ORDER, false);
       cs_wait_slot(&b, 3);
 
@@ -197,11 +197,12 @@ csf_oom_handler_init(struct panfrost_context *ctx)
 
       cs_wait_slot(&b, 0);
 
-      cs_select_sb_entries_for_async_ops(&b, 2);
+      cs_select_endpoint_sb(&b, 2);
    }
 
    assert(cs_is_valid(&b));
-   cs_finish(&b);
+   cs_end(&b);
+   cs_builder_fini(&b);
    ctx->csf.tiler_oom_handler.cs_bo = cs_bo;
    ctx->csf.tiler_oom_handler.length = handler.length * sizeof(uint64_t);
    ctx->csf.tiler_oom_handler.save_bo = reg_save_bo;
@@ -224,7 +225,10 @@ fail:
 void
 GENX(csf_cleanup_batch)(struct panfrost_batch *batch)
 {
-   free(batch->csf.cs.builder);
+   if (batch->csf.cs.builder) {
+      cs_builder_fini(batch->csf.cs.builder);
+      free(batch->csf.cs.builder);
+   }
 
    panfrost_pool_cleanup(&batch->csf.cs_chunk_pool);
 }
@@ -272,7 +276,7 @@ GENX(csf_init_batch)(struct panfrost_batch *batch)
 
    /* Set up entries */
    struct cs_builder *b = batch->csf.cs.builder;
-   cs_select_sb_entries_for_async_ops(b, 2);
+   cs_select_endpoint_sb(b, 2);
 
    batch->framebuffer = alloc_fbd(batch);
    if (!batch->framebuffer.gpu)
@@ -362,10 +366,9 @@ csf_emit_batch_end(struct panfrost_batch *batch)
    cs_wait_slot(b, 0);
 
    /* Finish the command stream */
-   if (!cs_is_valid(batch->csf.cs.builder))
-      return -1;
+   if (cs_is_valid(batch->csf.cs.builder))
+      cs_end(batch->csf.cs.builder);
 
-   cs_finish(batch->csf.cs.builder);
    return 0;
 }
 
@@ -966,8 +969,8 @@ GENX(csf_launch_grid)(struct panfrost_batch *batch,
    cs_move32_to(b, cs_sr_reg32(b, COMPUTE, JOB_OFFSET_Z), 0);
 
    unsigned threads_per_wg = info->block[0] * info->block[1] * info->block[2];
-   unsigned max_thread_cnt =
-      pan_compute_max_thread_count(&dev->kmod.props, cs->info.work_reg_count);
+   unsigned max_thread_cnt = pan_compute_max_thread_count(
+      &dev->kmod.dev->props, cs->info.work_reg_count);
 
    if (info->indirect) {
       /* Load size in workgroups per dimension from memory */
@@ -1165,9 +1168,9 @@ csf_emit_draw_state(struct panfrost_batch *batch,
    cs_move64_to(b, cs_sr_reg64(b, IDVS, SCISSOR_BOX), *sbd);
 
 #if PAN_ARCH >= 12
-   uint64_t *avalon_viewport = (uint64_t *)batch->avalon_viewport;
-   cs_move64_to(b, cs_sr_reg64(b, IDVS, VIEWPORT_HIGH), avalon_viewport[0]);
-   cs_move64_to(b, cs_sr_reg64(b, IDVS, VIEWPORT_LOW), avalon_viewport[1]);
+   uint64_t *fifthgen_viewport = (uint64_t *)batch->fifthgen_viewport;
+   cs_move64_to(b, cs_sr_reg64(b, IDVS, VIEWPORT_HIGH), fifthgen_viewport[0]);
+   cs_move64_to(b, cs_sr_reg64(b, IDVS, VIEWPORT_LOW), fifthgen_viewport[1]);
 #else
    cs_move32_to(b, cs_sr_reg32(b, IDVS, LOW_DEPTH_CLAMP),
                 fui(batch->minimum_z));
@@ -1600,10 +1603,12 @@ GENX(csf_init_context)(struct panfrost_context *ctx)
    };
 
    assert(cs_is_valid(&b));
-   cs_finish(&b);
+   cs_end(&b);
 
    uint64_t cs_start = cs_root_chunk_gpu_addr(&b);
    uint32_t cs_size = cs_root_chunk_size(&b);
+
+   cs_builder_fini(&b);
 
    csf_prepare_qsubmit(ctx, &qsubmit, 0, cs_start, cs_size, &sync, 1);
    csf_prepare_gsubmit(ctx, &gsubmit, &qsubmit, 1);

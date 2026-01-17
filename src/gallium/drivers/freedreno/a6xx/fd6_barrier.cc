@@ -3,8 +3,6 @@
  * SPDX-License-Identifier: MIT
  */
 
-#define FD_BO_NO_HARDPIN 1
-
 #include "freedreno_batch.h"
 
 #include "fd6_barrier.h"
@@ -30,6 +28,9 @@ fd6_emit_flushes(struct fd_context *ctx, fd_cs &cs, unsigned flushes)
 
    if (flushes & FD6_INVALIDATE_CCU_DEPTH)
       fd6_event_write<CHIP>(ctx, cs, FD_CCU_INVALIDATE_DEPTH);
+
+   if ((CHIP >= A7XX) && (flushes & FD6_INVALIDATE_CCHE))
+      fd_pkt7(cs, CP_CCHE_INVALIDATE, 0);
 
    if (flushes & FD6_FLUSH_CACHE)
       fd6_event_write<CHIP>(ctx, cs, FD_CACHE_CLEAN);

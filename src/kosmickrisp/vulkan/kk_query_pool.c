@@ -254,10 +254,13 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
+   /* Need to flush other availabilities just in case there is a reset after it
+    * was made available but the writes have not propagated yet. Need to avoid
+    * data rances in the writes. This is save to do sice vkCmdResetQueryPool
+    * cannot be called when a render pass is active. */
+   upload_queue_writes(cmd);
    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
-   /* If we are not mid encoder, just upload the writes */
-   if (cmd->encoder->main.last_used == KK_ENC_NONE)
-      upload_queue_writes(cmd);
+   upload_queue_writes(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -292,8 +295,10 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    cmd->state.gfx.dirty |= KK_DIRTY_OCCLUSION;
 
    /* Make the query available */
-   uint64_t addr = kk_query_available_addr(pool, query);
-   kk_cmd_write(cmd, pool->bo->map, addr, true);
+   if (kk_has_available(pool)) {
+      uint64_t addr = kk_query_available_addr(pool, query);
+      kk_cmd_write(cmd, pool->bo->map, addr, true);
+   }
 }
 
 static bool
@@ -419,6 +424,7 @@ kk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 
    util_dynarray_append(&cmd->encoder->copy_query_pool_result_infos, info);
    /* If we are not mid encoder, just upload the writes */
-   if (cmd->encoder->main.last_used == KK_ENC_NONE)
+   enum kk_encoder_type last_used = cmd->encoder->main.last_used;
+   if (last_used == KK_ENC_NONE || last_used == KK_ENC_COMPUTE)
       upload_queue_writes(cmd);
 }

@@ -69,10 +69,16 @@ static const struct vk_instance_extension_table pvr_instance_extensions = {
 #ifdef VK_USE_PLATFORM_WAYLAND_KHR
    .KHR_wayland_surface = true,
 #endif
+#ifdef VK_USE_PLATFORM_XCB_KHR
+   .KHR_xcb_surface = true,
+#endif
+#ifdef VK_USE_PLATFORM_XLIB_KHR
+   .KHR_xlib_surface = true,
+#endif
    .EXT_debug_report = true,
    .EXT_debug_utils = true,
 #ifndef VK_USE_PLATFORM_WIN32_KHR
-   .EXT_headless_surface = PVR_USE_WSI_PLATFORM && false,
+   .EXT_headless_surface = PVR_USE_WSI_PLATFORM,
 #endif
 };
 
@@ -300,7 +306,7 @@ out:
 }
 
 static bool
-pvr_get_driver_build_sha(uint8_t sha_out[const static SHA1_DIGEST_LENGTH])
+pvr_get_driver_build_sha(uint8_t sha_out[const static BUILD_ID_EXPECTED_HASH_LENGTH])
 {
    const struct build_id_note *note;
    unsigned build_id_len;
@@ -312,12 +318,12 @@ pvr_get_driver_build_sha(uint8_t sha_out[const static SHA1_DIGEST_LENGTH])
    }
 
    build_id_len = build_id_length(note);
-   if (build_id_len < SHA1_DIGEST_LENGTH) {
+   if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
       mesa_loge("Build-id too short. It needs to be a SHA.");
       return false;
    }
 
-   memcpy(sha_out, build_id_data(note), SHA1_DIGEST_LENGTH);
+   memcpy(sha_out, build_id_data(note), BUILD_ID_EXPECTED_HASH_LENGTH);
 
    return true;
 }

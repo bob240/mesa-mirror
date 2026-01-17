@@ -1,4 +1,5 @@
 /*
+ * Copyright © 2025 Arm Ltd.
  * Copyright © 2021 Collabora Ltd.
  *
  * Derived from tu_image.c which is:
@@ -54,7 +55,7 @@ panvk_image_can_use_afbc(
    VkImageUsageFlags usage, VkImageType type, VkImageTiling tiling,
    VkImageCreateFlags flags)
 {
-   unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
+   unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
    enum pipe_format pfmt = vk_format_to_pipe_format(fmt);
 
    /* Disallow AFBC if either of these is true
@@ -79,7 +80,7 @@ panvk_image_can_use_afbc(
    return !PANVK_DEBUG(NO_AFBC) &&
           !(usage &
             (VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_HOST_TRANSFER_BIT)) &&
-          pan_query_afbc(&phys_dev->kmod.props) &&
+          pan_query_afbc(&phys_dev->kmod.dev->props) &&
           pan_afbc_supports_format(arch, pfmt) &&
           tiling != VK_IMAGE_TILING_LINEAR && type != VK_IMAGE_TYPE_1D &&
           (type != VK_IMAGE_TYPE_3D || arch >= 7) &&
@@ -143,7 +144,7 @@ get_plane_count(struct panvk_image *image)
 
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(image->vk.base.device->physical);
-   unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
+   unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
 
    /* Z32_S8X24 is not supported on v9+, and we don't want to use it
     * on v7- anyway, because it's less efficient than the multiplanar
@@ -208,7 +209,7 @@ panvk_image_can_use_mod(struct panvk_image *image,
 {
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(image->vk.base.device->physical);
-   unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
+   unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
    const bool forced_linear = PANVK_DEBUG(LINEAR) ||
                               image->vk.tiling == VK_IMAGE_TILING_LINEAR ||
                               image->vk.image_type == VK_IMAGE_TYPE_1D;
@@ -254,6 +255,18 @@ panvk_image_can_use_mod(struct panvk_image *image,
       if ((image->vk.create_flags & VK_IMAGE_CREATE_ALIAS_BIT) &&
           (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT))
          return false;
+
+      /* No ms with AFBC, but we need to create multisampled images in the
+       * background for which the view formats need to be compatible to avoid
+       * headaches when copying --> disable afbc for the base image as well.
+       * When copying the depth plane block sizes aren't matching between
+       * utiled and afbc, thus the views created for the ms images are
+       * invalid.
+       */
+      if (image->vk.create_flags &
+          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+         return false;
+      }
    }
 
    if (mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
@@ -298,7 +311,7 @@ panvk_image_can_use_mod(struct panvk_image *image,
       };
 
       enum pan_mod_support supported =
-         pan_image_test_props(&phys_dev->kmod.props, &iprops, iusage);
+         pan_image_test_props(&phys_dev->kmod.dev->props, &iprops, iusage);
       if (supported == PAN_MOD_NOT_SUPPORTED ||
           (supported == PAN_MOD_NOT_OPTIMAL && optimal_only))
          return false;
@@ -413,7 +426,7 @@ panvk_image_init_layouts(struct panvk_image *image,
    struct panvk_device *dev = to_panvk_device(image->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
-   unsigned arch = pan_arch(phys_dev->kmod.props.gpu_id);
+   unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
    const VkImageDrmFormatModifierExplicitCreateInfoEXT *explicit_info =
       vk_find_struct_const(
          pCreateInfo->pNext,
@@ -604,6 +617,57 @@ panvk_image_plane_bind_addr(struct panvk_device *dev,
    plane->plane.base = addr;
 }
 
+static void
+create_ms_images(struct panvk_device *dev, struct panvk_image *img,
+                 const VkImageCreateInfo *pCreateInfo,
+                 const VkAllocationCallbacks *pAllocator)
+{
+   struct panvk_physical_device *pdev =
+      to_panvk_physical_device(dev->vk.physical);
+
+   VkPhysicalDeviceImageFormatInfo2 info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = pCreateInfo->format,
+      .type = pCreateInfo->imageType,
+      .tiling = pCreateInfo->tiling,
+      .usage = pCreateInfo->usage,
+      .flags = pCreateInfo->flags,
+   };
+   VkImageFormatProperties2 properties = {};
+   panvk_GetPhysicalDeviceImageFormatProperties2(
+      vk_physical_device_to_handle(&pdev->vk), &info, &properties);
+
+   VkImageCreateInfo ms_img_info = *pCreateInfo;
+
+   assert(ms_img_info.flags &
+          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT);
+   ms_img_info.flags &=
+      ~VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
+
+   for (uint32_t msaa_idx = 0; msaa_idx < ARRAY_SIZE(img->ms_imgs);
+        ++msaa_idx) {
+      VkSampleCountFlagBits msaa = 1 << (msaa_idx + 1);
+
+      if ((properties.imageFormatProperties.sampleCounts & msaa) == 0) {
+         img->ms_imgs[msaa_idx] = VK_NULL_HANDLE;
+         continue;
+      }
+
+      ms_img_info.samples = msaa;
+
+      panvk_CreateImage(panvk_device_to_handle(dev), &ms_img_info, pAllocator,
+                        &img->ms_imgs[msaa_idx]);
+
+      struct panvk_image *res = panvk_image_from_handle(img->ms_imgs[msaa_idx]);
+      assert(res->vk.format == img->vk.format);
+      assert(res->plane_count == img->plane_count);
+      for (uint32_t i = 0; i < res->plane_count; ++i) {
+         assert(res->planes[i].image.props.format ==
+                img->planes[i].image.props.format);
+      }
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                   const VkAllocationCallbacks *pAllocator, VkImage *pImage)
@@ -618,12 +682,9 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
                                                 pImage);
    }
 
-   const VkImageSwapchainCreateInfoKHR *swapchain_info =
-      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
-   if (swapchain_info && swapchain_info->swapchain != VK_NULL_HANDLE) {
+   if (wsi_common_is_swapchain_image(pCreateInfo)) {
       return wsi_common_create_swapchain_image(&phys_dev->wsi_device,
                                                pCreateInfo,
-                                               swapchain_info->swapchain,
                                                pImage);
    }
 
@@ -680,6 +741,10 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
       }
    }
 
+   if (pCreateInfo->flags &
+       VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT)
+      create_ms_images(dev, image, pCreateInfo, pAllocator);
+
    *pImage = panvk_image_to_handle(image);
    return VK_SUCCESS;
 
@@ -702,6 +767,13 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
 
    if (!image)
       return;
+
+   if (image->vk.create_flags &
+       VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+      for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+         panvk_DestroyImage(_device, image->ms_imgs[i], pAllocator);
+      }
+   }
 
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
       uint64_t va_range = panvk_image_get_sparse_size(image);
@@ -814,12 +886,32 @@ panvk_image_get_sparse_binding_granularity(struct panvk_image *image)
    return panvk_get_gpu_page_size(dev);
 }
 
+static void
+append_ms_to_ss_memory_reqs(VkMemoryRequirements2 *pMemoryRequirements,
+                            const VkMemoryRequirements2 *append)
+{
+   pMemoryRequirements->memoryRequirements.alignment =
+      MAX2(pMemoryRequirements->memoryRequirements.alignment,
+           append->memoryRequirements.alignment);
+   /* After the previous images, align this images start properly. */
+   pMemoryRequirements->memoryRequirements.size =
+      align(pMemoryRequirements->memoryRequirements.size,
+            append->memoryRequirements.alignment);
+   pMemoryRequirements->memoryRequirements.size +=
+      append->memoryRequirements.size;
+   pMemoryRequirements->memoryRequirements.memoryTypeBits &=
+      append->memoryRequirements.memoryTypeBits;
+   assert(pMemoryRequirements->memoryRequirements.memoryTypeBits != 0);
+}
+
 VKAPI_ATTR void VKAPI_CALL
 panvk_GetImageMemoryRequirements2(VkDevice device,
                                   const VkImageMemoryRequirementsInfo2 *pInfo,
                                   VkMemoryRequirements2 *pMemoryRequirements)
 {
    VK_FROM_HANDLE(panvk_image, image, pInfo->image);
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(image->vk.base.device->physical);
 
    /* For sparse resources alignment specifies binding granularity, rather than
     * the alignment requirement. It's up to us to satisfy the alignment
@@ -843,7 +935,8 @@ panvk_GetImageMemoryRequirements2(VkDevice device,
          ? align64(size_non_sparse, alignment)
          : size_non_sparse;
 
-   pMemoryRequirements->memoryRequirements.memoryTypeBits = 1;
+   pMemoryRequirements->memoryRequirements.memoryTypeBits =
+      BITFIELD_MASK(phys_dev->memory.type_count);
    pMemoryRequirements->memoryRequirements.alignment = alignment;
    pMemoryRequirements->memoryRequirements.size = size;
 
@@ -861,6 +954,24 @@ panvk_GetImageMemoryRequirements2(VkDevice device,
          break;
       }
    }
+
+   if (image->vk.create_flags &
+       VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+      for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+         if (image->ms_imgs[i] == VK_NULL_HANDLE)
+            continue;
+
+         VkImageMemoryRequirementsInfo2 info = *pInfo;
+         info.image = image->ms_imgs[i];
+
+         VkMemoryRequirements2 sub_reqs_2 = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+            .memoryRequirements = {},
+         };
+         panvk_GetImageMemoryRequirements2(device, &info, &sub_reqs_2);
+         append_ms_to_ss_memory_reqs(pMemoryRequirements, &sub_reqs_2);
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -870,9 +981,16 @@ panvk_GetDeviceImageMemoryRequirements(VkDevice device,
 {
    VK_FROM_HANDLE(panvk_device, dev, device);
 
+   /* Make a copy so we can turn off the ms2ss flag. */
+   VkDeviceImageMemoryRequirements info = *pInfo;
+   VkImageCreateInfo create_info = *(pInfo->pCreateInfo);
+   create_info.flags &=
+      ~VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
+   info.pCreateInfo = &create_info;
+
    struct panvk_image image;
-   vk_image_init(&dev->vk, &image.vk, pInfo->pCreateInfo);
-   panvk_image_init(&image, pInfo->pCreateInfo);
+   vk_image_init(&dev->vk, &image.vk, &create_info);
+   panvk_image_init(&image, &create_info);
 
    VkImageMemoryRequirementsInfo2 info2 = {
       .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
@@ -880,6 +998,24 @@ panvk_GetDeviceImageMemoryRequirements(VkDevice device,
    };
    panvk_GetImageMemoryRequirements2(device, &info2, pMemoryRequirements);
    vk_image_finish(&image.vk);
+
+   if (pInfo->pCreateInfo->flags &
+       VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+      for (uint32_t msaa_idx = 0; msaa_idx < ARRAY_SIZE(image.ms_imgs);
+           ++msaa_idx) {
+         /* idx 0 has sample count 2, 1 has sample count 4, ... */
+         create_info.samples = 1 << (msaa_idx + 1);
+         create_info.flags &=
+            ~VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT;
+
+         VkMemoryRequirements2 msaa_reqs = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+            .memoryRequirements = {},
+         };
+         panvk_GetDeviceImageMemoryRequirements(device, &info, &msaa_reqs);
+         append_ms_to_ss_memory_reqs(pMemoryRequirements, &msaa_reqs);
+      }
+   }
 }
 
 /* See Vulkan spec, 35.4.3. Standard Sparse Image Block Shapes for details */
@@ -1016,6 +1152,93 @@ panvk_GetDeviceImageSparseMemoryRequirements(VkDevice device,
    vk_image_finish(&image.vk);
 }
 
+static VkResult panvk_image_bind(struct panvk_device *dev,
+                                 const VkBindImageMemoryInfo *bind_info);
+
+static void
+bind_ms_images(struct panvk_device *dev, const VkBindImageMemoryInfo *bind_info)
+{
+   VK_FROM_HANDLE(panvk_image, image, bind_info->image);
+
+   uint64_t total_size = 0;
+   {
+      VkImageMemoryRequirementsInfo2 reqs_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+         .image = bind_info->image,
+      };
+      VkMemoryRequirements2 reqs2 = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+         .memoryRequirements = {},
+      };
+      panvk_GetImageMemoryRequirements2(panvk_device_to_handle(dev), &reqs_info,
+                                        &reqs2);
+
+      total_size = reqs2.memoryRequirements.size;
+   }
+
+   uint64_t sub_sz[ARRAY_SIZE(image->ms_imgs)];
+   uint64_t sub_al[ARRAY_SIZE(image->ms_imgs)];
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+      if (image->ms_imgs[i] == VK_NULL_HANDLE) {
+         sub_sz[i] = 0;
+         sub_al[i] = 1;
+         continue;
+      }
+
+      VkImageMemoryRequirementsInfo2 reqs_info = {
+         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+         .image = image->ms_imgs[i],
+      };
+      VkMemoryRequirements2 reqs2 = {
+         .sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2,
+         .memoryRequirements = {},
+      };
+      panvk_GetImageMemoryRequirements2(panvk_device_to_handle(dev), &reqs_info,
+                                        &reqs2);
+
+      sub_sz[i] = reqs2.memoryRequirements.size;
+      sub_al[i] = reqs2.memoryRequirements.alignment;
+   }
+
+   /*
+    *           sub_imgs_aligned_size
+    *        ----------------------------
+    * [ base, sub_0, sub_1, sub_2, sub_3 ]
+    *  -->-> -->->       ...      ------>
+    *  sz a  sz a                size only
+    */
+   uint64_t sub_imgs_aligned_size = 0;
+   for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+      sub_imgs_aligned_size += sub_sz[i];
+      if (i < ARRAY_SIZE(image->ms_imgs) - 1) {
+         sub_imgs_aligned_size = align(sub_imgs_aligned_size, sub_al[i + 1]);
+      }
+   }
+
+   uint64_t sub_image_offset =
+      bind_info->memoryOffset + total_size - sub_imgs_aligned_size;
+
+   for (uint32_t i = 0; i < ARRAY_SIZE(image->ms_imgs); ++i) {
+      if (image->ms_imgs[i] == VK_NULL_HANDLE)
+         continue;
+
+      sub_image_offset = align(sub_image_offset, sub_al[i]);
+
+      VkBindImageMemoryInfo sub_bind_info = {
+         .sType = VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_INFO,
+         .image = image->ms_imgs[i],
+         .memory = bind_info->memory,
+         .memoryOffset = sub_image_offset,
+      };
+
+      const VkResult res = panvk_image_bind(dev, &sub_bind_info);
+      assert(res == VK_SUCCESS);
+
+      sub_image_offset += sub_sz[i];
+   }
+}
+
 static VkResult
 panvk_image_bind(struct panvk_device *dev,
                  const VkBindImageMemoryInfo *bind_info)
@@ -1056,6 +1279,10 @@ panvk_image_bind(struct panvk_device *dev,
       for (unsigned plane = 0; plane < image->plane_count; plane++)
          panvk_image_plane_bind_mem(dev, &image->planes[plane], mem, offset);
    }
+
+   if (!!(image->vk.create_flags &
+          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT))
+      bind_ms_images(dev, bind_info);
 
    return VK_SUCCESS;
 }

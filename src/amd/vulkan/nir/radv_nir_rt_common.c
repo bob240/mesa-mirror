@@ -20,12 +20,11 @@ radv_use_bvh_stack_rtn(const struct radv_physical_device *pdevice)
 }
 
 nir_def *
-radv_build_bvh_stack_rtn_addr(nir_builder *b, const struct radv_physical_device *pdev, uint32_t workgroup_size,
+radv_build_bvh_stack_rtn_addr(nir_builder *b, nir_def *stack_idx, const struct radv_physical_device *pdev, uint32_t workgroup_size,
                               uint32_t stack_base, uint32_t max_stack_entries)
 {
    assert(stack_base % 4 == 0);
 
-   nir_def *stack_idx = nir_load_local_invocation_index(b);
    /* RDNA3's ds_bvh_stack_rtn instruction uses a special encoding for the stack address.
     * Bits 0-17 encode the current stack index (set to 0 initially)
     * Bits 18-31 encodes the stack base in multiples of 4
@@ -79,8 +78,8 @@ intersect_ray_amd_software_box(struct radv_device *device, nir_builder *b, nir_d
    const struct glsl_type *vec4_type = glsl_vector_type(GLSL_TYPE_FLOAT, 4);
    const struct glsl_type *uvec4_type = glsl_vector_type(GLSL_TYPE_UINT, 4);
 
-   bool old_exact = b->exact;
-   b->exact = true;
+   unsigned old_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
 
    nir_def *node_addr = build_node_to_addr(device, b, bvh_node, false);
 
@@ -165,7 +164,7 @@ intersect_ray_amd_software_box(struct radv_device *device, nir_builder *b, nir_d
    nir_sort_hit_pair(b, distances, child_indices, 1, 3);
    nir_sort_hit_pair(b, distances, child_indices, 1, 2);
 
-   b->exact = old_exact;
+   b->fp_math_ctrl = old_math_ctrl;
    return nir_load_var(b, child_indices);
 }
 
@@ -196,8 +195,8 @@ intersect_ray_amd_software_tri(struct radv_device *device, nir_builder *b, nir_d
 {
    const struct glsl_type *vec4_type = glsl_vector_type(GLSL_TYPE_FLOAT, 4);
 
-   bool old_exact = b->exact;
-   b->exact = true;
+   unsigned old_math_ctrl = b->fp_math_ctrl;
+   b->fp_math_ctrl |= nir_fp_exact;
 
    nir_def *node_addr = build_node_to_addr(device, b, bvh_node, false);
 
@@ -375,7 +374,7 @@ intersect_ray_amd_software_tri(struct radv_device *device, nir_builder *b, nir_d
    }
    nir_pop_if(b, NULL);
 
-   b->exact = old_exact;
+   b->fp_math_ctrl = old_math_ctrl;
    return nir_load_var(b, result);
 }
 
@@ -946,7 +945,7 @@ radv_build_ray_traversal(struct radv_device *device, nir_builder *b, const struc
       nir_def *global_bvh_node = nir_iadd(b, nir_load_deref(b, args->vars.bvh_base), nir_u2u64(b, bvh_node));
 
       bool has_result = false;
-      if (pdev->info.has_image_bvh_intersect_ray && !radv_emulate_rt(pdev)) {
+      if (pdev->info.cu_info.has_image_bvh_intersect_ray && !radv_emulate_rt(pdev)) {
          nir_store_var(
             b, intrinsic_result,
             nir_bvh64_intersect_ray_amd(b, 32, desc, nir_unpack_64_2x32(b, global_bvh_node),

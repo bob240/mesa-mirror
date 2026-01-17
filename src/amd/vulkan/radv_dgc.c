@@ -506,6 +506,7 @@ radv_get_sequence_size(const struct radv_indirect_command_layout *layout, const 
    if (device->sqtt.bo) {
       /* THREAD_TRACE_MARKER */
       *cmd_size += 2 * 4;
+      *ace_cmd_size += 2 * 4;
    }
 
    if (layout->vk.dgc_info & BITFIELD_BIT(MESA_VK_DGC_DISPATCH)) {
@@ -2266,7 +2267,9 @@ dgc_emit_dispatch_taskmesh_gfx(struct dgc_cmdbuf *cs, nir_def *sequence_id)
    dgc_cs_emit_imm(V_0287F0_DI_SRC_SEL_AUTO_INDEX);
    dgc_cs_end();
 
-   dgc_emit_after_draw(cs, ApiCmdDrawMeshTasksEXT);
+   dgc_gfx12_emit_hiz_his_wa(cs);
+   /* No SQTT marker emitted because it's part of the packet. */
+   dgc_emit_sqtt_end_api_marker(cs, ApiCmdDrawMeshTasksEXT);
 }
 
 static void
@@ -2452,6 +2455,8 @@ dgc_emit_draw_mesh_tasks_ace(struct dgc_cmdbuf *ace_cs, nir_def *stream_addr)
    {
       dgc_emit_userdata_task(ace_cs, x, y, z);
       dgc_emit_dispatch_taskmesh_direct_ace(ace_cs, x, y, z);
+
+      dgc_emit_sqtt_thread_trace_marker(ace_cs);
    }
    nir_pop_if(b, NULL);
 }
@@ -2493,6 +2498,8 @@ dgc_emit_draw_mesh_tasks_with_count_ace(struct dgc_cmdbuf *ace_cs, nir_def *stre
    dgc_cs_emit(stride);
    dgc_cs_emit(dispatch_initiator);
    dgc_cs_end();
+
+   dgc_emit_sqtt_thread_trace_marker(ace_cs);
 }
 
 /**
@@ -3380,7 +3387,7 @@ radv_update_ies_shader(struct radv_device *device, struct radv_indirect_executio
    /* The IES shader may be used on GFX and compute queues.
     * IP type doesn't matter here, but use compute because this emits a compute shader.
     */
-   radv_init_cmd_stream(&cs, AMD_IP_COMPUTE);
+   radv_init_cmd_stream(device, &cs, AMD_IP_COMPUTE);
 
    assert(shader->info.stage == MESA_SHADER_COMPUTE);
    radv_get_compute_shader_metadata(device, shader, &md);

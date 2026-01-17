@@ -1,5 +1,3 @@
-dEQP-GLES2.functional.clipping.line.wide_line_clip_viewport_center,Fail
-dEQP-GLES2.functional.clipping.line.wide_line_clip_viewport_corner,Fail
 dEQP-GLES2.functional.clipping.point.point_clip_viewport_center,Fail
 dEQP-GLES2.functional.clipping.point.point_clip_viewport_corner,Fail
 dEQP-GLES2.functional.clipping.point.point_z_clip,Fail
@@ -33,8 +31,6 @@ dEQP-GLES2.functional.draw.random.71,Fail
 dEQP-GLES2.functional.draw.random.8,Fail
 
 dEQP-GLES2.functional.fbo.completeness.renderable.texture.color0.rgb_half_float_oes,Fail
-dEQP-GLES2.functional.fbo.render.repeated_clear.tex2d_rgb,Fail
-dEQP-GLES2.functional.fbo.render.repeated_clear.tex2d_rgba,Fail
 
 # This bunch is not reproducible outside of CI
 dEQP-GLES2.functional.fragment_ops.interaction.basic_shader.8,Fail
@@ -696,7 +692,6 @@ spec@arb_texture_rectangle@copyteximage rect samples=2,Fail
 spec@arb_texture_rectangle@copyteximage rect samples=4,Fail
 spec@arb_texture_rectangle@copyteximage rect samples=6,Fail
 spec@arb_texture_rectangle@tex-miplevel-selection gl2:texture() 2drect,Fail
-spec@arb_texture_rectangle@tex-miplevel-selection gl2:texture() 2drectshadow,Fail
 spec@arb_texture_rectangle@tex-miplevel-selection gl2:textureproj 2drect,Fail
 spec@arb_texture_rectangle@tex-miplevel-selection gl2:textureproj 2drectshadow,Fail
 
@@ -1092,7 +1087,6 @@ spec@glsl-1.20@execution@tex-miplevel-selection gl2:texture() cube,Fail
 spec@glsl-1.20@execution@tex-miplevel-selection gl2:texture(bias) 1d,Fail
 spec@glsl-1.20@execution@tex-miplevel-selection gl2:texture(bias) 1dshadow,Fail
 spec@glsl-1.20@execution@tex-miplevel-selection gl2:texture(bias) cube,Fail
-spec@glsl-1.20@execution@tex-miplevel-selection gl2:textureproj 1d_projvec4,Fail
 spec@glsl-1.20@execution@tex-miplevel-selection gl2:textureproj 2d,Fail
 spec@glsl-1.20@execution@tex-miplevel-selection gl2:textureproj 2d_projvec4,Fail
 spec@glsl-1.20@execution@tex-miplevel-selection gl2:textureproj(bias) 1d,Fail

@@ -91,6 +91,10 @@ amd_common_files = files(
   'amd_family.c',
   'ac_parse_ib.c',
   'ac_perfcounter.c',
+  'ac_perfcounter_gfx10.c',
+  'ac_perfcounter_gfx103.c',
+  'ac_perfcounter_gfx11.c',
+  'ac_perfcounter_gfx12.c',
   'ac_perfcounter.h',
   'ac_pm4.c',
   'ac_pm4.h',
@@ -139,7 +143,7 @@ if not with_platform_windows
   )
 endif
 
-link_with = []
+link_with = [ libamdgpu_addrlib ]
 c_args = ['-DADDR_FASTCALL=']
 if with_amdgpu_virtio
   c_args += ['-DHAVE_AMDGPU_VIRTIO', '-DENABLE_DRM_AMDGPU']

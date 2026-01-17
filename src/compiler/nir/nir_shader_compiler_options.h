@@ -206,6 +206,22 @@ typedef enum {
     */
    nir_io_assign_color_input_bases_after_all_other_inputs = BITFIELD_BIT(11),
 
+   /**
+    * Whether nir_lower_io should use FRAG_RESULT_DUAL_SRC_BLEND instead of
+    * nir_io_semantics::dual_source_blend_index.
+    *
+    * This has the advantage that it behaves like a normal output and its
+    * presence is reflected in shader_info::outputs_written instead of
+    * shader_info::fs::color_is_dual_source.
+    */
+   nir_io_use_frag_result_dual_src_blend = BITFIELD_BIT(12),
+
+   /**
+    * Whether the implementation can compact 16-bit values in the higher
+    * 32-bits of a varying.
+    */
+   nir_io_compact_to_higher_16 = BITFIELD_BIT(13),
+
    /* Options affecting the GLSL compiler or Gallium are below. */
 
    /**
@@ -745,6 +761,12 @@ typedef struct nir_shader_compiler_options {
     */
    uint8_t support_indirect_inputs;
    uint8_t support_indirect_outputs;
+
+   /**
+    * If set, the maximum MSAA sample count supported -- can hint loop unrolling
+    * to optimistically unroll a loop doing txf_ms per sample.
+    */
+   uint8_t max_samples;
 
    /**
     * Lower fmulz to `min(abs(a), abs(b)) == 0.0 ? 0.0 : a * b`.

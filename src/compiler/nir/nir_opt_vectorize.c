@@ -453,15 +453,9 @@ instr_try_combine_alu(struct set *instr_set, nir_alu_instr *alu1, nir_alu_instr 
                 alu1->def.bit_size);
    new_alu->instr.pass_flags = alu1->instr.pass_flags;
 
-   /* If either channel is exact, we have to preserve it even if it's
-    * not optimal for other channels.
+   /* fp_math_ctrl is a set of restrictions, take the union of both.
     */
-   new_alu->exact = alu1->exact || alu2->exact;
-
-   /* fp_fast_math is a set of FLOAT_CONTROLS_*_PRESERVE_*.  Preserve anything
-    * preserved by either instruction.
-    */
-   new_alu->fp_fast_math = alu1->fp_fast_math | alu2->fp_fast_math;
+   new_alu->fp_math_ctrl = alu1->fp_math_ctrl | alu2->fp_math_ctrl;
 
    /* If all channels don't wrap, we can say that the whole vector doesn't
     * wrap.

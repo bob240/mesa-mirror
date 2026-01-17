@@ -529,7 +529,7 @@ union packed_instr {
    } any;
    struct {
       unsigned instr_type : 4;
-      unsigned exact : 1;
+      unsigned pad : 1;
       unsigned no_signed_wrap : 1;
       unsigned no_unsigned_wrap : 1;
       /* Swizzles for 2 srcs */
@@ -719,7 +719,6 @@ write_alu(write_ctx *ctx, const nir_alu_instr *alu)
    header.u32 = 0;
 
    header.alu.instr_type = alu->instr.type;
-   header.alu.exact = alu->exact;
    header.alu.no_signed_wrap = alu->no_signed_wrap;
    header.alu.no_unsigned_wrap = alu->no_unsigned_wrap;
    header.alu.op = alu->op;
@@ -733,7 +732,7 @@ write_alu(write_ctx *ctx, const nir_alu_instr *alu)
    }
 
    write_def(ctx, &alu->def, header, alu->instr.type);
-   blob_write_uint32(ctx->blob, alu->fp_fast_math);
+   blob_write_uint32(ctx->blob, alu->fp_math_ctrl);
 
    if (header.alu.packed_src_ssa_16bit) {
       for (unsigned i = 0; i < num_srcs; i++) {
@@ -783,12 +782,11 @@ read_alu(read_ctx *ctx, union packed_instr header)
    unsigned num_srcs = nir_op_infos[header.alu.op].num_inputs;
    nir_alu_instr *alu = nir_alu_instr_create(ctx->nir, header.alu.op);
 
-   alu->exact = header.alu.exact;
    alu->no_signed_wrap = header.alu.no_signed_wrap;
    alu->no_unsigned_wrap = header.alu.no_unsigned_wrap;
 
    read_def(ctx, &alu->def, &alu->instr, header);
-   alu->fp_fast_math = blob_read_uint32(ctx->blob);
+   alu->fp_math_ctrl = blob_read_uint32(ctx->blob);
 
    if (header.alu.packed_src_ssa_16bit) {
       for (unsigned i = 0; i < num_srcs; i++) {
@@ -915,8 +913,7 @@ write_deref(write_ctx *ctx, const nir_deref_instr *deref)
          header.deref_var.object_idx = var_idx;
    }
 
-   if (deref->deref_type == nir_deref_type_array ||
-       deref->deref_type == nir_deref_type_ptr_as_array) {
+   if (nir_deref_instr_is_arr(deref)) {
       header.deref.packed_src_ssa_16bit = are_object_ids_16bit(ctx);
 
       header.deref.in_bounds = deref->arr.in_bounds;

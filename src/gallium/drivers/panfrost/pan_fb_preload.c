@@ -19,10 +19,6 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * Authors:
- *   Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
- *   Boris Brezillon <boris.brezillon@collabora.com>
  */
 
 #include <math.h>
@@ -38,6 +34,8 @@
 #include "pan_pool.h"
 #include "pan_shader.h"
 #include "pan_texture.h"
+#include "compiler/pan_compiler.h"
+#include "compiler/pan_nir.h"
 
 #if PAN_ARCH >= 6
 /* On Midgard, the native preload infrastructure (via MFBD preloads) is broken
@@ -459,7 +457,7 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
    }
 
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_FRAGMENT, pan_shader_get_compiler_options(PAN_ARCH),
+      MESA_SHADER_FRAGMENT, pan_get_nir_shader_compiler_options(PAN_ARCH),
       "pan_preload(%s)", sig);
 
    nir_def *barycentric = nir_load_barycentric(
@@ -558,9 +556,9 @@ pan_preload_get_shader(struct pan_fb_preload_cache *cache,
    for (unsigned i = 0; i < active_count; ++i)
       BITSET_SET(b.shader->info.textures_used, i);
 
-   pan_shader_preprocess(b.shader, inputs.gpu_id);
-   pan_shader_lower_texture_early(b.shader, inputs.gpu_id);
-   pan_shader_postprocess(b.shader, inputs.gpu_id);
+   pan_preprocess_nir(b.shader, inputs.gpu_id);
+   pan_nir_lower_texture_early(b.shader, inputs.gpu_id);
+   pan_postprocess_nir(b.shader, inputs.gpu_id);
 
    if (PAN_ARCH == 4) {
       NIR_PASS(_, b.shader, nir_shader_intrinsics_pass,

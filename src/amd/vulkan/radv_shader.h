@@ -12,6 +12,7 @@
 #define RADV_SHADER_H
 
 #include "util/mesa-blake3.h"
+#include "util/sha1/sha1.h"
 #include "util/shader_stats.h"
 #include "util/u_math.h"
 #include "vulkan/vulkan.h"
@@ -33,6 +34,8 @@ struct radv_shader_args;
 struct radv_shader_args;
 struct radv_serialized_shader_arena_block;
 struct vk_pipeline_robustness_state;
+struct nir_parameter;
+typedef struct nir_parameter nir_parameter;
 
 #define RADV_GRAPHICS_STAGE_BITS                                                                                       \
    (VK_SHADER_STAGE_ALL_GRAPHICS | VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_TASK_BIT_EXT)
@@ -101,6 +104,8 @@ struct radv_ps_epilog_key {
    uint8_t color_is_int8;
    uint8_t color_is_int10;
    uint8_t enable_mrt_output_nan_fixup;
+
+   uint32_t colors_needed;
 
    uint32_t colors_written;
    uint8_t color_map[MAX_RTS];
@@ -267,7 +272,7 @@ struct radv_shader_stage {
    const char *entrypoint;
    const VkSpecializationInfo *spec_info;
 
-   unsigned char shader_sha1[20];
+   unsigned char shader_sha1[SHA1_DIGEST_LENGTH];
 
    nir_shader *nir;
    nir_shader *gs_copy_shader;
@@ -420,6 +425,7 @@ struct radv_shader {
    uint32_t code_size;
    uint32_t exec_size;
    struct radv_shader_info info;
+   struct radv_shader_regs regs;
    uint32_t max_waves;
 
    blake3_hash hash;
@@ -492,17 +498,6 @@ void radv_optimize_nir_algebraic_late(nir_shader *shader);
 void radv_optimize_nir_algebraic(nir_shader *shader, bool opt_offsets, bool opt_mqsad,
                                  enum amd_gfx_level gfx_level);
 
-void radv_nir_lower_rt_io(nir_shader *shader, bool monolithic, uint32_t payload_offset);
-
-struct radv_ray_tracing_stage_info;
-
-void radv_nir_lower_rt_abi(nir_shader *shader, const VkRayTracingPipelineCreateInfoKHR *pCreateInfo,
-                           const struct radv_shader_args *args, const struct radv_shader_info *info,
-                           uint32_t *stack_size, bool resume_shader, struct radv_device *device,
-                           struct radv_ray_tracing_pipeline *pipeline, bool monolithic, bool has_position_fetch,
-                           const struct radv_ray_tracing_stage_info *traversal_info);
-
-void radv_gather_unused_args(struct radv_ray_tracing_stage_info *info, nir_shader *nir);
 
 struct radv_shader_stage;
 
@@ -556,7 +551,8 @@ void radv_free_shader_memory(struct radv_device *device, union radv_shader_arena
 
 struct radv_shader *radv_create_trap_handler_shader(struct radv_device *device);
 
-struct radv_shader *radv_create_rt_prolog(struct radv_device *device);
+struct radv_shader *radv_create_rt_prolog(struct radv_device *device, unsigned raygen_param_count,
+                                          nir_parameter *raygen_params);
 
 struct radv_shader_part *radv_shader_part_create(struct radv_device *device, struct radv_shader_part_binary *binary,
                                                  unsigned wave_size);
@@ -658,38 +654,11 @@ bool radv_consider_culling(const struct radv_physical_device *pdev, struct nir_s
 
 void radv_get_nir_options(struct radv_physical_device *pdev);
 
-struct radv_ray_tracing_stage_info;
-
-nir_shader *radv_build_traversal_shader(struct radv_device *device, struct radv_ray_tracing_pipeline *pipeline,
-                                        const VkRayTracingPipelineCreateInfoKHR *pCreateInfo,
-                                        struct radv_ray_tracing_stage_info *info);
-
-enum radv_rt_priority {
-   radv_rt_priority_raygen = 0,
-   radv_rt_priority_traversal = 1,
-   radv_rt_priority_hit_miss = 2,
-   radv_rt_priority_callable = 3,
-   radv_rt_priority_mask = 0x3,
+enum radv_rt_lowering_mode {
+   RADV_RT_LOWERING_MODE_MONOLITHIC,
+   RADV_RT_LOWERING_MODE_CPS,
+   RADV_RT_LOWERING_MODE_FUNCTION_CALLS,
 };
-
-static inline enum radv_rt_priority
-radv_get_rt_priority(mesa_shader_stage stage)
-{
-   switch (stage) {
-   case MESA_SHADER_RAYGEN:
-      return radv_rt_priority_raygen;
-   case MESA_SHADER_INTERSECTION:
-   case MESA_SHADER_ANY_HIT:
-      return radv_rt_priority_traversal;
-   case MESA_SHADER_CLOSEST_HIT:
-   case MESA_SHADER_MISS:
-      return radv_rt_priority_hit_miss;
-   case MESA_SHADER_CALLABLE:
-      return radv_rt_priority_callable;
-   default:
-      UNREACHABLE("Unimplemented RT shader stage.");
-   }
-}
 
 struct radv_shader_layout;
 enum radv_pipeline_type;
@@ -723,10 +692,10 @@ radv_shader_need_push_constants_upload(const struct radv_shader *shader)
    return loc->sgpr_idx != -1;
 }
 
-void radv_precompute_registers_hw_gs(struct radv_device *device, struct radv_shader_info *es_info, struct radv_shader_info *gs_info);
+void radv_precompute_registers_hw_gs(struct radv_device *device, const struct radv_shader_info *es_info,
+                                     struct radv_shader *shader);
 
-void radv_precompute_registers_hw_ngg(struct radv_device *device, const struct ac_shader_config *config,
-                                      struct radv_shader_info *info);
+void radv_precompute_registers_hw_ngg(struct radv_device *device, struct radv_shader *shader);
 
 void radv_set_stage_key_robustness(const struct vk_pipeline_robustness_state *rs, mesa_shader_stage stage,
                                    struct radv_shader_stage_key *key);

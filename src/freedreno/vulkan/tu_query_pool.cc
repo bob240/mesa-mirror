@@ -27,7 +27,19 @@
 
 #define NSEC_PER_SEC 1000000000ull
 #define WAIT_TIMEOUT 5
-#define STAT_COUNT ((REG_A6XX_RBBM_PIPESTAT_CSINVOCATIONS - REG_A6XX_RBBM_PIPESTAT_IAVERTICES) / 2 + 1)
+#define __COUNTER_REG(CHIP, name) __RBBM_PIPESTAT_ ## name <CHIP>({}).reg
+#define COUNTER_REG(name) __COUNTER_REG(CHIP, name)
+
+/* Note: gen8 changes the order of the pipestat regs, but in either case
+ * they ones we are interested in are consecutive, so for the purposes of
+ * knowning how many values to read we can just use A6XX reg addresses.
+ *
+ * And in both cases, RBBM_PIPESTAT_IAVERTICES is the first one.
+ *
+ * Depending on how/if they shuffle around in the future, we might need
+ * to shift to reading them individually, like gallium does.
+ */
+#define STAT_COUNT ((__COUNTER_REG(A6XX, CSINVOCATIONS) - __COUNTER_REG(A6XX, IAVERTICES)) / 2 + 1)
 
 struct PACKED query_slot {
    uint64_t available;
@@ -463,35 +475,38 @@ get_result_count(struct tu_query_pool *pool)
    }
 }
 
+template <chip CHIP>
 static uint32_t
 statistics_index(uint32_t *statistics)
 {
    uint32_t stat;
    stat = u_bit_scan(statistics);
 
+#define COUNTER_OFFSET(name) ((COUNTER_REG(name) - COUNTER_REG(IAVERTICES)) / 2)
+
    switch (1 << stat) {
    case VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_VERTICES_BIT:
-      return 0;
+      return COUNTER_OFFSET(IAVERTICES);
    case VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT:
-      return 1;
+      return COUNTER_OFFSET(IAPRIMITIVES);
    case VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT:
-      return 2;
+      return COUNTER_OFFSET(VSINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_INVOCATIONS_BIT:
-      return 5;
+      return COUNTER_OFFSET(GSINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_GEOMETRY_SHADER_PRIMITIVES_BIT:
-      return 6;
+      return COUNTER_OFFSET(GSPRIMITIVES);
    case VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT:
-      return 7;
+      return COUNTER_OFFSET(CINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT:
-      return 8;
+      return COUNTER_OFFSET(CPRIMITIVES);
    case VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT:
-      return 9;
+      return COUNTER_OFFSET(PSINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_CONTROL_SHADER_PATCHES_BIT:
-      return 3;
+      return COUNTER_OFFSET(HSINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_TESSELLATION_EVALUATION_SHADER_INVOCATIONS_BIT:
-      return 4;
+      return COUNTER_OFFSET(DSINVOCATIONS);
    case VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT:
-      return 10;
+      return COUNTER_OFFSET(CSINVOCATIONS);
    default:
       return 0;
    }
@@ -588,6 +603,7 @@ write_performance_query_value_cpu(char *base,
    }
 }
 
+template <chip CHIP>
 static VkResult
 get_query_pool_results(struct tu_device *device,
                        struct tu_query_pool *pool,
@@ -634,7 +650,7 @@ get_query_pool_results(struct tu_device *device,
             uint64_t *result;
 
             if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
-               uint32_t stat_idx = statistics_index(&statistics);
+               uint32_t stat_idx = statistics_index<CHIP>(&statistics);
                result = query_result_addr(pool, query, uint64_t, stat_idx);
             } else if (is_perf_query_raw(pool)) {
                result = query_result_addr(pool, query, struct perfcntr_query_slot, k);
@@ -703,6 +719,7 @@ get_query_pool_results(struct tu_device *device,
    return result;
 }
 
+template <chip CHIP>
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_GetQueryPoolResults(VkDevice _device,
                        VkQueryPool queryPool,
@@ -731,13 +748,14 @@ tu_GetQueryPoolResults(VkDevice _device,
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
-      return get_query_pool_results(device, pool, firstQuery, queryCount,
-                                    dataSize, pData, stride, flags);
+      return get_query_pool_results<CHIP>(device, pool, firstQuery, queryCount,
+                                          dataSize, pData, stride, flags);
    default:
       assert(!"Invalid query type");
    }
    return VK_SUCCESS;
 }
+TU_GENX(tu_GetQueryPoolResults);
 
 /* Copies a query value from one buffer to another from the GPU. */
 static void
@@ -808,7 +826,7 @@ emit_copy_query_pool_results(struct tu_cmd_buffer *cmdbuf,
          uint64_t result_iova;
 
          if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
-            uint32_t stat_idx = statistics_index(&statistics);
+            uint32_t stat_idx = statistics_index<CHIP>(&statistics);
             result_iova = query_result_iova(pool, query, uint64_t, stat_idx);
          } else if (pool->vk.query_type == VK_QUERY_TYPE_PERFORMANCE_QUERY_KHR) {
             result_iova = query_result_iova(pool, query,
@@ -840,7 +858,7 @@ emit_copy_query_pool_results(struct tu_cmd_buffer *cmdbuf,
             tu_cs_emit_pkt7(cs, CP_COND_EXEC, 6);
             tu_cs_emit_qw(cs, available_iova);
             tu_cs_emit_qw(cs, available_iova);
-            tu_cs_emit(cs, CP_COND_EXEC_4_REF(0x2));
+            tu_cs_emit(cs, CP_COND_EXEC_ACTIVE_TIMESTAMP(0x2).reg);
             tu_cs_emit(cs, 6); /* Cond execute the next 6 DWORDS */
 
             /* Start of conditional execution */
@@ -895,6 +913,7 @@ tu_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdCopyQueryPoolResults);
 
+template <chip CHIP>
 static void
 emit_reset_query_pool(struct tu_cmd_buffer *cmdbuf,
                       struct tu_query_pool *pool,
@@ -915,7 +934,7 @@ emit_reset_query_pool(struct tu_cmd_buffer *cmdbuf,
          uint64_t result_iova;
 
          if (pool->vk.query_type == VK_QUERY_TYPE_PIPELINE_STATISTICS) {
-            uint32_t stat_idx = statistics_index(&statistics);
+            uint32_t stat_idx = statistics_index<CHIP>(&statistics);
             result_iova = query_result_iova(pool, query, uint64_t, stat_idx);
          } else if (is_perf_query_raw(pool)) {
             result_iova = query_result_iova(pool, query,
@@ -949,6 +968,7 @@ emit_reset_query_pool(struct tu_cmd_buffer *cmdbuf,
 
 }
 
+template <chip CHIP>
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdResetQueryPool(VkCommandBuffer commandBuffer,
                      VkQueryPool queryPool,
@@ -969,12 +989,13 @@ tu_CmdResetQueryPool(VkCommandBuffer commandBuffer,
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_BOTTOM_LEVEL_POINTERS_KHR:
    case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SIZE_KHR:
-      emit_reset_query_pool(cmdbuf, pool, firstQuery, queryCount);
+      emit_reset_query_pool<CHIP>(cmdbuf, pool, firstQuery, queryCount);
       break;
    default:
       assert(!"Invalid query type");
    }
 }
+TU_GENX(tu_CmdResetQueryPool);
 
 VKAPI_ATTR void VKAPI_CALL
 tu_ResetQueryPool(VkDevice device,
@@ -1147,7 +1168,7 @@ emit_begin_stat_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_wfi(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
-   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(REG_A6XX_RBBM_PIPESTAT_IAVERTICES) |
+   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(IAVERTICES)) |
                   CP_REG_TO_MEM_0_CNT(STAT_COUNT * 2) |
                   CP_REG_TO_MEM_0_64B);
    tu_cs_emit_qw(cs, begin_iova);
@@ -1158,7 +1179,7 @@ emit_perfcntrs_pass_start(bool has_pred_bit, struct tu_cs *cs, uint32_t pass)
 {
    tu_cs_emit_pkt7(cs, CP_REG_TEST, 1);
    tu_cs_emit(cs, A6XX_CP_REG_TEST_0_REG(
-                        REG_A6XX_CP_SCRATCH_REG(PERF_CNTRS_REG)) |
+                        REG_A6XX_CP_SCRATCH(PERF_CNTRS_REG)) |
                   A6XX_CP_REG_TEST_0_BIT(pass) |
                   (has_pred_bit ?
                      A6XX_CP_REG_TEST_0_PRED_BIT(TU_PREDICATE_PERFCNTRS) : 0) |
@@ -1327,7 +1348,7 @@ emit_begin_xfb_query(struct tu_cmd_buffer *cmdbuf,
    struct tu_cs *cs = cmdbuf->state.pass ? &cmdbuf->draw_cs : &cmdbuf->cs;
    uint64_t begin_iova = primitive_query_iova(pool, query, begin, 0, 0);
 
-   tu_cs_emit_regs(cs, A6XX_VPC_SO_QUERY_BASE(.qword = begin_iova));
+   tu_cs_emit_regs(cs, VPC_SO_QUERY_BASE(CHIP, .qword = begin_iova));
    tu_emit_event_write<CHIP>(cmdbuf, cs, FD_WRITE_PRIMITIVE_COUNTS);
 
    if (!cmdbuf->state.pass)
@@ -1365,7 +1386,7 @@ emit_begin_prim_generated_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_wfi(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
-   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(REG_A6XX_RBBM_PIPESTAT_CINVOCATIONS) |
+   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(CINVOCATIONS)) |
                   CP_REG_TO_MEM_0_CNT(2) |
                   CP_REG_TO_MEM_0_64B);
    tu_cs_emit_qw(cs, begin_iova);
@@ -1579,7 +1600,7 @@ emit_stop_primitive_ctrs(struct tu_cmd_buffer *cmdbuf,
             tu_cs_emit_pkt7(cs, CP_COND_EXEC, 6);
             tu_cs_emit_qw(cs, global_iova(cmdbuf, vtx_stats_query_not_running));
             tu_cs_emit_qw(cs, global_iova(cmdbuf, vtx_stats_query_not_running));
-            tu_cs_emit(cs, CP_COND_EXEC_4_REF(0x2));
+            tu_cs_emit(cs, CP_COND_EXEC_ACTIVE_TIMESTAMP(0x2).reg);
             tu_cs_emit(cs, 2); /* Cond execute the next 2 DWORDS */
 
             tu_emit_event_write<CHIP>(cmdbuf, cs, FD_STOP_PRIMITIVE_CTRS);
@@ -1633,7 +1654,7 @@ emit_end_stat_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_wfi(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
-   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(REG_A6XX_RBBM_PIPESTAT_IAVERTICES) |
+   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(IAVERTICES)) |
                   CP_REG_TO_MEM_0_CNT(STAT_COUNT * 2) |
                   CP_REG_TO_MEM_0_64B);
    tu_cs_emit_qw(cs, end_iova);
@@ -1860,7 +1881,7 @@ emit_end_xfb_query(struct tu_cmd_buffer *cmdbuf,
    if (!cmdbuf->state.pass)
       cmdbuf->state.xfb_query_running_before_rp = false;
 
-   tu_cs_emit_regs(cs, A6XX_VPC_SO_QUERY_BASE(.qword = end_iova));
+   tu_cs_emit_regs(cs, VPC_SO_QUERY_BASE(CHIP, .qword = end_iova));
    tu_emit_event_write<CHIP>(cmdbuf, cs, FD_WRITE_PRIMITIVE_COUNTS);
 
    tu_cs_emit_wfi(cs);
@@ -1918,7 +1939,7 @@ emit_end_prim_generated_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_wfi(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
-   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(REG_A6XX_RBBM_PIPESTAT_CINVOCATIONS) |
+   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(CINVOCATIONS)) |
                   CP_REG_TO_MEM_0_CNT(2) |
                   CP_REG_TO_MEM_0_64B);
    tu_cs_emit_qw(cs, end_iova);
@@ -2031,6 +2052,7 @@ tu_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer,
 }
 TU_GENX(tu_CmdEndQueryIndexedEXT);
 
+template <chip CHIP>
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
                       VkPipelineStageFlagBits2 pipelineStage,
@@ -2067,7 +2089,7 @@ tu_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
    }
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
-   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(REG_A6XX_CP_ALWAYS_ON_COUNTER) |
+   tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(__CP_ALWAYS_ON_COUNTER<CHIP>({}).reg) |
                   CP_REG_TO_MEM_0_CNT(2) |
                   CP_REG_TO_MEM_0_64B);
    tu_cs_emit_qw(cs, query_result_iova(pool, query, uint64_t, 0));
@@ -2108,6 +2130,7 @@ tu_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
     */
    handle_multiview_queries(cmd, pool, query);
 }
+TU_GENX(tu_CmdWriteTimestamp2);
 
 VKAPI_ATTR void VKAPI_CALL
 tu_CmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer commandBuffer,
@@ -2188,7 +2211,7 @@ tu_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
                counter->storage =
                      fd_perfcntr_type_to_vk_storage[group[i].countables[j].query_type];
 
-               unsigned char sha1_result[20];
+               unsigned char sha1_result[SHA1_DIGEST_LENGTH];
                _mesa_sha1_compute(group[i].countables[j].name,
                                   strlen(group[i].countables[j].name),
                                   sha1_result);
@@ -2220,7 +2243,7 @@ tu_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
             counter->unit = fd_perfcntr_type_to_vk_unit[derived_counter->type];
             counter->storage = fd_perfcntr_type_to_vk_storage[derived_counter->type];
 
-            unsigned char sha1_result[20];
+            unsigned char sha1_result[SHA1_DIGEST_LENGTH];
             _mesa_sha1_compute(derived_counter->name, strlen(derived_counter->name),
                                sha1_result);
             memcpy(counter->uuid, sha1_result, sizeof(counter->uuid));

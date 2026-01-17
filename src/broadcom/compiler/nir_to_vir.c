@@ -651,18 +651,14 @@ ntq_emit_tmu_general(struct v3d_compile *c, nir_intrinsic_instr *instr,
                                 v3d_tmu_get_type_from_op(tmu_op, !is_load) ==
                                 V3D_TMU_OP_TYPE_ATOMIC;
 
-                        /* Only load per-quad if we can be certain that all
-                         * lines in the quad are active. Notice that demoted
-                         * invocations, unlike terminated ones, are still
-                         * active: we want to skip memory writes for them but
-                         * loads should still work.
+                        /* Only load per-quad if we can't skip helper
+                         * invocations.
                          */
                         uint32_t perquad =
-                                is_load && !vir_in_nonuniform_control_flow(c) &&
-                                ((c->s->info.stage == MESA_SHADER_FRAGMENT &&
-                                  c->s->info.fs.needs_coarse_quad_helper_invocations &&
-                                  !c->emitted_discard) ||
-                                 c->s->info.uses_wide_subgroup_intrinsics) ?
+                                is_load &&
+                                c->s->info.stage == MESA_SHADER_FRAGMENT &&
+                                nir_intrinsic_has_access(instr) &&
+                                !(nir_intrinsic_access(instr) & ACCESS_SKIP_HELPERS) ?
                                 GENERAL_TMU_LOOKUP_PER_QUAD :
                                 GENERAL_TMU_LOOKUP_PER_PIXEL;
                         config = 0xffffff00 | tmu_op << 3 | perquad;
@@ -721,9 +717,9 @@ ntq_emit_tmu_general(struct v3d_compile *c, nir_intrinsic_instr *instr,
                 }
         }
 
-        /* nir_lower_wrmasks should've ensured that any writemask on a store
-         * operation only has consecutive bits set, in which case we should've
-         * processed the full writemask above.
+        /* v3d_nir_lower_load_store_bitsize should've ensured that any writemask
+         * on a store operation only has consecutive bits set, in which case
+         * we should've processed the full writemask above.
          */
         assert(writemask == 0);
 }
@@ -2128,10 +2124,6 @@ void
 v3d_optimize_nir(struct v3d_compile *c, struct nir_shader *s)
 {
         bool progress;
-        unsigned lower_flrp =
-                (s->options->lower_flrp16 ? 16 : 0) |
-                (s->options->lower_flrp32 ? 32 : 0) |
-                (s->options->lower_flrp64 ? 64 : 0);
 
         do {
                 progress = false;
@@ -2239,16 +2231,6 @@ v3d_optimize_nir(struct v3d_compile *c, struct nir_shader *s)
                                 NIR_PASS(progress, s, nir_lower_pack);
                                 progress = true;
                         }
-                }
-
-                if (lower_flrp != 0) {
-                        NIR_PASS(progress, s, nir_lower_flrp,
-                                 lower_flrp, false /* always_precise */);
-
-                        /* Nothing should rematerialize any flrps, so we only
-                         * need to do this lowering once.
-                         */
-                        lower_flrp = 0;
                 }
 
                 NIR_PASS(progress, s, nir_opt_undef);

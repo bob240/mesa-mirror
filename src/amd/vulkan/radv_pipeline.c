@@ -473,6 +473,14 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    if (!radv_use_llvm_for_stage(pdev, stage->stage))
       ac_nir_optimize_uniform_atomics(stage->nir);
 
+   NIR_PASS(_, stage->nir, nir_opt_uniform_subgroup,
+            &(struct nir_lower_subgroups_options){
+               .subgroup_size = stage->info.wave_size,
+               .ballot_bit_size = stage->info.wave_size,
+               .ballot_components = 1,
+               .lower_ballot_bit_count_to_mbcnt_amd = true,
+            });
+
    NIR_PASS(_, stage->nir, nir_opt_idiv_const, 8);
 
    NIR_PASS(_, stage->nir, nir_lower_idiv,
@@ -511,6 +519,9 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_graphics_stat
    NIR_PASS(_, stage->nir, ac_nir_lower_mem_access_bit_sizes, gfx_level, use_llvm);
    NIR_PASS(_, stage->nir, ac_nir_lower_global_access);
    NIR_PASS(_, stage->nir, nir_lower_int64);
+
+   if (pdev->cache_key.mitigate_smem_oob)
+      NIR_PASS(_, stage->nir, ac_nir_fixup_mem_access_gfx6, &stage->args.ac, 4096, true, true);
 
    radv_optimize_nir_algebraic(
       stage->nir, io_to_mem || lowered_ngg || stage->stage == MESA_SHADER_COMPUTE || stage->stage == MESA_SHADER_TASK,

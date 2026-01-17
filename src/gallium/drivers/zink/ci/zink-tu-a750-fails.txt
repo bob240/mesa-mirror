@@ -1,6 +1,4 @@
 GTF-GL46.gtf40.GL3Tests.transform_feedback2.transform_feedback2_two_buffers,Fail
-KHR-GL46.texture_lod_basic.lod_selection,Fail
-dEQP-GLES2.functional.texture.mipmap.cube.projected.nearest_linear,Fail
 dEQP-GLES3.functional.fbo.blit.rect.nearest_consistency_out_of_bounds_mag,Fail
 dEQP-GLES3.functional.fbo.blit.rect.nearest_consistency_out_of_bounds_mag_reverse_dst_x,Fail
 dEQP-GLES3.functional.fbo.blit.rect.nearest_consistency_out_of_bounds_mag_reverse_dst_y,Fail
@@ -78,7 +76,6 @@ spec@!opengl 3.2@gl-3.2-adj-prims line cull-front pv-first,Fail
 spec@!opengl 3.2@gl-3.2-adj-prims pv-first,Fail
 spec@!opengl 3.2@minmax,Fail
 spec@!opengl 3.3@minmax,Fail
-spec@arb_depth_buffer_float@fbo-clear-formats stencil,Crash
 spec@arb_framebuffer_object@fbo-blit-scaled-linear,Fail
 spec@arb_gl_spirv@execution@uniform@atomic-uint-aoa-cs,Fail
 spec@arb_gl_spirv@execution@uniform@atomic-uint-array-cs,Fail
@@ -171,7 +168,6 @@ spec@ext_framebuffer_multisample@interpolation 4 non-centroid-deriv-disabled,Fai
 spec@ext_framebuffer_multisample@interpolation 4 non-centroid-disabled,Fail
 spec@ext_framebuffer_multisample@sample-alpha-to-coverage 2 color,Fail
 spec@ext_framebuffer_multisample@sample-alpha-to-coverage 4 color,Fail
-spec@ext_packed_depth_stencil@fbo-clear-formats stencil,Crash
 spec@ext_transform_feedback@max-varyings,Fail
 spec@ext_transform_feedback@max-varyings@max-varying-arrays-of-arrays,Fail
 spec@ext_transform_feedback@max-varyings@max-varying-single-dimension-array,Fail
@@ -189,10 +185,6 @@ spec@glsl-1.50@execution@geometry@point-size-out,Fail
 spec@glsl-1.50@execution@geometry@primitive-id-restart gl_line_strip_adjacency other,Fail
 spec@glsl-1.50@execution@redeclare-pervertex-out-subset-gs,Fail
 spec@glsl-1.50@execution@variable-indexing@gs-output-array-vec4-index-wr,Fail
-spec@ovr_multiview2@triangle_compare_frag_index_uniform,Fail
-spec@ovr_multiview2@triangle_compare_frag_index_uniform_base2,Fail
-spec@ovr_multiview2@triangle_compare_frag_vary_color,Fail
-spec@ovr_multiview2@triangle_compare_frag_vary_color_base2,Fail
 
 spec@glsl-3.30@built-in constants,Fail
 spec@glsl-3.30@built-in constants@gl_MaxFragmentInputComponents,Fail

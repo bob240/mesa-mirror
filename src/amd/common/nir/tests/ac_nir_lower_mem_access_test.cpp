@@ -122,9 +122,9 @@ void create_shader(test_state *state, nir_shader_compiler_options *options)
       st->op == nir_intrinsic_load_global || st->op == nir_intrinsic_store_global ? 64 : 32;
    nir_def *offset;
    if (st->access & ACCESS_SMEM_AMD)
-      offset = nir_unit_test_uniform_amd(b, 1, offset_bit_size);
+      offset = nir_unit_test_uniform_input(b, 1, offset_bit_size);
    else
-      offset = nir_unit_test_divergent_amd(b, 1, offset_bit_size);
+      offset = nir_unit_test_divergent_input(b, 1, offset_bit_size);
    state->offset = offset;
 
    b->shader->info.next_stage = MESA_SHADER_NONE;
@@ -221,8 +221,8 @@ static void run_subtest(subtest *st, bool print = false)
 
    struct radeon_info info = {};
    info.gfx_level = st->gfx_level;
-   info.has_packed_math_16bit = true;
-   info.has_accelerated_dot_product = true;
+   info.cu_info.has_packed_math_16bit = true;
+   info.cu_info.has_accelerated_dot_product = true;
 
    nir_shader_compiler_options options = {};
    ac_nir_set_options(&info, st->use_llvm, &options);

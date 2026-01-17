@@ -42,7 +42,7 @@ enum radeon_bo_flag { /* bitfield */
                       RADEON_FLAG_CPU_ACCESS = (1 << 1),
                       RADEON_FLAG_NO_CPU_ACCESS = (1 << 2),
                       RADEON_FLAG_VIRTUAL = (1 << 3),
-                      RADEON_FLAG_VA_UNCACHED = (1 << 4),
+                      RADEON_FLAG_GL2_BYPASS = (1 << 4),
                       RADEON_FLAG_IMPLICIT_SYNC = (1 << 5),
                       RADEON_FLAG_NO_INTERPROCESS_SHARING = (1 << 6),
                       RADEON_FLAG_READ_ONLY = (1 << 7),
@@ -53,6 +53,7 @@ enum radeon_bo_flag { /* bitfield */
                       RADEON_FLAG_DISCARDABLE = (1 << 12),
                       RADEON_FLAG_GFX12_ALLOW_DCC = (1 << 13),
                       RADEON_FLAG_VM_UPDATE_WAIT = (1 << 14),
+                      RADEON_FLAG_VM_PAD_1PAGE = (1 << 15),
 };
 
 enum radeon_ctx_priority {

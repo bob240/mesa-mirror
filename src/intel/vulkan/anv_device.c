@@ -112,6 +112,32 @@ get_bo_from_pool(struct intel_batch_decode_bo *ret,
    return false;
 }
 
+/* Shader heap: find the backing BO for a GPU VA */
+static bool
+get_bo_from_shader_heap(struct intel_batch_decode_bo *ret,
+                        const struct anv_device *device,
+                        uint64_t address)
+{
+   unsigned i;
+   BITSET_FOREACH_SET(i, device->shader_heap.allocated_bos, ANV_SHADER_HEAP_MAX_BOS) {
+      struct anv_bo *bo = device->shader_heap.bos[i].bo;
+
+      /* Match the 48b-addressing convention used elsewhere */
+      uint64_t base = intel_48b_address(bo->offset);
+      uint64_t size = bo->size;
+
+      if (address >= base && address < base + size) {
+         *ret = (struct intel_batch_decode_bo) {
+            .addr = base,
+            .size = size,
+            .map  = bo->map,
+         };
+         return true;
+      }
+   }
+   return false;
+}
+
 /* Finding a buffer for batch decoding */
 static struct intel_batch_decode_bo
 decode_get_bo(void *v_batch, bool ppgtt, uint64_t address)
@@ -123,7 +149,7 @@ decode_get_bo(void *v_batch, bool ppgtt, uint64_t address)
 
    if (get_bo_from_pool(&ret_bo, &device->dynamic_state_pool.block_pool, address))
       return ret_bo;
-   if (get_bo_from_pool(&ret_bo, &device->instruction_state_pool.block_pool, address))
+   if (get_bo_from_shader_heap(&ret_bo, device, address))
       return ret_bo;
    if (get_bo_from_pool(&ret_bo, &device->binding_table_pool.block_pool, address))
       return ret_bo;
@@ -315,21 +341,15 @@ VkResult anv_CreateDevice(
    ANV_FROM_HANDLE(anv_physical_device, physical_device, physicalDevice);
    VkResult result;
    struct anv_device *device;
-   bool device_has_compute_queue = false;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO);
 
    /* Check requested queues and fail if we are requested to create any
     * queues with flags we don't support.
     */
-   for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+   for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++)
       if (pCreateInfo->pQueueCreateInfos[i].flags & ~VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT)
          return vk_error(physical_device, VK_ERROR_INITIALIZATION_FAILED);
-
-      const struct anv_queue_family *family =
-         &physical_device->queue.families[pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex];
-      device_has_compute_queue |= family->engine_class == INTEL_ENGINE_CLASS_COMPUTE;
-   }
 
    device = vk_zalloc2(&physical_device->instance->vk.alloc, pAllocator,
                        sizeof(*device), 8,
@@ -551,13 +571,9 @@ VkResult anv_CreateDevice(
    if (result != VK_SUCCESS)
       goto fail_dynamic_state_pool;
 
-   result = anv_state_pool_init(&device->instruction_state_pool, device,
-                                &(struct anv_state_pool_params) {
-                                   .name         = "instruction pool",
-                                   .base_address = device->physical->va.instruction_state_pool.addr,
-                                   .block_size   = 16384,
-                                   .max_size     = device->physical->va.instruction_state_pool.size,
-                                });
+   result = anv_shader_heap_init(&device->shader_heap, device,
+                                 device->physical->va.instruction_state_pool,
+                                 21 /* 2MiB */, 27 /* 64MiB */);
    if (result != VK_SUCCESS)
       goto fail_custom_border_color_pool;
 
@@ -573,7 +589,7 @@ VkResult anv_CreateDevice(
                                       .max_size     = device->physical->va.scratch_surface_state_pool.size,
                                    });
       if (result != VK_SUCCESS)
-         goto fail_instruction_state_pool;
+         goto fail_shader_vma_heap;
 
       result = anv_state_pool_init(&device->internal_surface_state_pool, device,
                                    &(struct anv_state_pool_params) {
@@ -764,36 +780,9 @@ VkResult anv_CreateDevice(
                                        device->workaround_bo->size,
                                        INTEL_DEBUG_BLOCK_TYPE_FRAME);
 
-   if (device->vk.enabled_extensions.KHR_ray_query) {
-      uint32_t ray_queries_size =
-         align(brw_rt_ray_queries_hw_stacks_size(device->info), 4096);
-
-      result = anv_device_alloc_bo(device, "ray queries",
-                                   ray_queries_size,
-                                   ANV_BO_ALLOC_INTERNAL,
-                                   0 /* explicit_address */,
-                                   &device->ray_query_bo[0]);
-      ANV_DMR_BO_ALLOC(&device->vk.base, device->ray_query_bo[0], result);
-      if (result != VK_SUCCESS)
-         goto fail_alloc_device_bo;
-
-      /* We need a separate ray query bo for CCS engine with Wa_14022863161. */
-      if (intel_needs_workaround(device->isl_dev.info, 14022863161) &&
-          device_has_compute_queue) {
-         result = anv_device_alloc_bo(device, "ray queries",
-                                      ray_queries_size,
-                                      ANV_BO_ALLOC_INTERNAL,
-                                      0 /* explicit_address */,
-                                      &device->ray_query_bo[1]);
-         ANV_DMR_BO_ALLOC(&device->vk.base, device->ray_query_bo[1], result);
-         if (result != VK_SUCCESS)
-            goto fail_ray_query_bo;
-      }
-   }
-
    result = anv_device_init_trivial_batch(device);
    if (result != VK_SUCCESS)
-      goto fail_ray_query_bo;
+      goto fail_alloc_device_bo;
 
    /* Emit the CPS states before running the initialization batch as those
     * structures are referenced.
@@ -1051,13 +1040,6 @@ VkResult anv_CreateDevice(
  fail_trivial_batch:
    ANV_DMR_BO_FREE(&device->vk.base, device->trivial_batch_bo);
    anv_device_release_bo(device, device->trivial_batch_bo);
- fail_ray_query_bo:
-   for (unsigned i = 0; i < ARRAY_SIZE(device->ray_query_bo); i++) {
-      if (device->ray_query_bo[i]) {
-         ANV_DMR_BO_FREE(&device->vk.base, device->ray_query_bo[i]);
-         anv_device_release_bo(device, device->ray_query_bo[i]);
-      }
-   }
  fail_alloc_device_bo:
    if (device->mem_fence_bo) {
       ANV_DMR_BO_FREE(&device->vk.base, device->mem_fence_bo);
@@ -1094,8 +1076,8 @@ VkResult anv_CreateDevice(
  fail_scratch_surface_state_pool:
    if (device->info->verx10 >= 125)
       anv_state_pool_finish(&device->scratch_surface_state_pool);
- fail_instruction_state_pool:
-   anv_state_pool_finish(&device->instruction_state_pool);
+ fail_shader_vma_heap:
+      anv_shader_heap_finish(&device->shader_heap);
  fail_custom_border_color_pool:
    anv_state_reserved_array_pool_finish(&device->custom_border_colors);
  fail_dynamic_state_pool:
@@ -1209,16 +1191,12 @@ void anv_DestroyDevice(
    anv_scratch_pool_finish(device, &device->protected_scratch_pool);
 
    if (device->vk.enabled_extensions.KHR_ray_query) {
-      for (unsigned i = 0; i < ARRAY_SIZE(device->ray_query_bo); i++) {
-         for (unsigned j = 0; j < ARRAY_SIZE(device->ray_query_shadow_bos[0]); j++) {
-            if (device->ray_query_shadow_bos[i][j] != NULL) {
-               ANV_DMR_BO_FREE(&device->vk.base, device->ray_query_shadow_bos[i][j]);
-               anv_device_release_bo(device, device->ray_query_shadow_bos[i][j]);
+      for (unsigned i = 0; i < ARRAY_SIZE(device->ray_query_bos); i++) {
+         for (unsigned j = 0; j < ARRAY_SIZE(device->ray_query_bos[0]); j++) {
+            if (device->ray_query_bos[i][j] != NULL) {
+               ANV_DMR_BO_FREE(&device->vk.base, device->ray_query_bos[i][j]);
+               anv_device_release_bo(device, device->ray_query_bos[i][j]);
             }
-         }
-         if (device->ray_query_bo[i]) {
-            ANV_DMR_BO_FREE(&device->vk.base, device->ray_query_bo[i]);
-            anv_device_release_bo(device, device->ray_query_bo[i]);
          }
       }
    }
@@ -1251,7 +1229,8 @@ void anv_DestroyDevice(
    anv_state_pool_finish(&device->internal_surface_state_pool);
    if (device->physical->indirect_descriptors)
       anv_state_pool_finish(&device->bindless_surface_state_pool);
-   anv_state_pool_finish(&device->instruction_state_pool);
+
+   anv_shader_heap_finish(&device->shader_heap);
    anv_state_pool_finish(&device->dynamic_state_pool);
    anv_state_pool_finish(&device->general_state_pool);
 

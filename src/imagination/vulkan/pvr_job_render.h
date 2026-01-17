@@ -36,7 +36,6 @@
 
 struct pvr_device;
 struct pvr_device_info;
-struct pvr_free_list;
 struct pvr_render_ctx;
 struct pvr_rt_dataset;
 struct vk_sync;
@@ -166,35 +165,36 @@ struct pvr_render_job {
    } view_state;
 };
 
-void pvr_rt_mtile_info_init(const struct pvr_device_info *dev_info,
-                            struct pvr_rt_mtile_info *info,
-                            uint32_t width,
-                            uint32_t height,
-                            uint32_t samples);
+#ifdef PVR_PER_ARCH
 
-VkResult pvr_free_list_create(struct pvr_device *device,
-                              uint32_t initial_size,
-                              uint32_t max_size,
-                              uint32_t grow_size,
-                              uint32_t grow_threshold,
-                              struct pvr_free_list *parent_free_list,
-                              struct pvr_free_list **const free_list_out);
-void pvr_free_list_destroy(struct pvr_free_list *free_list);
+void PVR_PER_ARCH(rt_mtile_info_init)(const struct pvr_device_info *dev_info,
+                                      struct pvr_rt_mtile_info *info,
+                                      uint32_t width,
+                                      uint32_t height,
+                                      uint32_t samples);
 
-VkResult
-pvr_render_target_dataset_create(struct pvr_device *device,
-                                 uint32_t width,
-                                 uint32_t height,
-                                 uint32_t samples,
-                                 uint32_t layers,
-                                 struct pvr_rt_dataset **const rt_dataset_out);
-void pvr_render_target_dataset_destroy(struct pvr_rt_dataset *dataset);
+#   define pvr_arch_rt_mtile_info_init PVR_PER_ARCH(rt_mtile_info_init)
 
-VkResult pvr_render_job_submit(struct pvr_render_ctx *ctx,
-                               struct pvr_render_job *job,
-                               struct vk_sync *wait_geom,
-                               struct vk_sync *wait_frag,
-                               struct vk_sync *signal_sync_geom,
-                               struct vk_sync *signal_sync_frag);
+VkResult PVR_PER_ARCH(render_target_dataset_create)(
+   struct pvr_device *device,
+   uint32_t width,
+   uint32_t height,
+   uint32_t samples,
+   uint32_t layers,
+   struct pvr_rt_dataset **const rt_dataset_out);
+
+#   define pvr_arch_render_target_dataset_create \
+      PVR_PER_ARCH(render_target_dataset_create)
+
+VkResult PVR_PER_ARCH(render_job_submit)(struct pvr_render_ctx *ctx,
+                                         struct pvr_render_job *job,
+                                         struct vk_sync *wait_geom,
+                                         struct vk_sync *wait_frag,
+                                         struct vk_sync *signal_sync_geom,
+                                         struct vk_sync *signal_sync_frag);
+
+#   define pvr_arch_render_job_submit PVR_PER_ARCH(render_job_submit)
+
+#endif
 
 #endif /* PVR_JOB_RENDER_H */

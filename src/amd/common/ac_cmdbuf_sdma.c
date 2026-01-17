@@ -151,12 +151,13 @@ ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma
    /* This packet is the same since SDMA v2.4, haven't bothered to check older versions.
     * The main difference is the bitfield sizes:
     *
-    * v2.4 - src/dst_pitch: 14 bits, rect_z: 11 bits
-    * v4.0 - src/dst_pitch: 19 bits, rect_z: 11 bits
-    * v5.0 - src/dst_pitch: 19 bits, rect_z: 13 bits
+    * v2.4 - src/dst_pitch: 14 bits (shift: 16), rect_z: 11 bits
+    * v4.0 - src/dst_pitch: 19 bits (shift: 13), rect_z: 11 bits
+    * v5.0 - src/dst_pitch: 19 bits (shift: 13), rect_z: 13 bits
     *
     * We currently use the smallest limits (from SDMA v2.4).
     */
+   uint32_t pitch_shift = (sdma_ip_version >= SDMA_7_0 || sdma_ip_version < SDMA_4_0) ? 16 : 13;
    assert(src->bpp == dst->bpp);
    assert(util_is_power_of_two_nonzero(src->bpp));
    ac_sdma_check_pitches(src->pitch, src->slice_pitch, src->bpp, false);
@@ -168,12 +169,12 @@ ac_emit_sdma_copy_linear_sub_window(struct ac_cmdbuf *cs, enum sdma_version sdma
    ac_cmdbuf_emit(src->va);
    ac_cmdbuf_emit(src->va >> 32);
    ac_cmdbuf_emit(src->offset.x | src->offset.y << 16);
-   ac_cmdbuf_emit(src->offset.z | (src->pitch - 1) << (sdma_ip_version >= SDMA_7_0 ? 16 : 13));
+   ac_cmdbuf_emit(src->offset.z | (src->pitch - 1) << pitch_shift);
    ac_cmdbuf_emit(src->slice_pitch - 1);
    ac_cmdbuf_emit(dst->va);
    ac_cmdbuf_emit(dst->va >> 32);
    ac_cmdbuf_emit(dst->offset.x | dst->offset.y << 16);
-   ac_cmdbuf_emit(dst->offset.z | (dst->pitch - 1) << (sdma_ip_version >= SDMA_7_0 ? 16 : 13));
+   ac_cmdbuf_emit(dst->offset.z | (dst->pitch - 1) << pitch_shift);
    ac_cmdbuf_emit(dst->slice_pitch - 1);
    if (sdma_ip_version == SDMA_2_0) {
       ac_cmdbuf_emit(width | (height << 16));
@@ -197,7 +198,7 @@ ac_sdma_get_tiled_header_dword(enum sdma_version sdma_ip_version,
 
       return (mip_max - 1) << 20 | mip_id << 24;
    } else {
-      UNREACHABLE("unsupported SDMA version");
+      return 0;
    }
 }
 
@@ -223,6 +224,8 @@ ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
 {
    const uint32_t swizzle_mode = tiled->surf->has_stencil ? tiled->surf->u.gfx9.zs.stencil_swizzle_mode
                                                           : tiled->surf->u.gfx9.swizzle_mode;
+   const uint16_t epitch = tiled->surf->has_stencil ? tiled->surf->u.gfx9.zs.stencil_epitch
+                                                    : tiled->surf->u.gfx9.epitch;
    const enum gfx9_resource_type dimension =
       ac_sdma_get_tiled_resource_dim(info->sdma_ip_version, tiled);
    const uint32_t mip_max = MAX2(tiled->num_levels, 1);
@@ -239,7 +242,7 @@ ac_sdma_get_tiled_info_dword(const struct radeon_info *info,
       } else if (info->sdma_ip_version >= SDMA_5_0) {
          return info_dword | dimension << 9 | (mip_max - 1) << 16 | mip_id << 20;
       } else {
-         return info_dword | dimension << 9 | tiled->surf->u.gfx9.epitch << 16;
+         return info_dword | dimension << 9 | epitch << 16;
       }
    } else {
       const uint32_t tile_index = tiled->surf->u.legacy.tiling_index[0];

@@ -39,6 +39,7 @@
 #include "vk_sync_dummy.h"
 #include "vk_util.h"
 
+#include <assert.h>
 #include <time.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1104,7 +1105,6 @@ wsi_CreateSwapchainKHR(VkDevice _device,
                                          sizeof (*swapchain->blit.semaphores),
                                          VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
       if (!swapchain->blit.semaphores) {
-         wsi_device->DestroySemaphore(_device, swapchain->present_id_timeline, alloc);
          swapchain->destroy(swapchain, alloc);
          return VK_ERROR_OUT_OF_HOST_MEMORY;
       }
@@ -1839,10 +1839,13 @@ wsi_GetDeviceGroupSurfacePresentModesKHR(VkDevice device,
 VkResult
 wsi_common_create_swapchain_image(const struct wsi_device *wsi,
                                   const VkImageCreateInfo *pCreateInfo,
-                                  VkSwapchainKHR _swapchain,
                                   VkImage *pImage)
 {
-   VK_FROM_HANDLE(wsi_swapchain, chain, _swapchain);
+   const VkImageSwapchainCreateInfoKHR *swapchain_info =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_SWAPCHAIN_CREATE_INFO_KHR);
+   assert(swapchain_info);
+
+   VK_FROM_HANDLE(wsi_swapchain, chain, swapchain_info->swapchain);
 
 #ifndef NDEBUG
    const VkImageCreateInfo *swcInfo = &chain->image_info.create;

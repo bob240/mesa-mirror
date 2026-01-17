@@ -485,7 +485,7 @@ brw_add_reloc(struct brw_codegen *p, uint32_t id,
    };
 }
 
-static brw_eu_inst *
+brw_eu_inst *
 brw_alu1(struct brw_codegen *p, unsigned opcode,
          struct brw_reg dest, struct brw_reg src)
 {
@@ -495,7 +495,7 @@ brw_alu1(struct brw_codegen *p, unsigned opcode,
    return insn;
 }
 
-static brw_eu_inst *
+brw_eu_inst *
 brw_alu2(struct brw_codegen *p, unsigned opcode,
          struct brw_reg dest, struct brw_reg src0, struct brw_reg src1)
 {
@@ -565,7 +565,7 @@ to_3src_align1_hstride(enum brw_horizontal_stride hstride)
    }
 }
 
-static brw_eu_inst *
+brw_eu_inst *
 brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
          struct brw_reg src0, struct brw_reg src1, struct brw_reg src2)
 {
@@ -704,31 +704,41 @@ brw_alu3(struct brw_codegen *p, unsigned opcode, struct brw_reg dest,
       brw_eu_inst_set_3src_a16_dst_writemask(devinfo, inst, dest.writemask);
 
       assert(src0.file == FIXED_GRF);
-      brw_eu_inst_set_3src_a16_src0_swizzle(devinfo, inst, src0.swizzle);
       brw_eu_inst_set_3src_a16_src0_subreg_nr(devinfo, inst, src0.subnr);
       brw_eu_inst_set_3src_src0_reg_nr(devinfo, inst, src0.nr);
       brw_eu_inst_set_3src_src0_abs(devinfo, inst, src0.abs);
       brw_eu_inst_set_3src_src0_negate(devinfo, inst, src0.negate);
-      brw_eu_inst_set_3src_a16_src0_rep_ctrl(devinfo, inst,
-                                          src0.vstride == BRW_VERTICAL_STRIDE_0);
+
+      /* From "Instruction Fields":
+       *
+       *     ChanSel does not apply when Replicate Control is set.
+       *
+       * In the code ChanSel is swizzle.  Also apply to the src1 and src2.
+       */
+      if (src0.vstride == BRW_VERTICAL_STRIDE_0)
+         brw_eu_inst_set_3src_a16_src0_rep_ctrl(devinfo, inst, 1);
+      else
+         brw_eu_inst_set_3src_a16_src0_swizzle(devinfo, inst, src0.swizzle);
 
       assert(src1.file == FIXED_GRF);
-      brw_eu_inst_set_3src_a16_src1_swizzle(devinfo, inst, src1.swizzle);
       brw_eu_inst_set_3src_a16_src1_subreg_nr(devinfo, inst, src1.subnr);
       brw_eu_inst_set_3src_src1_reg_nr(devinfo, inst, src1.nr);
       brw_eu_inst_set_3src_src1_abs(devinfo, inst, src1.abs);
       brw_eu_inst_set_3src_src1_negate(devinfo, inst, src1.negate);
-      brw_eu_inst_set_3src_a16_src1_rep_ctrl(devinfo, inst,
-                                          src1.vstride == BRW_VERTICAL_STRIDE_0);
+      if (src1.vstride == BRW_VERTICAL_STRIDE_0)
+         brw_eu_inst_set_3src_a16_src1_rep_ctrl(devinfo, inst, 1);
+      else
+         brw_eu_inst_set_3src_a16_src1_swizzle(devinfo, inst, src1.swizzle);
 
       assert(src2.file == FIXED_GRF);
-      brw_eu_inst_set_3src_a16_src2_swizzle(devinfo, inst, src2.swizzle);
       brw_eu_inst_set_3src_a16_src2_subreg_nr(devinfo, inst, src2.subnr);
       brw_eu_inst_set_3src_src2_reg_nr(devinfo, inst, src2.nr);
       brw_eu_inst_set_3src_src2_abs(devinfo, inst, src2.abs);
       brw_eu_inst_set_3src_src2_negate(devinfo, inst, src2.negate);
-      brw_eu_inst_set_3src_a16_src2_rep_ctrl(devinfo, inst,
-                                          src2.vstride == BRW_VERTICAL_STRIDE_0);
+      if (src2.vstride == BRW_VERTICAL_STRIDE_0)
+         brw_eu_inst_set_3src_a16_src2_rep_ctrl(devinfo, inst, 1);
+      else
+         brw_eu_inst_set_3src_a16_src2_swizzle(devinfo, inst, src2.swizzle);
 
       /* Set both the source and destination types based on dest.type,
        * ignoring the source register types.  The MAD and LRP emitters ensure
@@ -840,45 +850,7 @@ brw_eu_inst *brw_##OP(struct brw_codegen *p,		\
 	      struct brw_reg src1,			\
 	      struct brw_reg src2)   			\
 {                                                       \
-   if (p->current->access_mode == BRW_ALIGN_16) {       \
-      if (src0.vstride == BRW_VERTICAL_STRIDE_0)        \
-         src0.swizzle = BRW_SWIZZLE_XXXX;               \
-      if (src1.vstride == BRW_VERTICAL_STRIDE_0)        \
-         src1.swizzle = BRW_SWIZZLE_XXXX;               \
-      if (src2.vstride == BRW_VERTICAL_STRIDE_0)        \
-         src2.swizzle = BRW_SWIZZLE_XXXX;               \
-   }                                                    \
    return brw_alu3(p, BRW_OPCODE_##OP, dest, src0, src1, src2);	\
-}
-
-#define ALU3F(OP)                                               \
-brw_eu_inst *brw_##OP(struct brw_codegen *p,         \
-                                 struct brw_reg dest,           \
-                                 struct brw_reg src0,           \
-                                 struct brw_reg src1,           \
-                                 struct brw_reg src2)           \
-{                                                               \
-   assert(dest.type == BRW_TYPE_F ||                   \
-          dest.type == BRW_TYPE_DF);                   \
-   if (dest.type == BRW_TYPE_F) {                      \
-      assert(src0.type == BRW_TYPE_F);                 \
-      assert(src1.type == BRW_TYPE_F);                 \
-      assert(src2.type == BRW_TYPE_F);                 \
-   } else if (dest.type == BRW_TYPE_DF) {              \
-      assert(src0.type == BRW_TYPE_DF);                \
-      assert(src1.type == BRW_TYPE_DF);                \
-      assert(src2.type == BRW_TYPE_DF);                \
-   }                                                            \
-                                                                \
-   if (p->current->access_mode == BRW_ALIGN_16) {               \
-      if (src0.vstride == BRW_VERTICAL_STRIDE_0)                \
-         src0.swizzle = BRW_SWIZZLE_XXXX;                       \
-      if (src1.vstride == BRW_VERTICAL_STRIDE_0)                \
-         src1.swizzle = BRW_SWIZZLE_XXXX;                       \
-      if (src2.vstride == BRW_VERTICAL_STRIDE_0)                \
-         src2.swizzle = BRW_SWIZZLE_XXXX;                       \
-   }                                                            \
-   return brw_alu3(p, BRW_OPCODE_##OP, dest, src0, src1, src2); \
 }
 
 ALU2(SEL)
@@ -906,7 +878,7 @@ ALU2(DP3)
 ALU2(DP2)
 ALU3(DP4A)
 ALU3(MAD)
-ALU3F(LRP)
+ALU3(LRP)
 ALU1(BFREV)
 ALU3(BFE)
 ALU2(BFI1)
@@ -918,104 +890,12 @@ ALU2(ADDC)
 ALU2(SUBB)
 ALU3(ADD3)
 ALU1(MOV)
-
-brw_eu_inst *
-brw_ADD(struct brw_codegen *p, struct brw_reg dest,
-        struct brw_reg src0, struct brw_reg src1)
-{
-   /* 6.2.2: add */
-   if (src0.type == BRW_TYPE_F ||
-       (src0.file == IMM &&
-	src0.type == BRW_TYPE_VF)) {
-      assert(src1.type != BRW_TYPE_UD);
-      assert(src1.type != BRW_TYPE_D);
-   }
-
-   if (src1.type == BRW_TYPE_F ||
-       (src1.file == IMM &&
-	src1.type == BRW_TYPE_VF)) {
-      assert(src0.type != BRW_TYPE_UD);
-      assert(src0.type != BRW_TYPE_D);
-   }
-
-   return brw_alu2(p, BRW_OPCODE_ADD, dest, src0, src1);
-}
-
-brw_eu_inst *
-brw_AVG(struct brw_codegen *p, struct brw_reg dest,
-        struct brw_reg src0, struct brw_reg src1)
-{
-   assert(dest.type == src0.type);
-   assert(src0.type == src1.type);
-   switch (src0.type) {
-   case BRW_TYPE_B:
-   case BRW_TYPE_UB:
-   case BRW_TYPE_W:
-   case BRW_TYPE_UW:
-   case BRW_TYPE_D:
-   case BRW_TYPE_UD:
-      break;
-   default:
-      UNREACHABLE("Bad type for brw_AVG");
-   }
-
-   return brw_alu2(p, BRW_OPCODE_AVG, dest, src0, src1);
-}
-
-brw_eu_inst *
-brw_MUL(struct brw_codegen *p, struct brw_reg dest,
-        struct brw_reg src0, struct brw_reg src1)
-{
-   /* 6.32.38: mul */
-   if (src0.type == BRW_TYPE_D ||
-       src0.type == BRW_TYPE_UD ||
-       src1.type == BRW_TYPE_D ||
-       src1.type == BRW_TYPE_UD) {
-      assert(dest.type != BRW_TYPE_F);
-   }
-
-   if (src0.type == BRW_TYPE_F ||
-       (src0.file == IMM &&
-	src0.type == BRW_TYPE_VF)) {
-      assert(src1.type != BRW_TYPE_UD);
-      assert(src1.type != BRW_TYPE_D);
-   }
-
-   if (src1.type == BRW_TYPE_F ||
-       (src1.file == IMM &&
-	src1.type == BRW_TYPE_VF)) {
-      assert(src0.type != BRW_TYPE_UD);
-      assert(src0.type != BRW_TYPE_D);
-   }
-
-   assert(!brw_reg_is_arf(src0, BRW_ARF_ACCUMULATOR));
-   assert(!brw_reg_is_arf(src1, BRW_ARF_ACCUMULATOR));
-
-   return brw_alu2(p, BRW_OPCODE_MUL, dest, src0, src1);
-}
-
-brw_eu_inst *
-brw_LINE(struct brw_codegen *p, struct brw_reg dest,
-         struct brw_reg src0, struct brw_reg src1)
-{
-   src0.vstride = BRW_VERTICAL_STRIDE_0;
-   src0.width = BRW_WIDTH_1;
-   src0.hstride = BRW_HORIZONTAL_STRIDE_0;
-   return brw_alu2(p, BRW_OPCODE_LINE, dest, src0, src1);
-}
-
-brw_eu_inst *
-brw_PLN(struct brw_codegen *p, struct brw_reg dest,
-        struct brw_reg src0, struct brw_reg src1)
-{
-   src0.vstride = BRW_VERTICAL_STRIDE_0;
-   src0.width = BRW_WIDTH_1;
-   src0.hstride = BRW_HORIZONTAL_STRIDE_0;
-   src1.vstride = BRW_VERTICAL_STRIDE_8;
-   src1.width = BRW_WIDTH_8;
-   src1.hstride = BRW_HORIZONTAL_STRIDE_1;
-   return brw_alu2(p, BRW_OPCODE_PLN, dest, src0, src1);
-}
+ALU2(MUL)
+ALU2(AVG)
+ALU2(ADD)
+ALU2(SRND)
+ALU2(LINE)
+ALU2(PLN)
 
 brw_eu_inst *
 brw_DPAS(struct brw_codegen *p, enum gfx12_systolic_depth sdepth,
@@ -1024,15 +904,6 @@ brw_DPAS(struct brw_codegen *p, enum gfx12_systolic_depth sdepth,
 {
    return brw_dpas_three_src(p, BRW_OPCODE_DPAS, sdepth, rcount, dest, src0,
                              src1, src2);
-}
-
-brw_eu_inst *
-brw_SRND(struct brw_codegen *p, struct brw_reg dest,
-         struct brw_reg src0, struct brw_reg src1)
-{
-   assert(dest.type == BRW_TYPE_HF);
-   assert(src0.type == BRW_TYPE_F);
-   return brw_alu2(p, BRW_OPCODE_SRND, dest, src0, src1);
 }
 
 void brw_NOP(struct brw_codegen *p)
@@ -1399,30 +1270,7 @@ void gfx6_math(struct brw_codegen *p,
    const struct intel_device_info *devinfo = p->devinfo;
    brw_eu_inst *insn = next_insn(p, BRW_OPCODE_MATH);
 
-   assert(dest.file == FIXED_GRF);
-
    assert(dest.hstride == BRW_HORIZONTAL_STRIDE_1);
-
-   if (function == BRW_MATH_FUNCTION_INT_DIV_QUOTIENT ||
-       function == BRW_MATH_FUNCTION_INT_DIV_REMAINDER ||
-       function == BRW_MATH_FUNCTION_INT_DIV_QUOTIENT_AND_REMAINDER) {
-      assert(src0.type != BRW_TYPE_F);
-      assert(src1.type != BRW_TYPE_F);
-      assert(src1.file == FIXED_GRF ||
-             src1.file == IMM);
-      /* From BSpec 6647/47428 "[Instruction] Extended Math Function":
-       *     INT DIV function does not support source modifiers.
-       */
-      assert(!src0.negate);
-      assert(!src0.abs);
-      assert(!src1.negate);
-      assert(!src1.abs);
-   } else {
-      assert(src0.type == BRW_TYPE_F ||
-             (src0.type == BRW_TYPE_HF && devinfo->ver >= 9));
-      assert(src1.type == BRW_TYPE_F ||
-             (src1.type == BRW_TYPE_HF && devinfo->ver >= 9));
-   }
 
   /* This workaround says that we cannot use scalar broadcast with HF types.
    * However, for is_scalar values, all 16 elements contain the same value, so
@@ -1561,163 +1409,6 @@ brw_send_indirect_split_message(struct brw_codegen *p,
    }
    brw_eu_inst_set_sfid(devinfo, send, sfid);
    brw_eu_inst_set_eot(devinfo, send, eot);
-}
-
-static bool
-while_jumps_before_offset(const struct intel_device_info *devinfo,
-                          brw_eu_inst *insn, int while_offset, int start_offset)
-{
-   int scale = 16 / brw_jump_scale(devinfo);
-   int jip = brw_eu_inst_jip(devinfo, insn);
-   assert(jip < 0);
-   return while_offset + jip * scale <= start_offset;
-}
-
-
-static int
-brw_find_next_block_end(struct brw_codegen *p, int start_offset)
-{
-   int offset;
-   void *store = p->store;
-   const struct intel_device_info *devinfo = p->devinfo;
-
-   int depth = 0;
-
-   for (offset = next_offset(p, store, start_offset);
-        offset < p->next_insn_offset;
-        offset = next_offset(p, store, offset)) {
-      brw_eu_inst *insn = store + offset;
-
-      switch (brw_eu_inst_opcode(p->isa, insn)) {
-      case BRW_OPCODE_IF:
-         depth++;
-         break;
-      case BRW_OPCODE_ENDIF:
-         if (depth == 0)
-            return offset;
-         depth--;
-         break;
-      case BRW_OPCODE_WHILE:
-         /* If the while doesn't jump before our instruction, it's the end
-          * of a sibling do...while loop.  Ignore it.
-          */
-         if (!while_jumps_before_offset(devinfo, insn, offset, start_offset))
-            continue;
-         FALLTHROUGH;
-      case BRW_OPCODE_ELSE:
-      case BRW_OPCODE_HALT:
-         if (depth == 0)
-            return offset;
-         break;
-      default:
-         break;
-      }
-   }
-
-   return 0;
-}
-
-/* There is no DO instruction on gfx6, so to find the end of the loop
- * we have to see if the loop is jumping back before our start
- * instruction.
- */
-static int
-brw_find_loop_end(struct brw_codegen *p, int start_offset)
-{
-   const struct intel_device_info *devinfo = p->devinfo;
-   int offset;
-   void *store = p->store;
-
-   /* Always start after the instruction (such as a WHILE) we're trying to fix
-    * up.
-    */
-   for (offset = next_offset(p, store, start_offset);
-        offset < p->next_insn_offset;
-        offset = next_offset(p, store, offset)) {
-      brw_eu_inst *insn = store + offset;
-
-      if (brw_eu_inst_opcode(p->isa, insn) == BRW_OPCODE_WHILE) {
-	 if (while_jumps_before_offset(devinfo, insn, offset, start_offset))
-	    return offset;
-      }
-   }
-   UNREACHABLE("not reached");
-}
-
-/* After program generation, go back and update the UIP and JIP of
- * BREAK, CONT, and HALT instructions to their correct locations.
- */
-void
-brw_set_uip_jip(struct brw_codegen *p, int start_offset)
-{
-   const struct intel_device_info *devinfo = p->devinfo;
-   int offset;
-   int br = brw_jump_scale(devinfo);
-   int scale = 16 / br;
-   void *store = p->store;
-
-   for (offset = start_offset; offset < p->next_insn_offset; offset += 16) {
-      brw_eu_inst *insn = store + offset;
-      assert(brw_eu_inst_cmpt_control(devinfo, insn) == 0);
-
-      switch (brw_eu_inst_opcode(p->isa, insn)) {
-      case BRW_OPCODE_BREAK: {
-         int block_end_offset = brw_find_next_block_end(p, offset);
-         assert(block_end_offset != 0);
-         brw_eu_inst_set_jip(devinfo, insn, (block_end_offset - offset) / scale);
-	 /* Gfx7 UIP points to WHILE; Gfx6 points just after it */
-         brw_eu_inst_set_uip(devinfo, insn,
-	    (brw_find_loop_end(p, offset) - offset) / scale);
-	 break;
-      }
-
-      case BRW_OPCODE_CONTINUE: {
-         int block_end_offset = brw_find_next_block_end(p, offset);
-         assert(block_end_offset != 0);
-         brw_eu_inst_set_jip(devinfo, insn, (block_end_offset - offset) / scale);
-         brw_eu_inst_set_uip(devinfo, insn,
-            (brw_find_loop_end(p, offset) - offset) / scale);
-
-         assert(brw_eu_inst_uip(devinfo, insn) != 0);
-         assert(brw_eu_inst_jip(devinfo, insn) != 0);
-	 break;
-      }
-
-      case BRW_OPCODE_ENDIF: {
-         int block_end_offset = brw_find_next_block_end(p, offset);
-         int32_t jump = (block_end_offset == 0) ?
-                        1 * br : (block_end_offset - offset) / scale;
-         brw_eu_inst_set_jip(devinfo, insn, jump);
-	 break;
-      }
-
-      case BRW_OPCODE_HALT: {
-	 /* From the Sandy Bridge PRM (volume 4, part 2, section 8.3.19):
-	  *
-	  *    "In case of the halt instruction not inside any conditional
-	  *     code block, the value of <JIP> and <UIP> should be the
-	  *     same. In case of the halt instruction inside conditional code
-	  *     block, the <UIP> should be the end of the program, and the
-	  *     <JIP> should be end of the most inner conditional code block."
-	  *
-	  * The uip will have already been set by whoever set up the
-	  * instruction.
-	  */
-         int block_end_offset = brw_find_next_block_end(p, offset);
-	 if (block_end_offset == 0) {
-            brw_eu_inst_set_jip(devinfo, insn, brw_eu_inst_uip(devinfo, insn));
-	 } else {
-            brw_eu_inst_set_jip(devinfo, insn, (block_end_offset - offset) / scale);
-	 }
-         assert(brw_eu_inst_uip(devinfo, insn) != 0);
-         assert(brw_eu_inst_jip(devinfo, insn) != 0);
-	 break;
-      }
-
-      default:
-         break;
-      }
-   }
 }
 
 void

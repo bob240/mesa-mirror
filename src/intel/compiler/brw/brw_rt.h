@@ -36,7 +36,14 @@ extern "C" {
 #define BRW_RT_SBT_HANDLE_SIZE 32
 
 /** RT_DISPATCH_GLOBALS size (see gen_rt.xml) */
-#define BRW_RT_DISPATCH_GLOBALS_SIZE 80
+#define BRW_RT_DISPATCH_GLOBALS_SIZE 72
+
+/** RT_DISPATCH_GLOBALS alignment
+ *
+ * Use 256B to make sure we can access the pair of RT_DISPATCH_GLOBALS without
+ * 64bit math.
+ */
+#define BRW_RT_DISPATCH_GLOBALS_ALIGN 256
 
 /** Offset after the RT dispatch globals at which "push" constants live */
 #define BRW_RT_PUSH_CONST_OFFSET 128
@@ -184,10 +191,6 @@ struct brw_rt_raygen_trampoline_params {
     (BRW_RT_SIZEOF_RAY + BRW_RT_SIZEOF_TRAV_STACK) * BRW_RT_MAX_BVH_LEVELS + \
     (BRW_RT_MAX_BVH_LEVELS % 2 ? 32 : 0))
 
-#define BRW_RT_SIZEOF_SHADOW_RAY_QUERY  \
-   (BRW_RT_SIZEOF_HIT_INFO * 2 + \
-    (BRW_RT_SIZEOF_RAY + BRW_RT_SIZEOF_TRAV_STACK) * BRW_RT_MAX_BVH_LEVELS)
-
 #define BRW_RT_SIZEOF_HW_STACK \
    (BRW_RT_SIZEOF_HIT_INFO * 2 + \
     BRW_RT_SIZEOF_RAY * BRW_RT_MAX_BVH_LEVELS + \
@@ -258,30 +261,31 @@ brw_rt_ray_queries_hw_stacks_size(const struct intel_device_info *devinfo)
     * which includes all the threads.
     */
    uint32_t max_eu_id = devinfo->max_scratch_ids[MESA_SHADER_COMPUTE];
-   uint32_t max_simd_size = 16; /* Cannot run in SIMD32 with ray queries */
+   uint32_t max_simd_size = 32;
    return max_eu_id * max_simd_size * BRW_RT_SIZEOF_RAY_QUERY;
 }
 
 static inline uint32_t
-brw_rt_ray_queries_shadow_stack_size(const struct intel_device_info *devinfo)
+brw_rt_ray_queries_stack_ids_per_dss(const struct intel_device_info *devinfo)
 {
-   /* Maximum slice/subslice/EU ID can be computed from the max_scratch_ids
-    * which includes all the threads.
+   /* ATSM PRMs Vol 9, "State Model for Ray Tracing - RTDispatchGlobals"
+    *
+    *    "For Sync Ray tracing (i.e. using RayQueries), SW must allocate
+    *    space assuming 2K StackIDs"
     */
-   uint32_t max_eu_id = devinfo->max_scratch_ids[MESA_SHADER_COMPUTE];
-   uint32_t max_simd_size = 16; /* Cannot run in SIMD32 with ray queries */
-   return max_eu_id * max_simd_size * BRW_RT_SIZEOF_SHADOW_RAY_QUERY;
+   return 2048;
 }
 
 static inline uint32_t
-brw_rt_ray_queries_shadow_stacks_size(const struct intel_device_info *devinfo,
-                                      uint32_t ray_queries)
+brw_rt_ray_queries_stacks_offset(uint32_t num_queries)
 {
-   /* Don't bother a shadow stack if we only have a single query. We can
-    * directly write in the HW buffer.
-    */
-   return (ray_queries > 1 ? ray_queries : 0) * brw_rt_ray_queries_shadow_stack_size(devinfo) +
-          ray_queries * 4; /* Ctrl + Level data */
+   return BRW_RT_DISPATCH_GLOBALS_ALIGN << util_logbase2_ceil(num_queries);
+}
+
+static inline uint32_t
+brw_rt_ray_queries_stacks_stride(const struct intel_device_info *devinfo)
+{
+   return align(brw_rt_ray_queries_hw_stacks_size(devinfo), 4096);
 }
 
 #ifdef __cplusplus

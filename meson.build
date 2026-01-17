@@ -229,7 +229,6 @@ with_llvm = with_llvm \
   .enable_if(with_gallium_i915, error_message : 'i915 Gallium driver requires LLVM for vertex shaders') \
   .enable_if(with_gallium_llvmpipe, error_message : 'LLVMPipe Gallium driver requires LLVM') \
   .enable_if(with_gallium_r300 and draw_with_llvm, error_message : 'R300 Gallium driver requires LLVM for vertex shaders on IGP parts') \
-  .enable_if(with_gallium_r600 and amd_with_llvm, error_message : 'R600 Gallium driver configured to require LLVM') \
   .enable_if(with_gallium_radeonsi and amd_with_llvm, error_message : 'RadeonSI Gallium driver configured to require LLVM')
 
 # compatibility for "swrast" as an internal-ish driver name
@@ -708,6 +707,8 @@ if dep_va.found()
                           dependencies: dep_va_headers)
     pre_args += '-DHAVE_VA_SURFACE_ATTRIB_DRM_FORMAT_MODIFIERS'
   endif
+  libva_version = cc.get_define('VA_VERSION', prefix: '#include "va/va_version.h"',
+                                dependencies: dep_va_headers).split('.')
 endif
 with_gallium_va = dep_va.found()
 
@@ -786,9 +787,7 @@ if with_gallium_rusticl or with_nouveau_vk or with_tools.contains('etnaviv') or 
   rustc = meson.get_compiler('rust')
   rust = import('rust')
 
-  # Keep this in sync with the MINIMUM_SUPPORTED_RUST_VERSION in
-  # .gitlab-ci/container/build-rust.sh and the `rustup default` line in
-  # .gitlab-ci/meson/build.sh
+  # Keep this in sync with the `msrv` in clippy.toml
   if rustc.version().version_compare('< 1.82')
     error('Mesa requires Rust 1.82.0 or newer')
   endif
@@ -820,6 +819,19 @@ if with_gallium_rusticl or with_nouveau_vk or with_tools.contains('etnaviv') or 
     bindgen_output_args += ['--raw-line', '#![allow(unnecessary_transmutes)]']
   endif
 
+  rust_global_args = [
+    # We want to be able to write `else { if {} }` when it makes more sense than
+    # collapsing it into `else if {}`.
+    '-Aclippy::collapsible_else_if',
+
+    # "Needless lifetimes" might be needless but they're harmless and we
+    # prefer being explicit, so allow them.
+    '-Aclippy::needless_lifetimes',
+
+    # Being explicit has value, allow it.
+    '-Aclippy::question_mark',
+  ]
+
   rust_2024_lint_args = [
     '-Dboxed_slice_into_iter',
     '-Ddeprecated_safe_2024',
@@ -848,7 +860,7 @@ else
 endif
 
 with_driver_using_cl = [
-  with_gallium_iris, with_intel_vk,
+  with_gallium_iris, with_gallium_crocus, with_intel_vk, with_intel_hasvk,
   with_gallium_asahi, with_asahi_vk, with_tools.contains('asahi'),
   with_gallium_panfrost, with_panfrost_vk,
   with_nouveau_vk, with_imagination_vk,
@@ -1167,6 +1179,7 @@ if cc.get_argument_syntax() == 'msvc'
     '/we4024',  # Error when passing different type of parameter
     '/we4189',  # 'identifier' : local variable is initialized but not referenced
     '/Zc:__cplusplus', #Set __cplusplus macro to match the /std:c++<version> on the command line
+    '/Zc:enumTypes', # Enables C++ conforming enum underlying type and enumerator type deduction
     '/Zc:preprocessor', # Use the standards-conforming preprocessor
   ]
   c_args += cc.get_supported_arguments(_trial)
@@ -1767,11 +1780,8 @@ endif
 
 llvm_modules = ['bitwriter', 'engine', 'mcdisassembler', 'mcjit', 'core', 'executionengine', 'scalaropts', 'transformutils', 'instcombine']
 llvm_optional_modules = ['coroutines']
-if with_amd_vk or with_gallium_radeonsi or with_gallium_r600
+if with_amd_vk or with_gallium_radeonsi
   llvm_modules += ['amdgpu', 'bitreader', 'ipo']
-  if with_gallium_r600
-    llvm_modules += 'asmparser'
-  endif
 endif
 if with_clc
   llvm_modules += ['coverage', 'target', 'linker', 'irreader', 'option', 'libdriver', 'lto']
@@ -2217,6 +2227,13 @@ endif
 if get_option('android-libperfetto').enabled()
   pre_args += '-DANDROID_LIBPERFETTO'
 endif
+
+# Platforms where RenderDoc integration actually works
+renderdoc_integration_supported = [
+  'linux',
+  'android',
+].contains(host_machine.system())
+pre_args += '-DHAVE_RENDERDOC_INTEGRATION=@0@'.format(renderdoc_integration_supported)
 
 with_teflon = get_option('teflon')
 if with_teflon and with_tests

@@ -529,6 +529,10 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
                        const VkDependencyInfo *dep,
                        bool wait)
 {
+   VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+   enum nvkmd_engines engines =
+      nvk_queue_engines_from_queue_flags(queue_flags);
+
    enum nvk_barrier barriers = 0;
 
    /* For asymmetric, we don't know what the access flags will be yet.
@@ -563,6 +567,9 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
       barriers |= nvk_barrier_flushes_waits(bar->srcStageMask,
                                             bar->srcAccessMask);
    }
+
+   if (!(engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE)))
+      barriers &= ~NVK_BARRIER_FLUSH_SHADER_DATA;
 
    if (!barriers)
       return;
@@ -654,6 +661,20 @@ nvk_cmd_invalidate_deps(struct nvk_cmd_buffer *cmd,
                                              bar->dstAccessMask);
       }
    }
+
+   VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+   enum nvkmd_engines engines =
+      nvk_queue_engines_from_queue_flags(queue_flags);
+
+   if (!(engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE)))
+      barriers &= ~(NVK_BARRIER_INVALIDATE_TEX_DATA |
+                    NVK_BARRIER_INVALIDATE_RASTER_CACHE |
+                    NVK_BARRIER_INVALIDATE_SHADER_DATA |
+                    NVK_BARRIER_INVALIDATE_CONSTANT |
+                    NVK_BARRIER_INVALIDATE_MME_DATA);
+
+   if (!(engines & NVKMD_ENGINE_COMPUTE))
+      barriers &= ~NVK_BARRIER_INVALIDATE_QMD_DATA;
 
    if (!barriers)
       return;
@@ -1274,26 +1295,4 @@ nvk_CmdPushDescriptorSetWithTemplate2KHR(
    nvk_cmd_dirty_cbufs_for_descriptors(cmd, NVK_VK_GRAPHICS_STAGE_BITS |
                                             VK_SHADER_STAGE_COMPUTE_BIT,
                                        set, set + 1);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-nvk_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
-                             VkPipelineStageFlags2 stage,
-                             VkBuffer _buffer,
-                             VkDeviceSize offset,
-                             uint32_t marker)
-{
-   VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
-   VK_FROM_HANDLE(nvk_buffer, buffer, _buffer);
-   const uint64_t marker_addr = vk_buffer_address(&buffer->vk, offset);
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 5);
-
-   P_MTHD(p, NV9097, SET_REPORT_SEMAPHORE_A);
-   P_NV9097_SET_REPORT_SEMAPHORE_A(p, marker_addr >> 32);
-   P_NV9097_SET_REPORT_SEMAPHORE_B(p, marker_addr);
-   P_NV9097_SET_REPORT_SEMAPHORE_C(p, marker);
-   P_NV9097_SET_REPORT_SEMAPHORE_D(p, {
-      .pipeline_location = vk_stage_flags_to_nv9097_pipeline_location(stage),
-      .structure_size = STRUCTURE_SIZE_ONE_WORD,
-   });
 }

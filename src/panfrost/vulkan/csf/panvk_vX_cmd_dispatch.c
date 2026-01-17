@@ -87,10 +87,10 @@ panvk_per_arch(cmd_dispatch_prepare_tls)(
 
    if (tlsinfo.wls.size) {
       unsigned core_id_range;
-      pan_query_core_count(&phys_dev->kmod.props, &core_id_range);
+      pan_query_core_count(&phys_dev->kmod.dev->props, &core_id_range);
 
       tlsinfo.wls.instances = pan_calc_wls_instances(
-         &cs->cs.local_size, &phys_dev->kmod.props, indirect ? NULL : dim);
+         &cs->cs.local_size, &phys_dev->kmod.dev->props, indirect ? NULL : dim);
 
       unsigned wls_total_size = pan_calc_total_wls_size(
          tlsinfo.wls.size, tlsinfo.wls.instances, core_id_range);
@@ -128,7 +128,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    VkResult result;
 
    /* If there's no compute shader, we can skip the dispatch. */
-   if (!panvk_priv_mem_dev_addr(cs->spd))
+   if (!panvk_priv_mem_check_alloc(cs->spd))
       return;
 
    struct panvk_physical_device *phys_dev =
@@ -156,7 +156,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
    unsigned wg_per_task = 0;
    if (indirect)
       wg_per_task = pan_calc_workgroups_per_task(&cs->cs.local_size,
-                                                 &phys_dev->kmod.props);
+                                                 &phys_dev->kmod.dev->props);
 
    if (compute_state_dirty(cmdbuf, DESC_STATE) ||
        compute_state_dirty(cmdbuf, CS)) {
@@ -277,9 +277,8 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       }
    }
 
-   struct cs_index next_iter_sb_scratch = cs_scratch_reg_tuple(b, 0, 2);
-   panvk_per_arch(cs_next_iter_sb)(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
-                                   next_iter_sb_scratch);
+   cs_next_iter_sb(cmdbuf, PANVK_SUBQUEUE_COMPUTE,
+                   cs_scratch_reg_tuple(b, 0, 2));
 
    if (indirect) {
       /* Use run_compute with a set task axis instead of run_compute_indirect as
@@ -297,7 +296,7 @@ cmd_dispatch(struct panvk_cmd_buffer *cmdbuf, struct panvk_dispatch_info *info)
       unsigned task_axis = MALI_TASK_AXIS_X;
       unsigned task_increment = 0;
       panvk_per_arch(calculate_task_axis_and_increment)(
-         cs, phys_dev, &task_axis, &task_increment);
+         cs, phys_dev, &dim, &task_axis, &task_increment);
       cs_trace_run_compute(b, tracing_ctx, cs_scratch_reg_tuple(b, 0, 4),
                            task_increment, task_axis,
                            cs_shader_res_sel(0, 0, 0, 0));

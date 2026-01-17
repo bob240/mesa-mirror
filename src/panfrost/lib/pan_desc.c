@@ -455,39 +455,26 @@ pan_bytes_per_pixel_tib(enum pipe_format format)
 {
    const struct pan_blendable_format *bf =
       GENX(pan_blendable_format_from_pipe_format)(format);
-
-   if (bf->internal) {
-      /* Blendable formats are always 32-bits in the tile buffer,
-       * extra bits are used as padding or to dither */
-      return 4;
-   } else {
-      /* Non-blendable formats are raw, rounded up to the nearest
-       * power-of-two size */
-      unsigned bytes = util_format_get_blocksize(format);
-      return util_next_power_of_two(bytes);
-   }
+   return pan_format_tib_size(format, bf->internal);
 }
 
 static unsigned
 pan_cbuf_bytes_per_pixel(const struct pan_fb_info *fb)
 {
-   /* dummy/non-existent render-targets use RGBA8 UNORM, e.g 4 bytes */
-   const unsigned dummy_rt_size = 4 * fb->nr_samples;
-
+   bool need_dummy = false;
    unsigned sum = 0;
 
-   if (!fb->rt_count) {
-      /* The HW needs at least one render-target */
-      return dummy_rt_size;
-   }
-
-   for (int cb = 0; cb < fb->rt_count; ++cb) {
-      unsigned rt_size = dummy_rt_size;
+   for (int cb = 0; cb < MAX2(fb->rt_count, 1); ++cb) {
       const struct pan_image_view *rt = fb->rts[cb].view;
       if (rt)
-         rt_size = pan_bytes_per_pixel_tib(rt->format) * rt->nr_samples;
+         sum += pan_bytes_per_pixel_tib(rt->format) * rt->nr_samples;
+      else
+         need_dummy = true;
+   }
 
-      sum += rt_size;
+   if (need_dummy) {
+      /* dummy/non-existent render-targets use RGBA8 UNORM, e.g 4 bytes */
+      sum = MAX2(sum, 4 * fb->nr_samples);
    }
 
    if (fb->pls_enabled) {

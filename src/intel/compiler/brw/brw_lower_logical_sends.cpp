@@ -29,8 +29,14 @@
 #include "brw_shader.h"
 #include "brw_builder.h"
 #include "brw_sampler.h"
+#include "brw_rt.h"
 
 #include "util/bitpack_helpers.h"
+
+static void
+setup_lsc_surface_descriptors(const brw_builder &bld, brw_send_inst *send,
+                              uint32_t desc, const brw_reg &surface,
+                              int32_t base_offset);
 
 static inline brw_send_inst *
 brw_transform_inst_to_send(const brw_builder &bld, brw_inst *inst)
@@ -91,6 +97,7 @@ lower_urb_read_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
 
    /* Get the logical send arguments. */
    const brw_reg handle = urb->src[URB_LOGICAL_SRC_HANDLE];
+   const unsigned offset = urb->offset;
 
    /* Calculate the total number of components of the payload. */
    const unsigned dst_comps = urb->size_written / (REG_SIZE * reg_unit(devinfo));
@@ -98,14 +105,6 @@ lower_urb_read_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
    brw_reg payload = bld.vgrf(BRW_TYPE_UD);
 
    bld.MOV(payload, handle);
-
-   /* The low 24-bits of the URB handle is a byte offset into the URB area.
-    * Add the (OWord) offset of the write to this value.
-    */
-   if (urb->offset) {
-      bld.ADD(payload, payload, brw_imm_ud(urb->offset));
-      urb->offset = 0;
-   }
 
    brw_reg offsets = urb->src[URB_LOGICAL_SRC_PER_SLOT_OFFSETS];
    if (offsets.file != BAD_FILE) {
@@ -132,8 +131,8 @@ lower_urb_read_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
    send->has_side_effects = true;
    send->is_volatile = false;
 
-   send->src[SEND_SRC_DESC]     = brw_imm_ud(0);
-   send->src[SEND_SRC_EX_DESC]  = brw_imm_ud(0);
+   setup_lsc_surface_descriptors(bld, send, send->desc, brw_reg(), offset);
+
    send->src[SEND_SRC_PAYLOAD1] = payload;
    send->src[SEND_SRC_PAYLOAD2] = brw_reg();
 }
@@ -211,6 +210,7 @@ lower_urb_write_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
    const brw_reg src = urb->components_read(URB_LOGICAL_SRC_DATA) ?
       urb->src[URB_LOGICAL_SRC_DATA] : brw_reg(brw_imm_ud(0));
    assert(brw_type_size_bytes(src.type) == 4);
+   const unsigned offset = urb->offset;
 
    /* Calculate the total number of components of the payload. */
    const unsigned src_comps = MAX2(1, urb->components_read(URB_LOGICAL_SRC_DATA));
@@ -219,14 +219,6 @@ lower_urb_write_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
    brw_reg payload = bld.vgrf(BRW_TYPE_UD);
 
    bld.MOV(payload, handle);
-
-   /* The low 24-bits of the URB handle is a byte offset into the URB area.
-    * Add the (OWord) offset of the write to this value.
-    */
-   if (urb->offset) {
-      bld.ADD(payload, payload, brw_imm_ud(urb->offset));
-      urb->offset = 0;
-   }
 
    brw_reg offsets = urb->src[URB_LOGICAL_SRC_PER_SLOT_OFFSETS];
    if (offsets.file != BAD_FILE) {
@@ -262,6 +254,7 @@ lower_urb_write_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
                              false /* transpose */,
                              LSC_CACHE(devinfo, STORE, L1UC_L3UC));
 
+   setup_lsc_surface_descriptors(bld, send, send->desc, brw_reg(), offset);
 
    send->mlen = lsc_msg_addr_len(devinfo, LSC_ADDR_SIZE_A32, send->exec_size);
    send->ex_mlen = ex_mlen;
@@ -270,7 +263,6 @@ lower_urb_write_logical_send_xe2(const brw_builder &bld, brw_urb_inst *urb)
    send->is_volatile = false;
 
    send->src[SEND_SRC_DESC]     = desc;
-   send->src[SEND_SRC_EX_DESC]  = brw_imm_ud(0);
    send->src[SEND_SRC_PAYLOAD1] = payload;
    send->src[SEND_SRC_PAYLOAD2] = payload2;
 }
@@ -744,6 +736,30 @@ get_sampler_msg_payload_type_bit_size(const intel_device_info *devinfo,
    return src_type_size * 8;
 }
 
+/* Return one bit for each channel(ABGR), bit set means that channel should
+ * not be written back.
+ */
+static uint32_t
+sampler_calc_channel_mask(const intel_device_info *devinfo, brw_tex_inst *tex)
+{
+   /* If we're requesting fewer than four channels worth of response,
+    * and we have an explicit header, we need to set up the sampler
+    * writemask.  It's reversed from normal: 1 means "don't write".
+    */
+   unsigned comps_regs =
+      DIV_ROUND_UP(regs_written(tex) - reg_unit(devinfo) * tex->residency,
+                   reg_unit(devinfo));
+   unsigned comp_regs =
+      DIV_ROUND_UP(tex->dst.component_size(tex->exec_size),
+                   reg_unit(devinfo) * REG_SIZE);
+   if (comps_regs < 4 * comp_regs) {
+      assert(comps_regs % comp_regs == 0);
+      return ~((1 << (comps_regs / comp_regs)) - 1) & 0xf;
+   }
+
+   return 0;
+}
+
 static void
 lower_sampler_logical_send(const brw_builder &bld, brw_tex_inst *tex)
 {
@@ -805,21 +821,7 @@ lower_sampler_logical_send(const brw_builder &bld, brw_tex_inst *tex)
       if (tex->residency)
          g0_2 |= 1 << 23; /* g0.2 bit23 : Pixel Null Mask Enable */
 
-      /* If we're requesting fewer than four channels worth of response,
-       * and we have an explicit header, we need to set up the sampler
-       * writemask.  It's reversed from normal: 1 means "don't write".
-       */
-      unsigned comps_regs =
-         DIV_ROUND_UP(regs_written(tex) - reg_unit(devinfo) * tex->residency,
-                      reg_unit(devinfo));
-      unsigned comp_regs =
-         DIV_ROUND_UP(tex->dst.component_size(tex->exec_size),
-                      reg_unit(devinfo) * REG_SIZE);
-      if (comps_regs < 4 * comp_regs) {
-         assert(comps_regs % comp_regs == 0);
-         unsigned mask = ~((1 << (comps_regs / comp_regs)) - 1) & 0xf;
-         g0_2 |= mask << 12;
-      }
+      g0_2 |= sampler_calc_channel_mask(devinfo, tex) << 12;
 
       if (tex->has_const_offsets) {
          g0_2 |= ((tex->const_offsets[2] & 0xf) << 0) |
@@ -2078,11 +2080,16 @@ lower_trace_ray_logical_send(const brw_builder &bld, brw_inst *inst)
    brw_reg header = ubld.vgrf(BRW_TYPE_UD);
    ubld.MOV(header, brw_imm_ud(0));
 
+   const uint32_t second_group_offset =
+      align(BRW_RT_DISPATCH_GLOBALS_SIZE, 64);
+
    const brw_reg globals_addr = inst->src[RT_LOGICAL_SRC_GLOBALS];
    if (globals_addr.file != UNIFORM) {
       brw_reg addr_ud = retype(globals_addr, BRW_TYPE_UD);
       addr_ud.stride = 1;
       ubld.group(2, 0).MOV(header, addr_ud);
+      if (inst->group == 16)
+         ubld.group(1, 0).ADD(header, header, brw_imm_ud(second_group_offset));
    } else {
       /* If the globals address comes from a uniform, do not do the SIMD2
        * optimization. This occurs in many Vulkan CTS tests.
@@ -2092,8 +2099,14 @@ lower_trace_ray_logical_send(const brw_builder &bld, brw_inst *inst)
        * UNIFORM will be uniform (i.e., <0,1,0>). The clever SIMD2
        * optimization violates that assumption.
        */
-      ubld.group(1, 0).MOV(byte_offset(header, 0),
-                           subscript(globals_addr, BRW_TYPE_UD, 0));
+      if (inst->group == 16) {
+         ubld.group(1, 0).ADD(byte_offset(header, 0),
+                              subscript(globals_addr, BRW_TYPE_UD, 0),
+                              brw_imm_ud(second_group_offset));
+      } else {
+         ubld.group(1, 0).MOV(byte_offset(header, 0),
+                              subscript(globals_addr, BRW_TYPE_UD, 0));
+      }
       ubld.group(1, 0).MOV(byte_offset(header, 4),
                            subscript(globals_addr, BRW_TYPE_UD, 1));
    }

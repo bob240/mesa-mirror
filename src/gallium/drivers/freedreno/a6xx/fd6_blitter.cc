@@ -7,8 +7,6 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#define FD_BO_NO_HARDPIN 1
-
 #include "util/format_srgb.h"
 #include "util/half_float.h"
 #include "util/u_dump.h"
@@ -267,32 +265,24 @@ emit_setup(struct fd_context *ctx, fd_cs &cs)
                           FD6_FLUSH_CCU_DEPTH |
                           FD6_INVALIDATE_CCU_DEPTH);
 
+   fd6_set_render_mode<CHIP>(cs, {RM6_BLIT2DSCALE});
+
    /* normal BLIT_OP_SCALE operation needs bypass RB_CCU_CNTL */
-   fd6_emit_ccu_cntl<CHIP>(cs, ctx->screen, false);
+   fd6_emit_gmem_cache_cntl<CHIP>(cs, ctx->screen, false);
 }
 
 template <chip CHIP>
 static void
 emit_blit_fini(struct fd_context *ctx, fd_cs &cs)
 {
-   const struct fd_dev_info *info = ctx->screen->info;
-
    fd6_event_write<CHIP>(ctx, cs, FD_LABEL);
 
-   if (info->magic.RB_DBG_ECO_CNTL != info->magic.RB_DBG_ECO_CNTL_blit) {
-      fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
-      fd_pkt4(cs, 1)
-         .add(A6XX_RB_DBG_ECO_CNTL(.dword = info->magic.RB_DBG_ECO_CNTL_blit));
-   }
+   fd6_set_rb_dbg_eco_mode<CHIP>(ctx, cs, true);
 
    fd_pkt7(cs, CP_BLIT, 1)
       .add(CP_BLIT_0(.op = BLIT_OP_SCALE));
 
-   if (info->magic.RB_DBG_ECO_CNTL != info->magic.RB_DBG_ECO_CNTL_blit) {
-      fd_pkt7(cs, CP_WAIT_FOR_IDLE, 0);
-      fd_pkt4(cs, 1)
-         .add(A6XX_RB_DBG_ECO_CNTL(.dword = info->magic.RB_DBG_ECO_CNTL));
-   }
+   fd6_set_rb_dbg_eco_mode<CHIP>(ctx, cs, false);
 }
 
 /* nregs: 5 */
@@ -511,6 +501,8 @@ static void
 fd6_clear_ubwc(struct fd_batch *batch, struct fd_resource *rsc) assert_dt
 {
    fd_cs cs(fd_batch_get_prologue(batch));
+
+   fd6_set_render_mode<CHIP>(cs, {RM6_BLIT2DSCALE});
 
    clear_ubwc_setup<CHIP>(cs);
 
@@ -814,7 +806,7 @@ clear_lrz_setup(fd_cs &cs, struct fd_resource *zsbuf, struct fd_bo *lrz, double 
    ncrb.add(GRAS_A2D_DEST_TL(CHIP, .x = 0, .y = 0));
    ncrb.add(GRAS_A2D_DEST_BR(CHIP,
       .x = zsbuf->lrz_layout.lrz_pitch - 1,
-      .y = zsbuf->lrz_layout.lrz_height - 1,
+      .y = zsbuf->lrz_layout.lrz_height * zsbuf->b.b.array_size - 1,
    ));
 
    union pipe_color_union clear_color = { .f = {depth} };
@@ -833,11 +825,9 @@ clear_lrz_setup(fd_cs &cs, struct fd_resource *zsbuf, struct fd_bo *lrz, double 
 
 template <chip CHIP>
 void
-fd6_clear_lrz(struct fd_batch *batch, struct fd_resource *zsbuf,
+fd6_clear_lrz(fd_cs &cs, struct fd_resource *zsbuf,
               struct fd_bo *lrz, double depth)
 {
-   fd_cs cs(fd_batch_get_prologue(batch));
-
    if (DEBUG_BLIT) {
       fprintf(stderr, "lrz clear:\ndst resource: ");
       util_dump_resource(stderr, &zsbuf->b.b);
@@ -1169,7 +1159,6 @@ resolve_tile_setup(struct fd_batch *batch, fd_cs &cs, uint32_t base,
                    struct pipe_surface *psurf, uint32_t unknown_8c01)
 {
    const struct fd_gmem_stateobj *gmem = batch->gmem_state;
-   uint64_t gmem_base = batch->ctx->screen->gmem_base + base;
    uint32_t gmem_pitch = gmem->bin_w * batch->framebuffer.samples *
                          util_format_get_blocksize(psurf->format);
    unsigned width = pipe_surface_width(psurf);
@@ -1212,7 +1201,12 @@ resolve_tile_setup(struct fd_batch *batch, fd_cs &cs, uint32_t base,
       .width = width,
       .height = height,
    ));
-   ncrb.add(TPL1_A2D_SRC_TEXTURE_BASE(CHIP, .qword = gmem_base));
+
+   /* gen8 simply uses gmem offset when GMEM tiling (TILE6_2) is specified: */
+   if (CHIP < A8XX)
+      base += batch->ctx->screen->gmem_base;
+
+   ncrb.add(TPL1_A2D_SRC_TEXTURE_BASE(CHIP, .qword = base));
    ncrb.add(TPL1_A2D_SRC_TEXTURE_PITCH(CHIP, .pitch = gmem_pitch));
 }
 
@@ -1285,7 +1279,7 @@ handle_rgba_blit(struct fd_context *ctx, const struct pipe_blit_info *info)
 
    DBG_BLIT(info, batch);
 
-   trace_start_blit(&batch->trace, cs.ring(), info->src.resource->target,
+   trace_start_blit(&batch->trace, cs, info->src.resource->target,
                     info->dst.resource->target);
 
    if ((info->src.resource->target == PIPE_BUFFER) &&
@@ -1300,7 +1294,7 @@ handle_rgba_blit(struct fd_context *ctx, const struct pipe_blit_info *info)
       emit_blit_texture<CHIP>(ctx, cs, info);
    }
 
-   trace_end_blit(&batch->trace, cs.ring());
+   trace_end_blit(&batch->trace, cs);
 
    fd6_emit_flushes<CHIP>(batch->ctx, cs,
                           FD6_FLUSH_CCU_COLOR |

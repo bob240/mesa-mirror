@@ -83,8 +83,6 @@ _dev_icd = custom_target(
 )
 
 devenv.append('VK_DRIVER_FILES', _dev_icd.full_path())
-# Deprecated: replaced by VK_DRIVER_FILES above
-devenv.append('VK_ICD_FILENAMES', _dev_icd.full_path())
 
 libanv_per_hw_ver_libs = []
 anv_per_hw_ver_files = files(
@@ -194,6 +192,7 @@ libanv_files = files(
   'anv_sampler.c',
   'anv_shader.c',
   'anv_shader_compile.c',
+  'anv_shader_heap.c',
   'anv_slab_bo.c',
   'anv_slab_bo.h',
   'anv_sparse.c',
@@ -330,6 +329,7 @@ if with_tests
     'tests/block_pool_no_free.c',
     'tests/block_pool_grow_first.c',
     'tests/block_pool_max_size.c',
+    'tests/shader_heap_small_allocs.c',
   )
 
   test(
@@ -348,6 +348,31 @@ if with_tests
       include_directories : [
         inc_include, inc_src, inc_intel, inc_compiler, inc_nir
       ],
+    ),
+    suite : ['intel'],
+    protocol : 'gtest',
+    is_parallel : false,
+    timeout : 60,
+  )
+
+  test(
+    'anv_slab_bo_test',
+    executable(
+      'anv_slab_bo_test',
+      [
+        'tests/anv_slab_bo_test.c',
+        'tests/anv_slab_bo_test.cpp',
+        anv_entrypoints[0]
+      ],
+      c_args : [ sse2_args ],
+      link_with : libvulkan_intel_test,
+      dependencies : [
+        idep_gtest, idep_intel_driver_ds, anv_deps,
+      ],
+      include_directories : [
+        inc_include, inc_src, inc_intel, inc_compiler, inc_nir
+      ],
+      link_args : ['-Wl,--wrap=anv_device_release_bo,--wrap=anv_device_alloc_bo']
     ),
     suite : ['intel'],
     protocol : 'gtest',

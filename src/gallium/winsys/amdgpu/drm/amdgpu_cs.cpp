@@ -1392,12 +1392,7 @@ static int amdgpu_cs_submit_ib_kernelq(struct amdgpu_cs *acs,
 
    assert(num_chunks <= 8);
 
-   /* Submit the command buffer.
-    *
-    * The kernel returns -ENOMEM with many parallel processes using GDS such as test suites
-    * quite often, but it eventually succeeds after enough attempts. This happens frequently
-    * with dEQP using NGG streamout.
-    */
+   /* Submit the command buffer. */
    int r = 0;
 
    do {
@@ -1406,7 +1401,12 @@ static int amdgpu_cs_submit_ib_kernelq(struct amdgpu_cs *acs,
          os_time_sleep(1000);
 
       r = ac_drm_cs_submit_raw2(aws->dev, acs->ctx->ctx_handle, 0, num_chunks, chunks, seq_no);
-   } while (r == -ENOMEM);
+
+      /* The kernel returns -ENOMEM with many parallel processes using GDS such as test suites
+       * quite often, but it eventually succeeds after enough attempts. This happens frequently
+       * with dEQP using NGG streamout.
+       */
+   } while (r == -ENOMEM && aws->allocated_oa);
 
    return r;
 }
@@ -1415,6 +1415,15 @@ struct cond_exec_skip_count {
    uint32_t *count_dw_ptr;
    uint64_t start_wptr;
 };
+
+#define add_dbg_count_write_data_pkt(number) do { \
+   amdgpu_pkt_add_dw(PKT3(PKT3_WRITE_DATA, 4, 0)); \
+   amdgpu_pkt_add_dw(WRITE_DATA_DST_SEL(5) | WRITE_DATA_WR_CONFIRM | WRITE_DATA_CACHE_POLICY(3)); \
+   amdgpu_pkt_add_dw(userq->write_data_pkt_dbg_count_va); \
+   amdgpu_pkt_add_dw(userq->write_data_pkt_dbg_count_va >> 32); \
+   amdgpu_pkt_add_dw(number); \
+   amdgpu_pkt_add_dw((uint64_t)number >> 32); \
+} while (0)
 
 static void amdgpu_cs_add_userq_packets(struct amdgpu_winsys *aws,
                                         struct amdgpu_userq *userq,
@@ -1440,6 +1449,9 @@ static void amdgpu_cs_add_userq_packets(struct amdgpu_winsys *aws,
          cond_exec_skip_counts[0].count_dw_ptr = amdgpu_pkt_get_ptr_skip_dw();
          cond_exec_skip_counts[0].start_wptr = amdgpu_pkt_get_next_wptr();
       }
+
+      if (aws->userq_job_log)
+         add_dbg_count_write_data_pkt(1);
 
       if (num_fences) {
          unsigned max_num_fences_fwm;
@@ -1472,6 +1484,9 @@ static void amdgpu_cs_add_userq_packets(struct amdgpu_winsys *aws,
             }
          }
       }
+
+      if (aws->userq_job_log)
+         add_dbg_count_write_data_pkt(2);
 
       amdgpu_pkt_add_dw(PKT3(PKT3_HDP_FLUSH, 0, 0));
       amdgpu_pkt_add_dw(0x0);
@@ -1628,6 +1643,18 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
    if (r)
       mesa_loge("amdgpu: getting wait fences failed\n");
 
+   if (aws->userq_job_log) {
+      for (unsigned i = 0; i < userq_wait_data.num_fences; i++) {
+         /* The uq_va memory is allocated in kernel from a memory chunk. This memory chunk is
+          * mapped to same address for all process/apps. Once uq_va is guess mapped to a
+          * given queue, cross process/queue fence dependency can be analyzed.
+          */
+         mesa_logi("amdgpu: uq_log: %s:  num_wait_fences=%d  uq_va=%llx  job=%llx\n",
+                   amdgpu_userq_str[acs->queue_index], userq_wait_data.num_fences, fence_info[i].va,
+                   fence_info[i].value);
+      }
+   }
+
    simple_mtx_lock(&userq->lock);
    amdgpu_cs_add_userq_packets(aws, userq, csc, userq_wait_data.num_fences, fence_info);
    struct drm_amdgpu_userq_signal userq_signal_data = {
@@ -1657,6 +1684,11 @@ static int amdgpu_cs_submit_ib_userq(struct amdgpu_userq *userq,
 #endif
    userq->doorbell_bo_map[AMDGPU_USERQ_DOORBELL_INDEX] = userq->next_wptr;
    r = ac_drm_userq_signal(aws->dev, &userq_signal_data);
+
+   if (aws->userq_job_log) {
+      mesa_logi("amdgpu: uq_log: %s:  submitted_job=%llx\n", amdgpu_userq_str[acs->queue_index],
+                (long long)*userq->wptr_bo_map);
+   }
 
    *seq_no = userq->user_fence_seq_num;
    simple_mtx_unlock(&userq->lock);
@@ -2048,21 +2080,7 @@ static void amdgpu_cs_submit_ib(void *job, void *gdata, int thread_index)
       r = 0;
    } else {
       if (queue_type != USERQ) {
-         /* Submit the command buffer.
-          *
-          * The kernel returns -ENOMEM with many parallel processes using GDS such as test suites
-          * quite often, but it eventually succeeds after enough attempts. This happens frequently
-          * with dEQP using NGG streamout.
-          */
-         r = 0;
-
-         do {
-            /* Wait 1 ms and try again. */
-            if (r == -ENOMEM)
-               os_time_sleep(1000);
-
-            r = amdgpu_cs_submit_ib_kernelq(acs, num_submit_real_buffers, bo_list, &seq_no);
-         } while (r == -ENOMEM);
+         r = amdgpu_cs_submit_ib_kernelq(acs, num_submit_real_buffers, bo_list, &seq_no);
 
          if (!r) {
             /* Success. */
@@ -2315,10 +2333,12 @@ static int amdgpu_cs_flush(struct radeon_cmdbuf *rcs,
                            RADEON_USAGE_READ | RADEON_PRIO_IB, (radeon_bo_domain)0);
    }
 
+   simple_mtx_lock(&aws->stats_lock);
    if (acs->ip_type == AMD_IP_GFX)
       aws->num_gfx_IBs++;
    else if (acs->ip_type == AMD_IP_SDMA)
       aws->num_sdma_IBs++;
+   simple_mtx_unlock(&aws->stats_lock);
 
    return error_code;
 }

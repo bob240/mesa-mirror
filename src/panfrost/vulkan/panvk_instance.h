@@ -30,6 +30,9 @@ enum panvk_debug_flags {
    PANVK_DEBUG_IMPLICIT_OTHERS_INV = 1 << 11,
    PANVK_DEBUG_FORCE_BLACKHOLE = 1 << 12,
    PANVK_DEBUG_WSI_AFBC = 1 << 13,
+   PANVK_DEBUG_NO_WB_MMAP = 1 << 14,
+   PANVK_DEBUG_NO_USER_MMAP_SYNC = 1 << 15,
+   PANVK_DEBUG_COHERENT_BEFORE_CACHED = 1 << 16,
 };
 
 extern uint64_t panvk_debug;
@@ -49,7 +52,7 @@ struct panvk_instance {
    struct driOptionCache dri_options;
    struct driOptionCache available_dri_options;
 
-   uint8_t driver_build_sha[20];
+   uint8_t driver_build_sha[SHA1_DIGEST_LENGTH];
    uint32_t force_vk_vendor;
 
    bool enable_vertex_pipeline_stores_atomics;

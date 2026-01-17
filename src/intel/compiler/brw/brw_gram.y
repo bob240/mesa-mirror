@@ -358,8 +358,8 @@ i965_asm_set_instruction_options(struct brw_codegen *p,
 %token <integer> TYPE_D TYPE_UD
 %token <integer> TYPE_Q TYPE_UQ
 %token <integer> TYPE_V TYPE_UV
-%token <integer> TYPE_F TYPE_HF
-%token <integer> TYPE_BF
+%token <integer> TYPE_F TYPE_HF TYPE_HF8
+%token <integer> TYPE_BF TYPE_BF8
 %token <integer> TYPE_DF
 %token <integer> TYPE_VF
 
@@ -947,6 +947,12 @@ sendinstruction:
       brw_eu_inst_set_exec_size(p->devinfo, brw_last_inst, $3);
       brw_set_dest(p, brw_last_inst, $4);
       brw_set_src0(p, brw_last_inst, $5);
+      if ($6.file != ARF &&
+          $6.nr != BRW_ARF_ADDRESS &&
+          $6.subnr != 0) {
+         error(&@2, "SEND with indirect desc must use a0.0\n");
+      }
+      brw_eu_inst_set_send_sel_reg32_desc(p->devinfo, brw_last_inst, 1);
       brw_eu_inst_set_bits(brw_last_inst, 127, 96, $7);
       brw_eu_inst_set_sfid(p->devinfo, brw_last_inst, $8);
       brw_eu_inst_set_eot(p->devinfo, brw_last_inst, $10.end_of_thread);
@@ -1866,6 +1872,8 @@ reg_type:
    | TYPE_Q    { $$ = BRW_TYPE_Q;  }
    | TYPE_HF   { $$ = BRW_TYPE_HF; }
    | TYPE_BF   { $$ = BRW_TYPE_BF; }
+   | TYPE_HF8  { $$ = BRW_TYPE_HF8; }
+   | TYPE_BF8  { $$ = BRW_TYPE_BF8; }
    ;
 
 imm_type:

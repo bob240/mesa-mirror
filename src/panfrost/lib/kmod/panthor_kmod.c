@@ -13,6 +13,7 @@
 #include "util/libsync.h"
 #include "util/macros.h"
 #include "util/os_time.h"
+#include "util/stack_array.h"
 #include "util/simple_mtx.h"
 #include "util/u_debug.h"
 #include "util/vma.h"
@@ -102,6 +103,99 @@ struct panthor_kmod_bo {
       uint64_t write_point;
    } sync;
 };
+
+static uint32_t
+to_kmod_group_allow_priority_flags(uint32_t panthor_flags)
+{
+   uint32_t kmod_flags = 0;
+
+   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_REALTIME))
+      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME;
+
+   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_HIGH))
+      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH;
+
+   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_MEDIUM))
+      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
+
+   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_LOW))
+      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW;
+
+   return kmod_flags;
+}
+
+static void
+panthor_dev_query_thread_props(struct panthor_kmod_dev *panthor_dev)
+{
+   struct pan_kmod_dev_props *props = &panthor_dev->base.props;
+
+   props->max_threads_per_wg = panthor_dev->props.gpu.thread_max_workgroup_size;
+   props->max_threads_per_core = panthor_dev->props.gpu.max_threads;
+   props->max_tasks_per_core = panthor_dev->props.gpu.thread_features >> 24;
+   props->num_registers_per_core =
+      panthor_dev->props.gpu.thread_features & 0x3fffff;
+
+   /* We assume that all thread properties are populated. If we ever have a GPU
+    * that have one of the THREAD_xxx register that's zero, we can always add a
+    * quirk here.
+    */
+   assert(props->max_threads_per_wg && props->max_threads_per_core &&
+          props->max_tasks_per_core && props->num_registers_per_core);
+
+   /* There is no THREAD_TLS_ALLOC register on v10+, and the maximum number
+    * of TLS instance per core is assumed to be the maximum number of threads
+    * per core.
+    */
+   props->max_tls_instance_per_core = props->max_threads_per_core;
+}
+
+static void
+panthor_dev_query_props(struct panthor_kmod_dev *panthor_dev)
+{
+   struct pan_kmod_dev_props *props = &panthor_dev->base.props;
+
+   *props = (struct pan_kmod_dev_props){
+      .gpu_id = panthor_dev->props.gpu.gpu_id,
+      .gpu_variant = panthor_dev->props.gpu.core_features & 0xff,
+      .shader_present = panthor_dev->props.gpu.shader_present,
+      .tiler_features = panthor_dev->props.gpu.tiler_features,
+      .mem_features = panthor_dev->props.gpu.mem_features,
+      .mmu_features = panthor_dev->props.gpu.mmu_features,
+
+      /* This register does not exist because AFBC is no longer optional. */
+      .afbc_features = 0,
+
+      /* Access to timstamp from the GPU is always supported on Panthor. */
+      .gpu_can_query_timestamp = true,
+
+      .timestamp_frequency = panthor_dev->props.timestamp.timestamp_frequency,
+
+      .allowed_group_priorities_mask = to_kmod_group_allow_priority_flags(
+         panthor_dev->props.group_priorities.allowed_mask),
+
+      .supported_bo_flags = PAN_KMOD_BO_FLAG_EXECUTABLE |
+                            PAN_KMOD_BO_FLAG_NO_MMAP |
+                            PAN_KMOD_BO_FLAG_GPU_UNCACHED,
+   };
+
+   if (pan_kmod_driver_version_at_least(&panthor_dev->base.driver, 1, 6))
+      props->timestamp_device_coherent = true;
+
+   if (pan_kmod_driver_version_at_least(&panthor_dev->base.driver, 1, 7)) {
+      props->is_io_coherent = panthor_dev->props.gpu.selected_coherency !=
+                              DRM_PANTHOR_GPU_COHERENCY_NONE;
+      props->supported_bo_flags |= PAN_KMOD_BO_FLAG_WB_MMAP;
+   }
+
+   static_assert(sizeof(props->texture_features) ==
+                    sizeof(panthor_dev->props.gpu.texture_features),
+                 "Mismatch in texture_features array size");
+
+   memcpy(props->texture_features, panthor_dev->props.gpu.texture_features,
+          sizeof(props->texture_features));
+
+   panthor_dev_query_thread_props(panthor_dev);
+}
 
 static struct pan_kmod_dev *
 panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
@@ -195,8 +289,11 @@ panthor_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
    }
 
    assert(!ret);
-   pan_kmod_dev_init(&panthor_dev->base, fd, flags, version, &panthor_kmod_ops,
-                     allocator);
+
+   pan_kmod_dev_init(&panthor_dev->base, fd, flags, version,
+                     &panthor_kmod_ops, allocator);
+   panthor_dev_query_props(panthor_dev);
+
    return &panthor_dev->base;
 
 err_free_dev:
@@ -213,87 +310,6 @@ panthor_kmod_dev_destroy(struct pan_kmod_dev *dev)
    os_munmap(panthor_dev->flush_id, getpagesize());
    pan_kmod_dev_cleanup(dev);
    pan_kmod_free(dev->allocator, panthor_dev);
-}
-
-static uint32_t
-to_kmod_group_allow_priority_flags(uint32_t panthor_flags)
-{
-   uint32_t kmod_flags = 0;
-
-   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_REALTIME))
-      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_REALTIME;
-
-   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_HIGH))
-      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_HIGH;
-
-   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_MEDIUM))
-      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_MEDIUM;
-
-   if (panthor_flags & BITFIELD_BIT(PANTHOR_GROUP_PRIORITY_LOW))
-      kmod_flags |= PAN_KMOD_GROUP_ALLOW_PRIORITY_LOW;
-
-   return kmod_flags;
-}
-
-static void
-panthor_dev_query_thread_props(const struct panthor_kmod_dev *panthor_dev,
-                               struct pan_kmod_dev_props *props)
-{
-   props->max_threads_per_wg = panthor_dev->props.gpu.thread_max_workgroup_size;
-   props->max_threads_per_core = panthor_dev->props.gpu.max_threads;
-   props->max_tasks_per_core = panthor_dev->props.gpu.thread_features >> 24;
-   props->num_registers_per_core =
-      panthor_dev->props.gpu.thread_features & 0x3fffff;
-
-   /* We assume that all thread properties are populated. If we ever have a GPU
-    * that have one of the THREAD_xxx register that's zero, we can always add a
-    * quirk here.
-    */
-   assert(props->max_threads_per_wg && props->max_threads_per_core &&
-          props->max_tasks_per_core && props->num_registers_per_core);
-
-   /* There is no THREAD_TLS_ALLOC register on v10+, and the maximum number
-    * of TLS instance per core is assumed to be the maximum number of threads
-    * per core.
-    */
-   props->max_tls_instance_per_core = props->max_threads_per_core;
-}
-
-static void
-panthor_dev_query_props(const struct pan_kmod_dev *dev,
-                        struct pan_kmod_dev_props *props)
-{
-   struct panthor_kmod_dev *panthor_dev =
-      container_of(dev, struct panthor_kmod_dev, base);
-
-   *props = (struct pan_kmod_dev_props){
-      .gpu_id = panthor_dev->props.gpu.gpu_id,
-      .gpu_variant = panthor_dev->props.gpu.core_features & 0xff,
-      .shader_present = panthor_dev->props.gpu.shader_present,
-      .tiler_features = panthor_dev->props.gpu.tiler_features,
-      .mem_features = panthor_dev->props.gpu.mem_features,
-      .mmu_features = panthor_dev->props.gpu.mmu_features,
-
-      /* This register does not exist because AFBC is no longer optional. */
-      .afbc_features = 0,
-
-      /* Access to timstamp from the GPU is always supported on Panthor. */
-      .gpu_can_query_timestamp = true,
-
-      .timestamp_frequency = panthor_dev->props.timestamp.timestamp_frequency,
-
-      .allowed_group_priorities_mask = to_kmod_group_allow_priority_flags(
-         panthor_dev->props.group_priorities.allowed_mask),
-   };
-
-   static_assert(sizeof(props->texture_features) ==
-                    sizeof(panthor_dev->props.gpu.texture_features),
-                 "Mismatch in texture_features array size");
-
-   memcpy(props->texture_features, panthor_dev->props.gpu.texture_features,
-          sizeof(props->texture_features));
-
-   panthor_dev_query_thread_props(panthor_dev, props);
 }
 
 static struct pan_kmod_va_range
@@ -326,6 +342,11 @@ to_panthor_bo_flags(uint32_t flags)
 
    if (flags & PAN_KMOD_BO_FLAG_NO_MMAP)
       panthor_flags |= DRM_PANTHOR_BO_NO_MMAP;
+
+   if (flags & PAN_KMOD_BO_FLAG_WB_MMAP) {
+      assert(!(flags & PAN_KMOD_BO_FLAG_NO_MMAP));
+      panthor_flags |= DRM_PANTHOR_BO_WB_MMAP;
+   }
 
    return panthor_flags;
 }
@@ -393,6 +414,8 @@ panthor_kmod_bo_free(struct pan_kmod_bo *bo)
    struct panthor_kmod_bo *panthor_bo =
       container_of(bo, struct panthor_kmod_bo, base);
 
+   pan_kmod_bo_cleanup(bo);
+
    if (!bo->exclusive_vm)
       drmSyncobjDestroy(bo->dev->fd, panthor_bo->sync.handle);
 
@@ -404,6 +427,7 @@ static struct pan_kmod_bo *
 panthor_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size,
                        uint32_t flags)
 {
+   int ret;
    struct panthor_kmod_bo *panthor_bo =
       pan_kmod_dev_alloc(dev, sizeof(*panthor_bo));
    if (!panthor_bo) {
@@ -411,10 +435,28 @@ panthor_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size,
       return NULL;
    }
 
+   if (pan_kmod_driver_version_at_least(&dev->driver, 1, 7)) {
+      struct drm_panthor_bo_query_info args = {
+         .handle = handle,
+      };
+
+      ret = drmIoctl(dev->fd, DRM_IOCTL_PANTHOR_BO_QUERY_INFO, &args);
+      if (ret) {
+         mesa_loge("PANTHOR_BO_QUERY_INFO failed (err=%d)", errno);
+         goto err_free_bo;
+      }
+
+      /* If the BO comes from a different subsystem, we don't allow
+       * mmap() to avoid the CPU-sync churn.
+       */
+      if (args.extra_flags & DRM_PANTHOR_BO_IS_IMPORTED)
+         flags |= PAN_KMOD_BO_FLAG_NO_MMAP;
+   }
+
    /* Create a unsignalled syncobj on import. Will serve as a
     * temporary container for the exported dmabuf sync file.
     */
-   int ret = drmSyncobjCreate(dev->fd, 0, &panthor_bo->sync.handle);
+   ret = drmSyncobjCreate(dev->fd, 0, &panthor_bo->sync.handle);
    if (ret) {
       mesa_loge("drmSyncobjCreate() failed (err=%d)", errno);
       goto err_free_bo;
@@ -562,6 +604,38 @@ panthor_kmod_bo_wait(struct pan_kmod_bo *bo, int64_t timeout_ns,
    }
 }
 
+static int
+panthor_kmod_flush_bo_map_syncs(struct pan_kmod_dev *dev)
+{
+   STACK_ARRAY(struct drm_panthor_bo_sync_op, panthor_ops,
+               util_dynarray_num_elements(&dev->pending_bo_syncs.array,
+                                          struct pan_kmod_deferred_bo_sync));
+
+   uint32_t panthor_count = 0;
+   util_dynarray_foreach(&dev->pending_bo_syncs.array,
+                         struct pan_kmod_deferred_bo_sync, sync) {
+      panthor_ops[panthor_count++] = (struct drm_panthor_bo_sync_op){
+         .handle = sync->bo->handle,
+         .type = sync->type == PAN_KMOD_BO_SYNC_CPU_CACHE_FLUSH
+                    ? DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH
+                    : DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH_AND_INVALIDATE,
+         .offset = sync->start,
+         .size = sync->size,
+      };
+   }
+
+   struct drm_panthor_bo_sync req = {
+      .ops = DRM_PANTHOR_OBJ_ARRAY(panthor_count, panthor_ops),
+   };
+   int ret = pan_kmod_ioctl(dev->fd, DRM_IOCTL_PANTHOR_BO_SYNC, &req);
+   if (ret)
+      mesa_loge("DRM_IOCTL_PANTHOR_BO_SYNC failed (err=%d)", errno);
+
+   STACK_ARRAY_FINISH(panthor_ops);
+
+   return ret;
+}
+
 /* Attach a sync to a buffer object. */
 int
 panthor_kmod_bo_attach_sync_point(struct pan_kmod_bo *bo, uint32_t sync_handle,
@@ -702,10 +776,6 @@ static struct pan_kmod_vm *
 panthor_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
                        uint64_t user_va_start, uint64_t user_va_range)
 {
-   struct pan_kmod_dev_props props;
-
-   panthor_dev_query_props(dev, &props);
-
    struct panthor_kmod_vm *panthor_vm =
       pan_kmod_dev_alloc(dev, sizeof(*panthor_vm));
    if (!panthor_vm) {
@@ -1185,7 +1255,7 @@ panthor_kmod_get_csif_props(const struct pan_kmod_dev *dev)
 static uint64_t
 panthor_kmod_query_timestamp(const struct pan_kmod_dev *dev)
 {
-   if (dev->driver.version.major <= 1 && dev->driver.version.minor < 1)
+   if (!pan_kmod_driver_version_at_least(&dev->driver, 1, 1))
       return 0;
 
    struct drm_panthor_timestamp_info timestamp_info;
@@ -1210,7 +1280,7 @@ panthor_kmod_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const ch
 {
    char truncated_label[PANTHOR_BO_LABEL_MAXLEN];
 
-   if (!(dev->driver.version.major > 1 || dev->driver.version.minor >= 4))
+   if (!pan_kmod_driver_version_at_least(&dev->driver, 1, 4))
       return;
 
     if (strnlen(label, PANTHOR_BO_LABEL_MAXLEN) == PANTHOR_BO_LABEL_MAXLEN) {
@@ -1232,7 +1302,6 @@ panthor_kmod_bo_label(struct pan_kmod_dev *dev, struct pan_kmod_bo *bo, const ch
 const struct pan_kmod_ops panthor_kmod_ops = {
    .dev_create = panthor_kmod_dev_create,
    .dev_destroy = panthor_kmod_dev_destroy,
-   .dev_query_props = panthor_dev_query_props,
    .dev_query_user_va_range = panthor_kmod_dev_query_user_va_range,
    .bo_alloc = panthor_kmod_bo_alloc,
    .bo_free = panthor_kmod_bo_free,
@@ -1240,6 +1309,7 @@ const struct pan_kmod_ops panthor_kmod_ops = {
    .bo_export = panthor_kmod_bo_export,
    .bo_get_mmap_offset = panthor_kmod_bo_get_mmap_offset,
    .bo_wait = panthor_kmod_bo_wait,
+   .flush_bo_map_syncs = panthor_kmod_flush_bo_map_syncs,
    .vm_create = panthor_kmod_vm_create,
    .vm_destroy = panthor_kmod_vm_destroy,
    .vm_bind = panthor_kmod_vm_bind,

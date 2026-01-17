@@ -133,6 +133,11 @@ compile_shader(struct anv_device *device,
    memset(&prog_data, 0, sizeof(prog_data));
 
    if (stage == MESA_SHADER_COMPUTE) {
+      /* Pick SIMD16, it shouldn't spill prior Xe2 and it's the native size
+       * after.
+       */
+      nir->info.min_subgroup_size = nir->info.max_subgroup_size = 16;
+
       NIR_PASS(_, nir, brw_nir_lower_cs_intrinsics,
                  device->info, &prog_data.cs);
    }
@@ -147,14 +152,9 @@ compile_shader(struct anv_device *device,
    };
    NIR_PASS(_, nir, nir_opt_load_store_vectorize, &options);
 
-   nir->num_uniforms = uniform_size;
+   prog_data.base.push_sizes[0] = uniform_size;
 
    void *temp_ctx = ralloc_context(NULL);
-
-   prog_data.base.nr_params = nir->num_uniforms / 4;
-   prog_data.base.param = rzalloc_array(temp_ctx, uint32_t, prog_data.base.nr_params);
-
-   brw_nir_analyze_ubo_ranges(compiler, nir, prog_data.base.ubo_ranges);
 
    const unsigned *program;
    if (stage == MESA_SHADER_FRAGMENT) {
@@ -186,6 +186,8 @@ compile_shader(struct anv_device *device,
          }
       }
    } else {
+      brw_cs_fill_push_const_info(device->info, &prog_data.cs, -1);
+
       struct genisa_stats stats;
       struct brw_compile_cs_params params = {
          .base = {

@@ -36,8 +36,7 @@ resize_deref(nir_builder *b, nir_deref_instr *deref,
 
    /* NIR requires array indices have to match the deref bit size */
    if (deref->def.bit_size != bit_size &&
-       (deref->deref_type == nir_deref_type_array ||
-        deref->deref_type == nir_deref_type_ptr_as_array)) {
+       nir_deref_instr_is_arr(deref)) {
       b->cursor = nir_before_instr(&deref->instr);
       nir_def *idx;
       if (nir_src_is_const(deref->arr.index)) {
@@ -428,7 +427,6 @@ brw_nir_create_raygen_trampoline(const struct brw_compiler *compiler,
     * passed in as push constants in the first register.  We deal with the
     * raygen BSR address here; the global data we'll deal with later.
     */
-   b.shader->num_uniforms = 32;
    nir_def *raygen_param_bsr_addr =
       load_trampoline_param(&b, raygen_bsr_addr, 1, 64);
    nir_def *is_indirect =

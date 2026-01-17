@@ -446,7 +446,7 @@
  *
  * When we decide not to interpolate a varying, we need to convert Infs to
  * NaNs manually. Infs can be converted to NaNs like this: x*0 + x
- * (suggested by Ian Romanick, the multiplication must be "exact")
+ * (suggested by Ian Romanick, the multiplication must preserve nans/infs")
  *
  * Changes to optimizations:
  * - When we propagate a uniform expression and NaNs must be preserved,
@@ -659,6 +659,7 @@ struct linkage_info {
    bool has_flexible_interp;
    bool always_interpolate_convergent_fs_inputs;
    bool group_tes_inputs_into_pos_var_groups;
+   bool can_compact_to_higher_16;
 
    mesa_shader_stage producer_stage;
    mesa_shader_stage consumer_stage;
@@ -1017,20 +1018,20 @@ get_interp_vec4_type(struct linkage_info *linkage, unsigned slot,
 }
 
 static bool
-preserve_infs_nans(nir_shader *nir, unsigned bit_size)
+uses_preserve_nans(nir_def *def)
 {
-   unsigned mode = nir->info.float_controls_execution_mode;
+   nir_foreach_use_including_if(use, def) {
+      if (nir_src_is_if(use))
+         return true;
+      if (!nir_src_is_alu(*use))
+         return true;
 
-   return nir_is_float_control_inf_preserve(mode, bit_size) ||
-          nir_is_float_control_nan_preserve(mode, bit_size);
-}
+      nir_alu_instr *alu = nir_src_as_alu(*use);
+      if (nir_alu_instr_is_nan_preserve(alu))
+         return true;
+   }
 
-static bool
-preserve_nans(nir_shader *nir, unsigned bit_size)
-{
-   unsigned mode = nir->info.float_controls_execution_mode;
-
-   return nir_is_float_control_nan_preserve(mode, bit_size);
+   return false;
 }
 
 static nir_def *
@@ -1038,7 +1039,7 @@ build_convert_inf_to_nan(nir_builder *b, nir_def *x)
 {
    /* Do x*0 + x. The multiplication by 0 can't be optimized out. */
    nir_def *fma = nir_ffma_imm1(b, x, 0, x);
-   nir_def_as_alu(fma)->exact = true;
+   nir_def_as_alu(fma)->fp_math_ctrl = nir_fp_preserve_nan | nir_fp_preserve_inf | nir_fp_exact;
    return fma;
 }
 
@@ -2257,13 +2258,15 @@ clone_ssa_impl(struct linkage_info *linkage, nir_builder *b, nir_def *ssa)
                 NIR_MAX_VEC_COMPONENTS);
       }
 
-      alu_clone->exact = alu->exact;
-      alu_clone->no_signed_wrap = alu->no_signed_wrap;
-      alu_clone->no_unsigned_wrap = alu->no_unsigned_wrap;
       alu_clone->def.num_components = alu->def.num_components;
       alu_clone->def.bit_size = alu->def.bit_size;
 
       clone = nir_builder_alu_instr_finish_and_insert(b, alu_clone);
+
+      /* nir_builder_alu_instr_finish_and_insert overwrites fp_math_ctrl. */
+      alu_clone->fp_math_ctrl = alu->fp_math_ctrl;
+      alu_clone->no_signed_wrap = alu->no_signed_wrap;
+      alu_clone->no_unsigned_wrap = alu->no_unsigned_wrap;
       break;
    }
 
@@ -2521,7 +2524,7 @@ propagate_uniform_expressions(struct linkage_info *linkage,
              * convert Infs to NaNs manually.
              */
             if (loadi->intrinsic == nir_intrinsic_load_interpolated_input &&
-                preserve_nans(b->shader, clone->bit_size))
+                uses_preserve_nans(&loadi->def))
                clone = build_convert_inf_to_nan(b, clone);
 
             /* Replace the original load. */
@@ -2919,7 +2922,8 @@ find_tes_triangle_interp_3fmul_2fadd(struct linkage_info *linkage, unsigned i)
       /* Only maximum of 3 loads expected. Also reject exact ops because we
        * are going to do an inexact transformation with it.
        */
-      if (!fmul || fmul->op != nir_op_fmul || fmul->exact || num_fmuls == 3 ||
+      if (!fmul || fmul->op != nir_op_fmul || nir_alu_instr_is_exact(fmul) ||
+          num_fmuls == 3 ||
           !gather_fmul_tess_coord(iter->instr, fmul, vertex_index,
                                   &tess_coord_swizzle, &tess_coord_used,
                                   &load_tess_coord))
@@ -2930,7 +2934,7 @@ find_tes_triangle_interp_3fmul_2fadd(struct linkage_info *linkage, unsigned i)
       /* The multiplication must only be used by fadd. Also reject exact ops.
        */
       nir_alu_instr *fadd = get_single_use_as_alu(&fmul->def);
-      if (!fadd || fadd->op != nir_op_fadd || fadd->exact)
+      if (!fadd || fadd->op != nir_op_fadd || nir_alu_instr_is_exact(fadd))
          return false;
 
       /* The 3 fmuls must only be used by 2 fadds. */
@@ -3011,7 +3015,7 @@ find_tes_triangle_interp_1fmul_2ffma(struct linkage_info *linkage, unsigned i)
        * with it.
        */
       if (!alu || (alu->op != nir_op_fmul && alu->op != nir_op_ffma) ||
-          alu->exact ||
+          nir_alu_instr_is_exact(alu) ||
           !gather_fmul_tess_coord(iter->instr, alu, vertex_index,
                                   &tess_coord_swizzle, &tess_coord_used,
                                   &load_tess_coord))
@@ -3115,7 +3119,7 @@ static bool
 can_move_alu_across_interp(struct linkage_info *linkage, nir_alu_instr *alu)
 {
    /* Exact ALUs can't be moved across interpolation. */
-   if (alu->exact)
+   if (nir_alu_instr_is_exact(alu))
       return false;
 
    /* Interpolation converts Infs to NaNs. If we turn a result of an ALU
@@ -3123,7 +3127,7 @@ can_move_alu_across_interp(struct linkage_info *linkage, nir_alu_instr *alu)
     * that instruction, while removing the Infs to NaNs conversion for sourced
     * interpolated values. We can't do that if Infs and NaNs must be preserved.
     */
-   if (preserve_infs_nans(linkage->consumer_builder.shader, alu->def.bit_size))
+   if (nir_alu_instr_is_inf_preserve(alu) || nir_alu_instr_is_nan_preserve(alu))
       return false;
 
    switch (alu->op) {
@@ -4304,8 +4308,7 @@ relocate_slot(struct linkage_info *linkage, struct scalar_slot *slot,
              * we need to convert Infs to NaNs manually in the producer to
              * preserve that.
              */
-            if (preserve_nans(linkage->consumer_builder.shader,
-                              load->bit_size)) {
+            if (uses_preserve_nans(load)) {
                list_for_each_entry(struct list_node, iter,
                                    &slot->producer.stores, head) {
                   nir_intrinsic_instr *store = iter->instr;
@@ -4786,8 +4789,9 @@ vs_tcs_tes_gs_assign_slots_2sets(struct linkage_info *linkage,
     */
    vs_tcs_tes_gs_assign_slots(linkage, input32_mask, slot_index,
                               patch_slot_index, 2, progress);
+   unsigned slot_size_16bit = linkage->can_compact_to_higher_16 ? 1 : 2;
    vs_tcs_tes_gs_assign_slots(linkage, input16_mask, slot_index,
-                              patch_slot_index, 1, progress);
+                              patch_slot_index, slot_size_16bit, progress);
 
    assert(*slot_index <= VARYING_SLOT_MAX * 8);
    assert(!patch_slot_index || *patch_slot_index <= VARYING_SLOT_TESS_MAX * 8);
@@ -4808,6 +4812,7 @@ static void
 compact_varyings(struct linkage_info *linkage,
                  nir_opt_varyings_progress *progress)
 {
+   unsigned slot_size_16bit = linkage->can_compact_to_higher_16 ? 1 : 2;
    if (linkage->consumer_stage == MESA_SHADER_FRAGMENT) {
       /* These arrays are used to track which scalar slots we've already
        * assigned. We can fill unused components of indirectly-indexed slots,
@@ -4864,7 +4869,7 @@ compact_varyings(struct linkage_info *linkage,
          fs_assign_slot_groups(linkage, assigned_mask, assigned_fs_vec4_type,
                                linkage->interp_fp16_mask, linkage->flat16_mask,
                                linkage->convergent16_mask, NULL,
-                               FS_VEC4_TYPE_INTERP_FP16, 1, false, 0, progress);
+                               FS_VEC4_TYPE_INTERP_FP16, slot_size_16bit, false, 0, progress);
       } else {
          /* Basically the same as above. */
          fs_assign_slot_groups_separate_qual(
@@ -4877,7 +4882,7 @@ compact_varyings(struct linkage_info *linkage,
             linkage, assigned_mask, assigned_fs_vec4_type,
             &linkage->interp_fp16_qual_masks, linkage->flat16_mask,
             linkage->convergent16_mask, NULL,
-            FS_VEC4_TYPE_INTERP_FP16_PERSP_PIXEL, 1, false, 0, progress);
+            FS_VEC4_TYPE_INTERP_FP16_PERSP_PIXEL, slot_size_16bit, false, 0, progress);
       }
 
       /* Assign INTERP_MODE_EXPLICIT. Both FP32 and FP16 can occupy the same
@@ -5245,7 +5250,10 @@ init_linkage(nir_shader *producer, nir_shader *consumer, bool spirv,
       .group_tes_inputs_into_pos_var_groups =
          consumer->info.stage == MESA_SHADER_TESS_EVAL &&
          consumer->options->io_options &
-         nir_io_compaction_groups_tes_inputs_into_pos_and_var_groups,
+            nir_io_compaction_groups_tes_inputs_into_pos_and_var_groups,
+      .can_compact_to_higher_16 = producer->options->io_options &
+                                  consumer->options->io_options &
+                                  nir_io_compact_to_higher_16,
       .producer_stage = producer->info.stage,
       .consumer_stage = consumer->info.stage,
       .producer_builder =

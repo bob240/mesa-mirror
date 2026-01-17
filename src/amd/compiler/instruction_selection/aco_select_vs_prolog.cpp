@@ -341,8 +341,7 @@ load_unaligned_vs_attrib(Builder& bld, PhysReg dst, Operand desc, Operand index,
 bool
 is_last_attribute_large(const struct aco_vs_prolog_info* pinfo)
 {
-   const struct ac_vtx_format_info* vtx_info_table =
-      ac_get_vtx_format_info_table(GFX8, CHIP_POLARIS10);
+   const struct ac_vtx_format_info* vtx_info_table = ac_get_vtx_format_info_table(GFX8, true);
    unsigned last_attribute = pinfo->num_attributes - 1;
 
    if ((pinfo->misaligned_mask & (1u << last_attribute))) {
@@ -366,8 +365,7 @@ select_vs_prolog(Program* program, const struct aco_vs_prolog_info* pinfo, ac_sh
    /* This should be enough for any shader/stage. */
    unsigned max_user_sgprs = options->gfx_level >= GFX9 ? 32 : 16;
 
-   init_program(program, compute_cs, info, options->gfx_level, options->family, options->wgp_mode,
-                config);
+   init_program(program, compute_cs, info, options, config);
    program->dev.vgpr_limit = 256;
 
    Block* block = program->create_and_insert_block();
@@ -437,8 +435,7 @@ select_vs_prolog(Program* program, const struct aco_vs_prolog_info* pinfo, ac_sh
                Operand::c32((unsigned)options->address32_hi));
    }
 
-   const struct ac_vtx_format_info* vtx_info_table =
-      ac_get_vtx_format_info_table(GFX8, CHIP_POLARIS10);
+   const struct ac_vtx_format_info* vtx_info_table = ac_get_vtx_format_info_table(GFX8, true);
 
    UnalignedVsAttribLoadState unaligned_state;
    unaligned_state.max_vgprs = MAX2(84, num_vgprs + 8);

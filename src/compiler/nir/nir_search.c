@@ -334,6 +334,12 @@ match_value(const nir_algebraic_table *table,
                                                new_swizzle[i]);
             if (val != const_val->data.d)
                return false;
+
+            /* The comparison above does not check the sign bit for 0.0,
+             * so do it manually.
+             */
+            if ((dui(val) == 0) != (dui(const_val->data.d) == 0))
+               return false;
          }
          return true;
       }
@@ -386,8 +392,8 @@ match_expression(const nir_algebraic_table *table, const nir_search_expression *
        instr->def.bit_size != expr->value.bit_size)
       return false;
 
-   state->inexact_match = expr->inexact || expr->contract || state->inexact_match;
-   state->has_exact_alu = (instr->exact && !expr->ignore_exact) || state->has_exact_alu;
+   state->inexact_match |= expr->inexact || expr->contract;
+   state->has_exact_alu |= nir_alu_instr_is_exact(instr) && !expr->ignore_exact;
    if (state->inexact_match && state->has_exact_alu)
       return false;
 
@@ -479,8 +485,9 @@ construct_value(nir_builder *build,
        * expression we are replacing has any exact values, the entire
        * replacement should be exact.
        */
-      alu->exact = state->has_exact_alu || expr->exact;
-      alu->fp_fast_math = nir_instr_as_alu(instr)->fp_fast_math;
+      alu->fp_math_ctrl = nir_instr_as_alu(instr)->fp_math_ctrl;
+      if (state->has_exact_alu || expr->exact)
+         alu->fp_math_ctrl |= nir_fp_exact;
 
       for (unsigned i = 0; i < nir_op_infos[op].num_inputs; i++) {
          /* If the source is an explicitly sized source, then we need to reset

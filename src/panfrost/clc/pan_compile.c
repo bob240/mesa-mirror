@@ -5,10 +5,11 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "pan_compile.h"
 #include "compiler/glsl_types.h"
 #include "compiler/spirv/nir_spirv.h"
-#include "panfrost/compiler/bifrost_compile.h"
+#include "panfrost/compiler/bifrost/bifrost_compile.h"
+#include "panfrost/compiler/pan_compiler.h"
+#include "panfrost/compiler/pan_nir.h"
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_builder_opcodes.h"
@@ -24,7 +25,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "panfrost/util/pan_ir.h"
 #include "util/macros.h"
 #include "util/u_dynarray.h"
 #include "util/u_printf.h"
@@ -419,10 +419,10 @@ main(int argc, const char **argv)
             NIR_PASS(progress, s, nir_opt_loop);
          } while (progress);
 
-         pan_shader_preprocess(s, inputs.gpu_id);
-         pan_shader_lower_texture_early(s, inputs.gpu_id);
-         pan_shader_postprocess(s, inputs.gpu_id);
-         pan_shader_lower_texture_late(s, inputs.gpu_id);
+         pan_preprocess_nir(s, inputs.gpu_id);
+         pan_nir_lower_texture_early(s, inputs.gpu_id);
+         pan_postprocess_nir(s, inputs.gpu_id);
+         pan_nir_lower_texture_late(s, inputs.gpu_id);
 
          NIR_PASS(_, s, nir_opt_deref);
          NIR_PASS(_, s, nir_lower_vars_to_ssa);

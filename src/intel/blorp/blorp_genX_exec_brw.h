@@ -1319,11 +1319,11 @@ blorp_emit_null_surface_state(struct blorp_batch *batch,
 
 static uint32_t
 blorp_setup_binding_table(struct blorp_batch *batch,
-                           const struct blorp_params *params)
+                          const struct blorp_params *params)
 {
    const struct isl_device *isl_dev = batch->blorp->isl_dev;
-   uint32_t surface_offsets[2], bind_offset = 0;
-   void *surface_maps[2];
+   uint32_t surface_offsets[BLORP_NUM_BT_ENTRIES], bind_offset = 0;
+   void *surface_maps[BLORP_NUM_BT_ENTRIES];
 
    if (params->use_pre_baked_binding_table) {
       bind_offset = params->pre_baked_binding_table_offset;
@@ -1727,7 +1727,7 @@ blorp_exec_compute(struct blorp_batch *batch, const struct blorp_params *params)
    uint32_t group_x1 = DIV_ROUND_UP(params->x1, cs_prog_data->local_size[0]);
    uint32_t group_y1 = DIV_ROUND_UP(params->y1, cs_prog_data->local_size[1]);
    assert(params->num_layers >= 1);
-   uint32_t group_z1 = params->dst.z_offset + params->num_layers;
+   uint32_t group_z1 = params->num_samples * params->num_layers;
    assert(cs_prog_data->local_size[2] == 1);
 
 #if GFX_VERx10 >= 125
@@ -1790,6 +1790,14 @@ blorp_exec_compute(struct blorp_batch *batch, const struct blorp_params *params)
 
       .IndirectDataStartAddress       = push_const_offset,
       .IndirectDataLength             = push_const_size,
+
+      /* Send number of layers as inline register parameter to copy 2D MSAA
+       * array image/texture properly.
+       */
+      .EmitInlineParameter            = true,
+      .InlineData                     = {
+         [BLORP_INLINE_PARAM_THREAD_GROUP_ID_Z_DIMENSION / 4 + 0] = params->num_layers,
+      },
 
 #if GFX_VERx10 >= 125
       .GenerateLocalID                = cs_prog_data->generate_local_id != 0,
@@ -2043,19 +2051,22 @@ blorp_xy_block_copy_blt(struct blorp_batch *batch,
 
    unsigned dst_x0 = params->x0;
    unsigned dst_x1 = params->x1;
-   unsigned src_x0 =
-      dst_x0 - params->wm_inputs.coord_transform[0].offset;
-   ASSERTED unsigned src_x1 =
-      dst_x1 - params->wm_inputs.coord_transform[0].offset;
+   unsigned src_x0 = dst_x0;
+   ASSERTED unsigned src_x1 = dst_x1;
    unsigned dst_y0 = params->y0;
    unsigned dst_y1 = params->y1;
-   unsigned src_y0 =
-      dst_y0 - params->wm_inputs.coord_transform[1].offset;
-   ASSERTED unsigned src_y1 =
-      dst_y1 - params->wm_inputs.coord_transform[1].offset;
+   unsigned src_y0 = dst_y0;
+   ASSERTED unsigned src_y1 = dst_y1;
 
    assert(src_x1 - src_x0 == dst_x1 - dst_x0);
    assert(src_y1 - src_y0 == dst_y1 - dst_y0);
+
+   if (blorp_op_type_is_blit(params->op)) {
+      src_x0 = dst_x0 - params->wm_inputs.blit.coord_transform[0].offset;
+      src_x1 = dst_x1 - params->wm_inputs.blit.coord_transform[0].offset;
+      src_y0 = dst_y0 - params->wm_inputs.blit.coord_transform[1].offset;
+      src_y1 = dst_y1 - params->wm_inputs.blit.coord_transform[1].offset;
+   }
 
    const struct isl_surf *src_surf = &params->src.surf;
    const struct isl_surf *dst_surf = &params->dst.surf;
@@ -2234,9 +2245,13 @@ blorp_xy_fast_color_blit(struct blorp_batch *batch,
       blt.DestinationXOffset = params->dst.tile_x_sa;
       blt.DestinationYOffset = params->dst.tile_y_sa;
 
-      isl_color_value_pack((union isl_color_value *)
-                           params->wm_inputs.clear_color,
-                           params->dst.view.format, blt.FillColor);
+      if (blorp_op_type_is_clear(params->op)) {
+         isl_color_value_pack((union isl_color_value *)
+                              params->wm_inputs.clear.clear_color,
+                              params->dst.view.format, blt.FillColor);
+      } else {
+         memset(blt.FillColor, 0, sizeof(blt.FillColor));
+      }
 
 #if GFX_VERx10 >= 125
       blt.DestinationSurfaceType = xy_bcb_surf_dim(dst_surf);

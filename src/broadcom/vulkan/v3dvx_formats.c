@@ -22,8 +22,8 @@
  */
 
 #include "v3dv_private.h"
-#include "broadcom/common/v3d_macros.h"
-#include "broadcom/cle/v3dx_pack.h"
+#include "v3dv_format_table.h"
+#include "v3dvx_format_table.h"
 
 #include "util/format/u_format.h"
 #include "vk_enum_to_str.h"
@@ -331,7 +331,7 @@ v3dX(get_format)(VkFormat format)
 }
 
 void
-v3dX(get_internal_type_bpp_for_output_format)(uint32_t format,
+v3dX(get_internal_type_bpp_for_output_format)(enum V3DX(Output_Image_Format) format,
                                               uint32_t *type,
                                               uint32_t *bpp)
 {
@@ -501,7 +501,7 @@ v3dX(format_supports_blending)(const struct v3dv_format *format)
 }
 
 bool
-v3dX(tfu_supports_tex_format)(uint32_t tex_format)
+v3dX(tfu_supports_tex_format)(enum V3DX(Texture_Data_Formats) tex_format)
 {
    switch (tex_format) {
    case TEXTURE_DATA_FORMAT_R8:
@@ -542,7 +542,7 @@ v3dX(tfu_supports_tex_format)(uint32_t tex_format)
    }
 }
 
-uint8_t
+enum V3DX(Internal_Depth_Type)
 v3dX(get_internal_depth_type)(VkFormat format)
 {
    switch (format) {

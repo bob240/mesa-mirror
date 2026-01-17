@@ -69,13 +69,6 @@ typedef void *drmDevicePtr;
 #include "ac_formats.h"
 
 static bool
-radv_spm_trace_enabled(const struct radv_instance *instance)
-{
-   return (instance->vk.trace_mode & RADV_TRACE_MODE_RGP) &&
-          debug_get_bool_option("RADV_THREAD_TRACE_CACHE_COUNTERS", true);
-}
-
-static bool
 radv_trap_handler_enabled()
 {
    return !!os_get_option("RADV_TRAP_HANDLER");
@@ -603,11 +596,11 @@ radv_device_init_rgp(struct radv_device *device)
            "radv: Thread trace support is enabled (initial buffer size: %u MiB, "
            "instruction timing: %s, cache counters: %s, queue events: %s).\n",
            device->sqtt.buffer_size / (1024 * 1024), radv_is_instruction_timing_enabled() ? "enabled" : "disabled",
-           radv_spm_trace_enabled(instance) ? "enabled" : "disabled",
+           radv_spm_trace_enabled(pdev) ? "enabled" : "disabled",
            radv_sqtt_queue_events_enabled() ? "enabled" : "disabled");
 
-   if (radv_spm_trace_enabled(instance)) {
-      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX12 && pdev->info.gfx_level != GFX11_5) {
+   if (radv_spm_trace_enabled(pdev)) {
+      if (pdev->info.gfx_level >= GFX10 && pdev->info.gfx_level <= GFX12) {
          if (!radv_spm_init(device))
             return VK_ERROR_INITIALIZATION_FAILED;
       } else {
@@ -1091,6 +1084,11 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
 {
    radv_device_finish_perf_counter(device);
 
+   if (device->zero_bo) {
+      device->ws->buffer_make_resident(device->ws, device->zero_bo, false);
+      radv_bo_destroy(device, NULL, device->zero_bo);
+   }
+
    if (device->gfx_init)
       radv_bo_destroy(device, NULL, device->gfx_init);
 
@@ -1133,6 +1131,7 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
    simple_mtx_destroy(&device->trace_mtx);
    simple_mtx_destroy(&device->rt_handles_mtx);
    simple_mtx_destroy(&device->pso_cache_stats_mtx);
+   simple_mtx_destroy(&device->blit_queue_mtx);
 
    radv_destroy_shader_arenas(device);
    if (device->capture_replay_arena_vas)
@@ -1190,6 +1189,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    simple_mtx_init(&device->pstate_mtx, mtx_plain);
    simple_mtx_init(&device->rt_handles_mtx, mtx_plain);
    simple_mtx_init(&device->pso_cache_stats_mtx, mtx_plain);
+   simple_mtx_init(&device->blit_queue_mtx, mtx_plain);
 
    device->rt_handles = _mesa_hash_table_create(NULL, _mesa_hash_u32, _mesa_key_u32_equal);
 
@@ -1401,6 +1401,19 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
        device->vk.enabled_features.extendedDynamicState3AlphaToCoverageEnable ||
        device->vk.enabled_features.extendedDynamicState3ColorBlendEquation)
       radv_shader_part_cache_init(&device->ps_epilogs, &ps_epilog_ops);
+
+   if (pdev->info.has_zero_index_buffer_bug || pdev->cache_key.mitigate_smem_oob) {
+      result = radv_bo_create(device, NULL, 4096, 4096, RADEON_DOMAIN_VRAM,
+                              RADEON_FLAG_NO_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING | RADEON_FLAG_READ_ONLY |
+                                 RADEON_FLAG_ZERO_VRAM | RADEON_FLAG_32BIT,
+                              RADV_BO_PRIORITY_VIRTUAL, 0, true, &device->zero_bo);
+      if (result != VK_SUCCESS)
+         goto fail;
+
+      result = device->ws->buffer_make_resident(device->ws, device->zero_bo, true);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
 
    if (pdev->info.has_graphics && !(instance->debug_flags & RADV_DEBUG_NO_IB_CHAINING))
       radv_create_gfx_preamble(device);

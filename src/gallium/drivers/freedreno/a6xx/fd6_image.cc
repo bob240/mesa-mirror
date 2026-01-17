@@ -7,8 +7,6 @@
  *    Rob Clark <robclark@freedesktop.org>
  */
 
-#define FD_BO_NO_HARDPIN 1
-
 #include "pipe/p_state.h"
 
 #include "freedreno_resource.h"
@@ -283,7 +281,7 @@ fd6_build_bindless_state(struct fd_context *ctx, mesa_shader_stage shader,
          }
       }
 
-      if (bufso->enabled_mask) {
+      if ((CHIP < A8XX) && bufso->enabled_mask) {
          fd_pkt7(cs, CP_LOAD_STATE6_FRAG, 3)
             .add(CP_LOAD_STATE6_0(
                .dst_off     = IR3_BINDLESS_SSBO_OFFSET,
@@ -299,7 +297,7 @@ fd6_build_bindless_state(struct fd_context *ctx, mesa_shader_stage shader,
             ));
       }
 
-      if (imgso->enabled_mask) {
+      if ((CHIP < A8XX) && imgso->enabled_mask) {
          fd_pkt7(cs, CP_LOAD_STATE6_FRAG, 3)
             .add(CP_LOAD_STATE6_0(
                .dst_off     = IR3_BINDLESS_IMAGE_OFFSET,
@@ -329,7 +327,7 @@ fd6_build_bindless_state(struct fd_context *ctx, mesa_shader_stage shader,
          }
       }
 
-      if (bufso->enabled_mask) {
+      if ((CHIP < A8XX) && bufso->enabled_mask) {
          fd_pkt7(cs, CP_LOAD_STATE6, 3)
             .add(CP_LOAD_STATE6_0(
                .dst_off     = IR3_BINDLESS_SSBO_OFFSET,
@@ -345,7 +343,7 @@ fd6_build_bindless_state(struct fd_context *ctx, mesa_shader_stage shader,
             ));
       }
 
-      if (imgso->enabled_mask) {
+      if ((CHIP < A8XX) && imgso->enabled_mask) {
          fd_pkt7(cs, CP_LOAD_STATE6, 3)
             .add(CP_LOAD_STATE6_0(
                .dst_off     = IR3_BINDLESS_IMAGE_OFFSET,
@@ -362,7 +360,7 @@ fd6_build_bindless_state(struct fd_context *ctx, mesa_shader_stage shader,
       }
    }
 
-   return cs.ring();
+   return cs;
 }
 FD_GENX(fd6_build_bindless_state);
 

@@ -129,7 +129,6 @@ impl ShaderModel for ShaderModel32 {
 
 trait SM32Op {
     fn legalize(&mut self, b: &mut LegalizeBuilder);
-    #[allow(dead_code)]
     fn encode(&self, e: &mut SM32Encoder<'_>);
 }
 
@@ -141,7 +140,6 @@ fn true_reg() -> RegRef {
     RegRef::new(RegFile::Pred, 7, 1)
 }
 
-#[allow(dead_code)]
 struct SM32Encoder<'a> {
     sm: &'a ShaderModel32,
     ip: usize,
@@ -358,7 +356,7 @@ impl SM32Encoder<'_> {
             RRR,
         }
         let src1 = AluSrc::from_src(src1);
-        let src2 = src2.map(|s| AluSrc::from_src(s));
+        let src2 = src2.map(AluSrc::from_src);
 
         if let Some(dst) = dst {
             self.set_dst(dst);
@@ -642,7 +640,7 @@ impl SM32Op for OpRro {
             }
             SrcRef::CBuf(cb) => {
                 e.set_opcode(0x648, 2);
-                e.set_src_cbuf(23..42, &cb);
+                e.set_src_cbuf(23..42, cb);
             }
             _ => panic!("Invalid Rro src"),
         }
@@ -1053,7 +1051,7 @@ impl SM32Op for OpBfe {
         use RegFile::GPR;
         b.copy_alu_src_if_not_reg(&mut self.base, GPR, SrcType::ALU);
         if let SrcRef::Imm32(imm) = &mut self.range.src_ref {
-            *imm = *imm & 0xffff; // Only the lower 2 bytes matter
+            *imm &= 0xffff; // Only the lower 2 bytes matter
         }
     }
 
@@ -1087,7 +1085,7 @@ impl SM32Op for OpFlo {
             }
             SrcRef::CBuf(cb) => {
                 e.set_opcode(0x618, 2);
-                e.set_src_cbuf(23..42, &cb);
+                e.set_src_cbuf(23..42, cb);
             }
             _ => panic!("Invalid flo src"),
         }
@@ -2387,7 +2385,7 @@ impl SM32Op for OpSuLdGa {
                 e.set_mem_type(56..59, self.mem_type);
 
                 e.set_ld_cache_op(54..56, self.cache_op);
-                e.set_src_cbuf(23..42, &cb);
+                e.set_src_cbuf(23..42, cb);
             }
             SrcRef::Zero | SrcRef::Reg(_) => {
                 e.set_opcode(0x798, 2);
@@ -2440,7 +2438,7 @@ impl SM32Op for OpSuStGa {
                 };
 
                 e.set_su_ga_offset_mode(8..10, self.offset_mode);
-                e.set_src_cbuf(23..42, &cb);
+                e.set_src_cbuf(23..42, cb);
                 e.set_st_cache_op(54..56, self.cache_op);
             }
             SrcRef::Zero | SrcRef::Reg(_) => {

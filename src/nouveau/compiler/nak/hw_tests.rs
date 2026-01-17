@@ -4,10 +4,6 @@
 use crate::api::{GetDebugFlags, ShaderBin, DEBUG};
 use crate::hw_runner::{Context, Runner, BO, CB0};
 use crate::ir::*;
-use crate::sm20::ShaderModel20;
-use crate::sm32::ShaderModel32;
-use crate::sm50::ShaderModel50;
-use crate::sm70::ShaderModel70;
 
 use acorn::Acorn;
 use compiler::bindings::MESA_SHADER_COMPUTE;
@@ -25,7 +21,7 @@ use nv_push_rs::Push as NvPush;
 use nvidia_headers::classes::cl90b5::mthd as cl90b5;
 
 struct RunSingleton {
-    sm: Box<dyn ShaderModel + Send + Sync>,
+    sm: ShaderModelInfo,
     run: Runner,
 }
 
@@ -41,17 +37,8 @@ impl RunSingleton {
 
             let run = Runner::new(dev_id);
             let sm_nr = run.dev_info().sm;
-            let sm: Box<dyn ShaderModel + Send + Sync> = if sm_nr >= 70 {
-                Box::new(ShaderModel70::new(sm_nr))
-            } else if sm_nr >= 50 {
-                Box::new(ShaderModel50::new(sm_nr))
-            } else if sm_nr >= 32 {
-                Box::new(ShaderModel32::new(sm_nr))
-            } else if sm_nr >= 20 {
-                Box::new(ShaderModel20::new(sm_nr))
-            } else {
-                panic!("Unsupported shader model");
-            };
+            let sm =
+                ShaderModelInfo::new(sm_nr, run.dev_info().max_warps_per_mp);
             RunSingleton { sm, run }
         })
     }
@@ -60,7 +47,7 @@ impl RunSingleton {
 const LOCAL_SIZE_X: u16 = 32;
 
 pub struct TestShaderBuilder<'a> {
-    sm: &'a dyn ShaderModel,
+    sm: &'a ShaderModelInfo,
     alloc: SSAValueAllocator,
     b: InstrBuilder<'a>,
     start_block: BasicBlock,
@@ -70,7 +57,7 @@ pub struct TestShaderBuilder<'a> {
 }
 
 impl<'a> TestShaderBuilder<'a> {
-    pub fn new(sm: &'a dyn ShaderModel) -> Self {
+    pub fn new(sm: &'a ShaderModelInfo) -> Self {
         let mut alloc = SSAValueAllocator::new();
         let mut label_alloc = LabelAllocator::new();
         let mut b = SSAInstrBuilder::new(sm, &mut alloc);
@@ -287,7 +274,7 @@ impl SSABuilder for TestShaderBuilder<'_> {
 #[test]
 fn test_sanity() {
     let run = RunSingleton::get();
-    let b = TestShaderBuilder::new(run.sm.as_ref());
+    let b = TestShaderBuilder::new(&run.sm);
     let bin = b.compile();
     unsafe {
         run.run
@@ -323,7 +310,7 @@ pub fn test_foldable_op_with(
     mut rand_u32: impl FnMut(usize) -> u32,
 ) {
     let run = RunSingleton::get();
-    let mut b = TestShaderBuilder::new(run.sm.as_ref());
+    let mut b = TestShaderBuilder::new(&run.sm);
 
     let mut comps = 0_u16;
     let mut fold_src = Vec::new();
@@ -417,7 +404,7 @@ pub fn test_foldable_op_with(
         for ssa in &vec[..] {
             let u = match ssa.file() {
                 RegFile::Pred => b.sel((*ssa).into(), 1.into(), 0.into()),
-                RegFile::GPR => (*ssa).into(),
+                RegFile::GPR => *ssa,
                 RegFile::Carry => {
                     let gpr = b.alloc_ssa(RegFile::GPR);
                     b.push_op(OpIAdd2X {
@@ -426,7 +413,7 @@ pub fn test_foldable_op_with(
                         srcs: [0.into(), 0.into()],
                         carry_in: (*ssa).into(),
                     });
-                    gpr.into()
+                    gpr
                 }
                 file => panic!("Can't auto-test {file:?} data"),
             };
@@ -445,7 +432,7 @@ pub fn test_foldable_op_with(
     // to give us 2500 iterations.
     let invocations = src_comps * src_comps * 100;
 
-    let mut data = Vec::new();
+    let mut data = Vec::with_capacity(invocations * (dst_comps + src_comps));
     for _ in 0..invocations {
         for (i, src) in op.srcs_as_slice().iter().enumerate() {
             let SrcRef::SSA(vec) = &src.src_ref else {
@@ -462,9 +449,7 @@ pub fn test_foldable_op_with(
                 }
             }
         }
-        for _ in 0..dst_comps {
-            data.push(0_u32);
-        }
+        data.extend(std::iter::repeat_n(0_u32, dst_comps));
     }
     debug_assert!(data.len() == invocations * comps);
 
@@ -508,7 +493,7 @@ pub fn test_foldable_op_with(
             srcs: &fold_src,
             dsts: &mut fold_dst,
         };
-        op.fold(&*run.sm, &mut fold);
+        op.fold(&run.sm, &mut fold);
 
         debug_assert!(fold_dst.len() == op.dsts_as_slice().len());
         for (i, dst) in fold_dst.iter().enumerate() {
@@ -853,7 +838,7 @@ fn test_lea64() {
     let invocations = 100;
 
     for shift in 0..64 {
-        let mut b = TestShaderBuilder::new(run.sm.as_ref());
+        let mut b = TestShaderBuilder::new(&run.sm);
 
         let x = Src::from([
             b.ld_test_data(0, MemType::B32)[0],
@@ -1095,7 +1080,7 @@ fn test_plop2() {
 
     for op in logic_ops {
         for (x_mod, y_mod) in mods {
-            let mut b = TestShaderBuilder::new(run.sm.as_ref());
+            let mut b = TestShaderBuilder::new(&run.sm);
 
             let x = b.ld_test_data(0, MemType::B32)[0];
             let y = b.ld_test_data(4, MemType::B32)[0];
@@ -1159,7 +1144,7 @@ fn test_iadd64() {
     ];
 
     for (x_mod, y_mod) in cases {
-        let mut b = TestShaderBuilder::new(run.sm.as_ref());
+        let mut b = TestShaderBuilder::new(&run.sm);
 
         let mut x = Src::from([
             b.ld_test_data(0, MemType::B32)[0],
@@ -1370,7 +1355,7 @@ fn test_ineg64() {
     let run = RunSingleton::get();
     let invocations = 100;
 
-    let mut b = TestShaderBuilder::new(run.sm.as_ref());
+    let mut b = TestShaderBuilder::new(&run.sm);
 
     let x = SSARef::from([
         b.ld_test_data(0, MemType::B32)[0],
@@ -1414,7 +1399,7 @@ fn test_isetp64() {
     ];
 
     for i in 0..(ops.len() * 2) {
-        let mut b = TestShaderBuilder::new(run.sm.as_ref());
+        let mut b = TestShaderBuilder::new(&run.sm);
 
         let cmp_type = types[i % 2];
         let cmp_op = ops[i / 2];
@@ -1505,7 +1490,7 @@ fn test_shl64() {
 
     let invocations = 100;
 
-    let mut b = TestShaderBuilder::new(run.sm.as_ref());
+    let mut b = TestShaderBuilder::new(&run.sm);
 
     let srcs = SSARef::from([
         b.ld_test_data(0, MemType::B32)[0],
@@ -1546,7 +1531,7 @@ fn test_shr64() {
     let cases = [true, false];
 
     for signed in cases {
-        let mut b = TestShaderBuilder::new(run.sm.as_ref());
+        let mut b = TestShaderBuilder::new(&run.sm);
 
         let srcs = SSARef::from([
             b.ld_test_data(0, MemType::B32)[0],
@@ -1587,7 +1572,7 @@ fn test_f2fp_pack_ab() {
         return;
     }
 
-    let mut b = TestShaderBuilder::new(run.sm.as_ref());
+    let mut b = TestShaderBuilder::new(&run.sm);
 
     let srcs = SSARef::from([
         b.ld_test_data(0, MemType::B32)[0],
@@ -1640,7 +1625,7 @@ fn test_f2fp_pack_ab() {
 #[test]
 pub fn test_gpr_limit_from_local_size() {
     let run = RunSingleton::get();
-    let b = TestShaderBuilder::new(run.sm.as_ref());
+    let b = TestShaderBuilder::new(&run.sm);
     let mut bin = b.compile();
 
     for local_size in 1..=1024 {
@@ -1666,7 +1651,7 @@ fn test_op_ldsm() {
         return;
     }
 
-    let mut b = TestShaderBuilder::new(run.sm.as_ref());
+    let mut b = TestShaderBuilder::new(&run.sm);
 
     // First load the test data and store it inside shared memory. Each thread handles 8 elements.
     let input = b.ld_test_data(0, MemType::B128)[0];
@@ -1679,7 +1664,7 @@ fn test_op_ldsm() {
     b.push_op(OpSt {
         addr: offset.into(),
         data: input.into(),
-        offset: 0.into(),
+        offset: 0,
         access: MemAccess {
             mem_type: MemType::B128,
             space: MemSpace::Shared,
@@ -1698,9 +1683,9 @@ fn test_op_ldsm() {
         mat_size: LdsmSize::M8N8,
         mat_count: 4,
         addr: addr.into(),
-        offset: 0.into(),
+        offset: 0,
     });
-    b.st_test_data(16, MemType::B128, res.into());
+    b.st_test_data(16, MemType::B128, res);
 
     type Data = [u16; 4 * 2 * 2];
     b.set_shared_size((size_of::<Data>() * 32 / 2) as u16);
@@ -1740,6 +1725,7 @@ fn test_op_ldsm() {
     //
     // and each thread loads from the address from thread (thread_id >> 4)
     // plus the offset (thread_id & 0x3) * 2
+    #[expect(clippy::erasing_op)]
     for i in 0..32 {
         assert_eq!(i * 2 + 64 * 0 + 0, data[i][8].into());
         assert_eq!(i * 2 + 64 * 0 + 1, data[i][9].into());

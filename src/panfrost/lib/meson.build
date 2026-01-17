@@ -45,7 +45,6 @@ libpanfrost_lib_files = files(
   'pan_clear.c',
   'pan_earlyzs.c',
   'pan_samples.c',
-  'pan_shader.c',
   'pan_tiler.c',
   'pan_layout.c',
   'pan_scratch.c',
@@ -66,7 +65,7 @@ libpanfrost_lib = static_library(
 )
 
 libpanfrost_dep = declare_dependency(
-  link_with: [libpanfrost_lib, libpanfrost_decode, libpanfrost_midgard, libpanfrost_bifrost, libpanfrost_pixel_format, libpanfrost_per_arch],
+  link_with: [libpanfrost_lib, libpanfrost_decode, libpanfrost_compiler, libpanfrost_pixel_format, libpanfrost_per_arch],
   include_directories: [inc_include, inc_src, inc_panfrost],
   dependencies: [deps_for_libpanfrost, libpankmod_dep, idep_nir],
 )

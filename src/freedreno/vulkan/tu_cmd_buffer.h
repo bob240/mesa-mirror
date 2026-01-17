@@ -76,8 +76,10 @@ enum tu_cmd_dirty_bits
    TU_CMD_DIRTY_FS = BIT(14),
    TU_CMD_DIRTY_SHADING_RATE = BIT(15),
    TU_CMD_DIRTY_DISABLE_FS = BIT(16),
+   TU_CMD_DIRTY_TCS = BIT(17),
+
    /* all draw states were disabled and need to be re-enabled: */
-   TU_CMD_DIRTY_DRAW_STATE = BIT(17)
+   TU_CMD_DIRTY_DRAW_STATE = BIT(18)
 };
 
 /* There are only three cache domains we have to care about: the CCU, or
@@ -684,7 +686,7 @@ struct tu_cmd_buffer
    struct tu_image dynamic_msrtss_images[MAX_RTS + 1];
 
    struct tu_render_pass dynamic_pass;
-   struct tu_subpass dynamic_subpass;
+   struct tu_subpass dynamic_subpasses[2];
    struct tu_framebuffer dynamic_framebuffer;
 
    struct tu_cs cs;
@@ -835,9 +837,11 @@ tu_get_descriptors_state(struct tu_cmd_buffer *cmd_buffer,
    return &cmd_buffer->descriptors[bind_point];
 }
 
+template <chip CHIP>
 void tu6_emit_msaa(struct tu_cs *cs, VkSampleCountFlagBits samples,
                    bool msaa_disable);
 
+template <chip CHIP>
 void tu6_emit_window_scissor(struct tu_cs *cs, uint32_t x1, uint32_t y1, uint32_t x2, uint32_t y2);
 
 void tu6_emit_window_offset(struct tu_cs *cs, uint32_t x1, uint32_t y1);
@@ -856,7 +860,8 @@ typedef void (*tu_fdm_bin_apply_t)(struct tu_cmd_buffer *cmd,
                                    const VkOffset2D *hw_viewport_offsets,
                                    unsigned views,
                                    const VkExtent2D *frag_areas,
-                                   const VkRect2D *bins);
+                                   const VkRect2D *bins,
+                                   bool binning);
 
 enum tu_fdm_flags {
    TU_FDM_NONE = 0,
@@ -924,7 +929,7 @@ _tu_create_fdm_bin_patchpoint(struct tu_cmd_buffer *cmd,
       };
       hw_viewport_offsets[i] = (VkOffset2D) { 0, 0 };
    }
-   apply(cmd, cs, state, (VkOffset2D) {0, 0}, hw_viewport_offsets, num_views, unscaled_frag_areas, bins);
+   apply(cmd, cs, state, (VkOffset2D) {0, 0}, hw_viewport_offsets, num_views, unscaled_frag_areas, bins, false);
    assert(tu_cs_get_cur_iova(cs) == patch.iova + patch.size * sizeof(uint32_t));
 
    util_dynarray_append(&cmd->fdm_bin_patchpoints, patch);

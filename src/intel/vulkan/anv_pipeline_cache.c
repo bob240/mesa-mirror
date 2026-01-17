@@ -59,8 +59,7 @@ anv_shader_internal_destroy(struct vk_device *_device,
    for (uint32_t i = 0; i < shader->bind_map.embedded_sampler_count; i++)
       anv_embedded_sampler_unref(device, shader->embedded_samplers[i]);
 
-   ANV_DMR_SP_FREE(&device->vk.base, &device->instruction_state_pool, shader->kernel);
-   anv_state_pool_free(&device->instruction_state_pool, shader->kernel);
+   anv_shader_heap_free(&device->shader_heap, shader->kernel);
    vk_pipeline_cache_object_finish(&shader->base);
    vk_free(&device->vk.alloc, shader);
 }
@@ -95,7 +94,7 @@ anv_shader_internal_create(struct anv_device *device,
                                 prog_data_size);
    VK_MULTIALLOC_DECL(&ma, struct intel_shader_reloc, prog_data_relocs,
                            prog_data_in->num_relocs);
-   VK_MULTIALLOC_DECL(&ma, uint32_t, prog_data_param, prog_data_in->nr_params);
+   VK_MULTIALLOC_DECL(&ma, void, code, kernel_size);
 
    VK_MULTIALLOC_DECL_SIZE(&ma, nir_xfb_info, xfb_info,
                                 xfb_info_in == NULL ? 0 :
@@ -120,20 +119,28 @@ anv_shader_internal_create(struct anv_device *device,
                                  &anv_shader_internal_ops, obj_key_data, key_size);
 
    shader->stage = stage;
-   if(INTEL_DEBUG(DEBUG_SHOW_SHADER_STAGE))
-      fprintf(stderr, "Stage: %s\n", mesa_shader_stage_name(shader->stage));
 
-   shader->kernel =
-      anv_state_pool_alloc(&device->instruction_state_pool, kernel_size, 64);
-   ANV_DMR_SP_ALLOC(&device->vk.base, &device->instruction_state_pool, shader->kernel);
-   memcpy(shader->kernel.map, kernel_data, kernel_size);
+   shader->code = code;
+   memcpy(shader->code, kernel_data, kernel_size);
+
+   shader->kernel = anv_shader_heap_alloc(&device->shader_heap,
+                                          kernel_size, 64, false, 0);
+   if (shader->kernel.alloc_size == 0) {
+      vk_pipeline_cache_object_finish(&shader->base);
+      vk_free(&device->vk.alloc, shader);
+      return NULL;
+   }
+
+   anv_shader_heap_upload(&device->shader_heap, shader->kernel,
+                          kernel_data, kernel_size);
+
    shader->kernel_size = kernel_size;
 
    if (bind_map->embedded_sampler_count > 0) {
       shader->embedded_samplers = embedded_samplers;
       if (anv_device_get_embedded_samplers(device, embedded_samplers, bind_map) != VK_SUCCESS) {
-         ANV_DMR_SP_FREE(&device->vk.base, &device->instruction_state_pool, shader->kernel);
-         anv_state_pool_free(&device->instruction_state_pool, shader->kernel);
+         anv_shader_heap_free(&device->shader_heap, shader->kernel);
+         vk_pipeline_cache_object_finish(&shader->base);
          vk_free(&device->vk.alloc, shader);
          return NULL;
       }
@@ -143,7 +150,6 @@ anv_shader_internal_create(struct anv_device *device,
    typed_memcpy(prog_data_relocs, prog_data_in->relocs,
                 prog_data_in->num_relocs);
    prog_data->relocs = prog_data_relocs;
-   prog_data->param = prog_data_param;
    shader->prog_data = prog_data;
    shader->prog_data_size = prog_data_size;
 
@@ -194,7 +200,7 @@ anv_shader_internal_serialize(struct vk_pipeline_cache_object *object,
    blob_write_uint32(blob, shader->stage);
 
    blob_write_uint32(blob, shader->kernel_size);
-   blob_write_bytes(blob, shader->kernel.map, shader->kernel_size);
+   blob_write_bytes(blob, shader->code, shader->kernel_size);
 
    blob_write_uint32(blob, shader->prog_data_size);
 
@@ -202,7 +208,6 @@ anv_shader_internal_serialize(struct vk_pipeline_cache_object *object,
    assert(shader->prog_data_size <= sizeof(prog_data));
    memcpy(&prog_data, shader->prog_data, shader->prog_data_size);
    prog_data.base.relocs = NULL;
-   prog_data.base.param = NULL;
    blob_write_bytes(blob, &prog_data, shader->prog_data_size);
 
    blob_write_bytes(blob, shader->prog_data->relocs,
@@ -392,19 +397,17 @@ anv_device_upload_kernel(struct anv_device *device,
    return container_of(cached, struct anv_shader_internal, base);
 }
 
-#define SHA1_KEY_SIZE 20
-
 struct nir_shader *
 anv_device_search_for_nir(struct anv_device *device,
                           struct vk_pipeline_cache *cache,
                           const nir_shader_compiler_options *nir_options,
-                          unsigned char sha1_key[SHA1_KEY_SIZE],
+                          unsigned char sha1_key[SHA1_DIGEST_LENGTH],
                           void *mem_ctx)
 {
    if (cache == NULL)
       cache = device->vk.mem_cache;
 
-   return vk_pipeline_cache_lookup_nir(cache, sha1_key, SHA1_KEY_SIZE,
+   return vk_pipeline_cache_lookup_nir(cache, sha1_key, SHA1_DIGEST_LENGTH,
                                        nir_options, NULL, mem_ctx);
 }
 
@@ -412,12 +415,12 @@ void
 anv_device_upload_nir(struct anv_device *device,
                       struct vk_pipeline_cache *cache,
                       const struct nir_shader *nir,
-                      unsigned char sha1_key[SHA1_KEY_SIZE])
+                      unsigned char sha1_key[SHA1_DIGEST_LENGTH])
 {
    if (cache == NULL)
       cache = device->vk.mem_cache;
 
-   vk_pipeline_cache_add_nir(cache, sha1_key, SHA1_KEY_SIZE, nir);
+   vk_pipeline_cache_add_nir(cache, sha1_key, SHA1_DIGEST_LENGTH, nir);
 }
 
 void
@@ -428,7 +431,7 @@ anv_load_fp64_shader(struct anv_device *device)
 
    const char* shader_name = "float64_spv_lib";
    struct mesa_sha1 sha1_ctx;
-   uint8_t sha1[20];
+   uint8_t sha1[SHA1_DIGEST_LENGTH];
    _mesa_sha1_init(&sha1_ctx);
    _mesa_sha1_update(&sha1_ctx, shader_name, strlen(shader_name));
    _mesa_sha1_final(&sha1_ctx, sha1);

@@ -114,6 +114,7 @@ static const nir_shader_compiler_options ir3_base_options = {
    .force_indirect_unrolling_sampler = true,
    .lower_uniforms_to_ubo = true,
    .max_unroll_iterations = 32,
+   .max_samples = 4,
 
    /* Not actually supported but we want fmulz to be produced and then be
     * lowered with the abs min pattern since we have free abs on min.
@@ -267,9 +268,11 @@ ir3_compiler_create(struct fd_device *dev, const struct fd_dev_id *dev_id,
       compiler->has_alias_rt = dev_info->props.has_alias_rt;
       compiler->mergedregs = true;
       compiler->has_sel_b_fneg = dev_info->props.has_sel_b_fneg;
+      compiler->has_eolm_eogm = dev_info->props.has_eolm_eogm;
 
-      if (compiler->gen >= 7) {
-         compiler->has_alias_tex = true;
+      compiler->has_alias_tex = (compiler->gen >= 7);
+
+      if (compiler->gen == 7) {
          compiler->delay_slots.alu_to_alu = 2;
          compiler->delay_slots.non_alu = 5;
          compiler->delay_slots.cat3_src2_read = 1;

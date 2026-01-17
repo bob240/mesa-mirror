@@ -140,8 +140,8 @@ static void si_emit_draw_mesh_tasks_ace_packets(struct si_context *sctx,
 {
    struct radeon_cmdbuf *cs = sctx->gfx_cs.gang_cs;
    struct si_shader *shader = &sctx->ts_shader_state.program->shader;
-   bool uses_draw_id = shader->info.uses_draw_id;
-   bool uses_grid_size = shader->selector->info.uses_grid_size;
+   bool uses_draw_id = shader->info.uses_sysval_draw_id;
+   bool uses_grid_size = shader->info.uses_sysval_num_workgroups;
    unsigned sh_base_reg = R_00B900_COMPUTE_USER_DATA_0;
 
    unsigned reg = sh_base_reg + 4 * GFX10_SGPR_TS_TASK_RING_ENTRY;
@@ -245,7 +245,7 @@ static void clear_reg_saved_mask(struct si_context *sctx, unsigned reg)
 {
    if (reg >= SI_SGPR_BASE_VERTEX && reg <= SI_SGPR_START_INSTANCE) {
       BITSET_CLEAR(sctx->tracked_regs.reg_saved_mask,
-                   SI_TRACKED_SPI_SHADER_USER_DATA_ES__BASE_VERTEX +
+                   AC_TRACKED_SPI_SHADER_USER_DATA_ES__BASE_VERTEX +
                    (reg - SI_SGPR_BASE_VERTEX));
    }
 }
@@ -254,7 +254,7 @@ static void clear_reg_saved_mask(struct si_context *sctx, unsigned reg)
    do { \
       unsigned addr = sh_base_reg + (reg) * 4; \
       if ((reg) >= SI_SGPR_BASE_VERTEX && (reg) <= SI_SGPR_START_INSTANCE) { \
-         unsigned tracked_reg = SI_TRACKED_SPI_SHADER_USER_DATA_ES__BASE_VERTEX; \
+         unsigned tracked_reg = AC_TRACKED_SPI_SHADER_USER_DATA_ES__BASE_VERTEX; \
          tracked_reg += (reg) - SI_SGPR_BASE_VERTEX; \
          if (sctx->gfx_level >= GFX12) \
             gfx12_opt_push_gfx_sh_reg(addr, tracked_reg, value); \
@@ -279,7 +279,7 @@ static void si_emit_draw_mesh_tasks_gfx_packets(struct si_context *sctx,
    unsigned sh_base_reg = sctx->shader_pointers.sh_base[MESA_SHADER_MESH];
    struct si_shader *shader = sctx->ms_shader_state.current;
    struct si_shader_selector *sel = shader->selector;
-   bool uses_grid_size = sel->info.uses_grid_size;
+   bool uses_grid_size = shader->info.uses_sysval_num_workgroups;
 
    int offset = GFX11_SGPR_MS_ATTRIBUTE_RING_ADDR;
    if (sctx->gfx_level >= GFX11)
@@ -292,7 +292,7 @@ static void si_emit_draw_mesh_tasks_gfx_packets(struct si_context *sctx,
       offset++;
    }
    /* mesh shader after task shader should not use gl_DrawID */
-   assert(!shader->info.uses_draw_id);
+   assert(!shader->info.uses_sysval_draw_id);
    unsigned grid_size_reg = 0;
    if (uses_grid_size || sctx->gfx_level < GFX11) {
       grid_size_reg = offset;
@@ -353,8 +353,8 @@ static void si_emit_draw_mesh_shader_only_packets(struct si_context *sctx,
    struct radeon_cmdbuf *cs = &sctx->gfx_cs;
    struct si_shader *shader = sctx->ms_shader_state.current;
    struct si_shader_selector *sel = shader->selector;
-   bool uses_draw_id = shader->info.uses_draw_id;
-   bool uses_grid_size = sel->info.uses_grid_size;
+   bool uses_draw_id = shader->info.uses_sysval_draw_id;
+   bool uses_grid_size = shader->info.uses_sysval_num_workgroups;
    unsigned sh_base_reg = sctx->shader_pointers.sh_base[MESA_SHADER_MESH];
 
    int offset = GFX11_SGPR_MS_ATTRIBUTE_RING_ADDR;
@@ -847,7 +847,7 @@ static void si_draw_mesh_tasks(struct pipe_context *ctx,
       si_emit_task_shader_pointers(sctx);
    }
 
-   enum mesa_prim prim = sctx->ms_shader_state.cso->rast_prim;
+   enum mesa_prim prim = sctx->ms_shader_state.cso->info.rast_prim;
    si_set_rasterized_prim(sctx, prim, sctx->ms_shader_state.current, true);
 
    if (sctx->dirty_shaders_mask & SI_MESH_PIPELINE_STATE_DIRTY_MASK)

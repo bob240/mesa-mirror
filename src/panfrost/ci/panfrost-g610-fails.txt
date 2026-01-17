@@ -1,17 +1,12 @@
 dEQP-VK.glsl.loops.special.do_while_dynamic_iterations.dowhile_trap_vertex,Crash
+asan-dEQP-VK.glsl.loops.special.do_while_dynamic_iterations.dowhile_trap_vertex,Crash
 
-# CTS bug, see https://github.com/KhronosGroup/VK-GL-CTS/issues/523
-dEQP-VK.image.load_store.without_any_format.buffer.b8g8r8_srgb_minalign_uniform,Fail
-dEQP-VK.image.load_store.without_any_format.buffer.b8g8r8_srgb_minalign_uniform_linear,Fail
-dEQP-VK.image.load_store.without_any_format.buffer.r8g8b8_srgb_minalign_uniform,Fail
-dEQP-VK.image.load_store.without_any_format.buffer.r8g8b8_srgb_minalign_uniform_linear,Fail
+# New failures with VKCTS 1.4.4.0
+dEQP-VK.binding_model.unused_invalid_descriptor.write.invalid.combined_image_sampler,Crash
+dEQP-VK.binding_model.unused_invalid_descriptor.write.invalid.sampled_image,Crash
+asan-dEQP-VK.binding_model.unused_invalid_descriptor.write.invalid.combined_image_sampler,Crash
+asan-dEQP-VK.binding_model.unused_invalid_descriptor.write.invalid.sampled_image,Crash
 
-# https://gitlab.khronos.org/Tracker/vk-gl-cts/-/issues/5926
-dEQP-VK.pipeline.pipeline_library.pipeline_binary.creation_feedback.graphics_tests.vertex_stage_fragment_stage,Crash
-dEQP-VK.pipeline.pipeline_library.pipeline_binary.graphics_tests.vertex_stage_fragment_stage,Crash
-dEQP-VK.pipeline.pipeline_library.pipeline_binary.pipeline_from_get_data.vertex_stage_fragment_stage,Crash
-dEQP-VK.pipeline.pipeline_library.pipeline_binary.creation_feedback.graphics_tests.vertex_stage_fragment_stage_delayed_destroy,Crash
-dEQP-VK.pipeline.pipeline_library.pipeline_binary.creation_feedback.graphics_tests.vertex_stage_fragment_stage_zero_out_feedback_cout,Crash
 
 afbcp-spec@arb_shader_texture_lod@execution@arb_shader_texture_lod-texgradcube,Fail
 afbcp-spec@arb_shader_texture_lod@execution@arb_shader_texture_lod-texgrad,Fail
@@ -215,7 +210,6 @@ spec@ext_transform_feedback@tessellation triangle_strip flat_last,Fail
 spec@ext_transform_feedback@tessellation triangle_strip monochrome,Fail
 spec@ext_transform_feedback@tessellation triangle_strip smooth,Fail
 spec@ext_transform_feedback@tessellation triangle_strip wireframe,Fail
-spec@glsl-1.10@execution@variable-indexing@fs-input-array-vec4-index-rd,Fail
 spec@glsl-1.20@execution@fs-underflow-mul-compare-zero,Fail
 spec@glsl-1.30@execution@clipping@fs-clip-distance-interpolated,Crash
 spec@glsl-1.30@execution@interpolation@interpolation-noperspective-gl_backcolor-flat-distance,Fail
@@ -341,3 +335,8 @@ spec@!opengl 3.1@primitive-restart-xfb flush,Fail
 spec@!opengl 3.1@primitive-restart-xfb generated,Fail
 spec@!opengl 3.1@primitive-restart-xfb written,Fail
 spec@!opengl es 3.0@gles-3.0-transform-feedback-uniform-buffer-object,Fail
+
+# uprev Piglit in Mesa
+afbcp-spec@arb_texture_view@tex-view,Fail
+spec@arb_texture_view@tex-view,Fail
+

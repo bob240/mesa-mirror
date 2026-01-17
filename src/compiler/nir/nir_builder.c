@@ -49,7 +49,7 @@ nir_builder MUST_CHECK PRINTFLIKE(3, 4)
 
    nir_function *func = nir_function_create(b.shader, "main");
    func->is_entrypoint = true;
-   b.exact = false;
+   b.fp_math_ctrl = nir_fp_fast_math;
    b.impl = nir_function_impl_create(func);
    b.cursor = nir_after_cf_list(&b.impl->body);
 
@@ -71,8 +71,7 @@ nir_builder_alu_instr_finish_and_insert(nir_builder *build, nir_alu_instr *instr
 {
    const nir_op_info *op_info = &nir_op_infos[instr->op];
 
-   instr->exact = build->exact;
-   instr->fp_fast_math = build->fp_fast_math;
+   instr->fp_math_ctrl = build->fp_math_ctrl;
 
    /* Guess the number of components the destination temporary should have
     * based on our input sizes, if it's not fixed for the op.
@@ -275,6 +274,15 @@ nir_build_tex_struct(nir_builder *build, nir_texop op, struct nir_tex_builder f)
          glsl_get_sampler_result_type(type));
    }
 
+   /* Fix up the opcode to allow simplified usage. This helps ergonomics. */
+   if (op == nir_texop_txf && f.ms_index) {
+      op = nir_texop_txf_ms;
+   } else if (op == nir_texop_tex && f.lod) {
+      op = nir_texop_txl;
+   } else if (op == nir_texop_tex && f.bias) {
+      op = nir_texop_txb;
+   }
+
    if (lod == NULL && nir_dim_has_lod(dim) &&
        (op == nir_texop_txs || op == nir_texop_txf)) {
 
@@ -387,8 +395,7 @@ nir_vec_scalars(nir_builder *build, nir_scalar *comp, unsigned num_components)
       instr->src[i].src = nir_src_for_ssa(comp[i].def);
       instr->src[i].swizzle[0] = comp[i].comp;
    }
-   instr->exact = build->exact;
-   instr->fp_fast_math = build->fp_fast_math;
+   instr->fp_math_ctrl = build->fp_math_ctrl;
 
    /* Note: not reusing nir_builder_alu_instr_finish_and_insert() because it
     * can't re-guess the num_components when num_components == 1 (nir_op_mov).

@@ -495,23 +495,6 @@ struct si_shader_selector {
    unsigned nir_size;
 
    struct si_shader_info info;
-
-   uint8_t const_and_shader_buf_descriptors_index;
-   uint8_t sampler_and_images_descriptors_index;
-   uint8_t cs_shaderbufs_sgpr_index;
-   uint8_t cs_num_shaderbufs_in_user_sgprs;
-   uint8_t cs_images_sgpr_index;
-   uint8_t cs_images_num_sgprs;
-   uint8_t cs_num_images_in_user_sgprs;
-   unsigned ngg_cull_vert_threshold; /* UINT32_MAX = disabled */
-   enum mesa_prim rast_prim;
-
-   /* GS parameters. */
-   bool tess_turns_off_ngg;
-
-   /* bitmasks of used descriptor slots */
-   uint64_t active_const_and_shader_buffers;
-   uint64_t active_samplers_and_images;
 };
 
 /* Valid shader configurations:
@@ -911,16 +894,14 @@ struct nir_shader *si_deserialize_shader(struct si_shader_selector *sel);
 unsigned si_get_ps_num_interp(struct si_shader *ps);
 unsigned si_get_shader_prefetch_size(struct si_shader *shader);
 unsigned si_get_max_workgroup_size(const struct si_shader *shader);
+unsigned si_shader_encode_vgprs(struct si_shader *shader);
+unsigned si_shader_encode_sgprs(struct si_shader *shader);
 
 /* si_shader_info.c */
-void si_nir_scan_shader(struct si_screen *sscreen, struct nir_shader *nir,
+void si_nir_gather_info(struct si_screen *sscreen, struct nir_shader *nir,
                         struct si_shader_info *info, bool colors_lowered);
 
 /* si_shader_nir.c */
-void si_lower_mediump_io_default(nir_shader *nir);
-void si_lower_mediump_io_option(struct nir_shader *nir);
-
-bool si_alu_to_scalar_packed_math_filter(const struct nir_instr *instr, const void *data);
 void si_nir_opts(struct si_screen *sscreen, struct nir_shader *nir, bool has_array_temps);
 void si_nir_late_opts(struct nir_shader *nir);
 void si_finalize_nir(struct pipe_screen *screen, struct nir_shader *nir,
@@ -1000,7 +981,7 @@ static inline bool si_shader_culling_enabled(struct si_shader *shader)
    unsigned output_prim = si_get_output_prim_simplified(shader->selector, &shader->key);
 
    /* This enables NGG culling for non-monolithic TES and GS. */
-   return shader->selector->ngg_cull_vert_threshold == 0 &&
+   return shader->selector->info.ngg_cull_vert_threshold == 0 &&
           (output_prim == MESA_PRIM_TRIANGLES || output_prim == MESA_PRIM_LINES);
 }
 

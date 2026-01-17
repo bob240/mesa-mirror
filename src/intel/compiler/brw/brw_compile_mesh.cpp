@@ -134,63 +134,6 @@ brw_print_tue_map(FILE *fp, const struct brw_tue_map *map)
 }
 
 static bool
-brw_nir_adjust_task_payload_offsets_instr(struct nir_builder *b,
-                                          nir_intrinsic_instr *intrin,
-                                          void *data)
-{
-   switch (intrin->intrinsic) {
-   case nir_intrinsic_store_task_payload:
-   case nir_intrinsic_load_task_payload: {
-      nir_src *offset_src = nir_get_io_offset_src(intrin);
-
-      if (nir_src_is_const(*offset_src))
-         assert(nir_src_as_uint(*offset_src) % 4 == 0);
-
-      b->cursor = nir_before_instr(&intrin->instr);
-
-      /* Regular I/O uses dwords while explicit I/O used for task payload uses
-       * bytes.  Normalize it to dwords.
-       *
-       * TODO(mesh): Figure out how to handle 8-bit, 16-bit.
-       */
-
-      nir_def *offset = nir_ishr_imm(b, offset_src->ssa, 2);
-      nir_src_rewrite(offset_src, offset);
-
-      unsigned base = nir_intrinsic_base(intrin);
-      assert(base % 4 == 0);
-      nir_intrinsic_set_base(intrin, base / 4);
-
-      return true;
-   }
-
-   default:
-      return false;
-   }
-}
-
-static bool
-brw_nir_adjust_task_payload_offsets(nir_shader *nir)
-{
-   return nir_shader_intrinsics_pass(nir,
-                                       brw_nir_adjust_task_payload_offsets_instr,
-                                       nir_metadata_control_flow,
-                                       NULL);
-}
-
-void
-brw_nir_adjust_payload(nir_shader *shader)
-{
-   /* Adjustment of task payload offsets must be performed *after* last pass
-    * which interprets them as bytes, because it changes their unit.
-    */
-   bool adjusted = false;
-   NIR_PASS(adjusted, shader, brw_nir_adjust_task_payload_offsets);
-   if (adjusted) /* clean up the mess created by offset adjustments */
-      NIR_PASS(_, shader, nir_opt_constant_folding);
-}
-
-static bool
 brw_nir_align_launch_mesh_workgroups_instr(nir_builder *b,
                                            nir_intrinsic_instr *intrin,
                                            void *data)
@@ -528,13 +471,6 @@ enum {
    VERT_FLAT, /* per vertex flat */
 };
 
-struct attr_desc {
-   int location;
-   const struct glsl_type *type;
-   unsigned dwords;
-   unsigned slots;
-};
-
 static void
 brw_compute_mue_map(const struct brw_compiler *compiler,
                     nir_shader *nir, struct brw_mue_map *map,
@@ -688,116 +624,16 @@ brw_print_mue_map(FILE *fp, const struct brw_mue_map *map, struct nir_shader *ni
    brw_print_vue_map(fp, &map->vue_map, MESA_SHADER_MESH);
 }
 
-static bool
-remap_io_to_dwords(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
-{
-   if (intrin->intrinsic != nir_intrinsic_load_per_vertex_output &&
-       intrin->intrinsic != nir_intrinsic_load_per_primitive_output &&
-       intrin->intrinsic != nir_intrinsic_store_per_vertex_output &&
-       intrin->intrinsic != nir_intrinsic_store_per_primitive_output)
-      return false;
-
-   nir_io_semantics io_sem = nir_intrinsic_io_semantics(intrin);
-   if (io_sem.location == VARYING_SLOT_PRIMITIVE_INDICES ||
-       io_sem.location == VARYING_SLOT_PRIMITIVE_COUNT)
-      return false;
-
-   nir_intrinsic_set_base(intrin, nir_intrinsic_base(intrin) * 4);
-   if (nir_intrinsic_has_range(intrin))
-      nir_intrinsic_set_range(intrin, nir_intrinsic_range(intrin) * 4);
-
-   b->cursor = nir_before_instr(&intrin->instr);
-
-   nir_src *offset = nir_get_io_offset_src(intrin);
-   assert(offset != NULL);
-
-   nir_src_rewrite(offset, nir_ishl_imm(b, offset->ssa, 2));
-
-   io_sem.no_validate = true;
-   nir_intrinsic_set_io_semantics(intrin, io_sem);
-
-   return true;
-}
-
 static void
 brw_nir_lower_mue_outputs(nir_shader *nir, const struct brw_mue_map *map)
 {
-   nir_foreach_shader_out_variable(var, nir) {
-      int location = var->data.location;
-      assert(location >= 0);
-
-      switch (location) {
-      case VARYING_SLOT_PRIMITIVE_COUNT:
-      case VARYING_SLOT_PRIMITIVE_INDICES:
-         /* Primitive count & indices are not part of the per-primitive block,
-          * they have there own spot just before. We saved their offset in the
-          * the per-primitive array, we just don't need to add the block
-          * offset.
-          */
-         var->data.driver_location =
-            map->per_primitive_offsets[location] / 4;
-         break;
-
-      case VARYING_SLOT_PRIMITIVE_SHADING_RATE:
-         var->data.driver_location = map->per_primitive_offset / 16;
-         var->data.location_frac = 0;
-         break;
-
-      case VARYING_SLOT_LAYER:
-         var->data.driver_location = map->per_primitive_offset / 16;
-         var->data.location_frac = 1;
-         break;
-
-      case VARYING_SLOT_VIEWPORT:
-         var->data.driver_location = map->per_primitive_offset / 16;
-         var->data.location_frac = 2;
-         break;
-
-      case VARYING_SLOT_CULL_PRIMITIVE:
-         var->data.driver_location = map->per_primitive_offset / 16;
-         var->data.location_frac = 3;
-         break;
-
-      case VARYING_SLOT_PSIZ:
-         var->data.driver_location = map->per_vertex_offset / 16;
-         var->data.location_frac = 3;
-         break;
-
-      default:
-         if (nir->info.per_primitive_outputs & BITFIELD64_BIT(location))  {
-            assert(map->per_primitive_offsets[location] != -1);
-            var->data.driver_location =
-               (map->per_primitive_offset +
-                map->per_primitive_offsets[location]) / 16;
-         } else {
-            /* Each per vertex location has its own slot/vec4 (16B) of data, use
-             * map->vue_map.varying_to_slot[] to get the 16B offset and add the
-             * per-vertex block offset.
-             */
-            assert(map->vue_map.varying_to_slot[location] != -1);
-            var->data.driver_location =
-               map->per_vertex_offset / 16 +
-               map->vue_map.varying_to_slot[location];
-         }
-         break;
-      }
-   }
-
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_out,
             type_size_vec4,
             nir_lower_io_lower_64bit_to_32);
-
-   /* Everythings works with slots in terms if IO, but our backend deals with
-    * dwords. Apply remapping.
-    */
-   NIR_PASS(_, nir, nir_shader_intrinsics_pass,
-            remap_io_to_dwords, nir_metadata_control_flow, NULL);
 }
 
 static bool
-brw_nir_initialize_mue(nir_shader *nir,
-                       const struct brw_mue_map *map,
-                       unsigned dispatch_width)
+brw_nir_initialize_mue(nir_shader *nir, const struct brw_mue_map *map)
 {
    nir_builder b;
    nir_function_impl *entrypoint = nir_shader_get_entrypoint(nir);
@@ -832,10 +668,13 @@ brw_nir_initialize_mue(nir_shader *nir,
                                            prim_in_inv * workgroup_size);
 
       nir_store_per_primitive_output(&b, zerovec, prim, dw_off,
-                                     .base = (int)map->per_primitive_offset / 4,
                                      .write_mask = WRITEMASK_XYZW,
                                      .component = 0,
-                                     .src_type = nir_type_uint32);
+                                     .src_type = nir_type_uint32,
+                                     .io_semantics = {
+                                        .location = VARYING_SLOT_PRIMITIVE_SHADING_RATE,
+                                        .num_slots = 1
+                                     });
    }
 
    /* How many prims are left? */
@@ -852,10 +691,13 @@ brw_nir_initialize_mue(nir_shader *nir,
                                                prims_per_inv * workgroup_size);
 
          nir_store_per_primitive_output(&b, zerovec, prim, dw_off,
-                                        .base = (int)map->per_primitive_offset / 4,
                                         .write_mask = WRITEMASK_XYZW,
                                         .component = 0,
-                                        .src_type = nir_type_uint32);
+                                        .src_type = nir_type_uint32,
+                                        .io_semantics = {
+                                           .location = VARYING_SLOT_PRIMITIVE_SHADING_RATE,
+                                           .num_slots = 1
+                                        });
       }
       nir_pop_if(&b, if_stmt);
    }
@@ -863,11 +705,17 @@ brw_nir_initialize_mue(nir_shader *nir,
    /* If there's more than one subgroup, then we need to wait for all of them
     * to finish initialization before we can proceed. Otherwise some subgroups
     * may start filling MUE before other finished initializing.
+    *
+    * Note that brw_nir_lower_simd and subsequent optimizations will remove
+    * this code if condition is false.
     */
-   if (workgroup_size > dispatch_width) {
+   nir_push_if(&b, nir_ilt_imm(&b, nir_load_subgroup_size(&b), workgroup_size));
+   {
       nir_barrier(&b, SCOPE_WORKGROUP, SCOPE_WORKGROUP,
-                         NIR_MEMORY_ACQ_REL, nir_var_shader_out);
+                  NIR_MEMORY_ACQ_REL, nir_var_shader_out);
    }
+   nir_pop_if(&b, NULL);
+
 
    if (remaining) {
       nir_progress(true, entrypoint, nir_metadata_none);
@@ -875,67 +723,6 @@ brw_nir_initialize_mue(nir_shader *nir,
       nir_progress(true, entrypoint, nir_metadata_control_flow);
    }
    return true;
-}
-
-static void
-brw_nir_adjust_offset(nir_builder *b, nir_intrinsic_instr *intrin, uint32_t pitch)
-{
-   nir_src *index_src = nir_get_io_arrayed_index_src(intrin);
-   nir_src *offset_src = nir_get_io_offset_src(intrin);
-
-   b->cursor = nir_before_instr(&intrin->instr);
-   nir_def *offset =
-      nir_iadd(b,
-               offset_src->ssa,
-               nir_imul_imm(b, index_src->ssa, pitch));
-   nir_src_rewrite(offset_src, offset);
-
-   nir_io_semantics io_sem = nir_intrinsic_io_semantics(intrin);
-   io_sem.no_validate = true;
-   nir_intrinsic_set_io_semantics(intrin, io_sem);
-}
-
-static bool
-brw_nir_adjust_offset_for_arrayed_indices_instr(nir_builder *b,
-                                                nir_intrinsic_instr *intrin,
-                                                void *data)
-{
-   const struct brw_mue_map *map = (const struct brw_mue_map *) data;
-
-   /* Remap per_vertex and per_primitive offsets using the extra source and
-    * the pitch.
-    */
-   switch (intrin->intrinsic) {
-   case nir_intrinsic_load_per_vertex_output:
-   case nir_intrinsic_store_per_vertex_output:
-      brw_nir_adjust_offset(b, intrin, map->per_vertex_stride / 4);
-      return true;
-
-   case nir_intrinsic_load_per_primitive_output:
-   case nir_intrinsic_store_per_primitive_output: {
-      struct nir_io_semantics sem = nir_intrinsic_io_semantics(intrin);
-      uint32_t pitch;
-      if (sem.location == VARYING_SLOT_PRIMITIVE_INDICES)
-         pitch = map->per_primitive_indices_stride;
-      else
-         pitch = map->per_primitive_stride;
-
-      brw_nir_adjust_offset(b, intrin, pitch / 4);
-      return true;
-   }
-
-   default:
-      return false;
-   }
-}
-
-static bool
-brw_nir_adjust_offset_for_arrayed_indices(nir_shader *nir, const struct brw_mue_map *map)
-{
-   return nir_shader_intrinsics_pass(nir,
-                                       brw_nir_adjust_offset_for_arrayed_indices_instr,
-                                       nir_metadata_control_flow,
-                                       (void *)map);
 }
 
 struct index_packing_state {
@@ -1238,12 +1025,33 @@ brw_compile_mesh(const struct brw_compiler *compiler,
                        apply_wa_18019110168 ? wa_18019110168_mapping : NULL);
    brw_nir_lower_mue_outputs(nir, &prog_data->map);
 
+   /* When Primitive Header is enabled, we may not generates writes to all
+    * fields, so let's initialize everything.
+    */
+   if (prog_data->map.has_per_primitive_header)
+      NIR_PASS(_, nir, brw_nir_initialize_mue, &prog_data->map);
+
    prog_data->autostrip_enable = brw_mesh_autostrip_enable(compiler, nir, &prog_data->map);
 
    prog_data->base.uses_inline_data = brw_nir_uses_inline_data(nir) ||
                                       key->base.uses_inline_push_addr;
 
    brw_postprocess_nir_opts(nir, compiler, key->base.robust_flags);
+
+   const struct brw_lower_urb_cb_data cb_data = {
+      .devinfo = devinfo,
+      .varying_to_slot = prog_data->map.vue_map.varying_to_slot,
+      .per_vertex_stride = prog_data->map.per_vertex_stride,
+      .per_vertex_offset = prog_data->map.per_vertex_offset,
+      .per_primitive_offset = prog_data->map.per_primitive_offset,
+      .per_primitive_stride = prog_data->map.per_primitive_stride,
+      .per_primitive_indices_stride =
+         prog_data->map.per_primitive_indices_stride,
+      .per_primitive_byte_offsets = prog_data->map.per_primitive_offsets,
+   };
+   NIR_PASS(_, nir, brw_nir_lower_outputs_to_urb_intrinsics, &cb_data);
+   struct nir_opt_offsets_options offset_options = {};
+   NIR_PASS(_, nir, nir_opt_offsets, &offset_options);
 
    brw_simd_selection_state simd_state{
       .devinfo = compiler->devinfo,
@@ -1267,16 +1075,8 @@ brw_compile_mesh(const struct brw_compiler *compiler,
 
       brw_debug_archive_nir(params->base.archiver, shader, dispatch_width, "first");
 
-      /*
-       * When Primitive Header is enabled, we may not generates writes to all
-       * fields, so let's initialize everything.
-       */
-      if (prog_data->map.has_per_primitive_header)
-         NIR_PASS(_, shader, brw_nir_initialize_mue, &prog_data->map, dispatch_width);
-
       brw_nir_apply_key(shader, compiler, &key->base, dispatch_width);
 
-      NIR_PASS(_, shader, brw_nir_adjust_offset_for_arrayed_indices, &prog_data->map);
       /* Load uniforms can do a better job for constants, so fold before it. */
       NIR_PASS(_, shader, nir_opt_constant_folding);
 

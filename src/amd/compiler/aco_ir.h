@@ -26,6 +26,7 @@
 #include <vector>
 
 typedef struct nir_shader nir_shader;
+typedef struct nir_parameter nir_parameter;
 
 namespace aco {
 
@@ -1522,6 +1523,7 @@ struct Instruction {
 
    constexpr bool isVMEM() const noexcept { return isMTBUF() || isMUBUF() || isMIMG(); }
 
+   bool hasPrecoloredGPRs() const noexcept;
    bool accessesLDS() const noexcept;
    bool isTrans() const noexcept;
 };
@@ -1919,6 +1921,13 @@ struct Pseudo_call_instruction : public Instruction {
 };
 
 inline bool
+Instruction::hasPrecoloredGPRs() const noexcept
+{
+   return isCall() || opcode == aco_opcode::p_startpgm || opcode == aco_opcode::p_return ||
+          opcode == aco_opcode::p_end_with_regs || opcode == aco_opcode::p_jump_to_epilog;
+}
+
+inline bool
 Instruction::accessesLDS() const noexcept
 {
    return (isDS() && !ds().gds) || isLDSDIR() || isVINTRP();
@@ -2054,7 +2063,7 @@ enum vmem_type : uint8_t {
 /* VMEM instructions of the same type return in-order. For GFX12+, this determines which counter
  * is used.
  */
-uint8_t get_vmem_type(amd_gfx_level gfx_level, radeon_family family, Instruction* instr);
+uint8_t get_vmem_type(Instruction* instr, bool has_point_sample_accel);
 
 /* For all of the counters, the maximum value means no wait.
  * Some of the counters are larger than their bit field,
@@ -2127,6 +2136,7 @@ struct Block {
    edge_vec linear_succs;
    RegisterDemand register_demand = RegisterDemand();
    RegisterDemand live_in_demand = RegisterDemand();
+   RegisterDemand call_spills = RegisterDemand();
    uint32_t kind = 0;
    int32_t logical_idom = -1;
    int32_t linear_idom = -1;
@@ -2244,9 +2254,12 @@ struct DeviceInfo {
    bool has_fast_fma32 = false;
    bool has_mac_legacy32 = false;
    bool has_fmac_legacy32 = false;
+   bool has_mad32 = false;
    bool fused_mad_mix = false;
    bool xnack_enabled = false;
    bool sram_ecc_enabled = false;
+   bool has_point_sample_accel = false;
+   bool has_gfx6_mrt_export_bug = false;
 
    int32_t scratch_global_offset_min;
    int32_t scratch_global_offset_max;
@@ -2270,10 +2283,11 @@ public:
    std::vector<Block> blocks;
    std::vector<RegClass> temp_rc = {s1};
    RegisterDemand max_reg_demand = RegisterDemand();
+   RegisterDemand max_call_spills = RegisterDemand();
+   RegisterDemand fixed_reg_demand = RegisterDemand();
    ac_shader_config* config;
    struct aco_shader_info info;
    enum amd_gfx_level gfx_level;
-   enum radeon_family family;
    DeviceInfo dev;
    unsigned wave_size;
    RegClass lane_mask;
@@ -2322,9 +2336,9 @@ public:
 
    bool is_callee = false;
    bool has_call = false;
-   bool bypass_reg_preservation = false;
    ABI callee_abi = {};
    RegisterDemand callee_param_demand = RegisterDemand();
+   unsigned scratch_arg_size = 0;
 
    struct {
       monotonic_buffer_resource memory;
@@ -2385,8 +2399,7 @@ struct ra_test_policy {
 void init();
 
 void init_program(Program* program, Stage stage, const struct aco_shader_info* info,
-                  enum amd_gfx_level gfx_level, enum radeon_family family, bool wgp_mode,
-                  ac_shader_config* config);
+                  const aco_compiler_options* options, ac_shader_config* config);
 
 void select_program(Program* program, unsigned shader_count, struct nir_shader* const* shaders,
                     ac_shader_config* config, const struct aco_compiler_options* options,
@@ -2398,7 +2411,8 @@ void select_trap_handler_shader(Program* program, ac_shader_config* config,
 void select_rt_prolog(Program* program, ac_shader_config* config,
                       const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct ac_shader_args* in_args,
-                      const struct ac_shader_args* out_args);
+                      const struct ac_arg* descriptors, unsigned raygen_param_count,
+                      nir_parameter* raygen_params);
 void select_vs_prolog(Program* program, const struct aco_vs_prolog_info* pinfo,
                       ac_shader_config* config, const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct ac_shader_args* args);
@@ -2429,6 +2443,7 @@ void setup_reduce_temp(Program* program);
 void lower_to_cssa(Program* program);
 void register_allocation(Program* program, ra_test_policy = {});
 void reindex_ssa(Program* program);
+void spill_preserved(Program* program);
 void ssa_elimination(Program* program);
 void lower_to_hw_instr(Program* program);
 void schedule_program(Program* program);
@@ -2447,8 +2462,9 @@ unsigned emit_program(Program* program, std::vector<uint32_t>& code,
  * Returns true if print_asm can disassemble the given program for the current build/runtime
  * configuration
  */
-bool check_print_asm_support(Program* program);
-bool print_asm(Program* program, std::vector<uint32_t>& binary, unsigned exec_size, FILE* output);
+bool check_print_asm_support(Program* program, enum radeon_family family);
+bool print_asm(Program* program, enum radeon_family family, std::vector<uint32_t>& binary,
+               unsigned exec_size, FILE* output);
 bool validate_ir(Program* program);
 bool validate_cfg(Program* program);
 bool validate_ra(Program* program);
@@ -2590,5 +2606,11 @@ typedef struct {
 extern const Info instr_info;
 
 } // namespace aco
+
+namespace std {
+template <> struct hash<aco::PhysReg> {
+   size_t operator()(aco::PhysReg reg) const noexcept { return std::hash<uint32_t>{}(reg.reg_b); }
+};
+} // namespace std
 
 #endif /* ACO_IR_H */

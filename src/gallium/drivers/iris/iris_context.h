@@ -47,6 +47,7 @@ struct iris_bo;
 struct iris_context;
 struct blorp_batch;
 struct blorp_params;
+struct brw_ubo_range;
 
 #define IRIS_MAX_DRAW_BUFFERS 8
 #define IRIS_MAX_SOL_BINDINGS 64
@@ -575,7 +576,7 @@ struct iris_uncompiled_shader {
    struct pipe_stream_output_info stream_output;
 
    /* A SHA1 of the serialized NIR for the disk cache. */
-   unsigned char nir_sha1[20];
+   unsigned char nir_sha1[SHA1_DIGEST_LENGTH];
 
    /* Hash value based on shader source program */
    unsigned source_hash;
@@ -618,6 +619,9 @@ enum iris_surface_group {
 };
 
 enum {
+   /* Workaround index to HSDES #22020184996 */
+   IRIS_SURFACE_NULL_PUSH_TBIMR_WA = UINT16_MAX,
+
    /* Invalid value for a binding table index. */
    IRIS_SURFACE_NOT_USED = 0xa0a0a0a0,
 };
@@ -626,7 +630,7 @@ struct iris_binding_table {
    uint32_t size_bytes;
 
    /** Number of surfaces in each group, before compacting. */
-   uint32_t sizes[IRIS_SURFACE_GROUP_COUNT];
+   uint32_t surf_count[IRIS_SURFACE_GROUP_COUNT];
 
    /** Initial offset of each group. */
    uint32_t offsets[IRIS_SURFACE_GROUP_COUNT];
@@ -696,9 +700,14 @@ struct iris_compiled_shader {
    mesa_shader_stage stage;
 
    /**
-    * Data derived from prog_data.
+    * Data derived from ELK prog_data.
     */
    struct iris_ubo_range ubo_ranges[4];
+
+   /**
+    * Data derived from BRW prog_data.
+    */
+   uint16_t push_sizes[4];
 
    unsigned nr_params;
    unsigned total_scratch;
@@ -830,6 +839,10 @@ enum iris_context_priority {
    IRIS_CONTEXT_MEDIUM_PRIORITY = 0,
    IRIS_CONTEXT_LOW_PRIORITY,
    IRIS_CONTEXT_HIGH_PRIORITY
+};
+
+struct iris_scissor_state {
+   uint16_t minx, miny, maxx, maxy;
 };
 
 /**
@@ -1005,10 +1018,9 @@ struct iris_context {
       struct pipe_blend_color blend_color;
       struct pipe_poly_stipple poly_stipple;
       struct pipe_viewport_state viewports[IRIS_MAX_VIEWPORTS];
-      struct pipe_scissor_state scissors[IRIS_MAX_VIEWPORTS];
+      struct iris_scissor_state scissors[IRIS_MAX_VIEWPORTS];
       struct pipe_stencil_ref stencil_ref;
-      PIPE_FB_SURFACES; //STOP USING THIS
-      struct pipe_framebuffer_state framebuffer;
+      struct iris_framebuffer_state framebuffer;
       struct pipe_clip_state clip_planes;
       /* width and height treated like x2 and y2 */
       struct pipe_box render_area;
@@ -1347,7 +1359,8 @@ uint32_t iris_bti_to_group_index(const struct iris_binding_table *bt,
                                  enum iris_surface_group group,
                                  uint32_t bti);
 void iris_apply_brw_prog_data(struct iris_compiled_shader *shader,
-                              struct brw_stage_prog_data *prog_data);
+                              struct brw_stage_prog_data *prog_data,
+                              struct brw_ubo_range *ubo_ranges);
 void iris_apply_elk_prog_data(struct iris_compiled_shader *shader,
                               struct elk_stage_prog_data *prog_data);
 struct intel_cs_dispatch_info

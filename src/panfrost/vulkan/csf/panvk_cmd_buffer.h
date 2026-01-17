@@ -157,7 +157,8 @@ struct panvk_cache_flush_info {
 };
 
 struct panvk_cs_deps {
-   bool needs_draw_flush;
+   bool needs_fb_barrier;
+
    struct {
       uint32_t wait_sb_mask;
       struct panvk_cache_flush_info cache_flush;
@@ -468,7 +469,7 @@ panvk_cache_flush_is_nop(const struct panvk_cache_flush_info *cache_flush)
 
 extern const struct vk_command_buffer_ops panvk_per_arch(cmd_buffer_ops);
 
-void panvk_per_arch(cmd_flush_draws)(struct panvk_cmd_buffer *cmdbuf);
+void panvk_per_arch(cmd_fb_barrier)(struct panvk_cmd_buffer *cmdbuf);
 
 #if PAN_ARCH == 10
 /* Match against all possible iter_sb values. The constant iter_sb value for
@@ -479,9 +480,177 @@ void panvk_per_arch(cmd_flush_draws)(struct panvk_cmd_buffer *cmdbuf);
          cs_case(__b, SB_ITER(__val))
 #endif
 
-void panvk_per_arch(cs_next_iter_sb)(struct panvk_cmd_buffer *cmdbuf,
-                                     enum panvk_subqueue_id subqueue,
-                                     struct cs_index scratch_regs);
+#if PAN_ARCH >= 11
+struct cs_iter_sb_update_ctx {
+   struct cs_builder *b;
+   uint16_t all_iters_mask;
+
+   struct {
+      struct cs_index next_sb;
+      struct cs_index sb_mask;
+   } regs;
+};
+
+static inline struct cs_iter_sb_update_ctx
+cs_iter_sb_update_start(struct panvk_cmd_buffer *cmdbuf,
+                        enum panvk_subqueue_id subqueue,
+                        struct cs_index scratch_regs)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
+   struct cs_index next_sb = cs_extract32(b, scratch_regs, 0);
+   struct cs_iter_sb_update_ctx ctx = {
+      .b = b,
+      .all_iters_mask = dev->csf.sb.all_iters_mask,
+      .regs = {
+         .next_sb = next_sb,
+         .sb_mask = cs_extract32(b, scratch_regs, 1),
+      },
+   };
+
+   cs_next_sb_entry(b, next_sb, MALI_CS_SCOREBOARD_TYPE_ENDPOINT,
+                    MALI_CS_NEXT_SB_ENTRY_FORMAT_INDEX);
+
+   return ctx;
+}
+
+static inline void
+cs_iter_sb_update_end(struct cs_iter_sb_update_ctx *ctx)
+{
+   struct cs_builder *b = ctx->b;
+   struct cs_index next_sb = ctx->regs.next_sb;
+   struct cs_index sb_mask = ctx->regs.sb_mask;
+   uint16_t all_iters_mask = ctx->all_iters_mask;
+
+   /* Setup indirect scoreboard wait mask now for indirect defer */
+   cs_move32_to(b, sb_mask, 0);
+   cs_bit_set32(b, sb_mask, sb_mask, next_sb);
+   cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_WAIT, sb_mask);
+
+   /* Prevent direct re-use of the current SB to avoid conflict between
+    * wait(current),signal(next) (can't wait on an SB we signal).
+    */
+   cs_move32_to(b, sb_mask, all_iters_mask);
+   cs_bit_clear32(b, sb_mask, sb_mask, next_sb);
+   cs_set_state(b, MALI_CS_SET_STATE_TYPE_SB_MASK_STREAM, sb_mask);
+
+   ctx->b = NULL;
+}
+
+#define cs_iter_sb_update(__cmdbuf, __subq, __scratch_regs, __upd_ctx)         \
+   for (struct cs_iter_sb_update_ctx __upd_ctx =                               \
+           cs_iter_sb_update_start(__cmdbuf, __subq, __scratch_regs);          \
+        __upd_ctx.b; cs_iter_sb_update_end(&__upd_ctx))
+
+#else
+struct cs_iter_sb_update_ctx {
+   struct cs_builder *b;
+   uint8_t cur_sb;
+   uint8_t next_sb;
+
+   struct {
+      struct cs_index next_sb;
+      struct cs_index cmp_scratch;
+   } regs;
+};
+
+static inline struct cs_iter_sb_update_ctx
+cs_iter_sb_update_start(struct panvk_cmd_buffer *cmdbuf,
+                        enum panvk_subqueue_id subqueue,
+                        struct cs_index scratch_regs)
+{
+   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
+   struct cs_builder *b = panvk_get_cs_builder(cmdbuf, subqueue);
+   struct cs_index next_sb = cs_extract32(b, scratch_regs, 0);
+   struct cs_index cmp_scratch = cs_extract32(b, scratch_regs, 1);
+   struct cs_iter_sb_update_ctx ctx = {
+      .b = b,
+      .regs = {
+         .next_sb = next_sb,
+         .cmp_scratch = cmp_scratch,
+      },
+   };
+
+   cs_load32_to(b, next_sb, cs_subqueue_ctx_reg(b),
+                offsetof(struct panvk_cs_subqueue_context, iter_sb));
+
+   /* Select next scoreboard entry and wrap around if we get past the limit */
+   cs_add32(b, next_sb, next_sb, 1);
+   cs_add32(b, cmp_scratch, next_sb, -SB_ITER(dev->csf.sb.iter_count));
+
+   cs_if(b, MALI_CS_CONDITION_GEQUAL, cmp_scratch) {
+      cs_move32_to(b, next_sb, SB_ITER(0));
+   }
+
+   cs_store32(b, next_sb, cs_subqueue_ctx_reg(b),
+              offsetof(struct panvk_cs_subqueue_context, iter_sb));
+   cs_flush_stores(b);
+
+   return ctx;
+}
+
+static inline void
+cs_iter_sb_update_end(struct cs_iter_sb_update_ctx *ctx)
+{
+   ctx->b = NULL;
+}
+
+static void
+cs_iter_sb_update_first_case(struct cs_iter_sb_update_ctx *ctx)
+{
+   ctx->cur_sb = PANVK_SB_ITER_COUNT - 1;
+   ctx->next_sb = 0;
+}
+
+static void
+cs_iter_sb_update_next_case(struct cs_iter_sb_update_ctx *ctx)
+{
+   ctx->cur_sb = (ctx->cur_sb + 1) % PANVK_SB_ITER_COUNT;
+   ctx->next_sb++;
+}
+
+static inline bool
+cs_iter_sb_update_case_preamble(struct cs_iter_sb_update_ctx *ctx)
+{
+   struct cs_builder *b = ctx->b;
+
+   cs_wait_slot(b, SB_ITER(ctx->next_sb));
+   cs_select_endpoint_sb(b, SB_ITER(ctx->next_sb));
+   return false;
+}
+
+#define cs_iter_sb_update_case(__upd_ctx)                                      \
+   cs_case(__upd_ctx.b, SB_ITER(__upd_ctx.next_sb))                            \
+      for (bool __done = cs_iter_sb_update_case_preamble(&__upd_ctx); !__done; \
+           __done = true)
+
+#define cs_iter_sb_update(__cmdbuf, __subq, __scratch_regs, __upd_ctx)         \
+   for (struct cs_iter_sb_update_ctx __upd_ctx =                               \
+           cs_iter_sb_update_start(__cmdbuf, __subq, __scratch_regs);          \
+        __upd_ctx.b; cs_iter_sb_update_end(&__upd_ctx))                        \
+      cs_match((__upd_ctx).b, __upd_ctx.regs.next_sb,                          \
+               __upd_ctx.regs.cmp_scratch)                                     \
+         for (cs_iter_sb_update_first_case(&__upd_ctx);                        \
+              __upd_ctx.next_sb < PANVK_SB_ITER_COUNT;                         \
+              cs_iter_sb_update_next_case(&__upd_ctx))                         \
+            cs_iter_sb_update_case(__upd_ctx)
+
+#endif
+
+static inline void
+cs_next_iter_sb(struct panvk_cmd_buffer *cmdbuf,
+                enum panvk_subqueue_id subqueue, struct cs_index scratch_regs)
+{
+   /* Scoreboard transitions on the fragment subqueue is more complex than just
+    * updating the scoreboard slot, so make sure we never hit that path on a
+    * fragment subqueue. See issue_fragment_jobs() for more details.
+    */
+   assert(subqueue != PANVK_SUBQUEUE_FRAGMENT);
+
+   cs_iter_sb_update(cmdbuf, subqueue, scratch_regs, _) {
+      /* We only want to move to the new scoreboard, so nothing to do here. */
+   }
+}
 
 enum panvk_barrier_stage {
    PANVK_BARRIER_STAGE_FIRST,
@@ -504,41 +673,49 @@ void panvk_per_arch(cmd_inherit_render_state)(
 static inline void
 panvk_per_arch(calculate_task_axis_and_increment)(
    const struct panvk_shader_variant *shader,
-   struct panvk_physical_device *phys_dev, unsigned *task_axis,
-   unsigned *task_increment)
+   struct panvk_physical_device *phys_dev, const struct pan_compute_dim *wg_dim,
+   unsigned *task_axis, unsigned *task_increment)
 {
    /* Pick the task_axis and task_increment to maximize thread
     * utilization. */
-   unsigned threads_per_wg = shader->cs.local_size.x * shader->cs.local_size.y *
-                             shader->cs.local_size.z;
-   unsigned max_thread_cnt = pan_compute_max_thread_count(
-      &phys_dev->kmod.props, shader->info.work_reg_count);
-   unsigned threads_per_task = threads_per_wg;
-   unsigned local_size[3] = {
-      shader->cs.local_size.x,
-      shader->cs.local_size.y,
-      shader->cs.local_size.z,
-   };
+   const struct pan_kmod_dev_props *props = &phys_dev->kmod.dev->props;
+   const unsigned max_thread_cnt =
+      pan_compute_max_thread_count(props, shader->info.work_reg_count);
+   const unsigned threads_per_wg = shader->cs.local_size.x *
+                                   shader->cs.local_size.y *
+                                   shader->cs.local_size.z;
+   const unsigned wg_count[3] = {wg_dim->x, wg_dim->y, wg_dim->z};
+   const unsigned total_wgs = wg_dim->x * wg_dim->y * wg_dim->z;
+   const unsigned total_cores = util_bitcount64(phys_dev->compute_core_mask);
+   /* Split workgroups among cores evenly. */
+   const unsigned wgs_per_core = DIV_ROUND_UP(total_wgs, total_cores);
+   unsigned threads_per_task;
+   unsigned wgs_per_task;
 
-   for (unsigned i = 0; i < 3; i++) {
-      if (threads_per_task * local_size[i] >= max_thread_cnt) {
-         /* We reached out thread limit, stop at the current axis and
-          * calculate the increment so it doesn't exceed the per-core
-          * thread capacity.
-          */
-         *task_increment = max_thread_cnt / threads_per_task;
-         break;
-      } else if (*task_axis == MALI_TASK_AXIS_Z) {
-         /* We reached the Z axis, and there's still room to stuff more
-          * threads. Pick the current axis grid size as our increment
-          * as there's no point using something bigger.
-          */
-         *task_increment = local_size[i];
-         break;
-      }
+   if (!total_wgs) {
+      *task_axis = MALI_TASK_AXIS_X;
+      *task_increment = 1;
+      return;
+   }
 
-      threads_per_task *= local_size[i];
+   /* We used to maximize threads_per_task, but that is ideal when the system
+    * has a single gpu client. When there are multiple gpu clients, we want
+    * smaller threads_per_task such that cores can be more fairly shared among
+    * the clients.
+    */
+   threads_per_task = DIV_ROUND_UP(max_thread_cnt, props->max_tasks_per_core);
+
+   wgs_per_task = threads_per_task / threads_per_wg;
+   wgs_per_task = CLAMP(wgs_per_task, 1, wgs_per_core);
+
+   *task_axis = MALI_TASK_AXIS_X;
+   *task_increment = wgs_per_task;
+   for (unsigned i = 0; i < 2; i++) {
+      if (*task_increment <= wg_count[i])
+         break;
+
       (*task_axis)++;
+      *task_increment /= wg_count[i];
    }
 
    assert(*task_axis <= MALI_TASK_AXIS_Z);

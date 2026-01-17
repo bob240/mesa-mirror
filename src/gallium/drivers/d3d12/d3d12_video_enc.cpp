@@ -73,7 +73,6 @@ d3d12_video_encoder_convert_codec_to_d3d12_enc_codec(enum pipe_video_profile pro
          return D3D12_VIDEO_ENCODER_CODEC_AV1;
       } break;
       case PIPE_VIDEO_FORMAT_MPEG12:
-      case PIPE_VIDEO_FORMAT_MPEG4:
       case PIPE_VIDEO_FORMAT_VC1:
       case PIPE_VIDEO_FORMAT_JPEG:
       case PIPE_VIDEO_FORMAT_VP9:
@@ -991,17 +990,17 @@ d3d12_video_encoder_reconfigure_encoder_objects(struct d3d12_video_encoder *pD3D
          }
 
          //
-         // Prefer individual slice buffers when possible
+         // Prefer single buffer mode when possible
          //
          if (pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
-            D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS_AVAILABLE)
-         {
-            heapFlags |= D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS;
-         }
-         else if (pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
             D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_SINGLE_BUFFER_AVAILABLE)
          {
             heapFlags |= D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_SUBREGION_NOTIFICATION_SINGLE_BUFFER;
+         }
+         else if (pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
+            D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS_AVAILABLE)
+         {
+            heapFlags |= D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS;
          }
 
          if (pD3D12Enc->m_currentEncodeConfig.m_TwoPassEncodeDesc.AppRequested)
@@ -4067,15 +4066,10 @@ d3d12_video_encoder_encode_bitstream_impl(struct pipe_video_codec *codec,
          bitstreamArgs.NotificationMode = D3D12_VIDEO_ENCODER_COMPRESSED_BITSTREAM_NOTIFICATION_MODE_SUBREGIONS;
 
          //
-         // Prefer individual slice buffers when possible
+         // Prefer single buffer mode when possible
          //
-         D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE slicedEncodeBufferMode = D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE_ARRAY_OF_BUFFERS;
+         D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE slicedEncodeBufferMode = D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE_SINGLE_BUFFER;
          if (pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
-            D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS_AVAILABLE)
-         {
-            slicedEncodeBufferMode = D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE_ARRAY_OF_BUFFERS;
-         }
-         else if (pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
             D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_SINGLE_BUFFER_AVAILABLE)
          {
             slicedEncodeBufferMode = D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE_SINGLE_BUFFER;
@@ -4083,6 +4077,11 @@ d3d12_video_encoder_encode_bitstream_impl(struct pipe_video_codec *codec,
             for (uint32_t i = 0; i < num_slice_objects;i++)
                assert(pD3D12Enc->m_pOutputBufferD3D12Resources[i] == pD3D12Enc->m_pOutputBufferD3D12Resources[0]);
    #endif
+         }
+         else if (pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
+            D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS_AVAILABLE)
+         {
+            slicedEncodeBufferMode = D3D12_VIDEO_ENCODER_SUBREGION_COMPRESSED_BITSTREAM_BUFFER_MODE_ARRAY_OF_BUFFERS;
          }
          else
          {
@@ -4836,6 +4835,8 @@ d3d12_video_encoder_get_feedback(struct pipe_video_codec *codec,
          *output_buffer_size,
          pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].comp_bit_destinations[0/*first slice*/]->width0);
       opt_metadata.encode_result |= PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_MAX_FRAME_SIZE_OVERFLOW;
+      if (pMetadata)
+         *pMetadata = opt_metadata;
       assert(false);
    }
 

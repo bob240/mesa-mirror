@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 
 use crate::ir::*;
-use crate::sm70::ShaderModel70;
 use compiler::cfg::CFGBuilder;
 use rustc_hash::FxBuildHasher;
 
@@ -88,9 +87,9 @@ fn disassemble_instrs(instrs: Vec<Instr>, sm: u8) -> Vec<String> {
         io: ShaderIoInfo::None,
     };
 
-    let sm: Box<dyn ShaderModel> = Box::new(ShaderModel70::new(sm));
+    let sm = ShaderModelInfo::new(sm, 0);
     let s = Shader {
-        sm: &*sm,
+        sm: &sm,
         info: info,
         functions: vec![f],
     };
@@ -172,9 +171,9 @@ fn sm_list() -> &'static [u8] {
         assert!(out.status.success());
         let stdout = std::str::from_utf8(&out.stdout).unwrap();
 
-        if stdout.find("cuda_12").is_some() {
+        if stdout.contains("cuda_12") {
             &[70, 75, 80, 86, 89, 90, 100, 120]
-        } else if stdout.find("cuda_13").is_some() {
+        } else if stdout.contains("cuda_13") {
             &[75, 80, 86, 89, 90, 100, 120]
         } else {
             panic!("Unknown nvdisasm version. stdout: {stdout}");
@@ -550,7 +549,10 @@ pub fn test_texture() {
             nodep: true,
             channel_mask: ChannelMask::for_comps(3),
         };
-        c.push(instr, format!("tmml.b.lod.nodep r2, r0, r1, r3, 2d, 0x7;"));
+        c.push(
+            instr,
+            "tmml.b.lod.nodep r2, r0, r1, r3, 2d, 0x7;".to_string(),
+        );
 
         let instr = OpTxd {
             dsts: [Dst::Reg(r0), Dst::Reg(r2)],
@@ -568,7 +570,7 @@ pub fn test_texture() {
         };
         c.push(
             instr,
-            format!("txd.b.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;"),
+            "txd.b.ef.nodep p0, r2, r0, r1, r3, 2d, 0x7;".to_string(),
         );
 
         for tex_query in tex_queries {
