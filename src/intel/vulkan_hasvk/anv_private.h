@@ -65,7 +65,7 @@
 #include "util/u_vector.h"
 #include "util/u_math.h"
 #include "util/vma.h"
-#include "util/xmlconfig.h"
+#include "hasvk_drirc.h"
 #include "vk_alloc.h"
 #include "vk_buffer.h"
 #include "vk_command_buffer.h"
@@ -893,7 +893,7 @@ struct anv_physical_device {
     } memory;
 
     struct anv_memregion                        sys;
-    uint8_t                                     driver_build_sha1[SHA1_DIGEST_LENGTH];
+    uint8_t                                     driver_build_sha1[BLAKE3_KEY_LEN];
     uint8_t                                     pipeline_cache_uuid[VK_UUID_SIZE];
     uint8_t                                     driver_uuid[VK_UUID_SIZE];
     uint8_t                                     device_uuid[VK_UUID_SIZE];
@@ -923,20 +923,7 @@ struct anv_physical_device {
 struct anv_instance {
     struct vk_instance                          vk;
 
-    struct driOptionCache                       dri_options;
-    struct driOptionCache                       available_dri_options;
-
-    /**
-     * Workarounds for game bugs.
-     */
-    uint8_t                                     assume_full_subgroups;
-    bool                                        limit_trig_input_range;
-    bool                                        sample_mask_out_opengl_behaviour;
-    float                                       lower_depth_range_rate;
-    bool                                        report_vk_1_3;
-
-    /* HW workarounds */
-    bool                                        no_16bit;
+    struct hasvk_drirc                          drirc;
 };
 
 VkResult anv_init_wsi(struct anv_physical_device *physical_device);
@@ -988,14 +975,14 @@ struct nir_shader *
 anv_device_search_for_nir(struct anv_device *device,
                           struct vk_pipeline_cache *cache,
                           const struct nir_shader_compiler_options *nir_options,
-                          unsigned char sha1_key[SHA1_DIGEST_LENGTH],
+                          unsigned char blake3_key[BLAKE3_KEY_LEN],
                           void *mem_ctx);
 
 void
 anv_device_upload_nir(struct anv_device *device,
                       struct vk_pipeline_cache *cache,
                       const struct nir_shader *nir,
-                      unsigned char sha1_key[SHA1_DIGEST_LENGTH]);
+                      unsigned char blake3_key[BLAKE3_KEY_LEN]);
 
 struct anv_device {
     struct vk_device                            vk;
@@ -1939,7 +1926,7 @@ struct anv_pipeline_layout {
 
    uint32_t num_sets;
 
-   unsigned char sha1[SHA1_DIGEST_LENGTH];
+   unsigned char blake3[BLAKE3_KEY_LEN];
 };
 
 struct anv_buffer {
@@ -2161,12 +2148,7 @@ anv_pipe_invalidate_bits_for_access_flags(struct anv_device *device,
           * port) to avoid stale data.
           */
          pipe_bits |= ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT;
-         if (device->physical->compiler->indirect_ubos_use_sampler) {
-            pipe_bits |= ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT;
-         } else {
-            pipe_bits |= ANV_PIPE_HDC_PIPELINE_FLUSH_BIT;
-            pipe_bits |= ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT;
-         }
+         pipe_bits |= ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT;
          break;
       case VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT:
       case VK_ACCESS_2_TRANSFER_READ_BIT:
@@ -2182,10 +2164,6 @@ anv_pipe_invalidate_bits_for_access_flags(struct anv_device *device,
           */
          pipe_bits |= ANV_PIPE_CONSTANT_CACHE_INVALIDATE_BIT |
                       ANV_PIPE_TEXTURE_CACHE_INVALIDATE_BIT;
-         if (!device->physical->compiler->indirect_ubos_use_sampler) {
-            pipe_bits |= ANV_PIPE_HDC_PIPELINE_FLUSH_BIT;
-            pipe_bits |= ANV_PIPE_UNTYPED_DATAPORT_CACHE_FLUSH_BIT;
-         }
          break;
       case VK_ACCESS_2_MEMORY_READ_BIT:
          /* Transitioning a buffer for generic read, invalidate all the
@@ -2488,9 +2466,9 @@ struct anv_cmd_state {
    struct anv_state                             binding_tables[MESA_VULKAN_SHADER_STAGES];
    struct anv_state                             samplers[MESA_VULKAN_SHADER_STAGES];
 
-   unsigned char                                sampler_sha1s[MESA_VULKAN_SHADER_STAGES][SHA1_DIGEST_LENGTH];
-   unsigned char                                surface_sha1s[MESA_VULKAN_SHADER_STAGES][SHA1_DIGEST_LENGTH];
-   unsigned char                                push_sha1s[MESA_VULKAN_SHADER_STAGES][SHA1_DIGEST_LENGTH];
+   unsigned char                                sampler_blake3s[MESA_VULKAN_SHADER_STAGES][BLAKE3_KEY_LEN];
+   unsigned char                                surface_blake3s[MESA_VULKAN_SHADER_STAGES][BLAKE3_KEY_LEN];
+   unsigned char                                push_blake3s[MESA_VULKAN_SHADER_STAGES][BLAKE3_KEY_LEN];
 
    /**
     * Whether or not the gfx8 PMA fix is enabled.  We ensure that, at the top
@@ -2709,9 +2687,9 @@ struct anv_event {
         __tmp &= ~(1 << (stage)))
 
 struct anv_pipeline_bind_map {
-   unsigned char                                surface_sha1[SHA1_DIGEST_LENGTH];
-   unsigned char                                sampler_sha1[SHA1_DIGEST_LENGTH];
-   unsigned char                                push_sha1[SHA1_DIGEST_LENGTH];
+   unsigned char                                surface_blake3[BLAKE3_KEY_LEN];
+   unsigned char                                sampler_blake3[BLAKE3_KEY_LEN];
+   unsigned char                                push_blake3[BLAKE3_KEY_LEN];
 
    uint32_t surface_count;
    uint32_t sampler_count;
@@ -2941,7 +2919,7 @@ ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(vs, MESA_SHADER_VERTEX)
 ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(tcs, MESA_SHADER_TESS_CTRL)
 ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(tes, MESA_SHADER_TESS_EVAL)
 ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(gs, MESA_SHADER_GEOMETRY)
-ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(wm, MESA_SHADER_FRAGMENT)
+ANV_DECL_GET_GRAPHICS_PROG_DATA_FUNC(fs, MESA_SHADER_FRAGMENT)
 
 static inline const struct elk_cs_prog_data *
 get_cs_prog_data(const struct anv_compute_pipeline *pipeline)
@@ -3686,8 +3664,6 @@ anv_add_pending_pipe_bits(struct anv_cmd_buffer* cmd_buffer,
 
 struct anv_performance_configuration_intel {
    struct vk_object_base      base;
-
-   struct intel_perf_registers *register_config;
 
    uint64_t                   config_id;
 };

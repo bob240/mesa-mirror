@@ -72,6 +72,7 @@ struct amdgpu_ib {
 
 struct amdgpu_fence_list {
    struct pipe_fence_handle    **list;
+   uint64_t                    *points;
    unsigned                    num;
    unsigned                    max;
 };
@@ -249,7 +250,6 @@ static inline struct amdgpu_cs *
 amdgpu_cs(struct radeon_cmdbuf *rcs)
 {
    struct amdgpu_cs *acs = (struct amdgpu_cs*)rcs->priv;
-   assert(acs);
    return acs;
 }
 
@@ -275,7 +275,10 @@ amdgpu_bo_is_referenced_by_cs_with_usage(struct amdgpu_cs *acs,
                                          struct amdgpu_winsys_bo *bo,
                                          unsigned usage)
 {
-   struct amdgpu_cs_buffer *buffer = amdgpu_lookup_buffer_any_type(amdgpu_csc_get_current(acs), bo);
+   struct amdgpu_cs_buffer *buffer;
+   assert(acs);
+
+   buffer = amdgpu_lookup_buffer_any_type(amdgpu_csc_get_current(acs), bo);
 
    return buffer && (buffer->usage & usage) != 0;
 }

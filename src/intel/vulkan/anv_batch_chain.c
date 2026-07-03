@@ -75,8 +75,7 @@ anv_reloc_list_init_clone(struct anv_reloc_list *list,
       list->deps =
          vk_alloc(list->alloc, list->dep_words * sizeof(BITSET_WORD), 8,
                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      memcpy(list->deps, other_list->deps,
-             list->dep_words * sizeof(BITSET_WORD));
+      __bitset_copy(list->deps, other_list->deps, list->dep_words);
    } else {
       list->deps = NULL;
    }
@@ -109,8 +108,7 @@ anv_reloc_list_grow_deps(struct anv_reloc_list *list,
    list->deps = new_deps;
 
    /* Zero out the new data */
-   memset(list->deps + list->dep_words, 0,
-          (new_length - list->dep_words) * sizeof(BITSET_WORD));
+   __bitset_zero(list->deps + list->dep_words, new_length - list->dep_words);
    list->dep_words = new_length;
 
    return VK_SUCCESS;
@@ -139,7 +137,7 @@ static void
 anv_reloc_list_clear(struct anv_reloc_list *list)
 {
    if (list->dep_words > 0)
-      memset(list->deps, 0, list->dep_words * sizeof(BITSET_WORD));
+      __bitset_zero(list->deps, list->dep_words);
 }
 
 VkResult
@@ -270,6 +268,9 @@ anv_batch_bo_create(struct anv_cmd_buffer *cmd_buffer,
    if (result != VK_SUCCESS)
       goto fail_bo_alloc;
 
+   ANV_ADDR_BINDING_REPORT_BO_BIND(cmd_buffer->device, &cmd_buffer->vk.base,
+                                   bbo->bo);
+
    *bbo_out = bbo;
 
    return VK_SUCCESS;
@@ -379,6 +380,8 @@ anv_batch_bo_destroy(struct anv_batch_bo *bbo,
                      struct anv_cmd_buffer *cmd_buffer)
 {
    anv_reloc_list_finish(&bbo->relocs);
+   ANV_ADDR_BINDING_REPORT_BO_UNBIND(cmd_buffer->device, &cmd_buffer->vk.base,
+                                     bbo->bo);
    ANV_DMR_BO_FREE(&cmd_buffer->vk.base, bbo->bo);
    anv_bo_pool_free(&cmd_buffer->device->batch_bo_pool, bbo->bo);
    vk_free(&cmd_buffer->vk.pool->alloc, bbo);
@@ -453,11 +456,14 @@ anv_cmd_buffer_surface_base_address(struct anv_cmd_buffer *cmd_buffer)
       }
    }
 
-   struct anv_state_pool *pool = &cmd_buffer->device->binding_table_pool;
+   struct anv_state_pool *pool = anv_device_get_binding_table_pool(cmd_buffer->device);
    struct anv_state *bt_block = u_vector_head(&cmd_buffer->bt_block_states);
    return (struct anv_address) {
       .bo = pool->block_pool.bo,
-      .offset = bt_block->offset - pool->start_offset,
+      .offset = cmd_buffer->device->info->verx10 >= 125 ?
+                ROUND_DOWN_TO(bt_block->offset - pool->start_offset,
+                              BINDING_TABLE_VIEW_SIZE) :
+                (bt_block->offset - pool->start_offset),
    };
 }
 
@@ -721,15 +727,15 @@ anv_cmd_buffer_alloc_binding_table(struct anv_cmd_buffer *cmd_buffer,
    cmd_buffer->bt_next.map += bt_size;
    cmd_buffer->bt_next.alloc_size -= bt_size;
 
+   struct anv_state *bt_block = u_vector_head(&cmd_buffer->bt_block_states);
    if (cmd_buffer->device->info->verx10 >= 125) {
+      state.offset += bt_block->offset % BINDING_TABLE_VIEW_SIZE;
       /* We're using 3DSTATE_BINDING_TABLE_POOL_ALLOC to change the binding
        * table address independently from surface state base address.  We no
        * longer need any sort of offsetting.
        */
       *state_offset = 0;
    } else {
-      struct anv_state *bt_block = u_vector_head(&cmd_buffer->bt_block_states);
-
       assert(bt_block->offset < 0);
       *state_offset = -bt_block->offset;
    }
@@ -807,7 +813,7 @@ anv_cmd_buffer_alloc_space(struct anv_cmd_buffer *cmd_buffer,
 
       return (struct anv_cmd_alloc) {
          .address = anv_state_pool_state_address(
-            &cmd_buffer->device->dynamic_state_pool,
+            anv_device_get_dynamic_state_pool(cmd_buffer->device),
             state),
          .map = state.map,
          .size = size,
@@ -1071,7 +1077,7 @@ anv_cmd_buffer_end_batch_buffer(struct anv_cmd_buffer *cmd_buffer)
        * actual ExecuteCommands implementation.
        */
       const uint32_t length = cmd_buffer->batch.next - cmd_buffer->batch.start;
-      if (!(cmd_buffer->device->physical->instance->debug & ANV_DEBUG_NO_SECONDARY_CALL)) {
+      if (!ANV_DEBUG(NO_SECONDARY_CALL)) {
          cmd_buffer->exec_mode = ANV_CMD_BUFFER_EXEC_MODE_CALL_AND_RETURN;
 
          void *jump_addr =
@@ -1123,19 +1129,15 @@ anv_cmd_buffer_end_batch_buffer(struct anv_cmd_buffer *cmd_buffer)
    cmd_buffer->total_batch_size += batch_bo->length;
 }
 
-static VkResult
-anv_cmd_buffer_add_seen_bbos(struct anv_cmd_buffer *cmd_buffer,
-                             struct list_head *list)
+static void
+anv_cmd_buffer_add_seen_bbos(struct anv_cmd_buffer *primary,
+                             struct anv_cmd_buffer *secondary)
 {
-   list_for_each_entry(struct anv_batch_bo, bbo, list, link) {
-      struct anv_batch_bo **bbo_ptr = u_vector_add(&cmd_buffer->seen_bbos);
-      if (bbo_ptr == NULL)
-         return vk_error(cmd_buffer, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-      *bbo_ptr = bbo;
+   struct anv_batch_bo **bbo;
+   u_vector_foreach(bbo, &secondary->seen_bbos) {
+      struct anv_batch_bo **bbo_ptr = u_vector_add(&primary->seen_bbos);
+      *bbo_ptr = *bbo;
    }
-
-   return VK_SUCCESS;
 }
 
 void
@@ -1164,7 +1166,7 @@ anv_cmd_buffer_add_secondary(struct anv_cmd_buffer *primary,
        */
       anv_batch_bo_link(primary, last_bbo, this_bbo, offset);
 
-      anv_cmd_buffer_add_seen_bbos(primary, &secondary->batch_bos);
+      anv_cmd_buffer_add_seen_bbos(primary, secondary);
       break;
    }
    case ANV_CMD_BUFFER_EXEC_MODE_COPY_AND_CHAIN: {
@@ -1172,10 +1174,20 @@ anv_cmd_buffer_add_secondary(struct anv_cmd_buffer *primary,
       VkResult result = anv_batch_bo_list_clone(&secondary->batch_bos,
                                                 secondary,
                                                 &copy_list);
-      if (result != VK_SUCCESS)
+      if (result != VK_SUCCESS) {
+         anv_batch_set_error(&primary->batch, result);
          return; /* FIXME */
+      }
 
-      anv_cmd_buffer_add_seen_bbos(primary, &copy_list);
+      list_for_each_entry(struct anv_batch_bo, bbo, &copy_list, link) {
+         struct anv_batch_bo **bbo_ptr = u_vector_add(&primary->seen_bbos);
+         if (bbo_ptr == NULL) {
+            anv_batch_set_error(&primary->batch,
+                                VK_ERROR_OUT_OF_HOST_MEMORY);
+            return;
+         }
+         *bbo_ptr = bbo;
+      }
 
       struct anv_batch_bo *first_bbo =
          list_first_entry(&copy_list, struct anv_batch_bo, link);
@@ -1200,7 +1212,7 @@ anv_cmd_buffer_add_secondary(struct anv_cmd_buffer *primary,
          (struct anv_address) { .bo = first_bbo->bo },
          secondary->return_addr);
 
-      anv_cmd_buffer_add_seen_bbos(primary, &secondary->batch_bos);
+      anv_cmd_buffer_add_seen_bbos(primary, secondary);
       break;
    }
    default:
@@ -1335,6 +1347,16 @@ anv_queue_exec_locked(struct anv_queue *queue,
    struct anv_device *device = queue->device;
    VkResult result = VK_SUCCESS;
 
+#if ANV_SUPPORT_RT
+   /* The application could begin resetting command buffers before the
+    * submission thread actually reaches anv_dump_bvh_to_files, so we
+    * have to steal the BVH dump list earlier while we're still certain
+    * the command buffer is in the pending state.
+    */
+   struct list_head bvh_dumps;
+   anv_get_pending_bvh_dumps(&bvh_dumps, cmd_buffer_count, cmd_buffers);
+#endif
+
    /* We only need to synchronize the main & companion command buffers if we
     * have a companion command buffer somewhere in the list of command
     * buffers.
@@ -1360,6 +1382,11 @@ anv_queue_exec_locked(struct anv_queue *queue,
          perf_query_pool,
          perf_query_pass,
          utrace_submit);
+
+#if ANV_SUPPORT_RT
+   anv_dump_bvh_to_files(queue->device, &bvh_dumps);
+#endif
+
    if (result != VK_SUCCESS)
       return result;
 

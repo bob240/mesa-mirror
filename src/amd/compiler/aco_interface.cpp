@@ -12,8 +12,6 @@
 
 #include "ac_gpu_info.h"
 #include "nir.h"
-#include <array>
-#include <iostream>
 #include <vector>
 
 using namespace aco;
@@ -202,9 +200,6 @@ aco_compile_shader_part(const struct aco_compiler_options* options,
    program->collect_statistics = options->record_stats;
    memset(&program->statistics, 0, sizeof(program->statistics));
 
-   program->debug.func = options->debug.func;
-   program->debug.private_data = options->debug.private_data;
-
    program->is_prolog = is_prolog;
    program->is_epilog = !is_prolog;
 
@@ -222,7 +217,7 @@ aco_compile_shader_part(const struct aco_compiler_options* options,
    if (options->record_asm)
       disasm = get_disasm_string(program.get(), options->family, code, exec_size);
 
-   (*build_binary)(binary, config.num_sgprs, config.num_vgprs, code.data(), code.size(),
+   (*build_binary)(binary, config.num_sgprs, config.num_vgprs, exec_size, code.data(), code.size(),
                    disasm.data(), disasm.size());
 }
 
@@ -240,9 +235,6 @@ aco_compile_shader(const struct aco_compiler_options* options, const struct aco_
 
    program->collect_statistics = options->record_stats;
    memset(&program->statistics, 0, sizeof(program->statistics));
-
-   program->debug.func = options->debug.func;
-   program->debug.private_data = options->debug.private_data;
 
    /* Instruction Selection */
    select_program(program.get(), shader_count, shaders, &config, options, info, args);
@@ -268,49 +260,6 @@ aco_compile_shader(const struct aco_compiler_options* options, const struct aco_
    (*build_binary)(binary, &config, llvm_ir.c_str(), llvm_ir.size(), disasm.c_str(), disasm.size(),
                    &program->statistics, exec_size, code.data(), code.size(), symbols.data(),
                    symbols.size(), program->debug_info.data(), program->debug_info.size());
-}
-
-void
-aco_compile_rt_prolog(const struct aco_compiler_options* options,
-                      const struct aco_shader_info* info, const struct ac_shader_args* in_args,
-                      const struct ac_arg* descriptors, unsigned raygen_param_count,
-                      nir_parameter* raygen_params, aco_callback* build_prolog, void** binary)
-{
-   init();
-
-   /* create program */
-   ac_shader_config config = {0};
-   std::unique_ptr<Program> program{new Program};
-   program->collect_statistics = false;
-   program->debug.func = NULL;
-   program->debug.private_data = NULL;
-
-   select_rt_prolog(program.get(), &config, options, info, in_args, descriptors, raygen_param_count,
-                    raygen_params);
-   validate(program.get());
-   insert_waitcnt(program.get());
-   insert_NOPs(program.get());
-   if (program->gfx_level >= GFX11)
-      insert_delay_alu(program.get());
-   if (program->gfx_level >= GFX10)
-      form_hard_clauses(program.get());
-   if (program->gfx_level >= GFX11)
-      combine_delay_alu(program.get());
-
-   if (options->dump_ir)
-      aco_print_program(program.get(), stderr);
-
-   /* assembly */
-   std::vector<uint32_t> code;
-   code.reserve(align(program->blocks[0].instructions.size() * 2, 16));
-   unsigned exec_size = emit_program(program.get(), code);
-
-   std::string disasm;
-   if (options->record_asm)
-      disasm = get_disasm_string(program.get(), options->family, code, exec_size);
-
-   (*build_prolog)(binary, &config, NULL, 0, disasm.c_str(), disasm.size(), NULL, exec_size,
-                   code.data(), code.size(), NULL, 0, NULL, 0);
 }
 
 void
@@ -347,7 +296,7 @@ aco_compile_vs_prolog(const struct aco_compiler_options* options,
    if (options->record_asm)
       disasm = get_disasm_string(program.get(), options->family, code, exec_size);
 
-   (*build_prolog)(binary, config.num_sgprs, config.num_vgprs, code.data(), code.size(),
+   (*build_prolog)(binary, config.num_sgprs, config.num_vgprs, exec_size, code.data(), code.size(),
                    disasm.data(), disasm.size());
 }
 
@@ -437,6 +386,7 @@ aco_is_gpu_supported(const struct radeon_info* info)
    case GFX10_3:
    case GFX11:
    case GFX11_5:
+   case GFX11_7:
    case GFX12:
       return true;
    default:

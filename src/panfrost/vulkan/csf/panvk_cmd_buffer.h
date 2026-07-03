@@ -34,7 +34,11 @@ struct panvk_sync_scope {
 
 #define MAX_VBS 16
 #define MAX_RTS 8
+#if PAN_ARCH >= 14
+#define MAX_LAYERS_PER_TILER_DESC 256
+#else
 #define MAX_LAYERS_PER_TILER_DESC 8
+#endif
 
 struct panvk_cs_sync32 {
    uint32_t seqno;
@@ -61,18 +65,36 @@ enum panvk_incremental_rendering_pass {
    PANVK_IR_PASS_COUNT
 };
 
-struct panvk_ir_fbd_info {
-   uint32_t word0;
-   uint32_t word6;
-   uint32_t word7;
-   uint32_t word12;
-};
+#if PAN_ARCH >= 14
+/* Framebuffer per-layer state. Keep this structure 64-byte aligned, since
+ * we want the adjacent ZS_CRC_EXTENSION and RENDER_TARGET descriptors
+ * aligned. */
+struct panvk_fb_layer_state {
+   /** GPU address to the tiler descriptor. */
+   uint64_t tiler;
 
-struct panvk_ir_desc_info {
-   struct panvk_ir_fbd_info fbd;
-   uint32_t crc_zs_word0;
-   uint32_t rtd_word1[MAX_RTS];
-};
+   /** Frame argument. */
+   uint64_t frame_argument;
+
+   /** An instance of Fragment Flags 0. */
+   struct mali_fragment_flags_0_packed flags0;
+
+   /** An instance of Fragment Flags 2. */
+   struct mali_fragment_flags_2_packed flags2;
+
+   /** Z clear value. */
+   uint32_t z_clear;
+
+   /** GPU address to the draw call descriptors. It may be 0. */
+   uint64_t dcd_pointer;
+
+   /** GPU address to the ZS_CRC_EXTENSION descriptor. It may be 0. */
+   uint64_t dbd_pointer;
+
+   /** GPU address to the RENDER_TARGET descriptors. */
+   uint64_t rtd_pointer;
+} __attribute__((aligned(64)));
+#endif /* PAN_ARCH >= 14 */
 
 static inline uint32_t
 get_tiler_oom_handler_idx(bool has_zs_ext, uint32_t rt_count)
@@ -87,7 +109,11 @@ static inline uint32_t
 get_fbd_size(bool has_zs_ext, uint32_t rt_count)
 {
    assert(rt_count >= 1 && rt_count <= MAX_RTS);
+#if PAN_ARCH >= 14
+   uint32_t fbd_size = ALIGN_POT(sizeof(struct panvk_fb_layer_state), 64);
+#else
    uint32_t fbd_size = pan_size(FRAMEBUFFER);
+#endif
    if (has_zs_ext)
       fbd_size += pan_size(ZS_CRC_EXTENSION);
    fbd_size += pan_size(RENDER_TARGET) * rt_count;
@@ -138,8 +164,10 @@ struct panvk_cs_subqueue_context {
       uint64_t layer_fbd_ptr;
       /* Pointer to scratch FBD used in the event of IR */
       uint64_t ir_scratch_fbd_ptr;
-      /* Partial descriptor data needed in the event of IR */
-      struct panvk_ir_desc_info ir_desc_infos[PANVK_IR_PASS_COUNT];
+      /* FBD+DBD+RTDs IR descs to be copied to the scratch FBD when
+       * IR is triggered.
+       */
+      uint64_t ir_descs[PANVK_IR_PASS_COUNT];
       uint32_t td_count;
       uint32_t layer_count;
    } tiler_oom_ctx;
@@ -148,6 +176,11 @@ struct panvk_cs_subqueue_context {
          uint64_t cs;
       } tracebuf;
    } debug;
+   /* Non-zero when draws should execute, zero when they should be
+    * skipped. Written by the primary before cs_call, read by inherited
+    * secondaries at each draw/dispatch.
+    */
+   uint32_t cond_render_flag;
 } __attribute__((aligned(64)));
 
 struct panvk_cache_flush_info {
@@ -170,7 +203,6 @@ struct panvk_cs_deps {
       enum mali_cs_condition cond;
       struct cs_index cond_value;
    } dst[PANVK_SUBQUEUE_COUNT];
-   bool needs_layout_transitions;
 };
 
 enum panvk_sb_ids {
@@ -188,6 +220,21 @@ enum panvk_sb_ids {
 #define SB_ITER(x)      (PANVK_SB_ITER_START + (x))
 #define SB_WAIT_ITER(x) BITFIELD_BIT(PANVK_SB_ITER_START + (x))
 
+/* We use different resource registers for different types of compute shader
+ * dispatch, to avoid dirtying all the registers when switching from one to
+ * the other */
+#define PANVK_COMPUTE_SRT     MALI_COMPUTE_SR_SRT_0
+#define PANVK_COMPUTE_FAU     MALI_COMPUTE_SR_FAU_0
+#define PANVK_COMPUTE_SPD     MALI_COMPUTE_SR_SPD_0
+#define PANVK_COMPUTE_TSD     MALI_COMPUTE_SR_TSD_0
+#define PANVK_COMPUTE_RES_SEL cs_shader_res_sel(0, 0, 0, 0)
+
+#define PANVK_PRECOMP_SRT     MALI_COMPUTE_SR_SRT_1
+#define PANVK_PRECOMP_FAU     MALI_COMPUTE_SR_FAU_1
+#define PANVK_PRECOMP_SPD     MALI_COMPUTE_SR_SPD_1
+#define PANVK_PRECOMP_TSD     MALI_COMPUTE_SR_TSD_1
+#define PANVK_PRECOMP_RES_SEL cs_shader_res_sel(1, 1, 1, 1)
+
 enum panvk_cs_regs {
    /* RUN_IDVS staging regs. */
    PANVK_CS_REG_RUN_IDVS_SR_START = 0,
@@ -200,13 +247,39 @@ enum panvk_cs_regs {
    PANVK_CS_REG_RUN_IDVS_SR_END = 60,
 #endif
 
+#if PAN_ARCH >= 14
+   /* RUN_FRAGMENT2 staging regs.
+    * SW ABI:
+    * - r58:59 contain the pointer to the first tiler descriptor. This is
+    *   needed to gather completed heap chunks after a run_fragment2.
+    */
+   PANVK_CS_REG_RUN_FRAGMENT_SR_START = 0,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_END = 55,
+   PANVK_CS_REG_TILER_DESC_PTR = 58,
+
+   /* RUN_FRAGMENT2 RW staging regs. The rest are initialized to zero at
+    * command stream initialization, and should never be touched again. */
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_START = 28,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_END = 47,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_1_START = 52,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_1_END = 52,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_2_START = 54,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_2_END = 55,
+#else
    /* RUN_FRAGMENT staging regs.
     * SW ABI:
-    * - r38:39 contain the pointer to the first tiler descriptor. This is
+    * - r58:59 contain the pointer to the first tiler descriptor. This is
     *   needed to gather completed heap chunks after a run_fragment.
     */
    PANVK_CS_REG_RUN_FRAGMENT_SR_START = 38,
    PANVK_CS_REG_RUN_FRAGMENT_SR_END = 46,
+   PANVK_CS_REG_TILER_DESC_PTR = 58,
+
+   /* RUN_FRAGMENT RW staging regs. The rest are initialized to zero at
+    * command stream initialization, and should never be touched again. */
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_START = 0,
+   PANVK_CS_REG_RUN_FRAGMENT_SR_RANGE_0_END = 43,
+#endif
 
    /* RUN_COMPUTE staging regs. */
    PANVK_CS_REG_RUN_COMPUTE_SR_START = 0,
@@ -386,7 +459,17 @@ panvk_cs_reg_whitelist(progress_seqno, PANVK_CS_REG_RANGE(PROGRESS_SEQNO));
 panvk_cs_reg_whitelist(compute_ctx, PANVK_CS_REG_RANGE(RUN_COMPUTE_SR));
 #define cs_update_compute_ctx(__b) panvk_cs_reg_upd_ctx(__b, compute_ctx)
 
-panvk_cs_reg_whitelist(frag_ctx, PANVK_CS_REG_RANGE(RUN_FRAGMENT_SR));
+#if PAN_ARCH >= 14
+#define PANVK_RUN_FRAG_SR_WHITELIST_RANGES                                     \
+   PANVK_CS_REG_RANGE(RUN_FRAGMENT_SR_RANGE_0),                                \
+      PANVK_CS_REG_RANGE(RUN_FRAGMENT_SR_RANGE_1),                             \
+      PANVK_CS_REG_RANGE(RUN_FRAGMENT_SR_RANGE_2)
+#else
+#define PANVK_RUN_FRAG_SR_WHITELIST_RANGES                                     \
+   PANVK_CS_REG_RANGE(RUN_FRAGMENT_SR_RANGE_0)
+#endif
+
+panvk_cs_reg_whitelist(frag_ctx, PANVK_RUN_FRAG_SR_WHITELIST_RANGES);
 #define cs_update_frag_ctx(__b) panvk_cs_reg_upd_ctx(__b, frag_ctx)
 
 panvk_cs_reg_whitelist(vt_ctx, PANVK_CS_REG_RANGE(RUN_IDVS_SR));
@@ -400,6 +483,13 @@ struct panvk_tls_state {
    struct pan_ptr desc;
    struct pan_tls_info info;
    unsigned max_wg_count;
+};
+
+struct panvk_cond_render_state {
+   bool enabled;
+   bool inherited;
+   uint64_t addr;
+   enum mali_cs_condition exec_cond;
 };
 
 struct panvk_cmd_buffer {
@@ -421,11 +511,66 @@ struct panvk_cmd_buffer {
       struct panvk_cs_state cs[PANVK_SUBQUEUE_COUNT];
       struct panvk_tls_state tls;
       bool contains_timestamp_queries;
+
+      struct panvk_cond_render_state cond_render;
    } state;
 };
 
 VK_DEFINE_HANDLE_CASTS(panvk_cmd_buffer, vk.base, VkCommandBuffer,
                        VK_OBJECT_TYPE_COMMAND_BUFFER)
+
+struct panvk_cond_render_ctx {
+   bool active;
+   struct cs_if_else if_else;
+};
+
+static inline struct panvk_cond_render_ctx *
+panvk_cond_render_begin(struct panvk_cmd_buffer *cmdbuf, struct cs_builder *b,
+                        struct panvk_cond_render_ctx *ctx)
+{
+   ctx->active =
+      cmdbuf->state.cond_render.enabled || cmdbuf->state.cond_render.inherited;
+
+   if (ctx->active) {
+      struct cs_index pred_val = cs_scratch_reg32(b, 16);
+
+      if (cmdbuf->state.cond_render.enabled) {
+         /* Direct: load predicate from the buffer. */
+         struct cs_index pred_addr = cs_scratch_reg64(b, 14);
+
+         cs_move64_to(b, pred_addr, cmdbuf->state.cond_render.addr);
+         cs_load32_to(b, pred_val, pred_addr, 0);
+         cs_if_start(b, &ctx->if_else, cmdbuf->state.cond_render.exec_cond,
+                     pred_val);
+      } else {
+         /* Inherited: load flag from subqueue context. */
+         cs_load32_to(b, pred_val, cs_subqueue_ctx_reg(b),
+                      offsetof(struct panvk_cs_subqueue_context,
+                               cond_render_flag));
+         cs_if_start(b, &ctx->if_else, MALI_CS_CONDITION_NEQUAL, pred_val);
+      }
+   }
+
+   return ctx;
+}
+
+static inline void
+panvk_cond_render_end(struct cs_builder *b, struct panvk_cond_render_ctx *ctx)
+{
+   if (ctx->active)
+      cs_if_end(b, &ctx->if_else);
+}
+
+/* Wrap GPU commands (draws/dispatches) with conditional rendering.
+ * When conditional rendering is inactive, the body executes with zero
+ * overhead. When active, the body is wrapped in a cs_if that loads
+ * the predicate from the buffer and branches over the commands if
+ * the condition says to skip.
+ */
+#define panvk_cond_render(cmdbuf, b)                                           \
+   for (struct panvk_cond_render_ctx __cond_ctx,                               \
+        *__cond_p = panvk_cond_render_begin(cmdbuf, b, &__cond_ctx);           \
+        __cond_p != NULL; panvk_cond_render_end(b, __cond_p), __cond_p = NULL)
 
 static bool
 inherits_render_ctx(struct panvk_cmd_buffer *cmdbuf)
@@ -575,8 +720,8 @@ cs_iter_sb_update_start(struct panvk_cmd_buffer *cmdbuf,
                 offsetof(struct panvk_cs_subqueue_context, iter_sb));
 
    /* Select next scoreboard entry and wrap around if we get past the limit */
-   cs_add32(b, next_sb, next_sb, 1);
-   cs_add32(b, cmp_scratch, next_sb, -SB_ITER(dev->csf.sb.iter_count));
+   cs_add_imm32(b, next_sb, next_sb, 1);
+   cs_add_imm32(b, cmp_scratch, next_sb, -SB_ITER(dev->csf.sb.iter_count));
 
    cs_if(b, MALI_CS_CONDITION_GEQUAL, cmp_scratch) {
       cs_move32_to(b, next_sb, SB_ITER(0));
@@ -652,14 +797,8 @@ cs_next_iter_sb(struct panvk_cmd_buffer *cmdbuf,
    }
 }
 
-enum panvk_barrier_stage {
-   PANVK_BARRIER_STAGE_FIRST,
-   PANVK_BARRIER_STAGE_AFTER_LAYOUT_TRANSITION,
-};
-
 void panvk_per_arch(add_cs_deps)(
    struct panvk_cmd_buffer *cmdbuf,
-   enum panvk_barrier_stage barrier_stage,
    const VkDependencyInfo *in,
    struct panvk_cs_deps *out,
    bool is_set_event);
@@ -722,6 +861,13 @@ panvk_per_arch(calculate_task_axis_and_increment)(
    assert(*task_increment > 0);
 }
 
+void panvk_per_arch(cmd_dispatch_shader)(
+   struct panvk_cmd_buffer *cmdbuf,
+   const struct panvk_shader_variant *cs,
+   const struct panvk_shader_desc_state *cs_desc_state,
+   uint64_t push_uniforms, uint64_t tsd,
+   const struct panvk_dispatch_info *info);
+
 static VkPipelineStageFlags2
 panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
 {
@@ -730,17 +876,20 @@ panvk_get_subqueue_stages(enum panvk_subqueue_id subqueue)
       return VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
              VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT |
              VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+             VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+             VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
    case PANVK_SUBQUEUE_FRAGMENT:
       return VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
              VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
-             VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT;
+             VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_CLEAR_BIT |
+             VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
    case PANVK_SUBQUEUE_COMPUTE:
       return VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-             VK_PIPELINE_STAGE_2_COPY_BIT;
+             VK_PIPELINE_STAGE_2_COPY_BIT |
+             VK_PIPELINE_STAGE_2_CONDITIONAL_RENDERING_BIT_EXT;
    default:
       UNREACHABLE("Invalid subqueue id");
    }
@@ -795,19 +944,30 @@ vk_stages_to_subqueue_mask(VkPipelineStageFlags2 vk_stages,
 
 void panvk_per_arch(emit_barrier)(struct panvk_cmd_buffer *cmdbuf,
                                   struct panvk_cs_deps deps);
-#if PAN_ARCH >= 10
 
-void panvk_per_arch(cs_patch_ir_state)(
-   struct cs_builder *b, const struct cs_tracing_ctx *tracing_ctx,
-   bool has_zs_ext, uint32_t rt_count, struct cs_index remaining_layers_in_td,
-   struct cs_index current_fbd_ptr_reg, struct cs_index ir_desc_info_ptr,
-   struct cs_index ir_fbd_word_0, struct cs_index scratch_fbd_ptr_reg,
-   struct cs_index scratch_registers_5);
+#if PAN_ARCH >= 14
+static inline void
+cs_emit_layer_fragment_state(struct cs_builder *b, struct cs_index fbd_ptr)
+{
+   /* Emit the dynamic fragment state. This state may change per-layer. */
 
-void panvk_per_arch(cs_ir_update_registers_to_next_layer)(
-   struct cs_builder *b, bool has_zs_ext, uint32_t rt_count,
-   struct cs_index current_fbd_ptr_reg, struct cs_index ir_fbd_word_0,
-   struct cs_index remaining_layers_in_td);
-#endif /* PAN_ARCH >= 10 */
+   cs_load32_to(b, cs_sr_reg32(b, FRAGMENT, FLAGS_0), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, flags0));
+   cs_load32_to(b, cs_sr_reg32(b, FRAGMENT, FLAGS_2), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, flags2));
+   cs_load32_to(b, cs_sr_reg32(b, FRAGMENT, Z_CLEAR), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, z_clear));
+   cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, TILER_DESCRIPTOR_POINTER), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, tiler));
+   cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, RTD_POINTER), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, rtd_pointer));
+   cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, DBD_POINTER), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, dbd_pointer));
+   cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, FRAME_ARG), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, frame_argument));
+   cs_load64_to(b, cs_sr_reg64(b, FRAGMENT, FRAME_SHADER_DCD_POINTER), fbd_ptr,
+                offsetof(struct panvk_fb_layer_state, dcd_pointer));
+}
+#endif /* PAN_ARCH >= 14 */
 
 #endif /* PANVK_CMD_BUFFER_H */

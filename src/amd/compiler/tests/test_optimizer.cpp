@@ -474,19 +474,19 @@ BEGIN_TEST(optimize.clamp)
 
       /* correct NaN behaviour with precise */
       if (cfg.min == aco_opcode::v_min_f16 || cfg.min == aco_opcode::v_min_f32) {
-         //~f(16|32)! v1: %res7 = @med3 @ub, @lb, %a
-         //~f(16|32)! p_unit_test 7, %res7
+         //~.*f(16|32)! v1: (NaNPreserve)%res7 = @med3 @ub, @lb, %a
+         //~.*f(16|32)! p_unit_test 7, %res7
          Builder::Result max = bld.vop2(cfg.max, bld.def(v1), cfg.lb, inputs[0]);
-         max.def(0).setPrecise(true);
+         max.def(0).setNaNPreserve(true);
          Builder::Result min = bld.vop2(cfg.min, bld.def(v1), cfg.ub, max);
-         max.def(0).setPrecise(true);
+         min.def(0).setNaNPreserve(true);
          writeout(7, min);
 
-         //~f(16|32)! v1: (precise)%res8_tmp = @min @ub, %a
-         //~f(16|32)! v1: %res8 = @max @lb, %res8_tmp
-         //~f(16|32)! p_unit_test 8, %res8
+         //~.*f(16|32)! v1: (NaNPreserve)%res8_tmp = @min @ub, %a
+         //~.*f(16|32)! v1: %res8 = @max @lb, %res8_tmp
+         //~.*f(16|32)! p_unit_test 8, %res8
          min = bld.vop2(cfg.min, bld.def(v1), cfg.ub, inputs[0]);
-         min.def(0).setPrecise(true);
+         min.def(0).setNaNPreserve(true);
          writeout(8, bld.vop2(cfg.max, bld.def(v1), cfg.lb, min));
       }
 
@@ -2375,4 +2375,29 @@ BEGIN_TEST(optimizer.pk_mul_pk_cvt)
 
       finish_opt_test();
    }
+END_TEST
+
+BEGIN_TEST(optimizer.dotc_dpp)
+   //>>  v1: %a:v[0],  v1: %b:v[1],  v1: %c:v[2],  v1: %d:v[3] = p_startpgm
+   if (!setup_cs("v1 v1 v1 v1", GFX10_3))
+      return;
+
+   Temp a = inputs[0];
+   Temp b = inputs[1];
+   Temp c = inputs[2];
+   Temp d = inputs[3];
+
+   //! v1: %dot2 = v_dot2c_f32_f16 %a, %b, %c dpp8:[0,0,0,0,0,0,0,0] fi
+   //! p_unit_test 0, %dot2
+   Temp dpp = bld.vop1_dpp8(aco_opcode::v_mov_b32, bld.def(v1), a, 0);
+   Temp dot2 = bld.vop3p(aco_opcode::v_dot2_f32_f16, bld.def(v1), dpp, b, c, 0x0, 0x7);
+   writeout(0, dot2);
+
+   //!  v1: %dot4 = v_dot4c_i32_i8 %a, %b, %d row_mirror bound_ctrl:1 fi
+   //! p_unit_test 1, %dot4
+   dpp = bld.vop1_dpp(aco_opcode::v_mov_b32, bld.def(v1), a, dpp_row_mirror);
+   Temp dot4 = bld.vop3p(aco_opcode::v_dot4_i32_i8, bld.def(v1), dpp, b, d, 0x0, 0x7);
+   writeout(1, dot4);
+
+   finish_opt_test();
 END_TEST

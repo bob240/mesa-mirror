@@ -542,6 +542,12 @@ struct gl_constants
    GLboolean AllowGLSL120SubsetIn110;
 
    /**
+    * Allow a embedded structure declarations which were allowed in GLSL 1.10
+    * but are no longer allowed in GLSL 1.20+
+    */
+   GLboolean AllowGLSLEmbeddedStructureDeclarations;
+
+   /**
     * Allow builtins as part of constant expressions. This was not allowed
     * until GLSL 1.20 this allows it everywhere.
     */
@@ -868,8 +874,8 @@ struct gl_constants
    /** GL_ARB_sparse_buffer */
    GLuint SparseBufferPageSize;
 
-   /** Used as an input for sha1 generation in the on-disk shader cache */
-   unsigned char *dri_config_options_sha1;
+   /** Used as an input for blake3 generation in the on-disk shader cache */
+   unsigned char *dri_config_options_blake3;
 
    /** When drivers are OK with mapped buffers during draw and other calls. */
    bool AllowMappedBuffersDuringExecution;
@@ -925,6 +931,7 @@ struct gl_constants
    /** GL_ARB_spirv_extensions */
    struct spirv_supported_extensions *SpirVExtensions;
 
+   char *ForceExplicitUniformLocZero;
    char *VendorOverride;
    char *RendererOverride;
 

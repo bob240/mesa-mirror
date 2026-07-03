@@ -52,7 +52,7 @@ reswizzle_alu_uses(nir_def *def, uint8_t *reswizzle)
 {
    nir_foreach_use(use_src, def) {
       /* all uses must be ALU instructions */
-      assert(nir_src_parent_instr(use_src)->type == nir_instr_type_alu);
+      assert(nir_src_use_instr(use_src)->type == nir_instr_type_alu);
       nir_alu_src *alu_src = (nir_alu_src *)use_src;
 
       /* reswizzle ALU sources */
@@ -65,7 +65,7 @@ static bool
 is_only_used_by_alu(nir_def *def)
 {
    nir_foreach_use(use_src, def) {
-      if (nir_src_parent_instr(use_src)->type != nir_instr_type_alu)
+      if (nir_src_use_instr(use_src)->type != nir_instr_type_alu)
          return false;
    }
 
@@ -81,7 +81,7 @@ shrink_dest_to_read_mask(nir_def *def, bool shrink_start)
 
    /* don't remove any channels if used by an intrinsic */
    nir_foreach_use(use_src, def) {
-      if (nir_src_parent_instr(use_src)->type == nir_instr_type_intrinsic)
+      if (nir_src_use_instr(use_src)->type == nir_instr_type_intrinsic)
          return false;
    }
 
@@ -173,6 +173,9 @@ shrink_intrinsic_to_non_sparse(nir_intrinsic_instr *instr)
    case nir_intrinsic_image_deref_sparse_load:
       instr->intrinsic = nir_intrinsic_image_deref_load;
       break;
+   case nir_intrinsic_image_heap_sparse_load:
+      instr->intrinsic = nir_intrinsic_image_heap_load;
+      break;
    default:
       break;
    }
@@ -242,7 +245,7 @@ opt_shrink_or_split_vector(nir_builder *b, nir_alu_instr *vec)
 
    nir_foreach_use_including_if(src, &vec->def) {
       /* don't remove any channels if used by non-ALU */
-      if (nir_src_is_if(src) || nir_src_parent_instr(src)->type != nir_instr_type_alu)
+      if (nir_src_is_if(src) || nir_src_use_instr(src)->type != nir_instr_type_alu)
          return false;
 
       nir_component_mask_t read = nir_src_components_read(src);
@@ -391,6 +394,7 @@ opt_shrink_vectors_intrinsic(nir_builder *b, nir_intrinsic_instr *instr,
    case nir_intrinsic_image_sparse_load:
    case nir_intrinsic_bindless_image_sparse_load:
    case nir_intrinsic_image_deref_sparse_load:
+   case nir_intrinsic_image_heap_sparse_load:
       return shrink_intrinsic_to_non_sparse(instr);
    default:
       return false;
@@ -496,10 +500,10 @@ opt_shrink_vectors_phi(nir_builder *b, nir_phi_instr *instr)
    /* Check the uses. */
    nir_component_mask_t mask = 0;
    nir_foreach_use(src, def) {
-      if (nir_src_parent_instr(src)->type != nir_instr_type_alu)
+      if (nir_src_use_instr(src)->type != nir_instr_type_alu)
          return false;
 
-      nir_alu_instr *alu = nir_instr_as_alu(nir_src_parent_instr(src));
+      nir_alu_instr *alu = nir_instr_as_alu(nir_src_use_instr(src));
 
       nir_alu_src *alu_src = exec_node_data(nir_alu_src, src, src);
       int src_idx = alu_src - &alu->src[0];
@@ -511,7 +515,7 @@ opt_shrink_vectors_phi(nir_builder *b, nir_phi_instr *instr)
        * This can happen in the case of loops.
        */
       nir_foreach_use(alu_use_src, alu_def) {
-         if (nir_src_parent_instr(alu_use_src) != &instr->instr) {
+         if (nir_src_use_instr(alu_use_src) != &instr->instr) {
             mask |= src_read_mask;
          }
       }
@@ -523,7 +527,7 @@ opt_shrink_vectors_phi(nir_builder *b, nir_phi_instr *instr)
          if (src_idx != alu->src[src_idx].swizzle[0]) {
             mask |= src_read_mask;
          }
-      } else if (!nir_alu_src_is_trivial_ssa(alu, src_idx)) {
+      } else if (!nir_alu_has_trivial_src(alu, src_idx)) {
          mask |= src_read_mask;
       }
    }

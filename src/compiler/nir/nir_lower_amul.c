@@ -83,6 +83,8 @@ lower_large_src(nir_src *src, void *s)
    if (parent->pass_flags)
       return false;
 
+   parent->pass_flags = 1;
+
    nir_foreach_src(parent, lower_large_src, state);
 
    if (parent->type == nir_instr_type_alu) {
@@ -92,8 +94,6 @@ lower_large_src(nir_src *src, void *s)
          state->progress = true;
       }
    }
-
-   parent->pass_flags = 1;
 
    return true;
 }
@@ -153,6 +153,7 @@ lower_intrinsic(lower_state *state, nir_intrinsic_instr *intr)
    case nir_intrinsic_global_atomic_swap:
    case nir_intrinsic_load_global_constant:
    case nir_intrinsic_load_global:
+   case nir_intrinsic_load_global_transpose_amd:
    case nir_intrinsic_load_pixel_local:
       /* just assume that 24b is not sufficient: */
       lower_large_src(&intr->src[0], state);

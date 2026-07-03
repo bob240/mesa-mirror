@@ -20,7 +20,7 @@
 #include <sys/types.h>
 #include <xf86drm.h>
 
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 
 #include "wsi_common.h"
 
@@ -44,8 +44,11 @@ struct pvr_physical_device {
 
    char *render_path;
    char *display_path;
+   bool has_primary;
 
-   /* primary node (cardN) of the render device */
+   /* primary node (cardN) of the render device
+    * Only valid when has_primary is true.
+    */
    dev_t primary_devid;
    /* render node (renderN) of the render device */
    dev_t render_devid;
@@ -62,14 +65,30 @@ struct pvr_physical_device {
 
    struct pvr_format_table formats;
 
-   uint8_t device_uuid[SHA1_DIGEST_LENGTH];
-   uint8_t cache_uuid[SHA1_DIGEST_LENGTH];
+   uint8_t device_uuid[BLAKE3_KEY_LEN];
+   uint8_t cache_uuid[BLAKE3_KEY_LEN];
 };
 
 VK_DEFINE_HANDLE_CASTS(pvr_physical_device,
                        vk.base,
                        VkPhysicalDevice,
                        VK_OBJECT_TYPE_PHYSICAL_DEVICE)
+
+static void
+pvr_get_render_area_granularity(struct pvr_physical_device *pdevice,
+                                VkExtent2D *granularity)
+{
+   const struct pvr_device_info *dev_info = &pdevice->dev_info;
+
+   /* Granularity does not depend on any settings in the render pass, so return
+    * the tile granularity.
+    *
+    * The default value is based on the minimum value found in all existing
+    * cores.
+    */
+   granularity->width = PVR_GET_FEATURE_VALUE(dev_info, tile_size_x, 16);
+   granularity->height = PVR_GET_FEATURE_VALUE(dev_info, tile_size_y, 16);
+}
 
 VkResult pvr_physical_device_init(struct pvr_physical_device *pdevice,
                                   struct pvr_instance *instance,

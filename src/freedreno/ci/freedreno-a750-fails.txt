@@ -1,4 +1,4 @@
-KHR-GL46.shader_image_load_store.basic-allTargets-store,Fail
+KHR-GL46.copy_image.smoke_test,Fail
 KHR-GL46.shader_image_size.basic-nonMS-tes-int,Fail
 KHR-GL46.tessellation_shader.tessellation_control_to_tessellation_evaluation.gl_tessLevel,Fail
 KHR-GL46.tessellation_shader.tessellation_shader_tessellation.TES,Fail
@@ -15,25 +15,10 @@ KHR-GLES31.core.vertex_attrib_binding.advanced-iterations,Fail
 dEQP-GLES31.functional.copy_image.non_compressed.viewclass_32_bits.rgba8_rgba8ui.renderbuffer_to_renderbuffer,Fail
 dEQP-GLES31.functional.copy_image.non_compressed.viewclass_32_bits.srgb8_alpha8_rgba8ui.renderbuffer_to_renderbuffer,Fail
 
-
-gmem-dEQP-VK.clipping.user_defined.clip_cull_distance_dynamic_index.vert_geom.6_2,Fail
-gmem-dEQP-VK.clipping.user_defined.clip_cull_distance_dynamic_index.vert_geom.6_2_fragmentshader_read,Fail
-gmem-dEQP-VK.draw.dynamic_rendering.complete_secondary_cmd_buff.scissor.dynamic_scissor_out_of_order_updates,Fail
-gmem-dEQP-VK.glsl.builtin.function.integer.bitfieldextract.ivec4_highp_geometry,Fail
-gmem-dEQP-VK.glsl.builtin.function.integer.usubborrow.uvec4_mediump_geometry,Fail
-gmem-dEQP-VK.spirv_assembly.instruction.graphics.cross_stage.interface_blocks.relaxedprecision,Fail
-
-dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d24_unorm_s8_uint.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
-dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d24_unorm_s8_uint_separate_layouts.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
-dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d32_sfloat_s8_uint.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
-dynamic-dEQP-VK.renderpass2.depth_stencil_resolve.image_2d_32_32.samples_2.d32_sfloat_s8_uint_separate_layouts.compatibility_depth_zero_stencil_zero_testing_stencil,Fail
-
-# New failures with VKCTS 1.4.4.0
-dEQP-VK.binding_model.descriptor_buffer.traditional_buffer.capture_replay.sparse_buffer_descriptor_data_consistency_and_usage,Fail
-dEQP-VK.binding_model.descriptor_buffer.traditional_buffer.capture_replay.sparse_buffer_descriptor_data_consistency,Fail
-dEQP-VK.pipeline.monolithic.misc.identically_defined_layout,Fail
-dEQP-VK.renderpasses.dynamic_rendering.primary_cmd_buff.basic.partial_binding_depth_stencil,Fail
-gmem-dEQP-VK.binding_model.descriptor_buffer.traditional_buffer.capture_replay.sparse_buffer_descriptor_data_consistency_and_usage,Fail
+# New failures when updating kernel from msm-next at 6.16 to 6.19.5
+# https://gitlab.freedesktop.org/drm/msm/-/issues/93
+dEQP-VK.pipeline.monolithic.timestamp.calibrated.calibration_test,Fail
+dEQP-VK.pipeline.monolithic.timestamp.calibrated.dev_domain_test,Fail
 
 
 # Bad assumptions in piglit about layout of multiplanar formats,
@@ -45,14 +30,6 @@ spec@ext_image_dma_buf_import@ext_image_dma_buf_import-sample_yvu420,Fail
 #
 ## rusticl-core issues:
 #
-#Unexpected CL error: CL_BUILD_PROGRAM_FAILURE -11
-#Expected CL error: CL_INVALID_BUILD_OPTIONS -43
-api@clbuildprogram,Fail
-
-#Unexpected CL error: CL_COMPILE_PROGRAM_FAILURE -15
-#Expected CL error: CL_INVALID_COMPILER_OPTIONS -66
-api@clcompileprogram,Fail
-
 #Unexpected CL error: CL_SUCCESS 0
 #Expected CL error: CL_KERNEL_ARG_INFO_NOT_AVAILABLE -19
 api@clgetkernelarginfo,Fail
@@ -76,6 +53,13 @@ program@execute@global-offset@3d- input dependent,Fail
 
 # Regressed between https://gitlab.freedesktop.org/mesa/mesa/-/jobs/70146138 and https://gitlab.freedesktop.org/mesa/mesa/-/jobs/70217173
 program@execute@vector-conversion,Fail
+
+# Piglit doesn't check subbuffer alignment requirements
+api@clgetmemobjectinfo,Fail
+
+# Piglit checks the pre 3.1 behavior
+api@clsetkernelarg,Fail
+api@clsetkernelarg@Input checks,Fail
 
 #
 ## freedreno issues:
@@ -110,3 +94,8 @@ program@execute@builtin@builtin-float-nextafter-1.0.generated@nextafter float8,F
 angle-dEQP-GLES2.functional.shaders.algorithm.rgb_to_hsl_vertex,Fail
 
 KHR-GL46.shader_atomic_counters.basic-usage-tes,Fail
+
+# test_sampler_feedback_implicit_lod_aniso:3429:Test 19: Test failed: Mip 1, expected 0, got 1.
+# Enabled by EXT_shader_image_atomic_int64:
+# https://github.com/HansKristian-Work/vkd3d-proton/blob/master/docs/sampler_feedback.md
+vkd3d-test_sampler_feedback_implicit_lod_aniso,Fail

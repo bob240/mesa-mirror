@@ -1,6 +1,5 @@
 /*
  * Copyright © 2023 Collabora, Ltd.
- *
  * SPDX-License-Identifier: MIT
  */
 
@@ -212,16 +211,18 @@ panfrost_dev_query_props(struct panfrost_kmod_dev *panfrost_dev)
       props->is_io_coherent =
          selected_coherency != DRM_PANFROST_GPU_COHERENCY_NONE;
    }
+
+   props->pgsize_bitmap = PAN_PGSIZE_4K | PAN_PGSIZE_2M;
 }
 
 static struct pan_kmod_dev *
-panfrost_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
+panfrost_kmod_dev_create(int fd, uint32_t flags,
+                         const struct pan_kmod_driver *drv_info,
                          const struct pan_kmod_allocator *allocator)
 {
-   if (version->version_major < 1 ||
-       (version->version_major == 1 && version->version_minor < 1)) {
+   if (!pan_kmod_driver_version_at_least(drv_info, 1, 1)) {
       mesa_loge("kernel driver is too old (requires at least 1.1, found %d.%d)",
-                version->version_major, version->version_minor);
+                drv_info->version.major, drv_info->version.minor);
       return NULL;
    }
 
@@ -232,7 +233,7 @@ panfrost_kmod_dev_create(int fd, uint32_t flags, drmVersionPtr version,
       return NULL;
    }
 
-   pan_kmod_dev_init(&panfrost_dev->base, fd, flags, version,
+   pan_kmod_dev_init(&panfrost_dev->base, fd, flags, drv_info,
                      &panfrost_kmod_ops, allocator);
    panfrost_dev_query_props(panfrost_dev);
 
@@ -319,8 +320,8 @@ panfrost_kmod_bo_free(struct pan_kmod_bo *bo)
 }
 
 static struct pan_kmod_bo *
-panfrost_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size,
-                        uint32_t flags)
+panfrost_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle,
+                        uint64_t size)
 {
    struct panfrost_kmod_bo *panfrost_bo =
       pan_kmod_dev_alloc(dev, sizeof(*panfrost_bo));
@@ -340,6 +341,7 @@ panfrost_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size
 
    panfrost_bo->offset = get_bo_offset.offset;
 
+   uint32_t flags = PAN_KMOD_BO_FLAG_IMPORTED;
    if (pan_kmod_driver_version_at_least(&dev->driver, 1, 6)) {
       struct drm_panfrost_query_bo_info args = {
          .handle = handle,
@@ -351,15 +353,19 @@ panfrost_kmod_bo_import(struct pan_kmod_dev *dev, uint32_t handle, uint64_t size
          goto err_free_bo;
       }
 
-      /* If the BO comes from a different subsystem, we don't allow
-       * mmap() to avoid the CPU-sync churn.
+      /* FIXME: If the BO comes from a different subsystem
+       * (args.extra_flags & DRM_PANTHOR_BO_IS_IMPORTED), we should normally
+       * add extra DMA_BUF_IOCTL_SYNC calls around CPU accesses to ensure the
+       * CPU mapping consistency, but this is something we never worried about
+       * (we've always assumed exporters were exposing uncached mappings with
+       * NOP {begin,end}_cpu_access() implementations), and it worked fine until
+       * now.
+       * The long term plan is to hook up DMA_BUF_IOCTL_SYNC, but this requires
+       * more work.
        */
-      if (args.extra_flags & DRM_PANFROST_BO_IS_IMPORTED)
-         flags |= PAN_KMOD_BO_FLAG_NO_MMAP;
    }
 
-   pan_kmod_bo_init(&panfrost_bo->base, dev, NULL, size,
-                    flags | PAN_KMOD_BO_FLAG_IMPORTED, handle);
+   pan_kmod_bo_init(&panfrost_bo->base, dev, NULL, size, flags, handle);
    return &panfrost_bo->base;
 
 err_free_bo:
@@ -500,7 +506,7 @@ panfrost_kmod_vm_create(struct pan_kmod_dev *dev, uint32_t flags,
       return NULL;
    }
 
-   pan_kmod_vm_init(&vm->base, dev, 0, flags, PAN_PGSIZE_4K);
+   pan_kmod_vm_init(&vm->base, dev, 0, flags);
    panfrost_dev->vm = vm;
    return &vm->base;
 }
@@ -512,6 +518,7 @@ panfrost_kmod_vm_destroy(struct pan_kmod_vm *vm)
       container_of(vm->dev, struct panfrost_kmod_dev, base);
 
    panfrost_dev->vm = NULL;
+   pan_kmod_vm_cleanup(vm);
    pan_kmod_dev_free(vm->dev, vm);
 }
 
@@ -549,6 +556,12 @@ panfrost_kmod_vm_bind(struct pan_kmod_vm *vm, enum pan_kmod_vm_op_mode mode,
          if (ops[i].map.bo_offset != 0 ||
              ops[i].va.size != ops[i].map.bo->size) {
             mesa_loge("panfrost_kmod doesn't support partial BO mapping");
+            assert(0);
+            return -1;
+         }
+
+         if (ops[i].flags & PAN_KMOD_VM_OP_OP_MAP_SPARSE) {
+            mesa_loge("panfrost_kmod doesn't support sparse mappings");
             assert(0);
             return -1;
          }

@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2021 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "bi_builder.h"
@@ -245,6 +227,13 @@ va_fuse_cmp(bi_context *ctx, bi_instr **lut, const BITSET_WORD *multiple,
    bi_instr *src0_ins = lut[I->src[0].value];
    bi_instr *src1_ins = lut[I->src[1].value];
 
+   /* %1 = FCMP(a, b)
+    * %2 = LSHIFT_X(%1, %1, 0)
+    * We cannot fold that.
+    */
+   if (src0_ins == src1_ins)
+      return false;
+
    enum va_cmp_type cmp_type = va_cmp_opcode_to_cmp_type(src0_ins->op);
 
    /* Expect both side to use the same form type */
@@ -258,6 +247,8 @@ va_fuse_cmp(bi_context *ctx, bi_instr **lut, const BITSET_WORD *multiple,
 
    /* Ensure we really have a LSHIFT that we can remap (so without shift) */
    if (!va_remap_logical_to_logical_cmp(I->op, cmp_type) ||
+       I->src[0].swizzle != BI_SWIZZLE_H01 ||
+       I->src[1].swizzle != BI_SWIZZLE_H01 ||
        !bi_is_zero(I->src[2]))
       return false;
 
@@ -320,8 +311,8 @@ va_propagate_replicate_wide(bi_context *ctx, bi_instr **lut, bi_instr *I)
       /* If we have a MKVEC.v2i8 and current instruction only replicate, we
        * should propagate */
       if (src_ins->op == BI_OPCODE_MKVEC_V2I8 &&
-          bi_swizzle_replicates_8(src->swizzle) &&
-          bi_swizzle_to_byte_channels(src->swizzle, tmp)) {
+          bi_swizzle_replicates_8(src->swizzle)) {
+         bi_swizzle_to_byte_channels(src->swizzle, tmp);
          unsigned byte_idx = *tmp;
 
          /* In case of the top 16-bit, src2 contains the value we want without

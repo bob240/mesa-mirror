@@ -1,26 +1,8 @@
 /*
  * Copyright (C) 2020 Collabora, Ltd.
- * Copyright (C) 2018-2019 Alyssa Rosenzweig <alyssa@rosenzweig.io>
+ * Copyright (C) 2018-2019 Alyssa Rosenzweig
  * Copyright © 2014 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "util/u_memory.h"
@@ -66,7 +48,7 @@ bi_compute_liveness_ssa(bi_context *ctx)
       bi_block *blk = bi_worklist_pop_head(&worklist);
 
       /* Update its liveness information */
-      memcpy(blk->ssa_live_in, blk->ssa_live_out, words * sizeof(BITSET_WORD));
+      __bitset_copy(blk->ssa_live_in, blk->ssa_live_out, words);
 
       bi_foreach_instr_in_block_rev(blk, I) {
          /* Phi nodes are handled separately, so we skip them. As phi nodes are
@@ -90,7 +72,7 @@ bi_compute_liveness_ssa(bi_context *ctx)
        */
       bi_foreach_predecessor(blk, pred) {
          BITSET_WORD *live = ralloc_array(blk, BITSET_WORD, words);
-         memcpy(live, blk->ssa_live_in, words * sizeof(BITSET_WORD));
+         __bitset_copy(live, blk->ssa_live_in, words);
 
          /* Kill write */
          bi_foreach_phi_in_block(blk, I) {

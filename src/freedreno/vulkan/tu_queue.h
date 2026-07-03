@@ -43,8 +43,10 @@ VkResult
 tu_queue_init(struct tu_device *device,
               struct tu_queue *queue,
               enum tu_queue_type type,
+              const VkQueueGlobalPriorityKHR global_priority,
               int idx,
-              const VkDeviceQueueCreateInfo *create_info);
+              const VkDeviceQueueCreateInfo *create_info,
+              struct tu_queue *shared_queue);
 
 void
 tu_queue_finish(struct tu_queue *queue);

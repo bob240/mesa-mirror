@@ -1,24 +1,6 @@
 /*
  * Copyright © 2024 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "compiler/nir/nir_builder.h"
@@ -36,9 +18,40 @@
  *      to sample_po_c_l instead.
  */
 static bool
-pre_lower_tex_instr(nir_builder *b, nir_tex_instr *tex)
+pre_lower_tex_instr(nir_builder *b, nir_tex_instr *tex,
+                    const struct intel_device_info *devinfo)
 {
    switch (tex->op) {
+   case nir_texop_txs: {
+      unsigned mask = nir_component_mask(tex->def.num_components);
+
+      tex->op = nir_texop_resinfo_intel;
+      tex->def.num_components = 4;
+
+      b->cursor = nir_after_instr(&tex->instr);
+      nir_def_rewrite_uses_after(&tex->def, nir_channels(b, &tex->def, mask));
+      return true;
+   }
+   case nir_texop_query_levels: {
+      tex->op = nir_texop_resinfo_intel;
+      tex->def.num_components = 4;
+
+      b->cursor = nir_after_instr(&tex->instr);
+      nir_def *level = nir_channel(b, &tex->def, 3);
+
+      if (devinfo->ver == 9) {
+         /* Wa_1940217:
+          *
+          * When a surface of type SURFTYPE_NULL is accessed by resinfo,
+          * the MIPCount returned is undefined instead of 0.
+          */
+         nir_def *width_nonzero = nir_i2b(b, nir_channel(b, &tex->def, 0));
+         level = nir_bcsel(b, width_nonzero, level, nir_imm_int(b, 0));
+      }
+
+      nir_def_rewrite_uses_after(&tex->def, level);
+      return true;
+   }
    case nir_texop_txb: {
       int bias_index = nir_tex_instr_src_index(tex, nir_tex_src_bias);
       assert(bias_index != -1);
@@ -114,10 +127,14 @@ pre_lower_intrinsic_instr(nir_builder *b, nir_intrinsic_instr *intrin)
    bool bindless = rsrc && (nir_intrinsic_resource_access_intel(rsrc) &
                             nir_resource_intel_bindless);
 
-   nir_def *txs = nir_txs(b, .lod = nir_imm_int(b, 0),
-                             .dim = dim, .is_array = is_array,
-                             .texture_offset = bindless ? NULL : surface->ssa,
-                             .texture_handle = bindless ? surface->ssa : NULL);
+   nir_def *resinfo =
+      nir_build_tex(b, nir_texop_resinfo_intel,
+                    .lod = nir_imm_int(b, 0),
+                    .dim = dim, .is_array = is_array,
+                    .texture_offset = bindless ? NULL : surface->ssa,
+                    .texture_handle = bindless ? surface->ssa : NULL);
+   nir_def *txs =
+      nir_channels(b, resinfo, nir_component_mask(intrin->def.num_components));
 
    /* SKL PRM, vol07, 3D Media GPGPU Engine, Bounds Checking and Faulting:
     *
@@ -151,7 +168,7 @@ pre_lower_texture_instr(nir_builder *b, nir_instr *instr, void *data)
 {
    switch (instr->type) {
    case nir_instr_type_tex:
-      return pre_lower_tex_instr(b, nir_instr_as_tex(instr));
+      return pre_lower_tex_instr(b, nir_instr_as_tex(instr), data);
 
    case nir_instr_type_intrinsic:
       return pre_lower_intrinsic_instr(b, nir_instr_as_intrinsic(instr));
@@ -162,12 +179,13 @@ pre_lower_texture_instr(nir_builder *b, nir_instr *instr, void *data)
 }
 
 bool
-brw_nir_pre_lower_texture(nir_shader *shader)
+brw_nir_pre_lower_texture(nir_shader *shader,
+                          const struct intel_device_info *devinfo)
 {
    return nir_shader_instructions_pass(shader,
                                        pre_lower_texture_instr,
                                        nir_metadata_control_flow,
-                                       NULL);
+                                       (void*) devinfo);
 }
 
 /**
@@ -627,4 +645,58 @@ brw_nir_lower_mcs_fetch(nir_shader *shader,
                               brw_nir_lower_mcs_fetch_instr,
                               nir_metadata_control_flow,
                               (void *)devinfo);
+}
+
+static bool
+brw_nir_apply_sampler_undef_derivatives_workaround_instr(nir_builder *b,
+                                                         nir_tex_instr *tex,
+                                                         void *cb_data)
+{
+   if (!tex->instr.block->divergent)
+      return false;
+
+   if (tex->op != nir_texop_tex)
+      return false;
+
+   b->cursor = nir_before_instr(&tex->instr);
+
+   const int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   assert(coord_index >= 0);
+
+   nir_def *disabled_lanes =
+      nir_inot(b, nir_ballot(b, 1, 32, nir_imm_true(b)));
+   nir_def *disabled_quad =
+      nir_ishl(b, disabled_lanes,
+                  nir_iand_imm(b, nir_load_subgroup_invocation(b), ~3));
+
+   nir_def *coord = tex->src[coord_index].src.ssa;
+   nir_def *zero = nir_imm_zero(b, coord->num_components, coord->bit_size);
+
+   /* Calculate DDX_COARSE, or zero if lanes 0 or 1 are disabled */
+   nir_def *ddx =
+      nir_bcsel(b, nir_i2b(b, nir_iand_imm(b, disabled_quad, 0b0011)),
+                   zero, nir_ddx_coarse(b, coord));
+
+   /* Calculate DDY_COARSE, or zero if lanes 0 or 2 are disabled */
+   nir_def *ddy =
+      nir_bcsel(b, nir_i2b(b, nir_iand_imm(b, disabled_quad, 0b0101)),
+                   zero, nir_ddy_coarse(b, coord));
+
+   /* Convert the texture instruction to a sample_d with the sanitized DDX/DDY */
+   tex->op = nir_texop_txd;
+   nir_tex_instr_add_src(tex, nir_tex_src_ddx, ddx);
+   nir_tex_instr_add_src(tex, nir_tex_src_ddy, ddy);
+
+   return true;
+}
+
+bool brw_nir_apply_sampler_undef_derivatives_workaround(nir_shader *nir)
+{
+   nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+   nir_metadata_require(impl, nir_metadata_divergence);
+
+   return nir_shader_tex_pass(nir,
+                              brw_nir_apply_sampler_undef_derivatives_workaround_instr,
+                              nir_metadata_control_flow,
+                              NULL);
 }

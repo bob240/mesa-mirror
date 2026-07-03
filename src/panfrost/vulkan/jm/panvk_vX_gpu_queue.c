@@ -39,7 +39,7 @@ panvk_queue_submit_batch(struct panvk_gpu_queue *queue,
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
-   int ret;
+   ASSERTED int ret;
 
    /* Reset the batch if it's already been issued */
    if (batch->issued) {
@@ -155,7 +155,7 @@ static void
 panvk_queue_transfer_sync(struct panvk_gpu_queue *queue, uint32_t syncobj)
 {
    struct panvk_device *dev = to_panvk_device(queue->vk.base.device);
-   int ret;
+   ASSERTED int ret;
 
    struct drm_syncobj_handle handle = {
       .handle = queue->sync,
@@ -214,8 +214,8 @@ panvk_signal_event_syncobjs(struct panvk_gpu_queue *queue,
             .handles = (uint64_t)(uintptr_t)&event->syncobj,
             .count_handles = 1};
 
-         int ret = pan_kmod_ioctl(dev->drm_fd, DRM_IOCTL_SYNCOBJ_RESET,
-                                  &objs);
+         ASSERTED int ret = pan_kmod_ioctl(dev->drm_fd,
+                                  DRM_IOCTL_SYNCOBJ_RESET, &objs);
          assert(!ret);
          break;
       }
@@ -393,11 +393,15 @@ panvk_per_arch(QueueWaitIdle)(VkQueue _queue)
    /* we need to use vk_common_QueueWaitIdle if we ever go threaded */
    assert(queue->vk.submit.mode != VK_QUEUE_SUBMIT_MODE_THREADED);
 
-   if (vk_device_is_lost(&dev->vk))
+   if (vk_device_is_lost(&dev->vk)) {
+      /* Check printf buffer one more time before exiting */
+      u_printf_with_ctx(stdout, &dev->printf.ctx);
       return VK_ERROR_DEVICE_LOST;
+   }
 
-   int ret = drmSyncobjWait(dev->drm_fd, &queue->sync, 1,
-                            INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+   ASSERTED int ret = drmSyncobjWait(dev->drm_fd, &queue->sync, 1,
+                                     INT64_MAX, DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
+                                     NULL);
    assert(!ret);
 
    return VK_SUCCESS;

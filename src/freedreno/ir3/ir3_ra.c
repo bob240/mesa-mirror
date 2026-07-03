@@ -615,38 +615,41 @@ ra_interval_dump(struct log_stream *stream, struct ra_interval *interval)
 }
 
 static void
-ra_file_dump(struct log_stream *stream, struct ra_file *file)
+ra_file_dump(struct log_stream *stream, struct ra_file *file, const char *name)
 {
+   mesa_log_stream_printf(stream, "%s:\n", name);
    rb_tree_foreach (struct ra_interval, interval, &file->physreg_intervals,
                     physreg_node) {
       ra_interval_dump(stream, interval);
    }
 
    unsigned start, end;
-   mesa_log_stream_printf(stream, "available:\n");
+   mesa_log_stream_printf(stream, "%s available: ", name);
    BITSET_FOREACH_RANGE (start, end, file->available, file->size) {
       mesa_log_stream_printf(stream, "%u-%u ", start, end);
    }
    mesa_log_stream_printf(stream, "\n");
 
-   mesa_log_stream_printf(stream, "available to evict:\n");
+   mesa_log_stream_printf(stream, "%s available to evict: ", name);
    BITSET_FOREACH_RANGE (start, end, file->available_to_evict, file->size) {
       mesa_log_stream_printf(stream, "%u-%u ", start, end);
    }
    mesa_log_stream_printf(stream, "\n");
-   mesa_log_stream_printf(stream, "start: %u\n", file->start);
+   mesa_log_stream_printf(stream, "%s start: %u\n", name, file->start);
 }
 
 static void
 ra_ctx_dump(struct ra_ctx *ctx)
 {
    struct log_stream *stream = mesa_log_streami();
-   mesa_log_stream_printf(stream, "full:\n");
-   ra_file_dump(stream, &ctx->full);
-   mesa_log_stream_printf(stream, "half:\n");
-   ra_file_dump(stream, &ctx->half);
-   mesa_log_stream_printf(stream, "shared:\n");
-   ra_file_dump(stream, &ctx->shared);
+   ra_file_dump(stream, &ctx->full, "full");
+   if (ctx->half.size != 0) {
+      /* No need to print this file in the mergedregs case when nothing can
+       * allocate to it.
+       */
+      ra_file_dump(stream, &ctx->half, "half");
+   }
+   ra_file_dump(stream, &ctx->shared, "shared");
    mesa_log_stream_destroy(stream);
 }
 
@@ -1585,14 +1588,31 @@ assign_reg(struct ir3_instruction *instr, struct ir3_register *reg,
    }
 }
 
+/* True if src is killed and its register can be used to allocate a dst. A src
+ * is killed iff its SSA value is killed and it isn't part of or contains an
+ * interval that isn't killed yet.
+ */
+bool
+ir3_ra_src_is_killed(struct ir3_register *src,
+                     struct ir3_reg_interval *def_interval)
+{
+   return (src->flags & IR3_REG_FIRST_KILL) && !def_interval->parent &&
+          rb_tree_is_empty(&def_interval->children);
+}
+
+static bool
+is_killed(struct ra_ctx *ctx, struct ir3_register *src)
+{
+   struct ra_interval *interval = ra_interval_get(ctx, src->def);
+   return ir3_ra_src_is_killed(src, &interval->interval);
+}
+
 static void
 mark_src_killed(struct ra_ctx *ctx, struct ir3_register *src)
 {
    struct ra_interval *interval = ra_interval_get(ctx, src->def);
 
-   if (!(src->flags & IR3_REG_FIRST_KILL) || interval->is_killed ||
-       interval->interval.parent ||
-       !rb_tree_is_empty(&interval->interval.children))
+   if (interval->is_killed || !is_killed(ctx, src))
       return;
 
    ra_file_mark_killed(ra_get_file(ctx, src), interval);
@@ -2649,7 +2669,9 @@ calc_min_limit_pressure(struct ir3_shader_variant *v,
          cur_pressure = (struct ir3_pressure) {0};
 
          ra_foreach_dst (dst, instr) {
-            if ((dst->tied && !(dst->tied->flags & IR3_REG_KILL)) ||
+            if ((dst->tied &&
+                 !ir3_ra_src_is_killed(dst->tied,
+                                       &intervals[dst->tied->def->name])) ||
                 (dst->flags & IR3_REG_EARLY_CLOBBER))
                add_pressure(&cur_pressure, dst, v->mergedregs);
          }
@@ -2708,7 +2730,7 @@ calc_limit_pressure_for_cs_with_barrier(struct ir3_shader_variant *v,
 
    if (v->local_size_variable) {
       if (v->type == MESA_SHADER_KERNEL) {
-         threads_per_wg = compiler->threadsize_base * (double_threadsize ? 2 : 1);
+         threads_per_wg = compiler->info->threadsize_base * (double_threadsize ? 2 : 1);
       } else {
          /* We have to expect the worst case. */
          threads_per_wg = compiler->max_variable_workgroup_size;
@@ -2726,8 +2748,8 @@ calc_limit_pressure_for_cs_with_barrier(struct ir3_shader_variant *v,
     */
 
    unsigned waves_per_wg = DIV_ROUND_UP(
-      threads_per_wg, compiler->threadsize_base * (double_threadsize ? 2 : 1) *
-                         compiler->wave_granularity);
+      threads_per_wg, compiler->info->threadsize_base * (double_threadsize ? 2 : 1) *
+                         compiler->info->wave_granularity);
 
    uint32_t vec4_regs_per_thread =
       compiler->reg_size_vec4 / (waves_per_wg * (double_threadsize ? 2 : 1));
@@ -2767,8 +2789,10 @@ ir3_ra_get_reg_file_limits(struct ir3_shader_variant *v)
     */
    if (v->shader_options.real_wavesize == IR3_DOUBLE_ONLY) {
       limit_pressure.full =
-         MAX2(limit_pressure.full, v->compiler->reg_size_vec4 / 2 * 16);
+         MIN2(limit_pressure.full, v->compiler->reg_size_vec4 / 2 * 16);
    }
+
+   assert(limit_pressure.full <= RA_FULL_SIZE);
 
    return limit_pressure;
 }
@@ -2868,6 +2892,7 @@ ir3_ra(struct ir3_shader_variant *v)
    ctx->blocks = rzalloc_array(ctx, struct ra_block_state, live->block_count);
 
    ctx->full.size = calc_target_full_pressure(v, max_pressure.full);
+   assert(ctx->full.size <= RA_FULL_SIZE);
    d("full size: %u", ctx->full.size);
 
    if (!v->mergedregs)

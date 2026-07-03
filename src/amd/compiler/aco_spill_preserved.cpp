@@ -42,6 +42,8 @@ struct spill_preserved_ctx {
    /* Next linear VGPR lane to spill SGPRs to. */
    unsigned next_preserved_lane;
 
+   std::unordered_set<unsigned> input_temps;
+
    explicit spill_preserved_ctx(Program* program_)
        : program(program_), memory(), preserved_spill_offsets(memory), preserved_vgprs(memory),
          preserved_linear_vgprs(memory), preserved_spill_lanes(memory), preserved_sgprs(memory),
@@ -50,7 +52,8 @@ struct spill_preserved_ctx {
             DIV_ROUND_UP(program_->config->scratch_bytes_per_wave, program_->wave_size)),
          next_preserved_lane(0)
    {
-      program->callee_abi.preservedRegisters(abi_preserved_regs);
+      if (program->is_callee)
+         program->callee_abi.preservedRegisters(abi_preserved_regs);
       dom_info.resize(program->blocks.size(), {-1u, -1u});
    }
 };
@@ -63,9 +66,12 @@ can_reload_at_instr(const aco_ptr<Instruction>& instr)
 
 void
 add_instr(spill_preserved_ctx& ctx, unsigned block_index, bool seen_reload,
-          const aco_ptr<Instruction>& instr, Instruction* startpgm)
+          const aco_ptr<Instruction>& instr)
 {
    for (auto& def : instr->definitions) {
+      if (ctx.input_temps.count(def.tempId()))
+         continue;
+
       assert(def.isFixed());
       /* Round down subdword registers to their base */
       PhysReg start_reg = PhysReg{def.physReg().reg()};
@@ -106,12 +112,11 @@ add_instr(spill_preserved_ctx& ctx, unsigned block_index, bool seen_reload,
 
       if (!op.isTemp())
          continue;
+
       /* Temporaries defined by startpgm are the preserved value - these uses don't need
        * any preservation.
        */
-      if (std::any_of(startpgm->definitions.begin(), startpgm->definitions.end(),
-                      [op](const auto& def)
-                      { return def.isTemp() && def.tempId() == op.tempId(); }))
+      if (ctx.input_temps.count(op.tempId()))
          continue;
 
       /* Round down subdword registers to their base */
@@ -199,28 +204,25 @@ emit_vgpr_spills_reloads(spill_preserved_ctx& ctx, Builder& bld,
    for (const auto& spill : spills) {
       if (ctx.program->gfx_level >= GFX9) {
          if (reload)
-            bld.scratch(aco_opcode::scratch_load_dword,
-                        Definition(spill.first, linear ? v1.as_linear() : v1), Operand(v1),
-                        Operand(stack_reg, s1), spill.second - spill_stack_base,
+            bld.scratch(aco_opcode::scratch_load_dword, Definition(spill.first, linear ? lv1 : v1),
+                        Operand(v1), Operand(stack_reg, s1), spill.second - spill_stack_base,
                         memory_sync_info(storage_vgpr_spill, semantic_private));
          else
             bld.scratch(aco_opcode::scratch_store_dword, Operand(v1), Operand(stack_reg, s1),
-                        Operand(spill.first, linear ? v1.as_linear() : v1),
-                        spill.second - spill_stack_base,
+                        Operand(spill.first, linear ? lv1 : v1), spill.second - spill_stack_base,
                         memory_sync_info(storage_vgpr_spill, semantic_private));
       } else {
          if (reload) {
-            Instruction* instr = bld.mubuf(aco_opcode::buffer_load_dword,
-                                           Definition(spill.first, linear ? v1.as_linear() : v1),
-                                           Operand(stack_reg, s4), Operand(v1), Operand::c32(0),
-                                           spill.second - spill_stack_base, false);
+            Instruction* instr =
+               bld.mubuf(aco_opcode::buffer_load_dword, Definition(spill.first, linear ? lv1 : v1),
+                         Operand(stack_reg, s4), Operand(v1), Operand::c32(0),
+                         spill.second - spill_stack_base, false);
             instr->mubuf().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
             instr->mubuf().cache.value = ac_swizzled;
          } else {
-            Instruction* instr =
-               bld.mubuf(aco_opcode::buffer_store_dword, Operand(stack_reg, s4), Operand(v1),
-                         Operand::c32(0), Operand(spill.first, linear ? v1.as_linear() : v1),
-                         spill.second - spill_stack_base, false);
+            Instruction* instr = bld.mubuf(
+               aco_opcode::buffer_store_dword, Operand(stack_reg, s4), Operand(v1), Operand::c32(0),
+               Operand(spill.first, linear ? lv1 : v1), spill.second - spill_stack_base, false);
             instr->mubuf().sync = memory_sync_info(storage_vgpr_spill, semantic_private);
             instr->mubuf().cache.value = ac_swizzled;
          }
@@ -238,6 +240,9 @@ emit_vgpr_spills_reloads(spill_preserved_ctx& ctx, Builder& bld,
       bld.sop1(aco_opcode::s_bitset0_b32, Definition(stack_reg, s1), Operand::c32(0),
                Operand(stack_reg, s1));
    }
+
+   if (!reload)
+      ctx.program->config->spilled_vgprs += spills.size();
 }
 
 void
@@ -252,7 +257,7 @@ emit_sgpr_spills_reloads(spill_preserved_ctx& ctx, std::vector<aco_ptr<Instructi
    for (auto& spill : spills) {
       unsigned vgpr_idx = spill.second / ctx.program->wave_size;
       unsigned lane = spill.second % ctx.program->wave_size;
-      Operand vgpr_op = Operand(spill_reg.advance(vgpr_idx * 4), v1.as_linear());
+      Operand vgpr_op = Operand(spill_reg.advance(vgpr_idx * 4), lv1);
       if (reload)
          bld.pseudo(aco_opcode::p_reload, bld.def(s1, spill.first), vgpr_op, Operand::c32(lane));
       else
@@ -261,6 +266,9 @@ emit_sgpr_spills_reloads(spill_preserved_ctx& ctx, std::vector<aco_ptr<Instructi
 
    insert_point = instructions.insert(insert_point, std::move_iterator(spill_instructions.begin()),
                                       std::move_iterator(spill_instructions.end()));
+
+   if (!reload)
+      ctx.program->config->spilled_sgprs += spills.size();
 }
 
 void
@@ -360,7 +368,32 @@ emit_spills_reloads(spill_preserved_ctx& ctx, std::vector<aco_ptr<Instruction>>&
 void
 init_block_info(spill_preserved_ctx& ctx)
 {
-   Instruction* startpgm = ctx.program->blocks.front().instructions.front().get();
+   for (Block& block : ctx.program->blocks) {
+      for (aco_ptr<Instruction>& instr : block.instructions) {
+         if (instr->opcode == aco_opcode::p_startpgm) {
+            for (Definition def : instr->definitions)
+               ctx.input_temps.insert(def.tempId());
+         } else if (instr->operands.size() >= 1 && instr->operands[0].isTemp() &&
+                    ctx.input_temps.count(instr->operands[0].tempId())) {
+            if (instr->opcode == aco_opcode::p_parallelcopy &&
+                instr->operands[0].physReg() == instr->definitions[0].physReg()) {
+               ctx.input_temps.insert(instr->definitions[0].tempId());
+            } else if (instr->opcode == aco_opcode::p_split_vector) {
+               unsigned offset = 0;
+               for (Definition def : instr->definitions) {
+                  if (def.physReg() == instr->operands[0].physReg().advance(offset))
+                     ctx.input_temps.insert(def.tempId());
+                  offset += def.bytes();
+               }
+            } else if (instr->opcode == aco_opcode::p_extract_vector &&
+                       instr->definitions[0].physReg() ==
+                          instr->operands[0].physReg().advance(instr->operands[1].constantValue() *
+                                                               instr->definitions[0].bytes())) {
+               ctx.input_temps.insert(instr->definitions[0].tempId());
+            }
+         }
+      }
+   }
 
    int cur_loop_header = -1;
    for (int index = ctx.program->blocks.size() - 1; index >= 0;) {
@@ -430,7 +463,7 @@ init_block_info(spill_preserved_ctx& ctx)
             seen_reload_vgpr = true;
          }
 
-         add_instr(ctx, index, seen_reload_vgpr, instr, startpgm);
+         add_instr(ctx, index, seen_reload_vgpr, instr);
       }
 
       /* Process predecessors of loop headers again, since post-dominance information of the header

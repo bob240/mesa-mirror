@@ -98,6 +98,7 @@ struct blitter_context
    bool running;
 
    bool use_index_buffer;
+   bool use_single_triangle;
 
    /* Private members, really. */
    struct pipe_context *pipe; /**< pipe context */
@@ -113,7 +114,6 @@ struct blitter_context
    struct pipe_stencil_ref saved_stencil_ref;     /**< stencil ref */
    struct pipe_viewport_state saved_viewport;
    struct pipe_scissor_state saved_scissor;
-   bool skip_viewport_restore;
    bool is_sample_mask_saved;
    unsigned saved_sample_mask;
    unsigned saved_min_samples;

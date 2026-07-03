@@ -42,6 +42,10 @@ bool vl_codec_supported(struct pipe_screen *screen,
          return false;
       }
    }
+   if (profile == PIPE_VIDEO_PROFILE_JPEG_BASELINE) {
+      if (!VIDEO_CODEC_JPEGDEC)
+         return false;
+   }
    if (profile == PIPE_VIDEO_PROFILE_VP9_PROFILE0 ||
        profile == PIPE_VIDEO_PROFILE_VP9_PROFILE2) {
       if (!VIDEO_CODEC_VP9DEC)
@@ -51,6 +55,11 @@ bool vl_codec_supported(struct pipe_screen *screen,
        profile == PIPE_VIDEO_PROFILE_VC1_MAIN ||
        profile == PIPE_VIDEO_PROFILE_VC1_ADVANCED) {
       if (!VIDEO_CODEC_VC1DEC)
+         return false;
+   }
+   if (profile >= PIPE_VIDEO_PROFILE_MPEG1 &&
+       profile <= PIPE_VIDEO_PROFILE_MPEG2_MAIN) {
+      if (!VIDEO_CODEC_MPEG12DEC)
          return false;
    }
    if (profile >= PIPE_VIDEO_PROFILE_MPEG4_AVC_BASELINE &&

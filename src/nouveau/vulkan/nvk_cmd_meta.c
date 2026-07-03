@@ -10,6 +10,8 @@
 #include "nvk_image.h"
 #include "nvk_physical_device.h"
 
+#include "vk_format.h"
+
 #include "nv_push_cl9097.h"
 #include "nv_push_clb197.h"
 
@@ -78,10 +80,9 @@ nvk_meta_begin(struct nvk_cmd_buffer *cmd,
 {
    const struct nvk_descriptor_state *desc = &cmd->state.gfx.descriptors;
 
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
-
+   struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
+   P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_PASSTHROUGH);
    P_IMMD(p, NV9097, SET_RENDER_ENABLE_OVERRIDE, MODE_ALWAYS_RENDER);
-
    P_IMMD(p, NV9097, SET_STATISTICS_COUNTER, {
       .da_vertices_generated_enable = false,
       .da_primitives_generated_enable = false,
@@ -99,6 +100,8 @@ nvk_meta_begin(struct nvk_cmd_buffer *cmd,
       .total_streaming_primitives_needed_succeeded_enable = false,
       .vtg_primitives_out_enable = false,
    });
+   P_IMMD(p, NV9097, SET_ZPASS_PIXEL_COUNT, ENABLE_FALSE);
+   P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK_WITH_FILTER);
 
    save->dynamic = cmd->vk.dynamic_graphics_state;
    save->_dynamic_vi = cmd->state.gfx._dynamic_vi;
@@ -187,27 +190,13 @@ nvk_meta_end(struct nvk_cmd_buffer *cmd,
    nvk_descriptor_state_set_root_array(cmd, desc, push, 0, sizeof(save->push),
                                        save->push);
 
-   struct nv_push *p = nvk_cmd_buffer_push(cmd, 4);
-
-   P_IMMD(p, NV9097, SET_STATISTICS_COUNTER, {
-      .da_vertices_generated_enable = true,
-      .da_primitives_generated_enable = true,
-      .vs_invocations_enable = true,
-      .gs_invocations_enable = true,
-      .gs_primitives_generated_enable = true,
-      .streaming_primitives_succeeded_enable = true,
-      .streaming_primitives_needed_enable = true,
-      .clipper_invocations_enable = true,
-      .clipper_primitives_generated_enable = true,
-      .ps_invocations_enable = true,
-      .ti_invocations_enable = true,
-      .ts_invocations_enable = true,
-      .ts_primitives_generated_enable = true,
-      .total_streaming_primitives_needed_succeeded_enable = true,
-      .vtg_primitives_out_enable = true,
-   });
-
+   /* Replay the previous state from shadow RAM */
+   struct nv_push *p = nvk_cmd_buffer_push(cmd, 10);
+   P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_REPLAY);
+   P_IMMD(p, NV9097, SET_ZPASS_PIXEL_COUNT, ENABLE_FALSE);
+   P_IMMD(p, NV9097, SET_STATISTICS_COUNTER, {});
    P_IMMD(p, NV9097, SET_RENDER_ENABLE_OVERRIDE, MODE_USE_RENDER_ENABLE);
+   P_IMMD(p, NV9097, SET_MME_SHADOW_RAM_CONTROL, MODE_METHOD_TRACK_WITH_FILTER);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -252,4 +241,88 @@ nvk_meta_resolve_rendering(struct nvk_cmd_buffer *cmd,
    vk_meta_resolve_rendering(&cmd->vk, &dev->meta, pRenderingInfo);
 
    nvk_meta_end(cmd, &save);
+}
+
+static bool
+nvk_meta_image_copy_supported(struct nvk_image *img)
+{
+   if (vk_format_is_depth_or_stencil(img->vk.format))
+      return false;
+   if (vk_format_is_compressed(img->vk.format))
+      return false;
+   if (vk_format_get_ycbcr_info(img->vk.format))
+      return false;
+
+   assert(img->plane_count == 1);
+   const struct nvk_image_plane *plane = &img->planes[0];
+   const struct nil_image *nil_image = &plane->nil;
+
+   for (int l = 0; l < nil_image->num_levels; l++) {
+      const struct nil_image_level *level = &nil_image->levels[l];
+      if (level->tiling.z_log2 != 0)
+         return false;
+
+      if (level->tiling.gob_type == NIL_GOB_TYPE_LINEAR &&
+          !nvk_image_plane_aligned_for_linear_attachment(plane, level))
+         return false;
+   }
+
+   return true;
+}
+
+static struct vk_meta_copy_image_properties
+nvk_meta_copy_get_image_properties(struct nvk_image *img,
+                                   bool is_destination)
+{
+   struct vk_meta_copy_image_properties props = {};
+
+   assert(!vk_format_is_depth_or_stencil(img->vk.format));
+   assert(!vk_format_get_ycbcr_info(img->vk.format));
+
+   unsigned blk_sz = vk_format_get_blocksize(img->vk.format);
+   props.color.view_format = vk_meta_get_uint_format_for_blk_size(blk_sz);
+
+   return props;
+}
+
+static void
+nvk_cmd_copy_image_meta(struct nvk_cmd_buffer *cmd,
+                        const VkCopyImageInfo2 *pCopyImageInfo)
+{
+   VK_FROM_HANDLE(nvk_image, src, pCopyImageInfo->srcImage);
+   VK_FROM_HANDLE(nvk_image, dst, pCopyImageInfo->dstImage);
+
+   struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+
+   struct vk_meta_copy_image_properties dst_img_props =
+      nvk_meta_copy_get_image_properties(src, true);
+   struct vk_meta_copy_image_properties src_img_props =
+      nvk_meta_copy_get_image_properties(dst, false);
+
+   struct nvk_meta_save save;
+   nvk_meta_begin(cmd, &save);
+
+   vk_meta_copy_image(&cmd->vk, &dev->meta, pCopyImageInfo,
+                      &src_img_props, &dst_img_props,
+                      VK_PIPELINE_BIND_POINT_GRAPHICS);
+
+   nvk_meta_end(cmd, &save);
+}
+
+VKAPI_ATTR void VKAPI_CALL
+nvk_CmdCopyImage2(VkCommandBuffer commandBuffer,
+                  const VkCopyImageInfo2 *pCopyImageInfo)
+{
+   VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
+   VK_FROM_HANDLE(nvk_image, src, pCopyImageInfo->srcImage);
+   VK_FROM_HANDLE(nvk_image, dst, pCopyImageInfo->dstImage);
+
+   VkQueueFlags queue_flags = nvk_cmd_buffer_queue_flags(cmd);
+   if ((queue_flags & VK_QUEUE_GRAPHICS_BIT) &&
+       nvk_meta_image_copy_supported(src) &&
+       nvk_meta_image_copy_supported(dst)) {
+      nvk_cmd_copy_image_meta(cmd, pCopyImageInfo);
+   } else {
+      nvk_cmd_copy_image_ce(cmd, pCopyImageInfo);
+   }
 }

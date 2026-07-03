@@ -166,6 +166,11 @@ spec@arb_copy_image@arb_copy_image-formats --samples=4@Source: GL_R32F/Destinati
 spec@arb_copy_image@arb_copy_image-formats --samples=8,Fail
 spec@arb_copy_image@arb_copy_image-formats --samples=8@Source: GL_RGB32I/Destination: GL_RGB32F,Fail
 spec@arb_copy_image@arb_copy_image-formats --samples=8@Source: GL_RGB32UI/Destination: GL_RGB32F,Fail
+spec@arb_compute_shader@execution@shared-atomicadd-int,Fail
+spec@arb_compute_shader@execution@shared-atomiccompswap-int,Fail
+spec@arb_compute_shader@execution@shared-atomicexchange-int,Fail
+spec@arb_compute_shader@execution@shared-atomics,Fail
+spec@arb_compute_shader@execution@simple-barrier,Fail
 spec@arb_depth_buffer_float@fbo-stencil-gl_depth32f_stencil8-blit,Fail
 spec@arb_depth_buffer_float@texwrap formats bordercolor,Fail
 spec@arb_depth_buffer_float@texwrap formats bordercolor-swizzled,Fail
@@ -232,7 +237,6 @@ spec@arb_internalformat_query2@max dimensions related pname checks@GL_MAX_WIDTH,
 spec@arb_occlusion_query@occlusion_query_meta_no_fragments,Fail
 spec@arb_occlusion_query@occlusion_query_meta_save,Fail
 spec@arb_point_parameters@arb_point_parameters-point-attenuation,Fail
-spec@arb_point_parameters@arb_point_parameters-point-attenuation@Aliased combinations,Fail
 spec@arb_point_sprite@arb_point_sprite-checkerboard,Fail
 spec@arb_point_sprite@arb_point_sprite-mipmap,Fail
 spec@arb_program_interface_query@arb_program_interface_query-getprogramresourceindex,Fail
@@ -396,6 +400,7 @@ spec@arb_shader_image_load_store@shader-mem-barrier@Tessellation control shader/
 spec@arb_shader_image_load_store@shader-mem-barrier@Tessellation control shader/'volatile' qualifier memory barrier test/modulus=64,Fail
 spec@arb_shader_storage_buffer_object@array-ssbo-auto-binding,Fail
 spec@arb_shader_storage_buffer_object@array-ssbo-binding,Crash
+spec@arb_shader_storage_buffer_object@maxblocks,Fail
 spec@arb_shader_texture_lod@execution@arb_shader_texture_lod-texgrad,Fail
 spec@arb_shader_texture_lod@execution@arb_shader_texture_lod-texgradcube,Fail
 spec@arb_tessellation_shader@arb_tessellation_shader-tes-gs-max-output -small -scan 1 50,Fail
@@ -888,6 +893,7 @@ spec@glsl-1.50@execution@geometry@tri-strip-ordering-with-prim-restart gl_triang
 spec@glsl-1.50@execution@geometry@tri-strip-ordering-with-prim-restart gl_triangle_strip_adjacency other,Fail
 spec@glsl-1.50@execution@primitive-id-no-gs-quad-strip,Fail
 spec@glsl-1.50@execution@primitive-id-no-gs-quads,Fail
+spec@glsl-1.50@execution@out-of-ssa-dfs-pre-order,Fail
 spec@glsl-1.50@execution@variable-indexing@gs-output-array-vec4-index-wr,Fail
 spec@glsl-1.50@gs-max-output,Fail
 spec@glsl-1.50@gs-max-output-components,Fail
@@ -1044,6 +1050,8 @@ spec@nv_copy_image@nv_copy_image-formats --samples=8@Source: GL_RGB32UI/Destinat
 spec@nv_copy_image@nv_copy_image-formats --samples=8@Source: GL_RGB32UI/Destination: GL_RGB32UI,Fail
 
 # uprev Piglit in Mesa
+spec@!opengl 1.1@large-tex,Fail
+spec@!opengl 1.1@large-tex@test_clear_and_read_pixels,Fail
 spec@arb_copy_image@arb_copy_image-formats --samples=2@Source: GL_RGB32F/Destination: GL_RGB32I,Fail
 spec@arb_copy_image@arb_copy_image-formats --samples=2@Source: GL_RGB32F/Destination: GL_RGB32UI,Fail
 spec@arb_copy_image@arb_copy_image-formats --samples=2@Source: GL_RGB32I/Destination: GL_RGB32I,Fail
@@ -1065,6 +1073,14 @@ spec@arb_copy_image@arb_copy_image-formats --samples=8@Source: GL_RGB32UI/Destin
 spec@arb_copy_image@arb_copy_image-formats --samples=8@Source: GL_RGB32UI/Destination: GL_RGB32UI,Fail
 spec@arb_framebuffer_object@execution@msaa-alpha-to-coverage_alpha-to-one_write-z,Fail
 spec@arb_framebuffer_object@execution@msaa-alpha-to-coverage_alpha-to-one,Fail
+spec@arb_gpu_shader5@execution@precise@saturate-min-nan,Fail
+spec@arb_sample_shading@samplemask 2 all@0.500000 fix,Fail
+spec@arb_sample_shading@samplemask 2 all@0.500000 partition,Fail
+spec@arb_sample_shading@samplemask 2 all@1.000000 fix,Fail
+spec@arb_sample_shading@samplemask 2 all@1.000000 partition,Fail
+spec@arb_sample_shading@samplemask 2 all@noms fix,Fail
+spec@arb_sample_shading@samplemask 2 all@sample fix,Fail
+spec@arb_sample_shading@samplemask 2 all@sample partition,Fail
 spec@arb_sample_shading@samplemask 2@0.500000 mask_in_one,Fail
 spec@arb_sample_shading@samplemask 2@1.000000 mask_in_one,Fail
 spec@arb_sample_shading@samplemask 2@noms mask_in_one,Fail
@@ -1074,25 +1090,18 @@ spec@arb_sample_shading@samplemask 4@0.500000 mask_in_one,Fail
 spec@arb_sample_shading@samplemask 4@1.000000 mask_in_one,Fail
 spec@arb_sample_shading@samplemask 4@noms mask_in_one,Fail
 spec@arb_sample_shading@samplemask 4@sample mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@0.125000 fix,Fail
 spec@arb_sample_shading@samplemask 8 all@0.125000 mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@0.125000 partition,Fail
-spec@arb_sample_shading@samplemask 8 all@0.250000 fix,Fail
 spec@arb_sample_shading@samplemask 8 all@0.250000 mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@0.250000 partition,Fail
-spec@arb_sample_shading@samplemask 8 all@0.500000 fix,Fail
 spec@arb_sample_shading@samplemask 8 all@0.500000 mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@0.500000 partition,Fail
-spec@arb_sample_shading@samplemask 8 all@1.000000 fix,Fail
 spec@arb_sample_shading@samplemask 8 all@1.000000 mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@1.000000 partition,Fail
-spec@arb_sample_shading@samplemask 8 all@noms fix,Fail
 spec@arb_sample_shading@samplemask 8 all@noms mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@sample fix,Fail
 spec@arb_sample_shading@samplemask 8 all@sample mask_in_one,Fail
-spec@arb_sample_shading@samplemask 8 all@sample partition,Fail
 spec@arb_texture_view@tex-view,Fail
 spec@egl_chromium_sync_control@conformance,Fail
 spec@egl_chromium_sync_control@conformance@eglGetSyncValuesCHROMIUM_msc_and_sbc_test,Fail
 spec@ext_texture_integer@fbo-integer-attachments,Fail
+spec@ext_image_dma_buf_import@ext_image_dma_buf_import-tex-modifier,Fail
+spec@glsl-1.30@execution@glsl-packed-back-color,Fail
+spec@glsl-1.30@execution@glsl-packed-colors-clamping,Fail
+spec@arb_point_parameters@arb_point_parameters-point-attenuation@Antialiased combinations,Fail
 

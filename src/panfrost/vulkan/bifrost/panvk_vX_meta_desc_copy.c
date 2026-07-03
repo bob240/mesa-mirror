@@ -1,6 +1,5 @@
 /*
  * Copyright © 2024 Collabora Ltd.
- *
  * SPDX-License-Identifier: MIT
  */
 
@@ -177,7 +176,7 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
 
          nir_def *attrib_buf_desc = nir_vec8(
             b, nir_channel(b, src_desc, 0), nir_channel(b, src_desc, 1),
-            nir_iand_imm(b, nir_channel(b, src_desc, 2), BITFIELD_MASK(10)),
+            nir_iand_imm(b, nir_channel(b, src_desc, 2), BITFIELD_MASK(7)),
             nir_channel(b, src_desc, 3), nir_channel(b, null_desc, 0),
             nir_channel(b, null_desc, 1), nir_channel(b, null_desc, 2),
             nir_channel(b, null_desc, 3));
@@ -209,7 +208,7 @@ set_to_table_img_copy(nir_builder *b, nir_def *set_ptr, nir_def *set_desc_count,
 
          nir_def *attrib_buf_desc = nir_vec8(
             b, nir_channel(b, src_desc, 0), nir_channel(b, src_desc, 1),
-            nir_iand_imm(b, nir_channel(b, src_desc, 2), BITFIELD_MASK(10)),
+            nir_iand_imm(b, nir_channel(b, src_desc, 2), BITFIELD_MASK(7)),
             nir_channel(b, src_desc, 3), nir_channel(b, src_desc, 4),
             nir_channel(b, src_desc, 5), nir_channel(b, src_desc, 6),
             nir_channel(b, src_desc, 7));
@@ -333,7 +332,7 @@ panvk_meta_desc_copy_rsd(struct panvk_device *dev)
    nir_builder b = nir_builder_init_simple_shader(
       MESA_SHADER_COMPUTE,
       pan_get_nir_shader_compiler_options(
-         pan_arch(phys_dev->kmod.dev->props.gpu_id)),
+         pan_arch(phys_dev->kmod.dev->props.gpu_id), false),
       "%s", "desc_copy");
 
    /* We actually customize that at execution time to issue the
@@ -352,7 +351,6 @@ panvk_meta_desc_copy_rsd(struct panvk_device *dev)
    };
 
    pan_preprocess_nir(b.shader, inputs.gpu_id);
-   pan_postprocess_nir(b.shader, inputs.gpu_id);
 
    VkResult result = panvk_per_arch(create_internal_shader)(
       dev, b.shader, &inputs, &shader);
@@ -387,7 +385,8 @@ out:
 
 VkResult
 panvk_per_arch(meta_get_copy_desc_job)(
-   struct panvk_cmd_buffer *cmdbuf, const struct panvk_shader_variant *shader,
+   struct panvk_cmd_buffer *cmdbuf,
+   const struct panvk_shader_desc_info *desc_info,
    const struct panvk_descriptor_state *desc_state,
    const struct panvk_shader_desc_state *shader_desc_state,
    uint32_t attrib_buf_idx_offset, struct pan_ptr *job_desc)
@@ -396,10 +395,7 @@ panvk_per_arch(meta_get_copy_desc_job)(
 
    *job_desc = (struct pan_ptr){0};
 
-   if (!shader)
-      return VK_SUCCESS;
-
-   uint64_t copy_table = panvk_priv_mem_dev_addr(shader->desc_info.others.map);
+   uint64_t copy_table = panvk_priv_mem_dev_addr(desc_info->others.map);
    if (!copy_table)
       return VK_SUCCESS;
 
@@ -414,7 +410,7 @@ panvk_per_arch(meta_get_copy_desc_job)(
 
    for (uint32_t i = 0; i < ARRAY_SIZE(copy_info.desc_copy.limits); i++)
       copy_info.desc_copy.limits[i] =
-         shader->desc_info.others.count[i] +
+         desc_info->others.count[i] +
          (i > 0 ? copy_info.desc_copy.limits[i - 1] : 0);
 
    for (uint32_t i = 0; i < ARRAY_SIZE(desc_state->sets); i++) {
@@ -427,8 +423,8 @@ panvk_per_arch(meta_get_copy_desc_job)(
       copy_info.set_desc_counts[i] = set->desc_count;
    }
 
-   for (uint32_t i = 0; i < ARRAY_SIZE(shader->desc_info.others.count); i++) {
-      uint32_t desc_count = shader->desc_info.others.count[i];
+   for (uint32_t i = 0; i < ARRAY_SIZE(desc_info->others.count); i++) {
+      uint32_t desc_count = desc_info->others.count[i];
 
       if (!desc_count)
          continue;

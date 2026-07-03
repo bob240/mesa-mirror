@@ -50,9 +50,10 @@ DEPS=(
     libepoxy-dev
     libexpat1-dev
     libflatbuffers-dev
-    libgtk-3-dev
+    libglfw3-dev
     "libllvm${LLVM_VERSION}"
     libpciaccess-dev
+    libsdl3-dev
     libunwind-dev
     libva-dev
     libvulkan-dev

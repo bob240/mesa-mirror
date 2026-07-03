@@ -134,12 +134,12 @@ replace_tex_src(nir_tex_src *dst, nir_tex_src_type src_type, nir_def *src_def,
                 nir_instr *src_parent)
 {
    *dst = nir_tex_src_for_ssa(src_type, src_def);
-   nir_src_set_parent_instr(&dst->src, src_parent);
+   nir_src_set_use_instr(&dst->src, src_parent);
    list_addtail(&dst->src.use_link, &dst->src.ssa->uses);
 }
 
-void
-gl_nir_inline_functions(nir_shader *shader)
+static void
+gl_nir_inline_functions(const struct pipe_caps *caps, nir_shader *shader)
 {
    /* We have to lower away local constant initializers right before we
     * inline functions.  That way they get properly initialized at the top
@@ -181,6 +181,10 @@ gl_nir_inline_functions(nir_shader *shader)
                if (!nir_deref_mode_is(deref, nir_var_uniform) ||
                    nir_deref_instr_get_variable(deref)->data.bindless) {
                   nir_def *load = nir_load_deref(&b, deref);
+
+                  if (caps->glsl_bindless_handles_are_32bit)
+                     load = nir_u2u32(&b, load);
+
                   replace_tex_src(&intr->src[0], nir_tex_src_texture_handle,
                                   load, instr);
                   replace_tex_src(&intr->src[1], nir_tex_src_sampler_handle,
@@ -811,15 +815,15 @@ add_shader_variable(const struct gl_constants *consts,
        *     type, a single entry will be generated, using the variable name
        *     from the shader source."
        */
-      struct gl_shader_variable *sha_v =
+      struct gl_shader_variable *blake3_v =
          create_shader_variable(shProg, var, name, type, interface_type,
                                 use_implicit_location, location,
                                 outermost_struct_type);
-      if (!sha_v)
+      if (!blake3_v)
          return false;
 
       return link_util_add_program_resource(shProg, resource_set,
-                                            programInterface, sha_v, stage_mask);
+                                            programInterface, blake3_v, stage_mask);
    }
    }
 }
@@ -1192,9 +1196,12 @@ remove_dead_varyings_pre_linking(nir_shader *nir)
 bool
 gl_nir_add_point_size(nir_shader *nir)
 {
-   nir_variable *psiz = nir_create_variable_with_location(nir, nir_var_shader_out,
-                                                          VARYING_SLOT_PSIZ, glsl_float_type());
-   psiz->data.how_declared = nir_var_hidden;
+   nir_variable *psiz = NULL;
+   if (!nir->info.io_lowered) {
+      psiz = nir_create_variable_with_location(nir, nir_var_shader_out,
+                                               VARYING_SLOT_PSIZ, glsl_float_type());
+      psiz->data.how_declared = nir_var_hidden;
+   }
 
    nir_function_impl *impl = nir_shader_get_entrypoint(nir);
    nir_builder b = nir_builder_create(impl);
@@ -1207,10 +1214,19 @@ gl_nir_add_point_size(nir_shader *nir)
                 intr->intrinsic == nir_intrinsic_copy_deref) {
                nir_variable *var = nir_intrinsic_get_var(intr, 0);
                if (var->data.location == VARYING_SLOT_POS) {
+                  assert(!nir->info.io_lowered);
                   b.cursor = nir_after_instr(instr);
                   nir_deref_instr *deref = nir_build_deref_var(&b, psiz);
                   nir_store_deref(&b, deref, nir_imm_float(&b, 1.0), BITFIELD_BIT(0));
                   found = true;
+               }
+            } else if (intr->intrinsic == nir_intrinsic_store_output) {
+               nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+               if (sem.location == VARYING_SLOT_POS) {
+                  assert(nir->info.io_lowered);
+                  b.cursor = nir_after_instr(instr);
+                  nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                                   .io_semantics.location = VARYING_SLOT_PSIZ);
                }
             }
          }
@@ -1218,8 +1234,13 @@ gl_nir_add_point_size(nir_shader *nir)
    }
    if (!found) {
       b.cursor = nir_before_impl(impl);
-      nir_deref_instr *deref = nir_build_deref_var(&b, psiz);
-      nir_store_deref(&b, deref, nir_imm_float(&b, 1.0), BITFIELD_BIT(0));
+      if (nir->info.io_lowered) {
+         nir_store_output(&b, nir_imm_float(&b, 1.0), nir_imm_int(&b, 0),
+                          .io_semantics.location = VARYING_SLOT_PSIZ);
+      } else {
+         nir_deref_instr *deref = nir_build_deref_var(&b, psiz);
+         nir_store_deref(&b, deref, nir_imm_float(&b, 1.0), BITFIELD_BIT(0));
+      }
    }
 
    nir->info.outputs_written |= VARYING_BIT_PSIZ;
@@ -1354,7 +1375,7 @@ preprocess_shader(const struct pipe_screen *screen,
    NIR_PASS(_, nir, nir_opt_barrier_modes);
 
    /* before buffers and vars_to_ssa */
-   NIR_PASS(_, nir, gl_nir_lower_images, true);
+   NIR_PASS(_, nir, gl_nir_lower_images, &screen->caps, true);
 
    if (prog->nir->info.stage == MESA_SHADER_COMPUTE ||
        prog->nir->info.stage == MESA_SHADER_TASK ||
@@ -1443,6 +1464,12 @@ prelink_lowering(const struct pipe_screen *screen,
    return true;
 }
 
+static void
+optimize_varyings_opts(nir_shader *nir, void *data)
+{
+   gl_nir_opts(nir);
+}
+
 /**
  * Lower load_deref and store_deref on input/output variables to load_input
  * and store_output intrinsics, and perform varying optimizations and
@@ -1494,7 +1521,7 @@ gl_nir_lower_optimize_varyings(const struct gl_constants *consts,
       return;
 
    nir_opt_varyings_bulk(shaders, num_shaders, spirv, max_uniform_comps,
-                         max_ubos, gl_nir_opts);
+                         max_ubos, optimize_varyings_opts, NULL);
 }
 
 bool
@@ -1684,12 +1711,27 @@ cross_validate_globals(void *mem_ctx, const struct gl_constants *consts,
                      existing->data.mode == nir_var_mem_ssbo &&
                      existing->data.from_ssbo_unsized_array &&
                      glsl_get_gl_type(var->type) == glsl_get_gl_type(existing->type))) {
-                  linker_error(prog, "%s `%s' declared as type "
-                                 "`%s' and type `%s'\n",
-                                 gl_nir_mode_string(var),
-                                 var->name, glsl_get_type_name(var->type),
-                                 glsl_get_type_name(existing->type));
-                  return;
+
+                  /* Relax precision matching on unused uniforms for early ES shaders */
+                  if (prog->IsES && !var->interface_type &&
+                      !(existing->data.used && var->data.used) &&
+                      glsl_base_type_is_integer(glsl_get_gl_type(var->type)) == glsl_base_type_is_integer(glsl_get_gl_type(existing->type)) &&
+                      glsl_base_type_is_float(glsl_get_gl_type(var->type)) == glsl_base_type_is_float(glsl_get_gl_type(existing->type)) &&
+                      prog->GLSL_Version < 300) {
+                     linker_warning(prog, "%s `%s' declared as type "
+                                    "`%s' and type `%s'\n",
+                                    gl_nir_mode_string(var),
+                                    var->name, glsl_get_type_name(var->type),
+                                    glsl_get_type_name(existing->type));
+
+                  } else {
+                     linker_error(prog, "%s `%s' declared as type "
+                                    "`%s' and type `%s'\n",
+                                    gl_nir_mode_string(var),
+                                    var->name, glsl_get_type_name(var->type),
+                                    glsl_get_type_name(existing->type));
+                     return;
+                  }
                }
             }
          }
@@ -2957,7 +2999,7 @@ reserve_explicit_locations(struct gl_shader_program *prog,
 
    struct range_entry *re =
       util_range_insert_remap(location, max_loc, prog->UniformRemapTable,
-                              NULL);
+                              NULL, false);
    if (!re) {
       /* ARB_explicit_uniform_location specification states:
        *
@@ -3157,6 +3199,7 @@ link_assign_subroutine_types(struct gl_shader_program *prog)
          assert(fn->subroutine_index != -1);
          if (p->sh.NumSubroutineFunctions + 1 > MAX_SUBROUTINES) {
             linker_error(prog, "Too many subroutine functions declared.\n");
+            _mesa_set_destroy(fn_decl_set, NULL);
             return;
          }
          p->sh.SubroutineFunctions = reralloc(p, p->sh.SubroutineFunctions,
@@ -3181,6 +3224,7 @@ link_assign_subroutine_types(struct gl_shader_program *prog)
                 p->sh.SubroutineFunctions[j].index == fn->subroutine_index) {
                linker_error(prog, "each subroutine index qualifier in the "
                             "shader must be unique\n");
+               _mesa_set_destroy(fn_decl_set, NULL);
                return;
             }
          }
@@ -3913,7 +3957,8 @@ gl_nir_link_glsl(struct gl_context *ctx, struct gl_shader_program *prog)
       if (!prog->data->LinkStatus)
          goto done;
 
-      gl_nir_inline_functions(prog->_LinkedShaders[i]->Program->nir);
+      gl_nir_inline_functions(&ctx->screen->caps,
+                              prog->_LinkedShaders[i]->Program->nir);
    }
 
    resize_tes_inputs(consts, prog);

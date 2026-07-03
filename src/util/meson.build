@@ -69,8 +69,6 @@ files_mesa_util = files(
   'macros.h',
   'memstream.c',
   'memstream.h',
-  'mesa-sha1.c',
-  'mesa-sha1.h',
   'mesa-blake3.c',
   'mesa-blake3.h',
   'os_drm.h',
@@ -95,7 +93,6 @@ files_mesa_util = files(
   'u_qsort.h',
   'rwlock.c',
   'rwlock.h',
-  'sha1/sha1.h',
   'ralloc.c',
   'ralloc.h',
   'rand_xor.c',
@@ -215,10 +212,42 @@ else
 endif
 
 files_drirc = files('00-mesa-defaults.conf')
+devenv.set('DRIRC_CONFIGDIR', meson.current_source_dir())
 
-if with_amd_vk
-  files_drirc += files('00-radv-defaults.conf')
-endif
+foreach i : [
+  [with_amd_vk, 'src/amd/vulkan', '00-radv-defaults.conf'],
+  [with_intel_vk, 'src/intel/vulkan', '00-anv-defaults.conf'],
+  [with_intel_hasvk, 'src/intel/vulkan_hasvk', '00-hasvk-defaults.conf'],
+  [with_nouveau_vk, 'src/nouveau/vulkan', '00-nvk-defaults.conf'],
+  [with_microsoft_vk, 'src/microsoft/vulkan', '00-dzn-defaults.conf'],
+  [with_imagination_vk, 'src/imagination/vulkan', '00-pvr-defaults.conf'],
+  [with_broadcom_vk, 'src/broadcom/vulkan', '00-v3dv-defaults.conf'],
+  [with_freedreno_vk, 'src/freedreno/vulkan', '00-turnip-defaults.conf'],
+  [with_virtio_vk, 'src/virtio/vulkan', '00-venus-defaults.conf'],
+  [with_gallium_r300, 'src/gallium/drivers/r300', '00-r300-defaults.conf'],
+  [with_gallium_iris, 'src/gallium/drivers/iris', '00-iris-defaults.conf'],
+  [with_gallium_crocus, 'src/gallium/drivers/crocus', '00-crocus-defaults.conf'],
+  [with_gallium_asahi, 'src/gallium/drivers/asahi', '00-asahi-defaults.conf'],
+  [with_gallium_v3d, 'src/gallium/drivers/v3d', '00-v3d-defaults.conf'],
+  [with_asahi_vk, 'src/asahi/vulkan', '00-hk-defaults.conf'],
+  [with_panfrost_vk, 'src/panfrost/vulkan', '00-panvk-defaults.conf'],
+  [with_gallium_virgl, 'src/gallium/drivers/virgl', '00-virtio_gpu-defaults.conf'],
+  [with_gallium_panfrost, 'src/gallium/drivers/panfrost', '00-panfrost-defaults.conf'],
+  [with_gallium_radeonsi, 'src/gallium/drivers/radeonsi', '00-radeonsi-defaults.conf'],
+  [with_gallium_zink, 'src/gallium/drivers/zink', '00-zink-defaults.conf'],
+  [with_gallium_r600, 'src/gallium/drivers/r600', '00-r600-defaults.conf'],
+  [with_gallium_freedreno, 'src/gallium/drivers/freedreno', '00-msm-defaults.conf'],
+  [with_gallium_d3d12, 'src/gallium/drivers/d3d12', '00-d3d12-defaults.conf'],
+  [with_gallium_svga, 'src/gallium/drivers/svga', '00-vmwgfx-defaults.conf'],
+]
+  if i[0]
+    driver_folder = dir_source_root / i[1]
+    files_drirc += files(driver_folder / i[2])
+    devenv.append('DRIRC_CONFIGDIR', driver_folder)
+  endif
+endforeach
+
+drirc_gen = files('drirc_gen.py')
 
 if with_tests
   prog_xmllint = find_program('xmllint', required : false, native : true)
@@ -226,7 +255,7 @@ if with_tests
     test(
       'drirc xml validation',
       prog_xmllint,
-      args : ['--noout', '--valid', files_drirc],
+      args : ['--noout', '--dtdvalid', files('driconf.dtd'), files_drirc],
       suite : ['util'],
     )
   endif
@@ -331,7 +360,7 @@ u_trace_py = files('perf/u_trace.py')
 libmesa_util_simd = static_library(
   'mesa_util_simd',
   files('streaming-load-memcpy.c'),
-  c_args : [c_msvc_compat_args, sse41_args],
+  c_args : [c_msvc_compat_args, soong_compat_c_args, sse41_args],
   include_directories : [inc_util],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false,
@@ -344,14 +373,20 @@ _libmesa_util = static_library(
   include_directories : [inc_util, include_directories('format')],
   dependencies : deps_for_libmesa_util,
   link_with: libmesa_util_links,
-  c_args : [c_msvc_compat_args],
+  c_args : [c_msvc_compat_args, soong_compat_c_args],
   gnu_symbol_visibility : 'hidden',
   build_by_default : false
 )
 
+# Mesa leaves strict aliasing on in the compiler, and xxhash code likes to
+# dereference the passed in data as u32*, which means that the compiler is
+# free to move the u32 read before the write of the struct members being
+# hashed, and in practice it did in Freedreno and Intel drivers.
+# Forcing 2 flags below prevents it.
 idep_mesautil = declare_dependency(
   sources : [shader_stats_h],
   link_with : _libmesa_util,
+  compile_args : [ '-DXXH_FORCE_ALIGN_CHECK=0', '-DXXH_FORCE_MEMORY_ACCESS=0' ],
   include_directories : [inc_util],
   dependencies : deps_for_libmesa_util,
 )
@@ -375,6 +410,7 @@ _libxmlconfig = static_library(
   dependencies : [idep_mesautil, dep_m, xmlconfig_deps],
   c_args : [
     c_msvc_compat_args,
+    soong_compat_c_args,
     c_xmlconfig_arg,
     '-DSYSCONFDIR="@0@"'.format(
       join_paths(get_option('prefix'), get_option('sysconfdir'))
@@ -394,8 +430,6 @@ idep_xmlconfig = declare_dependency(
 
 files_xxd = files('xxd.py')
 glsl2spirv = files('glsl2spirv.py')
-
-devenv.set('DRIRC_CONFIGDIR', meson.current_source_dir())
 
 _libparson = static_library(
   'parson',
@@ -441,7 +475,7 @@ if with_tests
     'tests/linear_test.cpp',
     'tests/list_test.cpp',
     'tests/lut_test.cpp',
-    'tests/mesa-sha1_test.cpp',
+    'tests/mesa-blake3_test.cpp',
     'tests/os_mman_test.cpp',
     'tests/perf/u_trace_test.cpp',
     'tests/range_minimum_query_test.cpp',
@@ -460,6 +494,7 @@ if with_tests
     'tests/u_memstream_test.cpp',
     'tests/u_printf_test.cpp',
     'tests/u_qsort_test.cpp',
+    'tests/u_ycbcr_test.cpp',
     'tests/vector_test.cpp',
   )
 

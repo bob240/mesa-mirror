@@ -36,8 +36,6 @@ alu_type_to_string(nir_alu_type type)
       return "half";
    case nir_type_float32:
       return "float";
-   case nir_type_bool8:
-      return "bool";
    default:
       UNREACHABLE("Unsupported nir_alu_type");
    }
@@ -68,6 +66,14 @@ static const struct {
    [VARYING_SLOT_VIEWPORT] = {"viewport_array_index"},
    [VARYING_SLOT_CLIP_DIST0] = {"clip_0", .user = true, .scalarized = true},
    [VARYING_SLOT_CLIP_DIST1] = {"clip_1", .user = true, .scalarized = true},
+   [VARYING_SLOT_CULL_DIST0] = {"cull_0", .user = true, .scalarized = true},
+   [VARYING_SLOT_CULL_DIST1] = {"cull_1", .user = true, .scalarized = true},
+   [VARYING_SLOT_CULL_PRIMITIVE] = {"cull_primitive_0", .user = true,
+                                    .scalarized = true},
+   /* Using cull primitive slots to emulate cull distances in fragment shader,
+    * which may extend to one varying extra (which is otherwise unused) */
+   [VARYING_SLOT_CULL_PRIMITIVE + 1] = {"cull_primitive_1", .user = true,
+                                        .scalarized = true},
    [VARYING_SLOT_VAR0] = {"vary_00", .user = true},
    [VARYING_SLOT_VAR1] = {"vary_01", .user = true},
    [VARYING_SLOT_VAR2] = {"vary_02", .user = true},
@@ -183,10 +189,77 @@ vs_output_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
    }
 
    if (shader->info.clip_distance_array_size)
-      P_IND(ctx, "float gl_ClipDistance [[clip_distance]] [%d];",
-        shader->info.clip_distance_array_size);
+      P_IND(ctx, "float gl_ClipDistance [[clip_distance]] [%d];\n",
+            shader->info.clip_distance_array_size);
    ctx->indentlevel--;
    P(ctx, "};\n");
+}
+
+static void
+fs_input_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
+{
+   struct io_slot_info info = ctx->inputs_info[location];
+   bool scalarized = VARYING_SLOT_INFO[location].scalarized;
+   const char *type = alu_type_to_string(info.type);
+   const char *vector_suffix =
+      scalarized ? "" : vector_suffixes[info.num_components];
+   unsigned components = scalarized ? info.num_components : 1;
+   const char *interp = "";
+   switch (info.interpolation) {
+   case INTERP_MODE_SMOOTH:
+      interp = "interpolation::perspective";
+      break;
+   case INTERP_MODE_NOPERSPECTIVE:
+      interp = "interpolation::no_perspective";
+      break;
+   default:
+      UNREACHABLE("Only perspective and no-perspective are allowed");
+   }
+   for (int c = 0; c < components; c++) {
+      P_IND(ctx, "interpolant<%s%s, %s> ", type, vector_suffix, interp);
+      varying_slot_name(ctx, location, c);
+      P(ctx, " ");
+      varying_slot_semantic(ctx, location, c);
+      P(ctx, ";\n");
+   }
+}
+
+static void
+fs_input_no_interpolant(struct nir_to_msl_ctx *ctx, uint64_t location)
+{
+   struct io_slot_info info = ctx->inputs_info[location];
+   bool scalarized = VARYING_SLOT_INFO[location].scalarized;
+   const char *type = alu_type_to_string(info.type);
+   const char *vector_suffix =
+      scalarized ? "" : vector_suffixes[info.num_components];
+   unsigned components = scalarized ? info.num_components : 1;
+   const char *interp = "";
+   switch (info.interpolation) {
+   case INTERP_MODE_NOPERSPECTIVE:
+      if (info.centroid)
+         interp = "[[centroid_no_perspective]]";
+      else if (info.sample)
+         interp = "[[sample_no_perspective]]";
+      else
+         interp = "[[center_no_perspective]]";
+      break;
+   case INTERP_MODE_FLAT:
+      interp = "[[flat]]";
+      break;
+   default:
+      if (info.centroid)
+         interp = "[[centroid_perspective]]";
+      else if (info.sample)
+         interp = "[[sample_perspective]]";
+      break;
+   }
+   for (int c = 0; c < components; c++) {
+      P_IND(ctx, "%s%s ", type, vector_suffix);
+      varying_slot_name(ctx, location, c);
+      P(ctx, " ");
+      varying_slot_semantic(ctx, location, c);
+      P(ctx, " %s;\n", interp);
+   }
 }
 
 /* Generate the struct definition for the fragment shader input argument */
@@ -197,38 +270,10 @@ fs_input_block(nir_shader *shader, struct nir_to_msl_ctx *ctx)
    ctx->indentlevel++;
    u_foreach_bit64(location, shader->info.inputs_read) {
       struct io_slot_info info = ctx->inputs_info[location];
-      bool scalarized = VARYING_SLOT_INFO[location].scalarized;
-      const char *type = alu_type_to_string(info.type);
-      const char *vector_suffix =
-         scalarized ? "" : vector_suffixes[info.num_components];
-      const char *interp = "";
-      switch (info.interpolation) {
-      case INTERP_MODE_NOPERSPECTIVE:
-         if (info.centroid)
-            interp = "[[centroid_no_perspective]]";
-         else if (info.sample)
-            interp = "[[sample_no_perspective]]";
-         else
-            interp = "[[center_no_perspective]]";
-         break;
-      case INTERP_MODE_FLAT:
-         interp = "[[flat]]";
-         break;
-      default:
-         if (info.centroid)
-            interp = "[[centroid_perspective]]";
-         else if (info.sample)
-            interp = "[[sample_perspective]]";
-         break;
-      }
-      unsigned components = scalarized ? info.num_components : 1;
-      for (int c = 0; c < components; c++) {
-         P_IND(ctx, "%s%s ", type, vector_suffix);
-         varying_slot_name(ctx, location, c);
-         P(ctx, " ");
-         varying_slot_semantic(ctx, location, c);
-         P(ctx, " %s;\n", interp);
-      }
+      if (info.uses_interpolant)
+         fs_input_interpolant(ctx, location);
+      else
+         fs_input_no_interpolant(ctx, location);
    }
 
    /* Enable reading from framebuffer */
@@ -302,6 +347,9 @@ msl_nir_gather_io_info(nir_builder *b, nir_intrinsic_instr *intrin, void *data)
          interp_intrin->intrinsic == nir_intrinsic_load_barycentric_centroid;
       ctx->input[location].sample =
          interp_intrin->intrinsic == nir_intrinsic_load_barycentric_sample;
+      ctx->input[location].uses_interpolant |=
+         interp_intrin->intrinsic == nir_intrinsic_load_barycentric_at_sample ||
+         interp_intrin->intrinsic == nir_intrinsic_load_barycentric_at_offset;
       break;
    }
    case nir_intrinsic_load_input: {
@@ -391,6 +439,7 @@ msl_emit_io_blocks(struct nir_to_msl_ctx *ctx, nir_shader *shader)
       fs_output_block(shader, ctx);
       break;
    case MESA_SHADER_COMPUTE:
+   case MESA_SHADER_TESS_CTRL:
       break;
    default:
       assert(0);

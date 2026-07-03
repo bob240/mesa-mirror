@@ -1,24 +1,6 @@
 /*
- * Copyright (c) 2021 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * Copyright © 2021 Intel Corporation
+ * SPDX-License-Identifier: MIT
  */
 
 #include "brw_nir_rt.h"
@@ -38,10 +20,8 @@ struct lowering_state {
    struct hash_table *queries;
    uint32_t n_queries;
 
+   struct brw_nir_rt_globals_defs globals;
    nir_def *rq_globals;
-
-   uint32_t num_dss_rt_stacks;
-   uint32_t sync_stacks_stride;
 };
 
 struct brw_ray_query {
@@ -51,6 +31,12 @@ struct brw_ray_query {
 };
 
 #define SIZEOF_QUERY_STATE (sizeof(uint32_t))
+
+static bool
+need_spill_fill(struct lowering_state *state)
+{
+   return state->n_queries > 1;
+}
 
 /**
  * This pass converts opaque RayQuery structures from SPIRV into a vec3 where
@@ -94,8 +80,10 @@ create_internal_var(struct brw_ray_query *rq, struct lowering_state *state)
                                                 NULL);
 }
 
+
+
 static nir_def *
-get_ray_query_stack_index(nir_builder *b,
+get_ray_query_shadow_addr(nir_builder *b,
                           nir_deref_instr *deref,
                           struct lowering_state *state,
                           nir_deref_instr **out_state_deref)
@@ -110,17 +98,35 @@ get_ray_query_stack_index(nir_builder *b,
 
    struct brw_ray_query *rq = entry->data;
 
-   nir_def *query_idx = nir_imm_int(b, rq->id);
+   /* Base address in the shadow memory of the variable associated with this
+    * ray query variable.
+    */
+   nir_def *base_addr =
+      nir_iadd_imm(b, state->globals.resume_sbt_addr,
+                   brw_rt_ray_queries_shadow_stack_size(state->devinfo) * rq->id);
+
+   bool spill_fill = need_spill_fill(state);
    *out_state_deref = nir_build_deref_var(b, rq->internal_var);
+
+   if (!spill_fill)
+      return NULL;
 
    /* Just emit code and let constant-folding go to town */
    nir_deref_instr **p = &path.path[1];
    for (; *p; p++) {
       if ((*p)->deref_type == nir_deref_type_array) {
          nir_def *index = (*p)->arr.index.ssa;
+
+         /**/
          *out_state_deref = nir_build_deref_array(b, *out_state_deref, index);
-         index = nir_amul_imm(b, index, MAX2(1, glsl_get_aoa_size((*p)->type)));
-         query_idx = nir_iadd(b, query_idx, index);
+
+         /**/
+         uint64_t size = MAX2(1, glsl_get_aoa_size((*p)->type)) *
+            brw_rt_ray_queries_shadow_stack_size(state->devinfo);
+
+         nir_def *mul = nir_amul_imm(b, nir_i2i64(b, index), size);
+
+         base_addr = nir_iadd(b, base_addr, mul);
       } else {
          UNREACHABLE("Unsupported deref type");
       }
@@ -128,7 +134,28 @@ get_ray_query_stack_index(nir_builder *b,
 
    nir_deref_path_finish(&path);
 
-   return query_idx;
+   /* Add the lane offset to the shadow memory address */
+   nir_def *lane_offset =
+      nir_imul_imm(
+         b,
+         nir_iadd(
+            b,
+            nir_imul(
+               b,
+               brw_load_btd_dss_id(b, state->devinfo),
+               state->globals.num_dss_rt_stacks),
+            brw_nir_rt_sync_stack_id(b, state->devinfo)),
+         BRW_RT_SIZEOF_SHADOW_RAY_QUERY);
+
+   /* Top/bottom 16 lanes each get their own stack area */
+   lane_offset = nir_bcsel(
+      b,
+      nir_ilt_imm(b, nir_load_subgroup_invocation(b), 16),
+      lane_offset,
+      nir_iadd_imm(b, lane_offset,
+                   brw_rt_ray_queries_shadow_stack_size(state->devinfo) / 2));
+
+   return nir_iadd(b, base_addr, nir_i2i64(b, lane_offset));
 }
 
 static void
@@ -165,6 +192,44 @@ update_trace_ctrl_level(nir_builder *b,
 }
 
 static void
+fill_query(nir_builder *b,
+           nir_def *hw_stack_addr,
+           nir_def *shadow_stack_addr,
+           nir_def *ctrl)
+{
+   brw_nir_memcpy_global(b, hw_stack_addr, 64, shadow_stack_addr, 64,
+                         BRW_RT_SIZEOF_RAY_QUERY);
+}
+
+static void
+spill_query(nir_builder *b,
+            nir_def *hw_stack_addr,
+            nir_def *shadow_stack_addr)
+{
+   brw_nir_memcpy_global(b, shadow_stack_addr, 64, hw_stack_addr, 64,
+                         BRW_RT_SIZEOF_RAY_QUERY);
+}
+
+
+static void
+handle_terminate_on_first_hit(nir_builder *b, nir_def *stack_addr,
+                              struct lowering_state *state)
+{
+   struct brw_nir_rt_mem_ray_defs world_ray_in = {};
+   brw_nir_rt_load_mem_ray_from_addr(b, &world_ray_in, stack_addr,
+                                     BRW_RT_BVH_LEVEL_WORLD,
+                                     state->devinfo);
+   nir_def *terminate =
+      nir_test_mask(b, nir_u2u32(b, world_ray_in.ray_flags),
+                    BRW_RT_RAY_FLAG_TERMINATE_ON_FIRST_HIT);
+   nir_push_if(b, terminate);
+   {
+      brw_nir_rt_query_mark_done(b, stack_addr);
+   }
+   nir_pop_if(b, NULL);
+}
+
+static void
 lower_ray_query_intrinsic(nir_builder *b,
                           nir_intrinsic_instr *intrin,
                           struct lowering_state *state)
@@ -174,20 +239,13 @@ lower_ray_query_intrinsic(nir_builder *b,
    b->cursor = nir_instr_remove(&intrin->instr);
 
    nir_deref_instr *ctrl_level_deref;
-   nir_def *stack_index =
-      get_ray_query_stack_index(b, deref, state, &ctrl_level_deref);
-   nir_def *rq_globals_addr =
-      nir_iadd(b, state->rq_globals,
-               nir_i2i64(b, nir_amul_imm(b, stack_index,
-                                         BRW_RT_DISPATCH_GLOBALS_ALIGN)));
-   nir_def *stack_base_addr =
-      nir_isub(b, state->rq_globals,
-               nir_i2i64(b, nir_amul_imm(b, stack_index,
-                                         state->sync_stacks_stride)));
-   nir_def *stack_addr =
-      brw_nir_rt_sync_stack_addr(b, stack_base_addr,
-                                 state->num_dss_rt_stacks,
+   nir_def *shadow_stack_addr =
+      get_ray_query_shadow_addr(b, deref, state, &ctrl_level_deref);
+   nir_def *hw_stack_addr =
+      brw_nir_rt_sync_stack_addr(b, state->globals.base_mem_addr,
+                                 state->globals.num_dss_rt_stacks,
                                  state->devinfo);
+   nir_def *stack_addr = shadow_stack_addr ? shadow_stack_addr : hw_stack_addr;
    mesa_shader_stage stage = b->shader->info.stage;
 
    switch (intrin->intrinsic) {
@@ -230,7 +288,7 @@ lower_ray_query_intrinsic(nir_builder *b,
 
       update_trace_ctrl_level(b, ctrl_level_deref,
                               NULL, NULL,
-                              nir_imm_int(b, GEN_RT_TRACE_RAY_INITAL),
+                              nir_imm_int(b, GEN_RT_TRACE_RAY_INITIAL),
                               nir_imm_int(b, BRW_RT_BVH_LEVEL_WORLD));
       break;
    }
@@ -256,11 +314,21 @@ lower_ray_query_intrinsic(nir_builder *b,
           */
          brw_nir_rt_query_mark_done(b, stack_addr);
 
-         nir_trace_ray_intel(b, rq_globals_addr, level, ctrl, .synchronous = true);
+         if (shadow_stack_addr)
+            fill_query(b, hw_stack_addr, shadow_stack_addr, ctrl);
+
+         /* Do not use state->rq_globals, we want a uniform value for the
+          * tracing call.
+          */
+         brw_nir_trace_ray(b, nir_load_ray_query_global_intel(b),
+                           level, ctrl, true);
 
          struct brw_nir_rt_mem_hit_defs hit_in = {};
-         brw_nir_rt_load_mem_hit_from_addr(b, &hit_in, stack_addr, false,
+         brw_nir_rt_load_mem_hit_from_addr(b, &hit_in, hw_stack_addr, false,
                                            state->devinfo);
+
+         if (shadow_stack_addr)
+            spill_query(b, hw_stack_addr, shadow_stack_addr);
 
          update_trace_ctrl_level(b, ctrl_level_deref,
                                  NULL, NULL,
@@ -288,6 +356,7 @@ lower_ray_query_intrinsic(nir_builder *b,
                               NULL, NULL,
                               nir_imm_int(b, GEN_RT_TRACE_RAY_COMMIT),
                               nir_imm_int(b, BRW_RT_BVH_LEVEL_OBJECT));
+      handle_terminate_on_first_hit(b, stack_addr, state);
       break;
    }
 
@@ -297,6 +366,7 @@ lower_ray_query_intrinsic(nir_builder *b,
                               NULL, NULL,
                               nir_imm_int(b, GEN_RT_TRACE_RAY_COMMIT),
                               nir_imm_int(b, BRW_RT_BVH_LEVEL_OBJECT));
+      handle_terminate_on_first_hit(b, stack_addr, state);
       break;
    }
 
@@ -480,12 +550,21 @@ lower_ray_query_impl(nir_function_impl *impl, struct lowering_state *state)
    nir_builder _b, *b = &_b;
    _b = nir_builder_at(nir_before_impl(impl));
 
-   state->rq_globals = nir_load_ray_query_global_intel(b);
+   nir_def *rq_globals_base = nir_load_ray_query_global_intel(b);
 
-   state->num_dss_rt_stacks =
-      brw_rt_ray_queries_stack_ids_per_dss(state->devinfo);
-   state->sync_stacks_stride =
-      brw_rt_ray_queries_stacks_stride(state->devinfo);
+   /* Use a different global for each 16lanes groups (only in SIMD32). */
+   state->rq_globals = nir_bcsel(
+      b,
+      nir_iand(b,
+               nir_ige_imm(b, nir_load_subgroup_invocation(b), 16),
+               nir_ieq_imm(b, nir_load_subgroup_size(b), 32)),
+      nir_iadd_imm(
+         b, rq_globals_base,
+         align(4 * RT_DISPATCH_GLOBALS_length(state->devinfo), 64)),
+      rq_globals_base);
+
+   brw_nir_rt_load_globals_addr(b, &state->globals, state->rq_globals,
+                                state->devinfo);
 
    nir_foreach_block_safe(block, impl) {
       nir_foreach_instr_safe(instr, block) {

@@ -34,18 +34,13 @@ typedef void(aco_callback)(void** priv_ptr, const struct ac_shader_config* confi
                            unsigned debug_info_count);
 
 typedef void(aco_shader_part_callback)(void** priv_ptr, uint32_t num_sgprs, uint32_t num_vgprs,
-                                       const uint32_t* code, uint32_t code_size,
+                                       uint32_t exec_size, const uint32_t* code, uint32_t code_size,
                                        const char* disasm_str, uint32_t disasm_size);
 
 void aco_compile_shader(const struct aco_compiler_options* options,
                         const struct aco_shader_info* info, unsigned shader_count,
                         struct nir_shader* const* shaders, const struct ac_shader_args* args,
                         aco_callback* build_binary, void** binary);
-
-void aco_compile_rt_prolog(const struct aco_compiler_options* options,
-                           const struct aco_shader_info* info, const struct ac_shader_args* in_args,
-                           const struct ac_arg* descriptors, unsigned raygen_param_count,
-                           nir_parameter* raygen_params, aco_callback* build_prolog, void** binary);
 
 void aco_compile_vs_prolog(const struct aco_compiler_options* options,
                            const struct aco_shader_info* info,

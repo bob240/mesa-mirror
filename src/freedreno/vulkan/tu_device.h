@@ -11,24 +11,25 @@
 #define TU_DEVICE_H
 
 #include "tu_common.h"
+#include "perfcntrs/freedreno_perfcntr.h"
 
+#include "radix_sort/radix_sort_vk.h"
+#include "util/rwlock.h"
+#include "util/u_vector.h"
+#include "util/vma.h"
 #include "vk_device_memory.h"
 #include "vk_meta.h"
 
+#include "common/fd6_gmem_cache.h"
+#include "common/freedreno_rd_output.h"
 #include "tu_autotune.h"
 #include "tu_cs.h"
+#include "tu_drirc.h"
 #include "tu_pass.h"
 #include "tu_perfetto.h"
 #include "tu_queue.h"
 #include "tu_suballoc.h"
 #include "tu_util.h"
-
-#include "radix_sort/radix_sort_vk.h"
-
-#include "common/freedreno_rd_output.h"
-#include "common/fd6_gmem_cache.h"
-#include "util/vma.h"
-#include "util/u_vector.h"
 
 /* queue types */
 #define TU_QUEUE_GENERAL 0
@@ -36,6 +37,7 @@
 #define TU_MAX_QUEUE_FAMILIES 2
 
 #define TU_BORDER_COLOR_COUNT 4096
+#define TU_BORDER_COLOR_BUILTIN 6
 
 #define TU_BLIT_SHADER_SIZE 4096
 
@@ -44,6 +46,7 @@
 
 enum global_shader {
    GLOBAL_SH_VS_BLIT,
+   GLOBAL_SH_VS_MULTI_BLIT,
    GLOBAL_SH_VS_CLEAR,
    GLOBAL_SH_FS_BLIT,
    GLOBAL_SH_FS_BLIT_ZSCALE,
@@ -134,11 +137,23 @@ struct tu_physical_device
 
    bool has_cached_coherent_memory;
    bool has_cached_non_coherent_memory;
+   /* Index for device local, host-coherent, host-cached memory.
+    * Only set to positive index when overwriting device-local, uncached memory
+    */
+   int32_t preferred_uncached_as_cached_index;
    uintptr_t level1_dcache_size;
 
    struct fdl_ubwc_config ubwc_config;
 
    bool has_preemption;
+
+   bool expose_double_threadsize;
+
+   /* Whether performance counter selector registers can be written by userspace CSes. */
+   bool is_perf_cntr_selectable;
+
+   bool enable_texel_buffer_emulation;
+   bool enable_ssbo_emulation;
 
    struct {
       uint32_t non_lazy_type_count;
@@ -148,6 +163,9 @@ struct tu_physical_device
 
    struct tu_queue_family queue_families[TU_MAX_QUEUE_FAMILIES];
    unsigned num_queue_families;
+
+   /** Queue family index with an emulated second queue, or -1 if none */
+   int emulate_second_queue;
 
    struct fd_dev_id dev_id;
    struct fd_dev_info dev_info;
@@ -176,58 +194,12 @@ struct tu_instance
 {
    struct vk_instance vk;
 
+   struct turnip_drirc drirc;
+
    const struct tu_knl *knl;
 
    uint32_t instance_idx;
    uint32_t api_version;
-
-   struct driOptionCache dri_options;
-   struct driOptionCache available_dri_options;
-
-   uint32_t force_vk_vendor;
-   bool dont_care_as_load;
-
-   /* Conservative LRZ (default true) invalidates LRZ on draws with
-    * blend and depth-write enabled, because this can lead to incorrect
-    * rendering.  Driconf can be used to disable conservative LRZ for
-    * games which do not have the problematic sequence of draws *and*
-    * suffer a performance loss with conservative LRZ.
-    */
-   bool conservative_lrz;
-
-   /* If to internally reserve a descriptor set for descriptor set
-    * dynamic offsets, a descriptor set can be freed at the cost of
-    * being unable to use the feature. As it is a part of the Vulkan
-    * core, this is enabled by default.
-    */
-   bool reserve_descriptor_set;
-
-   /* Allow out of bounds UBO access by disabling lowering of UBO loads for
-    * indirect access, which rely on the UBO bounds specified in the shader,
-    * rather than the bound UBO size which isn't known until draw time.
-    *
-    * See: https://github.com/doitsujin/dxvk/issues/3861
-    */
-   bool allow_oob_indirect_ubo_loads;
-
-   /* DXVK and VKD3D-Proton use customBorderColorWithoutFormat
-    * and have most of D24S8 images with USAGE_SAMPLED, in such case we
-    * disable UBWC for correctness. However, games don't use border color for
-    * depth-stencil images. So we elect to ignore this edge case and force
-    * UBWC to be enabled.
-    */
-   bool disable_d24s8_border_color_workaround;
-
-   /* D3D emulation requires texture coordinates to be rounded to nearest even value. */
-   bool use_tex_coord_round_nearest_even_mode;
-
-   /* Apps may be accidentally incorrect  */
-   bool ignore_frag_depth_direction;
-
-   /* D3D12 SM6.2 requires float32 denorm support which we have to emulate.
-    * However we don't want native Vulkan apps using this.
-    */
-   bool enable_softfloat32;
 };
 VK_DEFINE_HANDLE_CASTS(tu_instance, vk.base, VkInstance,
                        VK_OBJECT_TYPE_INSTANCE)
@@ -260,7 +232,12 @@ struct tu6_global
 
    volatile uint32_t vtx_stats_query_not_running;
 
-   /* To know when renderpass stats for autotune are valid */
+   /* A fence with a monotonically increasing value that is
+    * incremented by the GPU on each submission that includes
+    * a tu_autotune::submission_entry CS. This is used to track
+    * which submissions have been processed by the GPU before
+    * processing the autotune packet on the CPU.
+    */
    volatile uint32_t autotune_fence;
 
    /* For recycling command buffers for dynamic suspend/resume comamnds */
@@ -282,6 +259,28 @@ struct tu6_global
    volatile uint32_t userspace_fence;
    uint32_t _pad5;
 
+   /* Autotune preemption delay tracking */
+   uint64_t cur_rp_hash;
+
+   uint64_t base_preemption_latency;
+   uint64_t new_preemption_latency;
+   volatile uint64_t preemption_latency;
+
+   uint64_t base_always_count;
+   uint64_t new_always_count;
+   uint64_t base_aon;
+   uint64_t new_aon;
+
+   /* These four fields must be contiguous so that snapshot_preempt_data can copy them all in a single CP_MEMCPY. */
+   volatile uint64_t max_preemption_latency;
+   volatile uint64_t max_preemption_latency_rp_hash;
+   volatile uint64_t max_always_count_delta;
+   volatile uint64_t max_aon_delta;
+
+   uint64_t preemption_latency_cmp_scratch;
+   uint64_t zero_64b;
+
+   struct bcolor_entry bcolor_builtin[TU_BORDER_COLOR_BUILTIN];
    struct bcolor_entry bcolor[];
 };
 #define gb_offset(member) offsetof(struct tu6_global, member)
@@ -296,7 +295,6 @@ struct tu_pvtmem_bo {
 };
 
 struct tu_virtio_device;
-struct tu_queue;
 
 struct tu_device
 {
@@ -350,12 +348,6 @@ struct tu_device
    struct tu_suballocator pipeline_suballoc;
    mtx_t pipeline_mutex;
 
-   /* Device-global BO suballocator for reducing BO management for small
-    * gmem/sysmem autotune result buffers.  Synchronized by autotune_mutex.
-    */
-   struct tu_suballocator autotune_suballoc;
-   mtx_t autotune_mutex;
-
    /* KGSL requires a small chunk of GPU mem to retrieve raw GPU time on
     * each submission.
     */
@@ -375,10 +367,6 @@ struct tu_device
    struct tu_suballocator vis_stream_suballocator;
    mtx_t vis_stream_suballocator_mtx;
 
-   /* the blob seems to always use 8K factor and 128K param sizes, copy them */
-#define TU_TESS_FACTOR_SIZE (8 * 1024)
-#define TU_TESS_PARAM_SIZE (128 * 1024)
-#define TU_TESS_BO_SIZE (TU_TESS_FACTOR_SIZE + TU_TESS_PARAM_SIZE)
    /* Lazily allocated, protected by the device mutex. */
    struct tu_bo *tess_bo;
 
@@ -445,6 +433,8 @@ struct tu_device
 
    struct tu_cs_entry bin_preamble_entry, bin_preamble_bv_entry;
 
+   struct tu_cs_entry switch_away_amble_entry, switch_back_amble_entry;
+
    struct tu_bo *vis_stream_bo;
    mtx_t vis_stream_mtx;
 
@@ -457,7 +447,9 @@ struct tu_device
    pthread_cond_t timeline_cond;
    pthread_mutex_t submit_mutex;
 
-   struct tu_autotune autotune;
+   struct fd_perfcntr_state *perfcntrs;
+
+   struct tu_autotune *autotune;
 
    struct breadcrumbs_context *breadcrumbs_ctx;
 
@@ -499,6 +491,25 @@ struct tu_device
    uint32_t vis_stream_size;
 };
 VK_DEFINE_HANDLE_CASTS(tu_device, vk.base, VkDevice, VK_OBJECT_TYPE_DEVICE)
+
+template <chip_range_support>
+struct TU_TESS;
+
+template <chip CHIP>
+struct TU_TESS<chip_range(CHIP <= A7XX)> {
+   /* the blob seems to always use 8K factor and 128K param sizes, copy them */
+   static const size_t FACTOR_SIZE = 8 * 1024;
+   static const size_t PARAM_SIZE = 128 * 1024;
+   static const size_t BO_SIZE = FACTOR_SIZE + PARAM_SIZE;
+};
+
+template <chip CHIP>
+struct TU_TESS<chip_range(CHIP >= A8XX)> {
+   /* for gen8, buffers are sized for two draws: */
+   static const size_t FACTOR_SIZE = 0x4040;
+   static const size_t PARAM_SIZE = 0x40000;
+   static const size_t BO_SIZE = FACTOR_SIZE + PARAM_SIZE;
+};
 
 struct tu_device_memory
 {
@@ -542,8 +553,11 @@ struct tu_vsc_config {
    /* Whether binning could be used for gmem rendering using this framebuffer. */
    bool binning_possible;
 
-   /* Whether binning should be used for gmem rendering using this framebuffer. */
-   bool binning;
+   /* Whether binning is useful for GMEM rendering performance using this framebuffer. This is independent of whether
+    * binning is possible, and is determined by the tile count. Not binning when it's useful would be a performance
+    * hazard, and GMEM rendering should be avoided in the case where it's useful to bin but not possible to do so.
+    */
+   bool binning_useful;
 
    /* pipe register values */
    uint32_t pipe_config[MAX_VSC_PIPES];
@@ -572,7 +586,8 @@ struct tu_framebuffer
 
    uint32_t max_tile_w_constraint;
    uint32_t max_tile_h_constraint;
-   struct tu_tiling_config tiling[TU_GMEM_LAYOUT_COUNT];
+   uint32_t initd_divisor; /* The tile divisors up to this have been initialized, for lazy init. */
+   struct tu_tiling_config tiling[TU_GMEM_LAYOUT_COUNT * TU_GMEM_LAYOUT_DIVISOR_MAX];
 
    uint32_t attachment_count;
    const struct tu_image_view *attachments[0];

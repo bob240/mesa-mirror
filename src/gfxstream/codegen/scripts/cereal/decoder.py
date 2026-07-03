@@ -35,6 +35,13 @@ GLOBAL_COMMANDS_WITHOUT_DISPATCH = [
     "vkEnumerateInstanceExtensionProperties",
     "vkEnumerateInstanceLayerProperties",
     "vkTraceAsyncGOOGLE",
+    "vkSetDebugMetadataAsyncGOOGLE",
+]
+
+COMMANDS_WITHOUT_TRACE = [
+    # This command is used to set perfetto track names (using the guest process and thread name)
+    # and track names should (ideally) be set before any trace events
+    'vkSetDebugMetadataAsyncGOOGLE',
 ]
 
 SNAPSHOT_API_CALL_HANDLE_VARNAME = "snapshotApiCallHandle"
@@ -84,7 +91,7 @@ public:
              m_boxedHandleCreateMapping(m_state),
              m_boxedHandleUnwrapMapping(m_state),
              m_prevSeqno(std::nullopt),
-             m_queueSubmitWithCommandsEnabled(m_state->getFeatures().VulkanQueueSubmitWithCommands.enabled),
+             m_queueSubmitWithCommandsEnabled(m_state->getFeatures().VulkanQueueSubmitWithCommands.enabled()),
              m_snapshotsEnabled(m_state->snapshotsEnabled()) {}
     %s* stream() { return &m_vkStream; }
     VulkanMemReadingStream* readStream() { return &m_vkMemReadingStream; }
@@ -632,6 +639,9 @@ def decode_unsupported_api(typeInfo, api, cgen):
     cgen.stmt("__builtin_trap()")
 
 custom_decodes = {
+    "vkGetInstanceProcAddr" : emit_global_state_wrapped_decoding,
+    "vkGetDeviceProcAddr" : emit_global_state_wrapped_decoding,
+
     "vkEnumerateInstanceVersion" : emit_global_state_wrapped_decoding,
     "vkCreateInstance" : emit_global_state_wrapped_decoding,
     "vkDestroyInstance" : emit_global_state_wrapped_decoding,
@@ -685,9 +695,11 @@ custom_decodes = {
 
     "vkCreateImage" : emit_global_state_wrapped_decoding,
     "vkCreateImageView" : emit_global_state_wrapped_decoding,
+    "vkCreateBufferView" : emit_global_state_wrapped_decoding,
     "vkCreateSampler" : emit_global_state_wrapped_decoding,
     "vkDestroyImage" : emit_global_state_wrapped_decoding,
     "vkDestroyImageView" : emit_global_state_wrapped_decoding,
+    "vkDestroyBufferView" : emit_global_state_wrapped_decoding,
     "vkDestroySampler" : emit_global_state_wrapped_decoding,
     "vkCmdCopyBufferToImage" : emit_global_state_wrapped_decoding_with_context,
     "vkCmdCopyImage" : emit_global_state_wrapped_decoding,
@@ -743,6 +755,9 @@ custom_decodes = {
     "vkResetCommandPool" : emit_global_state_wrapped_decoding,
     "vkCmdPipelineBarrier" : emit_global_state_wrapped_decoding,
     "vkCmdPipelineBarrier2" : emit_global_state_wrapped_decoding,
+    "vkCmdWaitEvents" : emit_global_state_wrapped_decoding,
+    "vkCmdWaitEvents2" : emit_global_state_wrapped_decoding,
+    "vkCmdWaitEvents2KHR" : emit_global_state_wrapped_decoding,
     "vkCmdBindPipeline" : emit_global_state_wrapped_decoding,
     "vkCmdBindDescriptorSets" : emit_global_state_wrapped_decoding,
 
@@ -792,6 +807,7 @@ custom_decodes = {
     "vkGetBlobGOOGLE" : emit_global_state_wrapped_decoding,
     "vkGetSemaphoreGOOGLE" : emit_global_state_wrapped_decoding,
     "vkTraceAsyncGOOGLE" : emit_global_state_wrapped_decoding,
+    "vkSetDebugMetadataAsyncGOOGLE" : emit_global_state_wrapped_decoding,
 
     # Descriptor update templates
     "vkCreateDescriptorUpdateTemplate" : emit_global_state_wrapped_decoding,
@@ -968,7 +984,9 @@ size_t VkDecoder::Impl::decode(void* buf, size_t len, IOStream* ioStream,
 
         cgen.line("case OP_%s:" % name)
         cgen.beginBlock()
-        cgen.stmt("GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY, \"VkDecoder %s\")" % name)
+
+        if name not in COMMANDS_WITHOUT_TRACE:
+            cgen.stmt("GFXSTREAM_TRACE_EVENT(GFXSTREAM_TRACE_DECODER_CATEGORY, \"VkDecoder %s\")" % name)
 
         if api.name in custom_decodes.keys():
             custom_decodes[api.name](typeInfo, api, cgen)

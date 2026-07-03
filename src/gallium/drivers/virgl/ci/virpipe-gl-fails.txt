@@ -26,7 +26,6 @@ dEQP-GLES3.functional.fbo.blit.rect.nearest_consistency_min_reverse_src_dst_x,Fa
 dEQP-GLES3.functional.fbo.blit.rect.nearest_consistency_min_reverse_src_dst_y,Fail
 
 KHR-GL43.cull_distance.functional,Fail
-KHR-GL43.map_buffer_alignment.functional,Crash
 KHR-GL43.shader_image_load_store.basic-allTargets-store,Fail
 KHR-GL43.shader_image_load_store.incomplete_textures,Fail
 
@@ -481,7 +480,6 @@ spec@!opengl 1.1@line-smooth-stipple,Fail
 
 spec@arb_gl_spirv@execution@ssbo@unsized-array,Fail
 spec@!opengl 1.1@line-flat-clip-color,Fail
-spec@glsl-1.40@uniform_buffer@two-stages,Fail
 spec@ext_texture_compression_s3tc@texwrap formats bordercolor-swizzled,Fail
 spec@ext_texture_compression_s3tc@texwrap formats bordercolor-swizzled@GL_COMPRESSED_RGBA_S3TC_DXT1_EXT- swizzled- border color only,Fail
 spec@ext_texture_compression_s3tc@texwrap formats bordercolor-swizzled@GL_COMPRESSED_RGBA_S3TC_DXT3_EXT- swizzled- border color only,Fail
@@ -504,9 +502,20 @@ spec@glsl-1.50@execution@geometry@dynamic_input_array_index,Crash
 # uprev Piglit in Mesa
 spec@!opengl 1.1@depthstencil-default_fb-drawpixels-24_8 samples=8,Fail
 spec@!opengl 1.1@depthstencil-default_fb-drawpixels-32f_24_8_rev samples=6,Fail
+spec@!opengl 1.1@texwrap 2d proj bordercolor,Fail
+spec@!opengl 1.1@texwrap 2d proj bordercolor@GL_RGBA8- projected- border color only,Fail
 spec@arb_es2_compatibility@texwrap formats bordercolor-swizzled,Fail
 spec@arb_es2_compatibility@texwrap formats bordercolor-swizzled@GL_RGB565- swizzled- border color only,Fail
 spec@arb_framebuffer_object@execution@msaa-alpha-to-coverage_alpha-to-one_write-z,Fail
+spec@arb_shader_image_load_store@max-size@image2DMS max size test/8x16384x8x1,Fail
+spec@arb_shader_image_load_store@max-size@image2DMS max size test/8x8x16384x1,Fail
+spec@arb_shader_image_load_store@max-size@image2DMSArray max size test/8x8x8x2048,Fail
+spec@arb_tessellation_shader@execution@built-in-functions@tcs-equal-vec2-vec2,Crash
+spec@arb_tessellation_shader@execution@built-in-functions@tcs-max-float-float,Crash
+spec@arb_tessellation_shader@execution@built-in-functions@tcs-op-eq-mat2-mat2-using-if,Crash
+spec@arb_tessellation_shader@execution@built-in-functions@tcs-op-eq-mat3x4-mat3x4-using-if,Crash
+spec@arb_tessellation_shader@execution@built-in-functions@tcs-op-eq-vec4-vec4,Crash
+spec@arb_tessellation_shader@execution@built-in-functions@tcs-op-ne-vec3-vec3-using-if,Crash
 spec@arb_tessellation_shader@execution@tcs-output-unmatched,Fail
 spec@arb_texture_compression_bptc@texwrap formats bordercolor-swizzled,Fail
 spec@arb_texture_compression_bptc@texwrap formats bordercolor-swizzled@GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT- swizzled- border color only,Fail
@@ -535,6 +544,8 @@ spec@egl 1.4@eglcreatepbuffersurface and then glclear,Crash
 spec@egl 1.4@largest possible eglcreatepbuffersurface and then glclear,Crash
 spec@ext_framebuffer_multisample@interpolation 6 centroid-edges,Fail
 spec@ext_framebuffer_multisample@no-color 6 depth single,Fail
+spec@ext_framebuffer_multisample@no-color 6 depth-computed single,Fail
+spec@ext_framebuffer_multisample@no-color 8 depth single,Fail
 spec@ext_framebuffer_multisample@no-color 8 depth-computed single,Fail
 spec@ext_packed_float@texwrap formats bordercolor,Fail
 spec@ext_packed_float@texwrap formats bordercolor-swizzled,Fail
@@ -584,3 +595,17 @@ KHR-Single-GL43.arrays_of_arrays_gl.InteractionFunctionCalls2_var_type_index_14,
 KHR-Single-GL43.arrays_of_arrays_gl.SubroutineArgumentAliasing4_var_type_index_14,Fail
 KHR-Single-GL43.arrays_of_arrays_gl.SubroutineFunctionCalls1_var_type_index_14,Fail
 KHR-Single-GL43.arrays_of_arrays_gl.SubroutineFunctionCalls2_var_type_index_14,Fail
+
+# New failures with GL CTS 4.6.8.0
+KHR-GL43.cull_distance.functional_test_item_5_primitive_mode_lines_max_culldist_0,Fail
+KHR-GL43.framebuffer_blit.multisampled_to_singlesampled_blit_depth_config_test,Fail
+KHR-Single-GL43.arrays_of_arrays_gl.SubroutineArgumentAliasing2_var_type_index_14,Fail
+
+# !41329
+dEQP-GLES3.functional.transform_feedback.random.separate.lines.6,Crash
+dEQP-GLES3.functional.transform_feedback.random.separate.triangles.4,Crash
+dEQP-GLES3.functional.transform_feedback.random.separate.triangles.5,Crash
+dEQP-GLES3.functional.transform_feedback.random_full_array_capture.interleaved.points.5,Crash
+dEQP-GLES3.functional.transform_feedback.random_full_array_capture.interleaved.triangles.1,Crash
+dEQP-GLES3.functional.transform_feedback.random_full_array_capture.separate.lines.6,Crash
+dEQP-GLES3.functional.transform_feedback.random_full_array_capture.separate.triangles.4,Crash

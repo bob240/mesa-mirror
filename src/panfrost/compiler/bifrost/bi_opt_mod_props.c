@@ -1,25 +1,7 @@
 /*
  * Copyright (C) 2021 Collabora, Ltd.
- * Copyright (C) 2021 Alyssa Rosenzweig <alyssa@rosenzweig.io>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (C) 2021 Alyssa Rosenzweig
+ * SPDX-License-Identifier: MIT
  */
 
 #include "bi_builder.h"
@@ -497,9 +479,20 @@ bi_lower_opt_instruction_helper(bi_builder *b, bi_instr *I)
       repl->clamp = I->clamp;
       return true;
 
-   case BI_OPCODE_DISCARD_B32:
-      bi_discard_f32(b, I->src[0], bi_zero(), BI_CMPF_NE);
+   case BI_OPCODE_DISCARD_B32: {
+      bi_index src1 = bi_zero();
+      /* Bifrost can only encode this if either swizzles are NONE or if both are
+       * h0|h1
+       */
+      if (I->src[0].swizzle != BI_SWIZZLE_NONE) {
+         assert(I->src[0].swizzle == BI_SWIZZLE_H0 ||
+                I->src[0].swizzle == BI_SWIZZLE_H1);
+         src1 = bi_half(src1, false);
+      }
+
+      bi_discard_f32(b, I->src[0], src1, BI_CMPF_NE);
       return true;
+   }
 
    default:
       return false;

@@ -1,25 +1,7 @@
 #encoding=utf-8
 
 # Copyright (C) 2021 Collabora, Ltd.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice (including the next
-# paragraph) shall be included in all copies or substantial portions of the
-# Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+# SPDX-License-Identifier: MIT
 
 import argparse
 import sys
@@ -52,11 +34,10 @@ SKIP = set([
         "ISUB.u64",
         "ISUB.s64",
         "IMULD.u64",
-        "SHADDX.u64",
-        "SHADDX.s64",
         "IMULD.u64",
-        "CLPER.s64",
-        "CLPER.u64",
+        "ARSHIFT_AND.i64",
+        "ARSHIFT_OR.i64",
+        "ARSHIFT_XOR.i64",
         "LSHIFT_AND.i64",
         "RSHIFT_AND.i64",
         "LSHIFT_OR.i64",
@@ -64,12 +45,17 @@ SKIP = set([
         "LSHIFT_XOR.i64",
         "RSHIFT_XOR.i64",
 
-        # CLPER widens
-        "CLPER.s32",
-        "CLPER.v2s16",
-        "CLPER.v4s8",
-        "CLPER.v2u16",
-        "CLPER.v4u8",
+        # Disassembly aliases. The compiler models these as RSHIFT_* with the
+        # arithmetic bit set.
+        "ARSHIFT_AND.i32",
+        "ARSHIFT_AND.v2i16",
+        "ARSHIFT_AND.v4i8",
+        "ARSHIFT_OR.i32",
+        "ARSHIFT_OR.v2i16",
+        "ARSHIFT_OR.v4i8",
+        "ARSHIFT_XOR.i32",
+        "ARSHIFT_XOR.v2i16",
+        "ARSHIFT_XOR.v4i8",
 
         # VAR_TEX
         "VAR_TEX_SINGLE",
@@ -174,7 +160,10 @@ valhall_opcodes[BI_NUM_OPCODES] = {
 
 # Exact value to be ORed in to every opcode
 def exact_op(op):
-    return (op.opcode << 48) | (op.opcode2 << op.secondary_shift)
+    exact_op = 0
+    for subcode in op.opcode:
+        exact_op |= (subcode.value << subcode.start)
+    return exact_op
 
 try:
     print(Template(template).render(immediates = immediates, instructions = instructions, skip = SKIP, exact = exact_op, typesize = typesize))

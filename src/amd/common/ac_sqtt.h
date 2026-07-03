@@ -15,6 +15,7 @@
 #include "ac_pm4.h"
 #include "ac_rgp.h"
 #include "amd_family.h"
+#include "util/simple_mtx.h"
 
 #define SQTT_BUFFER_ALIGN_SHIFT 12
 
@@ -36,7 +37,7 @@ struct ac_sqtt {
    /* Only used by RadeonSI */
    void *start_cs[2];
    void *stop_cs[2];
-   /* VkBuffer or struct pb_buffer */
+   /* VkBuffer or struct si_resource */
    void *bo;
    uint64_t buffer_va;
    void *ptr;
@@ -44,6 +45,7 @@ struct ac_sqtt {
    int start_frame;
    char *trigger_file;
    bool instruction_timing_enabled;
+   uint32_t instruction_timing_se_mask;
 
    /* Shader/memory clock frequencies in Mhz sampled at trace time. */
    uint32_t trace_shader_core_clock;
@@ -61,6 +63,8 @@ struct ac_sqtt {
    struct rgp_clock_calibration rgp_clock_calibration;
 
    struct hash_table_u64 *pipeline_bos;
+
+   simple_mtx_t lock;
 };
 
 struct ac_sqtt_data_info {
@@ -91,6 +95,7 @@ struct ac_sqtt_trace {
 
    uint32_t trace_shader_core_clock;
    uint32_t trace_memory_clock;
+   uint32_t instruction_timing_se_mask;
 
    uint32_t num_traces;
    struct ac_sqtt_data_se traces[SQTT_MAX_TRACES];
@@ -573,5 +578,7 @@ void ac_sqtt_emit_stop(const struct radeon_info *info, struct ac_pm4_state *pm4,
 
 void ac_sqtt_emit_wait(const struct radeon_info *info, struct ac_pm4_state *pm4,
                        const struct ac_sqtt *sqtt, bool is_compute_queue);
+
+bool ac_sqtt_update_bo_size(struct ac_sqtt *sqtt, const char *env_var_prefix);
 
 #endif

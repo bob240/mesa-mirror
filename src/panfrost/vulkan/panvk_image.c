@@ -1,30 +1,14 @@
 /*
  * Copyright © 2025 Arm Ltd.
  * Copyright © 2021 Collabora Ltd.
+ * Copyright © 2026 Google LLC
  *
  * Derived from tu_image.c which is:
  * Copyright © 2016 Red Hat.
  * Copyright © 2016 Bas Nieuwenhuizen
  * Copyright © 2015 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "pan_afbc.h"
@@ -37,7 +21,6 @@
 #include "panvk_image.h"
 #include "panvk_instance.h"
 #include "panvk_physical_device.h"
-#include "panvk_sparse.h"
 
 #include "drm-uapi/drm_fourcc.h"
 #include "util/u_atomic.h"
@@ -124,6 +107,8 @@ get_iusage(struct panvk_image *image, const VkImageCreateInfo *create_info)
    if (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
       iusage.bind |= PAN_BIND_RENDER_TARGET;
 
+   iusage.standard_sparse_mapping_granularity =
+      !!(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT);
    iusage.host_copy =
       !!(image->vk.usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT);
    iusage.legacy_scanout = wsi_info && wsi_info->scanout;
@@ -165,6 +150,7 @@ static enum pipe_format
 select_depth_plane_pfmt(struct panvk_image *image, uint64_t mod)
 {
    switch (image->vk.format) {
+   case VK_FORMAT_X8_D24_UNORM_PACK32:
    case VK_FORMAT_D24_UNORM_S8_UINT:
       /* We only use packed Z24 when AFBC is involved, to simplify copies on on
        * AFBC resources.
@@ -193,9 +179,15 @@ select_stencil_plane_pfmt(struct panvk_image *image)
 static enum pipe_format
 select_plane_pfmt(struct panvk_image *image, uint64_t mod, unsigned plane)
 {
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(image->vk.base.device->physical);
+   unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
    if (panvk_image_is_planar_depth_stencil(image)) {
       return plane > 0 ? select_stencil_plane_pfmt(image)
                        : select_depth_plane_pfmt(image, mod);
+   } else if (image->vk.format == VK_FORMAT_X8_D24_UNORM_PACK32 && arch >= 9) {
+      /* X8_D24 can be lowered to D24 on Valhall if AFBC is enabled. */
+      return select_depth_plane_pfmt(image, mod);
    }
 
    VkFormat plane_format = vk_format_get_plane_format(image->vk.format, plane);
@@ -256,29 +248,30 @@ panvk_image_can_use_mod(struct panvk_image *image,
           (image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT))
          return false;
 
-      /* No ms with AFBC, but we need to create multisampled images in the
-       * background for which the view formats need to be compatible to avoid
-       * headaches when copying --> disable afbc for the base image as well.
-       * When copying the depth plane block sizes aren't matching between
-       * utiled and afbc, thus the views created for the ms images are
-       * invalid.
+      /* On v6 and earlier, we can't reliably resolve directly to AFBC images
+       * (see avoid_direct_resolve_to() in panvk_vX_cmd_draw.c).  For MS2SS,
+       * this means we know a priori that the single-sampled image is going to
+       * be a resolve target.  It's better to leave it uncompressed than to
+       * eat the separate resolves.
        */
-      if (image->vk.create_flags &
-          VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) {
+      if ((image->vk.create_flags &
+           VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT) &&
+          arch < 7)
          return false;
-      }
    }
 
-   if (mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
-      /* Multiplanar YUV with U-interleaving isn't supported by the HW. We
-       * also need to make sure images that can be aliased to planes of
-       * multi-planar images remain compatible with the aliased images, so
-       * don't allow U-interleaving for those either.
-       */
-      if (vk_format_get_plane_count(image->vk.format) > 1 ||
-          vk_image_can_be_aliased_to_yuv_plane(&image->vk))
-         return false;
+   /* Multiplanar YUV with U-interleaving or interleaved_64k isn't supported by
+    * the HW. We also need to make sure images that can be aliased to planes of
+    * multi-planar images remain compatible with the aliased images, so don't
+    * allow U-interleaving or interleaved_64k for those either.
+    */
+   if ((mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED ||
+        mod == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K) &&
+       (vk_format_get_plane_count(image->vk.format) > 1 ||
+        vk_image_can_be_aliased_to_yuv_plane(&image->vk)))
+      return false;
 
+   if (mod == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
       /* If we're dealing with a compressed format that requires non-compressed
        * views we can't use U_INTERLEAVED tiling because the tiling is different
        * between compressed and non-compressed formats. If we wanted to support
@@ -287,8 +280,8 @@ panvk_image_can_use_mod(struct panvk_image *image,
        * sampled/storage image, frag_coord patching for color attachments). Let's
        * keep things simple for now and make all compressed images that
        * have VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT set linear. */
-      return !(image->vk.create_flags &
-               VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT);
+      if (image->vk.create_flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT)
+         return false;
    }
 
    /* Defer the rest of the checks to the mod handler. */
@@ -405,24 +398,52 @@ is_disjoint(const struct panvk_image *image)
    return image->vk.create_flags & VK_IMAGE_CREATE_DISJOINT_BIT;
 }
 
-static bool
-strict_import(struct panvk_image *image, uint32_t plane)
+static inline bool
+strict_import(struct panvk_image *image)
 {
    /* We can't do strict imports for AFBC because a Vulkan-based compositor
     * might be importing buffers from clients that are relying on the old
     * behavior. The only exception is AFBC(YUV) because support for these
     * formats was added after we started enforcing WSI pitch. */
-   if (drm_is_afbc(image->vk.drm_format_mod) &&
-       !pan_format_is_yuv(image->planes[plane].image.props.format))
-      return false;
+   return !drm_is_afbc(image->vk.drm_format_mod) ||
+          vk_format_get_ycbcr_info(image->vk.format);
+}
 
-   return true;
+static struct pan_image_props
+get_pan_image_props(const struct vk_image *image, enum pipe_format pfmt,
+                    uint32_t plane)
+{
+   return (struct pan_image_props){
+      .modifier = image->drm_format_mod,
+      .format = pfmt,
+      .dim = panvk_image_type_to_mali_tex_dim(image->image_type),
+      .extent_px =
+         {
+            .width = vk_format_get_plane_width(image->format, plane,
+                                               image->extent.width),
+            .height = vk_format_get_plane_height(image->format, plane,
+                                                 image->extent.height),
+            .depth = image->extent.depth,
+         },
+      .array_size = image->array_layers,
+      .nr_samples = image->samples,
+      .nr_slices = image->mip_levels,
+   };
 }
 
 static VkResult
 panvk_image_init_layouts(struct panvk_image *image,
                          const VkImageCreateInfo *pCreateInfo)
 {
+   /* For single plane:
+    * - 1 x panvk_image -> 1 x (1 x pan_image -> 1 x pan_image_plane)
+    *
+    * For multi-plane Z/S and sw YUV:
+    * - 1 x panvk_image -> N x (1 x pan_image -> 1 x pan_image_plane)
+    *
+    * For hw YUV texturing:
+    * - 1 x panvk_image -> 1 x (1 x pan_image -> N x pan_image_plane)
+    */
    struct panvk_device *dev = to_panvk_device(image->vk.base.device);
    struct panvk_physical_device *phys_dev =
       to_panvk_physical_device(dev->vk.physical);
@@ -434,47 +455,44 @@ panvk_image_init_layouts(struct panvk_image *image,
 
    const struct pan_mod_handler *mod_handler =
       pan_mod_get_handler(arch, image->vk.drm_format_mod);
+
+   /* initialize pan_image props and mod_handler */
+   if (panvk_image_use_yuv_tex(arch, image->vk.format)) {
+      const enum pipe_format pfmt = vk_format_to_pipe_format(image->vk.format);
+      image->planes[0].image = (struct pan_image){
+         .props = get_pan_image_props(&image->vk, pfmt, 0),
+         .mod_handler = mod_handler,
+      };
+   } else {
+      for (uint8_t plane = 0; plane < image->plane_count; plane++) {
+         const enum pipe_format pfmt =
+            select_plane_pfmt(image, image->vk.drm_format_mod, plane);
+         image->planes[plane].image = (struct pan_image){
+            .props = get_pan_image_props(&image->vk, pfmt, plane),
+            .mod_handler = mod_handler,
+         };
+      }
+   }
+
+   /* initialize plane layout */
+   const bool use_strict_import = strict_import(image);
    struct pan_image_layout_constraints plane_layout = {
       .offset_B = 0,
    };
-   if (pCreateInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
-      plane_layout.array_align_B = panvk_get_sparse_block_desc(pCreateInfo->imageType, pCreateInfo->format).size_B;
-      plane_layout.u_tiled.row_align_B = panvk_get_gpu_page_size(dev);
-   }
    for (uint8_t plane = 0; plane < image->plane_count; plane++) {
-      enum pipe_format pfmt =
-         select_plane_pfmt(image, image->vk.drm_format_mod, plane);
-
       if (explicit_info) {
          plane_layout = (struct pan_image_layout_constraints){
             .offset_B = explicit_info->pPlaneLayouts[plane].offset,
             .wsi_row_pitch_B = explicit_info->pPlaneLayouts[plane].rowPitch,
+            .strict = use_strict_import,
          };
       }
 
-      image->planes[plane].image = (struct pan_image){
-         .props = {
-            .modifier = image->vk.drm_format_mod,
-            .format = pfmt,
-            .dim = panvk_image_type_to_mali_tex_dim(image->vk.image_type),
-            .extent_px = {
-               .width = vk_format_get_plane_width(image->vk.format, plane,
-                                                  image->vk.extent.width),
-               .height = vk_format_get_plane_height(image->vk.format, plane,
-                                                    image->vk.extent.height),
-               .depth = image->vk.extent.depth,
-            },
-            .array_size = image->vk.array_layers,
-            .nr_samples = image->vk.samples,
-            .nr_slices = image->vk.mip_levels,
-         },
-         .mod_handler = mod_handler,
-         .planes = {&image->planes[plane].plane},
-      };
+      struct pan_image *pan_img = PAN_IMAGE_FROM(arch, image, plane);
+      const uint8_t pan_plane = PAN_IMAGE_PLANE_INDEX_FROM(arch, image, plane);
 
-      plane_layout.strict = strict_import(image, plane);
-      if (!pan_image_layout_init(arch, &image->planes[plane].image, 0,
-                                 &plane_layout)) {
+      pan_img->planes[pan_plane] = &image->planes[plane].plane;
+      if (!pan_image_layout_init(arch, pan_img, pan_plane, &plane_layout)) {
          return panvk_error(image->vk.base.device,
                             VK_ERROR_INITIALIZATION_FAILED);
       }
@@ -534,7 +552,12 @@ panvk_image_pre_mod_select_meta_adjustments(struct panvk_image *image)
         (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT)) &&
        vk_format_is_compressed(image->vk.format)) {
       /* We need to be able to create RGBA views of compressed formats for
-       * vk_meta copies. */
+       * vk_meta copies.
+       *
+       * FIXME: this might cause LINEAR to be used instead of a better modifier.
+       * See https://gitlab.freedesktop.org/panfrost/mesa/-/issues/271 for
+       * details.
+       */
       image->vk.create_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
                                 VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
    }
@@ -555,15 +578,43 @@ panvk_image_post_mod_select_meta_adjustments(struct panvk_image *image)
 }
 
 static uint64_t
+panvk_image_plane_size(const struct panvk_image *image, unsigned plane)
+{
+   const struct pan_image_layout *layout = &image->planes[plane].plane.layout;
+   return layout->slices[0].offset_B + layout->data_size_B;
+}
+
+static uint64_t
 panvk_image_get_total_size(const struct panvk_image *image)
 {
    uint64_t size = 0;
-   for (uint8_t plane = 0; plane < image->plane_count; plane++) {
-      const struct pan_image_layout *layout =
-         &image->planes[plane].plane.layout;
-      size = MAX2(size, layout->slices[0].offset_B + layout->data_size_B);
-   }
+   for (uint8_t plane = 0; plane < image->plane_count; plane++)
+      size = MAX2(size, panvk_image_plane_size(image, plane));
    return size;
+}
+
+/* Report the VA ranges of a bound non-sparse image. Disjoint images can place
+ * each plane in a different allocation, so they are reported individually.
+ * Otherwise the planes share a base and a single range covers the image.
+ */
+static void
+panvk_image_report_binding(struct panvk_device *dev, struct panvk_image *image,
+                           VkDeviceAddressBindingTypeEXT type)
+{
+   if (is_disjoint(image)) {
+      for (unsigned plane = 0; plane < image->plane_count; plane++) {
+         if (!image->planes[plane].plane.base)
+            continue;
+         panvk_address_binding_report(dev, &image->vk.base,
+                                      image->planes[plane].plane.base,
+                                      panvk_image_plane_size(image, plane),
+                                      type);
+      }
+   } else if (image->planes[0].plane.base) {
+      panvk_address_binding_report(dev, &image->vk.base,
+                                   image->planes[0].plane.base,
+                                   panvk_image_get_total_size(image), type);
+   }
 }
 
 static uint64_t
@@ -661,12 +712,13 @@ create_ms_images(struct panvk_device *dev, struct panvk_image *img,
       struct panvk_image *res = panvk_image_from_handle(img->ms_imgs[msaa_idx]);
       assert(res->vk.format == img->vk.format);
       assert(res->plane_count == img->plane_count);
-      for (uint32_t i = 0; i < res->plane_count; ++i) {
-         assert(res->planes[i].image.props.format ==
-                img->planes[i].image.props.format);
-      }
    }
 }
+
+/* See Vulkan spec, 35.4.3. Standard Sparse Image Block Shapes for details */
+enum {
+   STANDARD_SPARSE_BLOCK_SIZE_B = 65536,
+};
 
 VKAPI_ATTR VkResult VKAPI_CALL
 panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
@@ -707,16 +759,20 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
     *    If the size of the resultant image would exceed maxResourceSize, then
     *    vkCreateImage must fail and return VK_ERROR_OUT_OF_DEVICE_MEMORY.
     */
-   if (size > UINT32_MAX) {
+   if (size > panvk_get_max_resource_size(phys_dev)) {
       result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
       goto err_destroy_image;
    }
 
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
       uint64_t va_range = panvk_image_get_sparse_size(image);
+      /* Sparse images must be aligned to the sparse block size */
+      uint64_t alignment =
+         MAX2(pan_choose_gpu_va_alignment(dev->kmod.vm, va_range),
+              STANDARD_SPARSE_BLOCK_SIZE_B);
 
-      image->sparse.device_address = panvk_as_alloc(dev, va_range,
-         pan_choose_gpu_va_alignment(dev->kmod.vm, va_range));
+      image->sparse.device_address =
+         panvk_as_alloc(dev, &dev->as.heap, va_range, alignment);
       if (!image->sparse.device_address) {
          result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
          goto err_destroy_image;
@@ -732,14 +788,29 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
          /* Map last so that we don't have a possibility of getting any more
           * errors, in which case we'd have to unmap.
           */
-         result = panvk_map_to_blackhole(dev, image->sparse.device_address,
-                                         va_range);
-         if (result != VK_SUCCESS) {
-            result = panvk_error(dev, result);
+         struct pan_kmod_vm_op map = {
+            .type = PAN_KMOD_VM_OP_TYPE_MAP,
+            .va = {
+               .start = image->sparse.device_address,
+               .size = va_range,
+            },
+            .flags = PAN_KMOD_VM_OP_OP_MAP_SPARSE,
+         };
+
+         int ret = pan_kmod_vm_bind(dev->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE,
+                                    &map, 1);
+         if (ret) {
+            result = panvk_error(device, VK_ERROR_OUT_OF_DEVICE_MEMORY);
             goto err_free_va;
          }
       }
    }
+
+   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      panvk_address_binding_report(dev, &image->vk.base,
+                                   image->sparse.device_address,
+                                   panvk_image_get_sparse_size(image),
+                                   VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
 
    if (pCreateInfo->flags &
        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT)
@@ -750,7 +821,7 @@ panvk_CreateImage(VkDevice device, const VkImageCreateInfo *pCreateInfo,
 
 err_free_va:
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
-      panvk_as_free(dev, image->sparse.device_address,
+      panvk_as_free(dev, &dev->as.heap, image->sparse.device_address,
                     panvk_image_get_sparse_size(image));
 
 err_destroy_image:
@@ -778,6 +849,10 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
    if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
       uint64_t va_range = panvk_image_get_sparse_size(image);
 
+      panvk_address_binding_report(device, &image->vk.base,
+                                   image->sparse.device_address, va_range,
+                                   VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+
       struct pan_kmod_vm_op unmap = {
          .type = PAN_KMOD_VM_OP_TYPE_UNMAP,
          .va = {
@@ -789,7 +864,11 @@ panvk_DestroyImage(VkDevice _device, VkImage _image,
          device->kmod.vm, PAN_KMOD_VM_OP_MODE_IMMEDIATE, &unmap, 1);
       assert(!ret);
 
-      panvk_as_free(device, image->sparse.device_address, va_range);
+      panvk_as_free(device, &device->as.heap, image->sparse.device_address,
+                    va_range);
+   } else {
+      panvk_image_report_binding(device, image,
+                                 VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
    }
 
    vk_image_destroy(&device->vk, pAllocator, &image->vk);
@@ -815,9 +894,15 @@ get_image_subresource_layout(const struct panvk_image *image,
    layout->arrayPitch = image->planes[plane].plane.layout.array_stride_B;
 
    if (drm_is_afbc(image->vk.drm_format_mod)) {
+      struct panvk_physical_device *phys_dev =
+         to_panvk_physical_device(image->vk.base.device->physical);
+      unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
+      const struct pan_image *pan_img = PAN_IMAGE_FROM(arch, image, plane);
+      const uint8_t pan_plane = PAN_IMAGE_PLANE_INDEX_FROM(arch, image, plane);
+
       /* row/depth pitch expressed in (AFBC superblocks * payload size). */
-      layout->rowPitch = pan_image_get_wsi_row_pitch(
-         &image->planes[plane].image, plane, subres->mipLevel);
+      layout->rowPitch =
+         pan_image_get_wsi_row_pitch(pan_img, pan_plane, subres->mipLevel);
       layout->depthPitch = slice_layout->afbc.surface_stride_B;
    } else {
       layout->rowPitch = slice_layout->tiled_or_linear.row_stride_B;
@@ -1018,11 +1103,6 @@ panvk_GetDeviceImageMemoryRequirements(VkDevice device,
    }
 }
 
-/* See Vulkan spec, 35.4.3. Standard Sparse Image Block Shapes for details */
-enum {
-   STANDARD_SPARSE_BLOCK_SIZE_B = 65536,
-};
-
 /* Sparse block extents, in texel blocks, single sample.
  * Indexed by log2(texel block size in bytes).
  * See Vulkan spec, 35.4.3. Standard Sparse Image Block Shapes for details. */
@@ -1042,7 +1122,8 @@ panvk_get_sparse_block_desc(VkImageType type, VkFormat format)
    uint32_t texel_block_size_B = fmt_desc->block.bits / 8;
 
    switch (type) {
-   case VK_IMAGE_TYPE_2D: {
+   case VK_IMAGE_TYPE_2D:
+   case VK_IMAGE_TYPE_3D: {
       if (!util_is_power_of_two_nonzero(texel_block_size_B))
          break;
 
@@ -1060,7 +1141,7 @@ panvk_get_sparse_block_desc(VkImageType type, VkFormat format)
       return (struct panvk_sparse_block_desc){
          .extent = extent,
          .size_B = STANDARD_SPARSE_BLOCK_SIZE_B,
-         .standard = true,
+         .standard = type == VK_IMAGE_TYPE_2D,
       };
    }
 
@@ -1232,7 +1313,7 @@ bind_ms_images(struct panvk_device *dev, const VkBindImageMemoryInfo *bind_info)
          .memoryOffset = sub_image_offset,
       };
 
-      const VkResult res = panvk_image_bind(dev, &sub_bind_info);
+      ASSERTED const VkResult res = panvk_image_bind(dev, &sub_bind_info);
       assert(res == VK_SUCCESS);
 
       sub_image_offset += sub_sz[i];
@@ -1275,9 +1356,18 @@ panvk_image_bind(struct panvk_device *dev,
       const uint8_t plane =
          panvk_plane_index(image, plane_info->planeAspect);
       panvk_image_plane_bind_mem(dev, &image->planes[plane], mem, offset);
+      /* Disjoint planes are bound one per call, so report just this one to
+       * avoid re-emitting a BIND for planes bound by earlier calls.
+       */
+      panvk_address_binding_report(dev, &image->vk.base,
+                                   image->planes[plane].plane.base,
+                                   panvk_image_plane_size(image, plane),
+                                   VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
    } else {
       for (unsigned plane = 0; plane < image->plane_count; plane++)
          panvk_image_plane_bind_mem(dev, &image->planes[plane], mem, offset);
+      panvk_image_report_binding(dev, image,
+                                 VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT);
    }
 
    if (!!(image->vk.create_flags &

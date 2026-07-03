@@ -44,13 +44,6 @@ static pco_block *trans_cf_nodes(trans_ctx *tctx,
                                  struct list_head *cf_node_list,
                                  struct exec_list *nir_cf_node_list);
 
-static inline void pco_fence(pco_builder *b)
-{
-   pco_flush_p0(b);
-   pco_br_next(b, .exec_cnd = PCO_EXEC_CND_E1_Z1);
-   pco_br_next(b, .exec_cnd = PCO_EXEC_CND_E1_Z0);
-}
-
 /**
  * \brief Splits a vector destination into scalar components.
  *
@@ -325,13 +318,7 @@ static inline pco_instr *build_itr(pco_builder *b,
 
    pco_instr_set_itr_mode(instr, itr_mode);
 
-   if (d)
-      pco_fence(b);
-
    pco_builder_insert_instr(b, instr);
-
-   if (d)
-      pco_fence(b);
 
    return instr;
 }
@@ -657,14 +644,26 @@ trans_store_output_fs(trans_ctx *tctx, nir_intrinsic_instr *intr, pco_ref src)
       pco_ref_new_ssa(tctx->func, pco_ref_get_bits(src), chans);
    pco_comp(&tctx->b, data_comp, addr_data, pco_ref_val16(2));
 
+   pco_ref cov_mask_ss = pco_ref_new_ssa32(tctx->func);
+   pco_savmsk(&tctx->b,
+              cov_mask_ss,
+              pco_ref_null(),
+              .savmsk_mode = PCO_SAVMSK_MODE_VM);
+
+   pco_ref cov_mask_ms = pco_ref_new_ssa32(tctx->func);
+   pco_savmsk(&tctx->b,
+              cov_mask_ms,
+              pco_ref_null(),
+              .savmsk_mode = PCO_SAVMSK_MODE_ICM);
+
    pco_ref cov_mask = pco_ref_new_ssa32(tctx->func);
-   pco_ref sample_id = pco_ref_hwreg(PCO_SR_SAMP_NUM, PCO_REG_CLASS_SPEC);
-   pco_shift(&tctx->b,
-             cov_mask,
-             pco_one,
-             sample_id,
-             pco_ref_null(),
-             .shiftop = PCO_SHIFTOP_LSL);
+   pco_csel(&tctx->b,
+            cov_mask,
+            fs_is_single_sampled(tctx),
+            cov_mask_ss,
+            cov_mask_ms,
+            .tst_op_main = PCO_TST_OP_MAIN_GZERO,
+            .tst_type_main = PCO_TST_TYPE_MAIN_U32);
 
    return pco_st_tiled(&tctx->b,
                        data_comp,
@@ -937,6 +936,24 @@ static pco_instr *trans_store_common_store(trans_ctx *tctx,
                          offset_src,
                          .offset_sd = PCO_OFFSET_SD_DEST,
                          .rpt = chans);
+}
+
+static pco_instr *trans_load_shared_base_ptr(trans_ctx *tctx, pco_ref dest)
+{
+   assert(tctx->stage == MESA_SHADER_COMPUTE);
+   assert(tctx->shader->data.cs.shmem.count > 0);
+   assert(tctx->shader->data.cs.global_shmem);
+
+   unsigned chans = pco_ref_get_chans(dest);
+   assert(chans == 2);
+   assert(pco_ref_get_bits(dest) == 32);
+
+   pco_ref shmem_base_addr =
+      pco_ref_hwreg_vec(tctx->shader->data.cs.shmem.start,
+                        PCO_REG_CLASS_SHARED,
+                        chans);
+
+   return pco_mov(&tctx->b, dest, shmem_base_addr, .rpt = chans);
 }
 
 static inline enum pco_atom_op to_atom_op(nir_atomic_op op)
@@ -1698,15 +1715,20 @@ static pco_instr *lower_smp(trans_ctx *tctx,
    enum pco_sb_mode sb_mode = PCO_SB_MODE_NONE;
    switch (intr->intrinsic) {
    case nir_intrinsic_smp_coeffs_pco:
-      /* Shrink the destination to its actual size. */
-      *dest = pco_ref_chans(*dest, ROGUE_SMP_COEFF_COUNT);
+      /* Shrink the destination to its actual size.
+       * Trilinear filtering will produce two sets of coeffs;
+       * reserve both just in case so that we don't clobber output regs.
+       */
+      *dest = pco_ref_chans(*dest, ROGUE_SMP_COEFF_COUNT * 2u);
       chans = 1; /* Chans must be 1 for coeff mode. */
 
       sb_mode = PCO_SB_MODE_COEFFS;
       break;
 
    case nir_intrinsic_smp_raw_pco:
-      chans = 4;
+      chans = nir_intrinsic_enabled_channels(intr);
+      /* Shrink the destination to its actual size. */
+      *dest = pco_ref_chans(*dest, chans * 4);
       sb_mode = PCO_SB_MODE_RAWDATA;
       break;
 
@@ -1873,6 +1895,37 @@ static enum pco_pck_fmt pco_pck_format_from_pipe_format(enum pipe_format fmt)
    }
 
    UNREACHABLE("Unsupported format.");
+}
+
+static pco_instr *trans_subgroup_first_invocation(trans_ctx *tctx, pco_ref dest)
+{
+   /* N.B. link register can only hold 31 bits, but that's plenty for
+    * first_invocation.
+    */
+
+   /* Backup/restore is disabled as nothing else is using the link register. */
+   /* Backup the link register's contents. */
+   /* pco_ref link_backup = pco_ref_new_ssa32(tctx->func); */
+   /* pco_savl(&tctx->b, link_backup); */
+
+   /* With setl only the first valid instance within a slot will write its
+    * instance number to the link register.
+    */
+   pco_ref inst_num = pco_ref_new_ssa32(tctx->func);
+   pco_mov(&tctx->b,
+           inst_num,
+           pco_ref_hwreg(PCO_SR_INST_NUM, PCO_REG_CLASS_SPEC));
+
+   pco_setl(&tctx->b, inst_num);
+
+   /* Retrieve the instance number stored in the link register. */
+   pco_ref inst_num_read = pco_ref_new_ssa32(tctx->func);
+   pco_savl(&tctx->b, inst_num_read);
+
+   /* Restore the link register's previous contents. */
+   /* pco_setl(&tctx->b, link_backup); */
+
+   return pco_mov(&tctx->b, dest, inst_num_read);
 }
 
 /**
@@ -2045,6 +2098,10 @@ static pco_instr *trans_intr(trans_ctx *tctx, nir_intrinsic_instr *intr)
                                        src[1],
                                        true,
                                        &tctx->shader->data.cs.shmem);
+      break;
+
+   case nir_intrinsic_load_shared_base_ptr:
+      instr = trans_load_shared_base_ptr(tctx, dest);
       break;
 
    case nir_intrinsic_shared_atomic:
@@ -2362,6 +2419,18 @@ static pco_instr *trans_intr(trans_ctx *tctx, nir_intrinsic_instr *intr)
                       pco_ref_hwreg(PCO_SR_INST_NUM, PCO_REG_CLASS_SPEC));
       break;
 
+   case nir_intrinsic_load_slot_num_pco:
+      instr = pco_mov(&tctx->b,
+                      dest,
+                      pco_ref_hwreg(PCO_SR_SLOT_NUM, PCO_REG_CLASS_SPEC));
+      break;
+
+   case nir_intrinsic_load_cluster_num_pco:
+      instr = pco_mov(&tctx->b,
+                      dest,
+                      pco_ref_hwreg(PCO_SR_CLUSTER_NUM, PCO_REG_CLASS_SPEC));
+      break;
+
    case nir_intrinsic_load_shared_reg_alloc_size_pco:
       instr = pco_mov(&tctx->b,
                       dest,
@@ -2463,6 +2532,24 @@ static pco_instr *trans_intr(trans_ctx *tctx, nir_intrinsic_instr *intr)
                         .scale = scale);
       break;
    }
+
+   case nir_intrinsic_as_uniform:
+      instr = pco_mov(&tctx->b, dest, src[0]);
+      break;
+
+   case nir_intrinsic_first_invocation:
+      instr = trans_subgroup_first_invocation(tctx, dest);
+      break;
+
+   case nir_intrinsic_vote_any:
+   case nir_intrinsic_vote_all:
+      instr = pco_vote(&tctx->b,
+                       dest,
+                       src[0],
+                       .vote_op = intr->intrinsic == nir_intrinsic_vote_all
+                                     ? PCO_VOTE_OP_ALL
+                                     : PCO_VOTE_OP_ANY);
+      break;
 
    default:
       printf("Unsupported intrinsic: \"");
@@ -3200,6 +3287,28 @@ static pco_instr *trans_alu(trans_ctx *tctx, nir_alu_instr *alu)
 
    case nir_op_iadd:
       instr = pco_iadd32(&tctx->b, dest, src[0], src[1], pco_ref_null());
+      break;
+
+   /* TODO: PCO pass to combine u{add,sub}{carry,borrow}s with the same srcs. */
+   case nir_op_uadd_carry:
+      instr = pco_uadd_carry(&tctx->b, pco_ref_null(), dest, src[0], src[1]);
+      break;
+
+   case nir_op_usub_borrow:
+      instr = pco_uadd_carry(&tctx->b,
+                             pco_ref_null(),
+                             dest,
+                             pco_ref_neg(src[1]),
+                             src[0]);
+      break;
+
+   case nir_op_uadd_sat:
+      instr = pco_uadd_sat(&tctx->b, dest, src[0], src[1], pco_u32max);
+      break;
+
+   case nir_op_usub_sat:
+      instr =
+         pco_uadd_sat(&tctx->b, dest, pco_ref_neg(src[1]), src[0], pco_zero);
       break;
 
    case nir_op_uadd64_32: {

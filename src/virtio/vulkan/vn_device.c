@@ -38,6 +38,8 @@ vn_queue_fini(struct vn_queue *queue)
       simple_mtx_destroy(&queue->async_present.queue_mutex);
       mtx_destroy(&queue->async_present.mutex);
       cnd_destroy(&queue->async_present.cond);
+
+      vn_DestroyFence(dev_handle, queue->async_present.fence, NULL);
    }
 
    if (queue->wait_fence != VK_NULL_HANDLE) {
@@ -98,8 +100,8 @@ vn_queue_init(struct vn_device *dev,
    };
 
    VkQueue queue_handle = vn_queue_to_handle(queue);
-   vn_async_vkGetDeviceQueue2(dev->primary_ring, vn_device_to_handle(dev),
-                              &device_queue_info, &queue_handle);
+   vn_call_vkGetDeviceQueue2(dev->primary_ring, vn_device_to_handle(dev),
+                             &device_queue_info, &queue_handle);
 
    return VK_SUCCESS;
 }
@@ -437,7 +439,7 @@ vn_device_update_shader_cache_id(struct vn_device *dev)
    /* The entry header is what contains the cache id / timestamp so we
     * need to create a fake entry.
     */
-   uint8_t key[SHA1_DIGEST_LENGTH];
+   uint8_t key[BLAKE3_KEY_LEN];
    char data[] = "Fake Shader";
 
    disk_cache_compute_key(cache, data, sizeof(data), key);

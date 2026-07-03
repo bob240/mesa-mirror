@@ -18,12 +18,13 @@ pub use crate::ssa_value::*;
 use compiler::as_slice::*;
 use compiler::cfg::CFG;
 use compiler::dataflow::ForwardDataflow;
+use compiler::enum_as_u8::EnumAsU8;
 use compiler::smallvec::SmallVec;
+use compiler::vec_pair::VecPair;
 use nak_ir_proc::*;
 use std::cmp::{max, min};
 use std::fmt;
 use std::fmt::Write;
-use std::iter::Zip;
 use std::ops::{BitAnd, BitOr, Deref, DerefMut, Index, IndexMut, Not, Range};
 use std::slice;
 
@@ -56,7 +57,7 @@ impl LabelAllocator {
 
 /// Represents a register file
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, EnumAsU8, Eq, Hash, PartialEq)]
 pub enum RegFile {
     /// The general-purpose register file
     ///
@@ -185,45 +186,6 @@ impl fmt::Display for RegFile {
     }
 }
 
-impl From<RegFile> for u8 {
-    fn from(value: RegFile) -> u8 {
-        value as u8
-    }
-}
-
-impl TryFrom<u32> for RegFile {
-    type Error = &'static str;
-
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(RegFile::GPR),
-            1 => Ok(RegFile::UGPR),
-            2 => Ok(RegFile::Pred),
-            3 => Ok(RegFile::UPred),
-            4 => Ok(RegFile::Carry),
-            5 => Ok(RegFile::Bar),
-            6 => Ok(RegFile::Mem),
-            _ => Err("Invalid register file number"),
-        }
-    }
-}
-
-impl TryFrom<u16> for RegFile {
-    type Error = &'static str;
-
-    fn try_from(value: u16) -> Result<Self, Self::Error> {
-        RegFile::try_from(u32::from(value))
-    }
-}
-
-impl TryFrom<u8> for RegFile {
-    type Error = &'static str;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        RegFile::try_from(u32::from(value))
-    }
-}
-
 /// A trait for things which have an associated register file
 pub trait HasRegFile {
     fn file(&self) -> RegFile;
@@ -311,7 +273,7 @@ impl Iterator for RegFileSet {
         if self.is_empty() {
             None
         } else {
-            let file = self.bits.trailing_zeros().try_into().unwrap();
+            let file = (self.bits.trailing_zeros() as u8).try_into().unwrap();
             self.remove(file);
             Some(file)
         }
@@ -438,7 +400,7 @@ impl RegRef {
 
 impl HasRegFile for RegRef {
     fn file(&self) -> RegFile {
-        ((self.packed >> 29) & 0x7).try_into().unwrap()
+        (((self.packed >> 29) & 0x7) as u8).try_into().unwrap()
     }
 }
 
@@ -890,7 +852,7 @@ impl SrcMod {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SrcSwizzle {
     None,
     Xx,
@@ -976,6 +938,21 @@ impl Src {
         self
     }
 
+    #[allow(dead_code)]
+    pub fn swizzle(mut self, src_swizzle: SrcSwizzle) -> Src {
+        // Since we only have xx, yy, and xy, for any composition of swizzles,
+        // the inner-most non-xy swizzle wins.
+        if matches!(self.src_swizzle, SrcSwizzle::None) {
+            self.src_swizzle = src_swizzle
+        }
+        self
+    }
+
+    pub fn without_swizzle(mut self) -> Src {
+        self.src_swizzle = SrcSwizzle::None;
+        self
+    }
+
     pub fn as_u32(&self, src_type: SrcType) -> Option<u32> {
         let u = match &self.src_ref {
             SrcRef::Zero => 0,
@@ -998,7 +975,10 @@ impl Src {
 
         Some(match src_type {
             SrcType::F16 => {
-                let low = u & 0xFFFF;
+                let low = match self.src_swizzle {
+                    SrcSwizzle::None | SrcSwizzle::Xx => u & 0xffff,
+                    SrcSwizzle::Yy => u >> 16,
+                };
 
                 match self.src_mod {
                     SrcMod::None => low,
@@ -1136,6 +1116,24 @@ impl Src {
         match &self.src_ref {
             SrcRef::SSA(ssa) => ssa.file() == RegFile::UPred,
             SrcRef::Reg(reg) => reg.file() == RegFile::UPred,
+            _ => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_gpr_reg(&self) -> bool {
+        match &self.src_ref {
+            SrcRef::SSA(ssa) => ssa.file() == RegFile::GPR,
+            SrcRef::Reg(reg) => reg.file() == RegFile::GPR,
+            _ => false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn is_ugpr_reg(&self) -> bool {
+        match &self.src_ref {
+            SrcRef::SSA(ssa) => ssa.file() == RegFile::UGPR,
+            SrcRef::Reg(reg) => reg.file() == RegFile::UGPR,
             _ => false,
         }
     }
@@ -1297,11 +1295,51 @@ pub enum SrcType {
 
 impl SrcType {
     const DEFAULT: SrcType = SrcType::GPR;
+
+    pub fn is_fp16(&self) -> bool {
+        matches!(self, Self::F16 | Self::F16v2)
+    }
+
+    /// Checks if consuming a value has the same semantics in regards to ftz
+    /// and modifiers. E.g. F16v2 and F16 would return true here.
+    pub fn eq_ftz_mod(&self, other: Self) -> bool {
+        *self == other || (self.is_fp16() && other.is_fp16())
+    }
+}
+
+pub enum AttrList<T: 'static> {
+    Array(&'static [T]),
+    Uniform(T),
+}
+
+impl<T: 'static> Index<usize> for AttrList<T> {
+    type Output = T;
+
+    fn index(&self, idx: usize) -> &T {
+        match self {
+            AttrList::Array(arr) => &arr[idx],
+            AttrList::Uniform(typ) => typ,
+        }
+    }
 }
 
 pub type SrcTypeList = AttrList<SrcType>;
 
-pub trait SrcsAsSlice: AsSlice<Src, Attr = SrcType> {
+pub trait SrcsAsSlice {
+    fn srcs_as_slice(&self) -> &[Src];
+
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src];
+
+    fn src_types(&self) -> SrcTypeList;
+
+    fn src_idx(&self, src: &Src) -> usize {
+        let r = self.srcs_as_slice().as_ptr_range();
+        assert!(r.contains(&(src as *const Src)));
+        unsafe { (src as *const Src).offset_from(r.start) as usize }
+    }
+}
+
+impl<T: AsSlice<Src, Attr = SrcType>> SrcsAsSlice for T {
     fn srcs_as_slice(&self) -> &[Src] {
         self.as_slice()
     }
@@ -1311,17 +1349,9 @@ pub trait SrcsAsSlice: AsSlice<Src, Attr = SrcType> {
     }
 
     fn src_types(&self) -> SrcTypeList {
-        self.attrs()
-    }
-
-    fn src_idx(&self, src: &Src) -> usize {
-        let r = self.srcs_as_slice().as_ptr_range();
-        assert!(r.contains(&(src as *const Src)));
-        unsafe { (src as *const Src).offset_from(r.start) as usize }
+        AttrList::Array(self.attrs())
     }
 }
-
-impl<T: AsSlice<Src, Attr = SrcType>> SrcsAsSlice for T {}
 
 fn all_dsts_uniform(dsts: &[Dst]) -> bool {
     let mut uniform = None;
@@ -1338,6 +1368,7 @@ fn all_dsts_uniform(dsts: &[Dst]) -> bool {
 }
 
 #[repr(u8)]
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DstType {
     Pred,
@@ -1357,20 +1388,14 @@ impl DstType {
 
 pub type DstTypeList = AttrList<DstType>;
 
-pub trait DstsAsSlice: AsSlice<Dst, Attr = DstType> {
-    fn dsts_as_slice(&self) -> &[Dst] {
-        self.as_slice()
-    }
+pub trait DstsAsSlice {
+    fn dsts_as_slice(&self) -> &[Dst];
 
-    fn dsts_as_mut_slice(&mut self) -> &mut [Dst] {
-        self.as_mut_slice()
-    }
+    fn dsts_as_mut_slice(&mut self) -> &mut [Dst];
 
     // Currently only used by test code
     #[allow(dead_code)]
-    fn dst_types(&self) -> DstTypeList {
-        self.attrs()
-    }
+    fn dst_types(&self) -> DstTypeList;
 
     fn dst_idx(&self, dst: &Dst) -> usize {
         let r = self.dsts_as_slice().as_ptr_range();
@@ -1379,7 +1404,19 @@ pub trait DstsAsSlice: AsSlice<Dst, Attr = DstType> {
     }
 }
 
-impl<T: AsSlice<Dst, Attr = DstType>> DstsAsSlice for T {}
+impl<T: AsSlice<Dst, Attr = DstType>> DstsAsSlice for T {
+    fn dsts_as_slice(&self) -> &[Dst] {
+        self.as_slice()
+    }
+
+    fn dsts_as_mut_slice(&mut self) -> &mut [Dst] {
+        self.as_mut_slice()
+    }
+
+    fn dst_types(&self) -> DstTypeList {
+        AttrList::Array(self.attrs())
+    }
+}
 
 pub trait IsUniform {
     fn is_uniform(&self) -> bool;
@@ -2576,7 +2613,7 @@ impl MemAccess {
 #[allow(dead_code)]
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub enum AtomType {
-    F16x2,
+    F16v2,
     U32,
     I32,
     F32,
@@ -2586,11 +2623,11 @@ pub enum AtomType {
 }
 
 impl AtomType {
-    pub fn F(bits: u8) -> AtomType {
-        match bits {
-            16 => panic!("16-bit float atomics not yet supported"),
-            32 => AtomType::F32,
-            64 => AtomType::F64,
+    pub fn F(bits: u8, comps: u8) -> AtomType {
+        match (bits, comps) {
+            (16, 2) => AtomType::F16v2,
+            (32, 1) => AtomType::F32,
+            (64, 1) => AtomType::F64,
             _ => panic!("Invalid float atomic type"),
         }
     }
@@ -2613,7 +2650,7 @@ impl AtomType {
 
     pub fn bits(&self) -> usize {
         match self {
-            AtomType::F16x2 | AtomType::F32 => 32,
+            AtomType::F16v2 | AtomType::F32 => 32,
             AtomType::U32 | AtomType::I32 => 32,
             AtomType::U64 | AtomType::I64 | AtomType::F64 => 64,
         }
@@ -2621,7 +2658,7 @@ impl AtomType {
 
     pub fn is_float(&self) -> bool {
         match self {
-            AtomType::F16x2 | AtomType::F32 | AtomType::F64 => true,
+            AtomType::F16v2 | AtomType::F32 | AtomType::F64 => true,
             AtomType::U32 | AtomType::I32 | AtomType::U64 | AtomType::I64 => {
                 false
             }
@@ -2632,7 +2669,7 @@ impl AtomType {
 impl fmt::Display for AtomType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            AtomType::F16x2 => write!(f, ".f16x2"),
+            AtomType::F16v2 => write!(f, ".f16v2"),
             AtomType::U32 => write!(f, ".u32"),
             AtomType::I32 => write!(f, ".i32"),
             AtomType::F32 => write!(f, ".f32"),
@@ -3120,20 +3157,40 @@ impl fmt::Display for MuFuOp {
 }
 
 #[repr(C)]
-#[derive(SrcsAsSlice, DstsAsSlice)]
+#[derive(DstsAsSlice)]
 pub struct OpMuFu {
     #[dst_type(F32)]
     pub dst: Dst,
 
     pub op: MuFuOp,
 
-    #[src_type(F32)]
     pub src: Src,
+
+    pub op_type: FloatType,
+}
+
+impl SrcsAsSlice for OpMuFu {
+    fn srcs_as_slice(&self) -> &[Src] {
+        std::slice::from_ref(&self.src)
+    }
+
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
+        std::slice::from_mut(&mut self.src)
+    }
+
+    fn src_types(&self) -> SrcTypeList {
+        let src_type = match self.op_type {
+            FloatType::F16 => SrcType::F16,
+            FloatType::F32 => SrcType::F32,
+            FloatType::F64 => unreachable!("MuFu does not support F64"),
+        };
+        SrcTypeList::Uniform(src_type)
+    }
 }
 
 impl DisplayOp for OpMuFu {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "mufu.{} {}", self.op, self.src)
+        write!(f, "mufu.{}{} {}", self.op, self.op_type, self.src)
     }
 }
 impl_display_for_op!(OpMuFu);
@@ -4621,28 +4678,22 @@ pub struct OpF2F {
     pub dst_type: FloatType,
     pub rnd_mode: FRndMode,
     pub ftz: bool,
-    /// For 16-bit up-conversions, take the high 16 bits of the source register.
-    /// For 16-bit down-conversions, place the result into the upper 16 bits of
-    /// the destination register
-    pub high: bool,
     /// Round to the nearest integer rather than nearest float
     ///
     /// Not available on SM70+
     pub integer_rnd: bool,
 }
 
-impl AsSlice<Src> for OpF2F {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
+impl SrcsAsSlice for OpF2F {
+    fn srcs_as_slice(&self) -> &[Src] {
         std::slice::from_ref(&self.src)
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
         std::slice::from_mut(&mut self.src)
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         let src_type = match self.src_type {
             FloatType::F16 => SrcType::F16,
             FloatType::F32 => SrcType::F32,
@@ -4652,18 +4703,16 @@ impl AsSlice<Src> for OpF2F {
     }
 }
 
-impl AsSlice<Dst> for OpF2F {
-    type Attr = DstType;
-
-    fn as_slice(&self) -> &[Dst] {
+impl DstsAsSlice for OpF2F {
+    fn dsts_as_slice(&self) -> &[Dst] {
         std::slice::from_ref(&self.dst)
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Dst] {
+    fn dsts_as_mut_slice(&mut self) -> &mut [Dst] {
         std::slice::from_mut(&mut self.dst)
     }
 
-    fn attrs(&self) -> DstTypeList {
+    fn dst_types(&self) -> DstTypeList {
         let dst_type = match self.dst_type {
             FloatType::F16 => DstType::F16,
             FloatType::F32 => DstType::F32,
@@ -4728,18 +4777,16 @@ pub struct OpF2I {
     pub ftz: bool,
 }
 
-impl AsSlice<Src> for OpF2I {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
+impl SrcsAsSlice for OpF2I {
+    fn srcs_as_slice(&self) -> &[Src] {
         std::slice::from_ref(&self.src)
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
         std::slice::from_mut(&mut self.src)
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         let src_type = match self.src_type {
             FloatType::F16 => SrcType::F16,
             FloatType::F32 => SrcType::F32,
@@ -4771,18 +4818,16 @@ pub struct OpI2F {
     pub rnd_mode: FRndMode,
 }
 
-impl AsSlice<Src> for OpI2F {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
+impl SrcsAsSlice for OpI2F {
+    fn srcs_as_slice(&self) -> &[Src] {
         std::slice::from_ref(&self.src)
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
         std::slice::from_mut(&mut self.src)
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         if self.src_type.bits() <= 32 {
             SrcTypeList::Uniform(SrcType::ALU)
         } else {
@@ -4791,18 +4836,16 @@ impl AsSlice<Src> for OpI2F {
     }
 }
 
-impl AsSlice<Dst> for OpI2F {
-    type Attr = DstType;
-
-    fn as_slice(&self) -> &[Dst] {
+impl DstsAsSlice for OpI2F {
+    fn dsts_as_slice(&self) -> &[Dst] {
         std::slice::from_ref(&self.dst)
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Dst] {
+    fn dsts_as_mut_slice(&mut self) -> &mut [Dst] {
         std::slice::from_mut(&mut self.dst)
     }
 
-    fn attrs(&self) -> DstTypeList {
+    fn dst_types(&self) -> DstTypeList {
         let dst_type = match self.dst_type {
             FloatType::F16 => DstType::F16,
             FloatType::F32 => DstType::F32,
@@ -4873,18 +4916,16 @@ pub struct OpFRnd {
     pub ftz: bool,
 }
 
-impl AsSlice<Src> for OpFRnd {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
+impl SrcsAsSlice for OpFRnd {
+    fn srcs_as_slice(&self) -> &[Src] {
         std::slice::from_ref(&self.src)
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
         std::slice::from_mut(&mut self.src)
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         let src_type = match self.src_type {
             FloatType::F16 => SrcType::F16,
             FloatType::F32 => SrcType::F32,
@@ -5402,6 +5443,7 @@ pub struct OpTex {
     pub mem_eviction_priority: MemEvictionPriority,
     pub nodep: bool,
     pub channel_mask: ChannelMask,
+    pub scalar: bool,
 }
 
 impl DisplayOp for OpTex {
@@ -5415,6 +5457,9 @@ impl DisplayOp for OpTex {
             write!(f, ".dc")?;
         }
         write!(f, "{}", self.mem_eviction_priority)?;
+        if self.scalar {
+            write!(f, ".scr")?;
+        }
         if self.nodep {
             write!(f, ".nodep")?;
         }
@@ -5442,6 +5487,7 @@ pub struct OpTld {
     pub mem_eviction_priority: MemEvictionPriority,
     pub nodep: bool,
     pub channel_mask: ChannelMask,
+    pub scalar: bool,
 }
 
 impl DisplayOp for OpTld {
@@ -5451,6 +5497,9 @@ impl DisplayOp for OpTld {
             write!(f, ".ms")?;
         }
         write!(f, "{}", self.mem_eviction_priority)?;
+        if self.scalar {
+            write!(f, ".scr")?;
+        }
         if self.nodep {
             write!(f, ".nodep")?;
         }
@@ -5478,6 +5527,7 @@ pub struct OpTld4 {
     pub mem_eviction_priority: MemEvictionPriority,
     pub nodep: bool,
     pub channel_mask: ChannelMask,
+    pub scalar: bool,
 }
 
 impl DisplayOp for OpTld4 {
@@ -5487,6 +5537,9 @@ impl DisplayOp for OpTld4 {
             write!(f, ".dc")?;
         }
         write!(f, "{}", self.mem_eviction_priority)?;
+        if self.scalar {
+            write!(f, ".scr")?;
+        }
         if self.nodep {
             write!(f, ".nodep")?;
         }
@@ -6384,6 +6437,51 @@ impl DisplayOp for OpSuStGa {
 }
 impl_display_for_op!(OpSuStGa);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OffsetStride {
+    X1 = 0,
+    X4 = 2,
+    X8 = 3,
+    X16 = 4,
+}
+
+impl OffsetStride {
+    pub fn shift(&self) -> u32 {
+        match self {
+            Self::X1 => 0,
+            Self::X4 => 2,
+            Self::X8 => 3,
+            Self::X16 => 4,
+        }
+    }
+}
+
+impl fmt::Display for OffsetStride {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            Self::X1 => return Ok(()),
+            Self::X4 => ".x4",
+            Self::X8 => ".x8",
+            Self::X16 => ".x16",
+        };
+        write!(f, "{s}")
+    }
+}
+
+impl TryFrom<u8> for OffsetStride {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::X1),
+            2 => Ok(Self::X4),
+            3 => Ok(Self::X8),
+            4 => Ok(Self::X16),
+            _ => Err("Unknown LdSt shift value {value}"),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpLd {
@@ -6392,17 +6490,29 @@ pub struct OpLd {
     #[src_type(GPR)]
     pub addr: Src,
 
+    #[src_type(GPR)]
+    pub uniform_addr: Src,
+
+    /// On false the load returns 0
+    #[src_type(Pred)]
+    pub pred: Src,
+
     pub offset: i32,
+    pub stride: OffsetStride,
     pub access: MemAccess,
 }
 
 impl DisplayOp for OpLd {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ld{} [{}", self.access, self.addr)?;
+        write!(
+            f,
+            "ld{} [{}{}+{}",
+            self.access, self.addr, self.stride, self.uniform_addr
+        )?;
         if self.offset > 0 {
             write!(f, "+{:#x}", self.offset)?;
         }
-        write!(f, "]")
+        write!(f, "], {}", self.pred)
     }
 }
 impl_display_for_op!(OpLd);
@@ -6487,6 +6597,9 @@ pub struct OpLdsm {
     #[src_type(SSA)]
     pub addr: Src,
 
+    #[src_type(SSA)]
+    pub uniform_addr: Src,
+
     pub offset: i32,
 }
 
@@ -6543,13 +6656,21 @@ pub struct OpSt {
     #[src_type(SSA)]
     pub data: Src,
 
+    #[src_type(GPR)]
+    pub uniform_addr: Src,
+
     pub offset: i32,
+    pub stride: OffsetStride,
     pub access: MemAccess,
 }
 
 impl DisplayOp for OpSt {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "st{} [{}", self.access, self.addr)?;
+        write!(
+            f,
+            "st{} [{}{}+{}",
+            self.access, self.addr, self.stride, self.uniform_addr
+        )?;
         if self.offset > 0 {
             write!(f, "+{:#x}", self.offset)?;
         }
@@ -6596,6 +6717,9 @@ pub struct OpAtom {
     pub addr: Src,
 
     #[src_type(GPR)]
+    pub uniform_address: Src,
+
+    #[src_type(GPR)]
     pub cmpr: Src,
 
     #[src_type(SSA)]
@@ -6605,6 +6729,7 @@ pub struct OpAtom {
     pub atom_type: AtomType,
 
     pub addr_offset: i32,
+    pub addr_stride: OffsetStride,
 
     pub mem_space: MemSpace,
     pub mem_order: MemOrder,
@@ -6624,10 +6749,16 @@ impl DisplayOp for OpAtom {
         )?;
         write!(f, " [")?;
         if !self.addr.is_zero() {
-            write!(f, "{}", self.addr)?;
+            write!(f, "{}{}", self.addr, self.addr_stride)?;
+        }
+        if !self.uniform_address.is_zero() {
+            if !self.addr.is_zero() {
+                write!(f, "+")?;
+            }
+            write!(f, "{}", self.uniform_address)?;
         }
         if self.addr_offset > 0 {
-            if !self.addr.is_zero() {
+            if !self.addr.is_zero() || !self.uniform_address.is_zero() {
                 write!(f, "+")?;
             }
             write!(f, "{:#x}", self.addr_offset)?;
@@ -7159,22 +7290,107 @@ impl DisplayOp for OpCS2R {
 }
 impl_display_for_op!(OpCS2R);
 
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub enum IsbeAccessType {
+    Map,
+    Patch,
+    Primitive,
+    Attribute,
+}
+
+impl fmt::Display for IsbeAccessType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IsbeAccessType::Map => write!(f, "map"),
+            IsbeAccessType::Patch => write!(f, "patch"),
+            IsbeAccessType::Primitive => write!(f, "prim"),
+            IsbeAccessType::Attribute => write!(f, "attr"),
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(SrcsAsSlice, DstsAsSlice)]
 pub struct OpIsberd {
     #[dst_type(GPR)]
     pub dst: Dst,
 
-    #[src_type(SSA)]
-    pub idx: Src,
+    #[src_type(GPR)]
+    pub offset: Src,
+
+    pub imm_offset: u16,
+    pub mem_type: MemType,
+    pub access_type: IsbeAccessType,
+    pub output: bool,
+    pub skew: bool,
 }
 
 impl DisplayOp for OpIsberd {
     fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "isberd [{}]", self.idx)
+        write!(f, "isberd")?;
+
+        if self.output {
+            write!(f, ".o")?;
+        }
+
+        write!(f, ".{}", self.access_type)?;
+
+        if self.skew {
+            write!(f, ".skew")?;
+        }
+
+        write!(f, "{} {}", self.mem_type, self.dst)?;
+
+        if self.imm_offset != 0 {
+            write!(f, " [{}+0x{:x}]", self.offset, self.imm_offset)
+        } else {
+            write!(f, " [{}]", self.offset)
+        }
     }
 }
 impl_display_for_op!(OpIsberd);
+
+#[repr(C)]
+#[derive(SrcsAsSlice, DstsAsSlice)]
+pub struct OpIsbewr {
+    #[src_type(GPR)]
+    pub offset: Src,
+
+    #[src_type(GPR)]
+    pub data: Src,
+
+    pub imm_offset: u16,
+    pub mem_type: MemType,
+    pub access_type: IsbeAccessType,
+    pub output: bool,
+    pub skew: bool,
+}
+
+impl DisplayOp for OpIsbewr {
+    fn fmt_op(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "isbewr")?;
+
+        if self.output {
+            write!(f, ".o")?;
+        }
+
+        write!(f, ".{}", self.access_type)?;
+
+        if self.skew {
+            write!(f, ".skew")?;
+        }
+
+        write!(f, "{}", self.mem_type)?;
+        if self.imm_offset != 0 {
+            write!(f, " [{}+0x{:x}]", self.offset, self.imm_offset)?;
+        } else {
+            write!(f, " [{}]", self.offset)?;
+        }
+
+        write!(f, " {}", self.data)
+    }
+}
+impl_display_for_op!(OpIsbewr);
 
 /// Vertex Index Load
 /// (Only available in Kepler)
@@ -7410,89 +7626,6 @@ impl DisplayOp for OpSrcBar {
 }
 impl_display_for_op!(OpSrcBar);
 
-pub struct VecPair<A, B> {
-    a: Vec<A>,
-    b: Vec<B>,
-}
-
-impl<A, B> VecPair<A, B> {
-    pub fn append(&mut self, other: &mut VecPair<A, B>) {
-        self.a.append(&mut other.a);
-        self.b.append(&mut other.b);
-    }
-
-    pub fn is_empty(&self) -> bool {
-        debug_assert!(self.a.len() == self.b.len());
-        self.a.is_empty()
-    }
-
-    pub fn iter(&self) -> Zip<slice::Iter<'_, A>, slice::Iter<'_, B>> {
-        debug_assert!(self.a.len() == self.b.len());
-        self.a.iter().zip(self.b.iter())
-    }
-
-    pub fn iter_mut(
-        &mut self,
-    ) -> Zip<slice::IterMut<'_, A>, slice::IterMut<'_, B>> {
-        debug_assert!(self.a.len() == self.b.len());
-        self.a.iter_mut().zip(self.b.iter_mut())
-    }
-
-    pub fn len(&self) -> usize {
-        debug_assert!(self.a.len() == self.b.len());
-        self.a.len()
-    }
-
-    pub fn new() -> Self {
-        Self {
-            a: Vec::new(),
-            b: Vec::new(),
-        }
-    }
-
-    pub fn push(&mut self, a: A, b: B) {
-        debug_assert!(self.a.len() == self.b.len());
-        self.a.push(a);
-        self.b.push(b);
-    }
-}
-
-impl<A: Clone, B: Clone> VecPair<A, B> {
-    pub fn retain(&mut self, mut f: impl FnMut(&A, &B) -> bool) {
-        debug_assert!(self.a.len() == self.b.len());
-        let len = self.a.len();
-        let mut i = 0_usize;
-        while i < len {
-            if !f(&self.a[i], &self.b[i]) {
-                break;
-            }
-            i += 1;
-        }
-
-        let mut new_len = i;
-
-        // Don't check this one twice.
-        i += 1;
-
-        while i < len {
-            // This could be more efficient but it's good enough for our
-            // purposes since everything we're storing is small and has a
-            // trivial Drop.
-            if f(&self.a[i], &self.b[i]) {
-                self.a[new_len] = self.a[i].clone();
-                self.b[new_len] = self.b[i].clone();
-                new_len += 1;
-            }
-            i += 1;
-        }
-
-        if new_len < len {
-            self.a.truncate(new_len);
-            self.b.truncate(new_len);
-        }
-    }
-}
-
 mod phi {
     #[allow(unused_imports)]
     use crate::ir::{OpPhiDsts, OpPhiSrcs};
@@ -7585,18 +7718,16 @@ impl OpPhiSrcs {
     }
 }
 
-impl AsSlice<Src> for OpPhiSrcs {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
-        &self.srcs.b
+impl SrcsAsSlice for OpPhiSrcs {
+    fn srcs_as_slice(&self) -> &[Src] {
+        self.srcs.b_as_slice()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
-        &mut self.srcs.b
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
+        self.srcs.b_as_mut_slice()
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         SrcTypeList::Uniform(SrcType::GPR)
     }
 }
@@ -7634,18 +7765,16 @@ impl OpPhiDsts {
     }
 }
 
-impl AsSlice<Dst> for OpPhiDsts {
-    type Attr = DstType;
-
-    fn as_slice(&self) -> &[Dst] {
-        &self.dsts.b
+impl DstsAsSlice for OpPhiDsts {
+    fn dsts_as_slice(&self) -> &[Dst] {
+        self.dsts.b_as_slice()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Dst] {
-        &mut self.dsts.b
+    fn dsts_as_mut_slice(&mut self) -> &mut [Dst] {
+        self.dsts.b_as_mut_slice()
     }
 
-    fn attrs(&self) -> DstTypeList {
+    fn dst_types(&self) -> DstTypeList {
         DstTypeList::Uniform(DstType::Vec)
     }
 }
@@ -7751,34 +7880,30 @@ impl OpParCopy {
     }
 }
 
-impl AsSlice<Src> for OpParCopy {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
-        &self.dsts_srcs.b
+impl SrcsAsSlice for OpParCopy {
+    fn srcs_as_slice(&self) -> &[Src] {
+        self.dsts_srcs.b_as_slice()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
-        &mut self.dsts_srcs.b
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
+        self.dsts_srcs.b_as_mut_slice()
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         SrcTypeList::Uniform(SrcType::GPR)
     }
 }
 
-impl AsSlice<Dst> for OpParCopy {
-    type Attr = DstType;
-
-    fn as_slice(&self) -> &[Dst] {
-        &self.dsts_srcs.a
+impl DstsAsSlice for OpParCopy {
+    fn dsts_as_slice(&self) -> &[Dst] {
+        self.dsts_srcs.a_as_slice()
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Dst] {
-        &mut self.dsts_srcs.a
+    fn dsts_as_mut_slice(&mut self) -> &mut [Dst] {
+        self.dsts_srcs.a_as_mut_slice()
     }
 
-    fn attrs(&self) -> DstTypeList {
+    fn dst_types(&self) -> DstTypeList {
         DstTypeList::Uniform(DstType::Vec)
     }
 }
@@ -7807,18 +7932,16 @@ pub struct OpRegOut {
     pub srcs: Vec<Src>,
 }
 
-impl AsSlice<Src> for OpRegOut {
-    type Attr = SrcType;
-
-    fn as_slice(&self) -> &[Src] {
+impl SrcsAsSlice for OpRegOut {
+    fn srcs_as_slice(&self) -> &[Src] {
         &self.srcs
     }
 
-    fn as_mut_slice(&mut self) -> &mut [Src] {
+    fn srcs_as_mut_slice(&mut self) -> &mut [Src] {
         &mut self.srcs
     }
 
-    fn attrs(&self) -> SrcTypeList {
+    fn src_types(&self) -> SrcTypeList {
         SrcTypeList::Uniform(SrcType::GPR)
     }
 }
@@ -8020,6 +8143,7 @@ pub enum Op {
     TexDepBar(Box<OpTexDepBar>),
     CS2R(Box<OpCS2R>),
     Isberd(Box<OpIsberd>),
+    Isbewr(Box<OpIsbewr>),
     ViLd(Box<OpViLd>),
     Kill(Box<OpKill>),
     Nop(OpNop),
@@ -8205,6 +8329,7 @@ impl Op {
             | Op::TexDepBar(_)
             | Op::CS2R(_)
             | Op::Isberd(_)
+            | Op::Isbewr(_)
             | Op::ViLd(_)
             | Op::Kill(_)
             | Op::PixLd(_)
@@ -8387,6 +8512,7 @@ impl Op {
             | Op::TexDepBar(_)
             | Op::CS2R(_)
             | Op::Isberd(_)
+            | Op::Isbewr(_)
             | Op::ViLd(_)
             | Op::Kill(_)
             | Op::PixLd(_)
@@ -8782,6 +8908,7 @@ impl Instr {
             | Op::RegOut(_)
             | Op::Out(_)
             | Op::OutFinal(_)
+            | Op::Isbewr(_)
             | Op::Annotate(_) => false,
             Op::BMov(op) => !op.clear,
             _ => true,
@@ -8804,6 +8931,144 @@ impl Instr {
             write!(f, "@{} ", self.pred)?;
         }
         Ok(())
+    }
+
+    pub fn ftz(&self) -> bool {
+        match &self.op {
+            Op::F2F(op) => op.ftz,
+            Op::F2I(op) => op.ftz,
+            Op::FAdd(op) => op.ftz,
+            Op::FFma(op) => op.ftz,
+            Op::FMnMx(op) => op.ftz,
+            Op::FMul(op) => op.ftz,
+            Op::FRnd(op) => op.ftz,
+            Op::FSet(op) => op.ftz,
+            Op::FSetP(op) => op.ftz,
+            Op::FSwz(op) => op.ftz,
+            Op::FSwzAdd(op) => op.ftz,
+            Op::HAdd2(op) => op.ftz,
+            Op::HFma2(op) => op.ftz,
+            Op::HMnMx2(op) => op.ftz,
+            Op::HMul2(op) => op.ftz,
+            Op::HSet2(op) => op.ftz,
+            Op::HSetP2(op) => op.ftz,
+            Op::MuFu(op) => {
+                op.op_type == FloatType::F32 && op.op != MuFuOp::Tanh
+            }
+
+            Op::Rro(_)
+            | Op::DAdd(_)
+            | Op::DFma(_)
+            | Op::DMnMx(_)
+            | Op::DMul(_)
+            | Op::DSetP(_)
+            | Op::Imma(_)
+            | Op::Hmma(_)
+            | Op::Ldsm(_)
+            | Op::BMsk(_)
+            | Op::BRev(_)
+            | Op::Bfe(_)
+            | Op::Flo(_)
+            | Op::IAbs(_)
+            | Op::IAdd2(_)
+            | Op::IAdd2X(_)
+            | Op::IAdd3(_)
+            | Op::IAdd3X(_)
+            | Op::IDp4(_)
+            | Op::IMad(_)
+            | Op::IMad64(_)
+            | Op::IMul(_)
+            | Op::IMnMx(_)
+            | Op::ISetP(_)
+            | Op::Lea(_)
+            | Op::LeaX(_)
+            | Op::Lop2(_)
+            | Op::Lop3(_)
+            | Op::PopC(_)
+            | Op::Shf(_)
+            | Op::Shl(_)
+            | Op::Shr(_)
+            | Op::F2FP(_)
+            | Op::I2F(_)
+            | Op::I2I(_)
+            | Op::Mov(_)
+            | Op::Movm(_)
+            | Op::Prmt(_)
+            | Op::Sel(_)
+            | Op::Sgxt(_)
+            | Op::Shfl(_)
+            | Op::PLop3(_)
+            | Op::PSetP(_)
+            | Op::R2UR(_)
+            | Op::Redux(_)
+            | Op::Tex(_)
+            | Op::Tld(_)
+            | Op::Tld4(_)
+            | Op::Tmml(_)
+            | Op::Txd(_)
+            | Op::Txq(_)
+            | Op::SuLd(_)
+            | Op::SuSt(_)
+            | Op::SuAtom(_)
+            | Op::SuClamp(_)
+            | Op::SuBfm(_)
+            | Op::SuEau(_)
+            | Op::IMadSp(_)
+            | Op::SuLdGa(_)
+            | Op::SuStGa(_)
+            | Op::Ld(_)
+            | Op::Ldc(_)
+            | Op::LdSharedLock(_)
+            | Op::St(_)
+            | Op::StSCheckUnlock(_)
+            | Op::Atom(_)
+            | Op::AL2P(_)
+            | Op::ALd(_)
+            | Op::ASt(_)
+            | Op::Ipa(_)
+            | Op::LdTram(_)
+            | Op::CCtl(_)
+            | Op::MemBar(_)
+            | Op::BClear(_)
+            | Op::BMov(_)
+            | Op::Break(_)
+            | Op::BSSy(_)
+            | Op::BSync(_)
+            | Op::Bra(_)
+            | Op::SSy(_)
+            | Op::Sync(_)
+            | Op::Brk(_)
+            | Op::PBk(_)
+            | Op::Cont(_)
+            | Op::PCnt(_)
+            | Op::Exit(_)
+            | Op::WarpSync(_)
+            | Op::Bar(_)
+            | Op::TexDepBar(_)
+            | Op::CS2R(_)
+            | Op::Isberd(_)
+            | Op::Isbewr(_)
+            | Op::ViLd(_)
+            | Op::Kill(_)
+            | Op::Nop(_)
+            | Op::PixLd(_)
+            | Op::S2R(_)
+            | Op::Vote(_)
+            | Op::Match(_)
+            | Op::Undef(_)
+            | Op::SrcBar(_)
+            | Op::PhiSrcs(_)
+            | Op::PhiDsts(_)
+            | Op::Copy(_)
+            | Op::Pin(_)
+            | Op::Unpin(_)
+            | Op::Swap(_)
+            | Op::ParCopy(_)
+            | Op::RegOut(_)
+            | Op::Out(_)
+            | Op::OutFinal(_)
+            | Op::Annotate(_) => false,
+        }
     }
 }
 
@@ -8834,20 +9099,9 @@ pub struct BasicBlock {
 }
 
 impl BasicBlock {
-    pub fn map_instrs(&mut self, mut map: impl FnMut(Instr) -> MappedInstrs) {
-        let mut instrs = Vec::new();
-        for i in self.instrs.drain(..) {
-            match map(i) {
-                MappedInstrs::None => (),
-                MappedInstrs::One(i) => {
-                    instrs.push(i);
-                }
-                MappedInstrs::Many(mut v) => {
-                    instrs.append(&mut v);
-                }
-            }
-        }
-        self.instrs = instrs;
+    pub fn map_instrs(&mut self, map: impl FnMut(Instr) -> MappedInstrs) {
+        let instrs = std::mem::take(&mut self.instrs);
+        self.instrs = instrs.into_iter().flat_map(map).collect();
     }
 
     pub fn phi_dsts_ip(&self) -> Option<usize> {
@@ -9092,12 +9346,6 @@ impl Default for GeometryShaderInfo {
     }
 }
 
-#[derive(Debug)]
-pub struct TessellationInitShaderInfo {
-    pub per_patch_attribute_count: u8,
-    pub threads_per_patch: u8,
-}
-
 #[repr(u8)]
 #[derive(Clone, Copy, Debug)]
 pub enum TessellationDomain {
@@ -9114,20 +9362,43 @@ pub enum TessellationSpacing {
     FractionalEven = NAK_TS_SPACING_FRACT_EVEN,
 }
 
-#[repr(u8)]
-#[derive(Clone, Copy, Debug)]
-pub enum TessellationPrimitives {
-    Points = NAK_TS_PRIMS_POINTS,
-    Lines = NAK_TS_PRIMS_LINES,
-    TrianglesCW = NAK_TS_PRIMS_TRIANGLES_CW,
-    TrianglesCCW = NAK_TS_PRIMS_TRIANGLES_CCW,
+#[derive(Debug)]
+pub struct TesselationCommonShaderInfo {
+    pub spacing: Option<TessellationSpacing>,
+    pub ccw: bool,
+    pub point_mode: bool,
+}
+
+#[derive(Debug)]
+pub struct TessellationInitShaderInfo {
+    pub per_patch_attribute_count: u8,
+    pub threads_per_patch: u8,
+    pub common: TesselationCommonShaderInfo,
 }
 
 #[derive(Debug)]
 pub struct TessellationShaderInfo {
     pub domain: TessellationDomain,
-    pub spacing: TessellationSpacing,
-    pub primitives: TessellationPrimitives,
+    pub common: TesselationCommonShaderInfo,
+}
+
+#[derive(Debug)]
+pub struct TaskShaderInfo {
+    pub local_size: u16,
+    pub payload_smem_size: u16,
+    pub smem_size: u16,
+}
+
+#[derive(Debug)]
+pub struct MeshShaderInfo {
+    pub has_task_shader: bool,
+    pub has_gs_sph: bool,
+    pub primitive_io: VtgIoInfo,
+    pub max_vertices: u16,
+    pub max_primitives: u16,
+    pub output_topology: nak_mesh_topology,
+    pub local_size: u16,
+    pub smem_size: u16,
 }
 
 #[derive(Debug)]
@@ -9138,6 +9409,8 @@ pub enum ShaderStageInfo {
     Geometry(GeometryShaderInfo),
     TessellationInit(TessellationInitShaderInfo),
     Tessellation(TessellationShaderInfo),
+    Task(TaskShaderInfo),
+    Mesh(MeshShaderInfo),
 }
 
 #[derive(Debug, Default)]
@@ -9590,8 +9863,14 @@ impl IsbeSpaceSharingStateTracker {
     }
 
     pub fn visit_instr(&mut self, instr: &Instr) {
-        // Track attribute store. (XXX: ISBEWR)
-        self.has_attribute_store |= matches!(instr.op, Op::ASt(_));
+        // Track attribute store.
+        match &instr.op {
+            Op::ASt(_) => self.has_attribute_store = true,
+            Op::Isbewr(op) if op.access_type == IsbeAccessType::Attribute => {
+                self.has_attribute_store = true;
+            }
+            _ => {}
+        }
 
         // Track attribute load.
         if matches!(instr.op, Op::ALd(_) | Op::Isberd(_)) {
@@ -9689,9 +9968,9 @@ impl Shader<'_> {
     pub fn remove_annotations(&mut self) {
         self.map_instrs(|instr: Instr, _| -> MappedInstrs {
             if matches!(instr.op, Op::Annotate(_)) {
-                MappedInstrs::None
+                [].into()
             } else {
-                MappedInstrs::One(instr)
+                [instr].into()
             }
         })
     }

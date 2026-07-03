@@ -11,6 +11,9 @@
 
 /* The public winsys interface header for the radeon driver. */
 
+/* Force flush. */
+#define RADEON_FLUSH_FORCE                    (1u << 28)
+
 /* Skip command submission. Same as RADEON_NOOP=1. */
 #define RADEON_FLUSH_NOOP                     (1u << 29)
 
@@ -24,11 +27,12 @@
 #define RADEON_FLUSH_ASYNC_START_NEXT_GFX_IB_NOW                                                   \
    (PIPE_FLUSH_ASYNC | RADEON_FLUSH_START_NEXT_GFX_IB_NOW)
 
-#include "amd/common/ac_cmdbuf.h"
+#include "amd/common/ac_cmdbuf_base.h"
 #include "amd/common/ac_gpu_info.h"
 #include "amd/common/ac_surface.h"
-#include "amd/common/ac_pm4.h"
 #include "pipebuffer/pb_buffer.h"
+
+struct ac_pm4_state;
 
 /* Tiling flags. */
 enum radeon_bo_layout
@@ -467,13 +471,6 @@ struct radeon_winsys {
                          uint64_t offset, uint64_t size, bool commit);
 
    /**
-    * Calc size of the first committed part of the given sparse buffer.
-    * \note Only implemented by the amdgpu winsys.
-    * \return the skipped count if the range_offset fall into a hole.
-    */
-   unsigned (*buffer_find_next_committed_memory)(struct pb_buffer_lean *buf,
-                        uint64_t range_offset, unsigned *range_size);
-   /**
     * Return the virtual address of a buffer.
     *
     * When virtual memory is not in use, this is the offset relative to the
@@ -709,12 +706,14 @@ struct radeon_winsys {
     * Add a fence dependency to the CS, so that the CS will wait for
     * the fence before execution.
     */
-   void (*cs_add_fence_dependency)(struct radeon_cmdbuf *rcs, struct pipe_fence_handle *fence);
+   void (*cs_add_fence_dependency)(struct radeon_cmdbuf *rcs, struct pipe_fence_handle *fence,
+                                   uint64_t timeline_point);
 
    /**
     * Signal a syncobj when the CS finishes execution.
     */
-   void (*cs_add_syncobj_signal)(struct radeon_cmdbuf *rcs, struct pipe_fence_handle *fence);
+   void (*cs_add_syncobj_signal)(struct radeon_cmdbuf *rcs, struct pipe_fence_handle *fence,
+                                 uint64_t timeline_point);
 
    /**
     * Returns the amd_ip_type type of a CS.

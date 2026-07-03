@@ -631,6 +631,7 @@ zink_bind_rasterizer_state(struct pipe_context *pctx, void *cso)
    bool rasterizer_discard = ctx->rast_state ? ctx->rast_state->base.rasterizer_discard : false;
    bool half_pixel_center = ctx->rast_state ? ctx->rast_state->base.half_pixel_center : true;
    bool representative_fragment_test = ctx->rast_state ? ctx->rast_state->base.representative_fragment_test : false;
+   bool multisample = ctx->rast_state ? ctx->rast_state->base.multisample : false;
    float line_width = ctx->rast_state ? ctx->rast_state->base.line_width : 1.0;
    ctx->rast_state = cso;
 
@@ -646,12 +647,15 @@ zink_bind_rasterizer_state(struct pipe_context *pctx, void *cso)
       ctx->rast_state_changed = true;
 
       if (clip_halfz != ctx->rast_state->base.clip_halfz) {
-         if (screen->info.have_EXT_depth_clip_control)
-            ctx->gfx_pipeline_state.dirty = ctx->gfx_pipeline_state.mesh_dirty = true;
+         if (screen->info.have_EXT_depth_clip_control) {
+            ctx->gfx_pipeline_state.dirty |= !screen->have_full_ds3;
+            ctx->gfx_pipeline_state.mesh_dirty |= !screen->have_full_ds3;
+         }
          else
             zink_set_last_vertex_key(ctx)->clip_halfz = ctx->rast_state->base.clip_halfz;
          ctx->vp_state_changed = true;
       }
+      ctx->sample_locations_changed |= screen->base.caps.programmable_sample_locations && (multisample != ctx->rast_state->base.multisample);
 
       if (screen->info.have_EXT_extended_dynamic_state3) {
 #define STATE_CHECK(NAME, FLAG) \

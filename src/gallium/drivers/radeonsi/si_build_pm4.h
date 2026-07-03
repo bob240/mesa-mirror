@@ -11,10 +11,7 @@
 #ifndef SI_BUILD_PM4_H
 #define SI_BUILD_PM4_H
 
-#include "ac_cmdbuf_cp.h"
-
 #include "si_pipe.h"
-#include "sid.h"
 
 #define radeon_begin(cs) struct radeon_cmdbuf *__rcs = (cs); \
                          ac_cmdbuf_begin(&__rcs->current)
@@ -196,14 +193,14 @@
 
 /* Packet building helpers for CONFIG registers. */
 #define radeon_set_config_reg(reg, value) \
-   ac_cmdbuf_set_config_reg(reg, value)
+   ac_cmdbuf_set_cfg_reg(reg, value)
 
 /* Packet building helpers for CONTEXT registers. */
 #define radeon_set_context_reg_seq(reg, num) \
-   ac_cmdbuf_set_context_reg_seq(reg, num)
+   ac_cmdbuf_set_ctx_reg_seq(reg, num)
 
 #define radeon_set_context_reg(reg, value) \
-   ac_cmdbuf_set_context_reg(reg, value)
+   ac_cmdbuf_set_ctx_reg(reg, value)
 
 #define radeon_opt_set_context_reg(reg, reg_enum, value) \
    radeon_opt_set_reg(reg, reg_enum, 0, value, SI_CONTEXT, PKT3_SET_CONTEXT_REG)
@@ -262,13 +259,13 @@
 
 /* Packet building helpers for UCONFIG registers. */
 #define radeon_set_uconfig_reg_seq(reg, num) \
-   ac_cmdbuf_set_uconfig_reg_seq(reg, num)
+   ac_cmdbuf_set_ucfg_reg_seq(reg, num)
 
 #define radeon_set_uconfig_perfctr_reg_seq(gfx_level, ip_type, reg, num) \
-   ac_cmdbuf_set_uconfig_perfctr_reg_seq(gfx_level, ip_type, reg, num)
+   ac_cmdbuf_set_ucfg_perfctr_reg_seq(gfx_level, ip_type, reg, num)
 
 #define radeon_set_uconfig_reg(reg, value) \
-   ac_cmdbuf_set_uconfig_reg(reg, value)
+   ac_cmdbuf_set_ucfg_reg(reg, value)
 
 #define radeon_opt_set_uconfig_reg(reg, reg_enum, value) \
    radeon_opt_set_reg(reg, reg_enum, 0, value, CIK_UCONFIG, PKT3_SET_UCONFIG_REG)
@@ -318,10 +315,10 @@
  * Registers are buffered on the stack and then copied to the command buffer at the end.
  */
 #define gfx11_begin_packed_context_regs() \
-   ac_gfx11_begin_packed_context_regs()
+   ac_gfx11_begin_packed_ctx_regs()
 
 #define gfx11_set_context_reg(reg, value) \
-   ac_gfx11_set_context_reg(reg, value)
+   ac_gfx11_set_ctx_reg(reg, value)
 
 #define gfx11_opt_set_context_reg(reg, reg_enum, value) \
    gfx11_opt_push_reg(reg, reg_enum, value, SI_CONTEXT, __cs_context_regs, \
@@ -332,7 +329,7 @@
                        __cs_context_reg_count)
 
 #define gfx11_end_packed_context_regs() \
-   ac_gfx11_end_packed_context_regs()
+   ac_gfx11_end_packed_ctx_regs()
 
 /* GFX12 generic packet building helpers for PAIRS packets. Don't use these directly. */
 
@@ -349,10 +346,10 @@
 
 /* GFX12 packet building helpers for PAIRS packets. */
 #define gfx12_begin_context_regs() \
-   ac_gfx12_begin_context_regs()
+   ac_gfx12_begin_ctx_regs()
 
 #define gfx12_set_context_reg(reg, value) \
-   ac_gfx12_set_context_reg(reg, value)
+   ac_gfx12_set_ctx_reg(reg, value)
 
 #define gfx12_opt_set_context_reg(reg, reg_enum, value) do { \
    struct ac_tracked_regs *__tracked_regs = &sctx->tracked_regs; \
@@ -365,7 +362,7 @@
 } while (0)
 
 #define gfx12_end_context_regs() \
-   ac_gfx12_end_context_regs()
+   ac_gfx12_end_ctx_regs()
 
 /* GFX12 packet building helpers for buffered registers. */
 #define gfx12_push_gfx_sh_reg(reg, value) \
@@ -397,7 +394,7 @@
 
 #define radeon_emit_alt_hiz_packets() do { \
    radeon_emit(PKT3(PKT3_RELEASE_MEM, 6, 0)); \
-   radeon_emit(S_490_EVENT_TYPE(V_028A90_BOTTOM_OF_PIPE_TS) | S_490_EVENT_INDEX(5)); \
+   radeon_emit(S_491_EVENT_TYPE(V_028A90_BOTTOM_OF_PIPE_TS) | S_491_EVENT_INDEX(5)); \
    radeon_emit(0); /* DST_SEL, INT_SEL = no write confirm, DATA_SEL = no data */ \
    radeon_emit(0); /* ADDRESS_LO */ \
    radeon_emit(0); /* ADDRESS_HI */ \

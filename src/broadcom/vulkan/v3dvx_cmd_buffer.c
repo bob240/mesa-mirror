@@ -21,7 +21,10 @@
  * IN THE SOFTWARE.
  */
 
-#include "v3dv_private.h"
+#include "v3dv_device.h"
+#include "v3dv_cmd_buffer.h"
+#include "v3dv_image.h"
+#include "v3dv_version_dispatch.h"
 #include "v3dv_format_table.h"
 #include "v3dvx_format_table.h"
 #include "broadcom/common/v3d_util.h"
@@ -56,6 +59,10 @@ v3dX(job_emit_enable_double_buffer)(struct v3dv_job *job)
    };
    config.width_in_pixels = tiling->width;
    config.height_in_pixels = tiling->height;
+   config.tile_allocation_initial_block_size =
+      V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM;
+   config.tile_allocation_block_size =
+      V3D_TILE_ALLOC_OVERFLOW_BLOCK_SIZE_ENUM;
 #if V3D_VERSION == 42
    config.number_of_render_targets = MAX2(tiling->render_target_count, 1);
    config.multisample_mode_4x = tiling->msaa;
@@ -88,6 +95,10 @@ v3dX(job_emit_binning_prolog)(struct v3dv_job *job,
    cl_emit(&job->bcl, TILE_BINNING_MODE_CFG, config) {
       config.width_in_pixels = tiling->width;
       config.height_in_pixels = tiling->height;
+      config.tile_allocation_initial_block_size =
+         V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM;
+      config.tile_allocation_block_size =
+         V3D_TILE_ALLOC_OVERFLOW_BLOCK_SIZE_ENUM;
 #if V3D_VERSION == 42
       config.number_of_render_targets = MAX2(tiling->render_target_count, 1);
       config.multisample_mode_4x = tiling->msaa;
@@ -97,12 +108,6 @@ v3dX(job_emit_binning_prolog)(struct v3dv_job *job,
 #if V3D_VERSION >= 71
       config.log2_tile_width = log2_tile_size(tiling->tile_width);
       config.log2_tile_height = log2_tile_size(tiling->tile_height);
-      /* FIXME: ideally we would like next assert on the packet header (as is
-       * general, so also applies to GL). We would need to expand
-       * gen_pack_header for that.
-       */
-      assert(config.log2_tile_width == config.log2_tile_height ||
-             config.log2_tile_width == config.log2_tile_height + 1);
 #endif
    }
 
@@ -755,7 +760,8 @@ cmd_buffer_emit_render_pass_layer_rcl(struct v3dv_cmd_buffer *cmd_buffer,
     */
    const struct v3dv_frame_tiling *tiling = &job->frame_tiling;
    const uint32_t tile_alloc_offset =
-      64 * layer * tiling->draw_tiles_x * tiling->draw_tiles_y;
+      V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE *
+      layer * tiling->draw_tiles_x * tiling->draw_tiles_y;
    cl_emit(rcl, MULTICORE_RENDERING_TILE_LIST_SET_BASE, list) {
       list.address = v3dv_cl_address(job->tile_alloc, tile_alloc_offset);
    }
@@ -977,12 +983,6 @@ v3dX(cmd_buffer_emit_render_pass_rcl)(struct v3dv_cmd_buffer *cmd_buffer)
 #if V3D_VERSION >= 71
       config.log2_tile_width = log2_tile_size(tiling->tile_width);
       config.log2_tile_height = log2_tile_size(tiling->tile_height);
-      /* FIXME: ideallly we would like next assert on the packet header (as is
-       * general, so also applies to GL). We would need to expand
-       * gen_pack_header for that.
-       */
-      assert(config.log2_tile_width == config.log2_tile_height ||
-             config.log2_tile_width == config.log2_tile_height + 1);
 #endif
 
       if (ds_attachment_idx != VK_ATTACHMENT_UNUSED) {
@@ -1236,7 +1236,7 @@ v3dX(cmd_buffer_emit_render_pass_rcl)(struct v3dv_cmd_buffer *cmd_buffer)
    cl_emit(rcl, TILE_LIST_INITIAL_BLOCK_SIZE, init) {
       init.use_auto_chained_tile_lists = true;
       init.size_of_first_block_in_chained_tile_lists =
-         TILE_ALLOCATION_BLOCK_SIZE_64B;
+         V3D_TILE_ALLOC_INITIAL_BLOCK_SIZE_ENUM;
    }
 
    cl_emit(rcl, MULTICORE_RENDERING_SUPERTILE_CFG, config) {
@@ -1633,7 +1633,7 @@ v3dX(cmd_buffer_emit_blend)(struct v3dv_cmd_buffer *cmd_buffer)
       return;
 
    const struct v3d_device_info *devinfo = &cmd_buffer->device->devinfo;
-   const uint32_t max_color_rts = V3D_MAX_RENDER_TARGETS(devinfo->ver);
+   const uint32_t max_color_rts = devinfo->max_render_targets;
 
    const uint32_t blend_packets_size =
       cl_packet_length(BLEND_ENABLES) +
@@ -2266,22 +2266,25 @@ v3dX(cmd_buffer_execute_inside_pass)(struct v3dv_cmd_buffer *primary,
              * primary's job list right after it.
              */
             v3dv_cmd_buffer_finish_job(primary);
-            v3dv_job_clone_in_cmd_buffer(secondary_job, primary);
+            struct v3dv_job *job =
+               v3dv_job_clone_in_cmd_buffer(secondary_job, primary);
+            if (!job)
+               return;
+
             if (pending_barrier.dst_mask) {
-               /* FIXME: do the same we do for primaries and only choose the
-                * relevant src masks.
-                */
-               secondary_job->serialize = pending_barrier.src_mask_graphics |
-                                          pending_barrier.src_mask_transfer |
-                                          pending_barrier.src_mask_compute;
-               if (pending_barrier.bcl_buffer_access ||
-                   pending_barrier.bcl_image_access) {
-                  secondary_job->needs_bcl_sync = true;
+               const uint8_t prev_dst_mask = pending_barrier.dst_mask;
+               v3dv_job_apply_barrier_state(job, &pending_barrier);
+
+               if ((prev_dst_mask & V3DV_BARRIER_GRAPHICS_BIT) &&
+                   !(pending_barrier.dst_mask & V3DV_BARRIER_GRAPHICS_BIT) &&
+                   (pending_barrier.bcl_buffer_access ||
+                    pending_barrier.bcl_image_access)) {
+                  job->needs_bcl_sync = true;
+                  pending_barrier.bcl_buffer_access = 0;
+                  pending_barrier.bcl_image_access = 0;
                }
             }
          }
-
-         memset(&pending_barrier, 0, sizeof(pending_barrier));
       }
 
       /* If the secondary has recorded any vkCmdEndQuery commands, we need to
@@ -2609,12 +2612,16 @@ v3dX(cmd_buffer_emit_gl_shader_state)(struct v3dv_cmd_buffer *cmd_buffer)
 
       cl_emit_with_prepacked(&job->indirect, GL_SHADER_STATE_ATTRIBUTE_RECORD,
                              &pipeline->vertex_attrs[i * packet_length], attr) {
-
-         assert(c_vb->buffer->mem->bo);
-         attr.address = v3dv_cl_address(c_vb->buffer->mem->bo,
-                                        c_vb->buffer->mem_offset +
-                                        pipeline->va[i].offset +
-                                        c_vb->offset);
+         if (c_vb->buffer) {
+            assert(c_vb->buffer->mem->bo);
+            attr.address = v3dv_cl_address(c_vb->buffer->mem->bo,
+                                           c_vb->buffer->mem_offset +
+                                           pipeline->va[i].offset +
+                                           c_vb->offset);
+         } else {
+            assert(cmd_buffer->device->null_bo);
+            attr.address = v3dv_cl_address(cmd_buffer->device->null_bo, 0);
+         }
 
          attr.number_of_values_read_by_coordinate_shader =
             prog_data_vs_bin->vattr_sizes[location];

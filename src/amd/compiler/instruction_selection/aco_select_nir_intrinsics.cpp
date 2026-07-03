@@ -110,7 +110,7 @@ emit_bpermute(isel_context* ctx, Builder& bld, Temp index, Temp data)
                            bld.def(s1, scc), index_x4, data, same_half);
       } else {
          return bld.pseudo(aco_opcode::p_bpermute_permlane, bld.def(v1), bld.def(s2),
-                           bld.def(s1, scc), Operand(v1.as_linear()), index_x4, data, same_half);
+                           bld.def(s1, scc), Operand(lv1), index_x4, data, same_half);
       }
    } else {
       /* GFX6-7: there is no bpermute instruction */
@@ -288,12 +288,13 @@ struct LoadEmitInfo {
    nir_src* offset_src = NULL; /* should be equal to offset or NULL */
    isel_context* ctx;
 
-   ac_hw_cache_flags cache = {{0, 0, 0, 0, 0}};
+   ac_hw_cache_flags cache = {{0, 0, 0, 0}};
    bool split_by_component_stride = true;
    bool disable_wqm = false;
    unsigned swizzle_component_size = 0;
    memory_sync_info sync;
    Temp soffset = Temp(0, s1);
+   bool tfe = false;
 };
 
 struct EmitLoadParameters {
@@ -726,6 +727,7 @@ mubuf_load_format_callback(Builder& bld, const LoadEmitInfo& info, unsigned byte
 
    aco_opcode op = aco_opcode::num_opcodes;
    if (info.component_size == 2) {
+      assert(!info.tfe);
       switch (bytes_needed) {
       case 2: op = aco_opcode::buffer_load_format_d16_x; break;
       case 4: op = aco_opcode::buffer_load_format_d16_xy; break;
@@ -735,7 +737,7 @@ mubuf_load_format_callback(Builder& bld, const LoadEmitInfo& info, unsigned byte
       }
    } else {
       assert(info.component_size == 4);
-      switch (bytes_needed) {
+      switch (bytes_needed - info.tfe * 4) {
       case 4: op = aco_opcode::buffer_load_format_x; break;
       case 8: op = aco_opcode::buffer_load_format_xy; break;
       case 12: op = aco_opcode::buffer_load_format_xyz; break;
@@ -744,7 +746,8 @@ mubuf_load_format_callback(Builder& bld, const LoadEmitInfo& info, unsigned byte
       }
    }
 
-   aco_ptr<Instruction> mubuf{create_instruction(op, Format::MUBUF, 3, 1)};
+   aco_ptr<Instruction> mubuf{
+      create_instruction(op, Format::MUBUF, 3 + info.tfe + 2 * info.disable_wqm, 1)};
    mubuf->operands[0] = Operand(info.resource);
    mubuf->operands[1] = vaddr;
    mubuf->operands[2] = soffset;
@@ -753,8 +756,12 @@ mubuf_load_format_callback(Builder& bld, const LoadEmitInfo& info, unsigned byte
    mubuf->mubuf().cache = info.cache;
    mubuf->mubuf().sync = info.sync;
    mubuf->mubuf().offset = info.const_offset;
+   mubuf->mubuf().tfe = info.tfe;
    RegClass rc = RegClass::get(RegType::vgpr, bytes_needed);
    Temp val = rc == info.dst.regClass() ? info.dst : bld.tmp(rc);
+   if (info.tfe)
+      mubuf->operands[3] = emit_tfe_init(bld, val);
+   init_disable_wqm(bld, mubuf->mubuf(), info.disable_wqm);
    mubuf->definitions[0] = Definition(val);
    bld.insert(std::move(mubuf));
 
@@ -810,7 +817,8 @@ Temp
 get_mubuf_global_rsrc(Builder& bld, Temp addr)
 {
    uint32_t desc[4];
-   ac_build_raw_buffer_descriptor(bld.program->gfx_level, 0, 0xffffffff, desc);
+   ac_build_raw_buffer_descriptor(bld.program->gfx_level, bld.program->dev.has_desc_resource_level,
+                                  0, 0xffffffff, desc);
 
    if (addr.type() == RegType::vgpr)
       return bld.pseudo(aco_opcode::p_create_vector, bld.def(s4), Operand::zero(), Operand::zero(),
@@ -1463,9 +1471,10 @@ visit_load_fs_input(isel_context* ctx, nir_intrinsic_instr* instr)
 
    Temp prim_mask = get_arg(ctx, ctx->args->prim_mask);
 
+   nir_io_semantics sem = nir_intrinsic_io_semantics(instr);
    unsigned idx = nir_intrinsic_base(instr);
    unsigned component = nir_intrinsic_component(instr);
-   bool high_16bits = nir_intrinsic_io_semantics(instr).high_16bits;
+   bool high_16bits = sem.high_16bits;
    unsigned vertex_id = 0; /* P0 */
 
    if (instr->intrinsic == nir_intrinsic_load_input_vertex)
@@ -1584,7 +1593,8 @@ visit_load_constant(isel_context* ctx, nir_intrinsic_instr* instr)
    Builder bld(ctx->program, ctx->block);
 
    uint32_t desc[4];
-   ac_build_raw_buffer_descriptor(ctx->options->gfx_level, 0, 0, desc);
+   ac_build_raw_buffer_descriptor(ctx->options->gfx_level,
+                                  ctx->program->dev.has_desc_resource_level, 0, 0, desc);
 
    unsigned base = nir_intrinsic_base(instr);
    unsigned range = nir_intrinsic_range(instr);
@@ -1858,13 +1868,12 @@ visit_image_load(isel_context* ctx, nir_intrinsic_instr* instr)
    bool is_sparse = instr->intrinsic == nir_intrinsic_bindless_image_sparse_load;
    Temp dst = get_ssa_temp(ctx, &instr->def);
 
+   assert(dim != GLSL_SAMPLER_DIM_BUF);
    memory_sync_info sync = get_memory_sync_info(instr, storage_image, 0);
 
    unsigned result_size = instr->def.num_components - is_sparse;
    unsigned expand_mask = nir_def_components_read(&instr->def) & u_bit_consecutive(0, result_size);
    expand_mask = MAX2(expand_mask, 1); /* this can be zero in the case of sparse image loads */
-   if (dim == GLSL_SAMPLER_DIM_BUF)
-      expand_mask = (1u << util_last_bit(expand_mask)) - 1u;
    unsigned dmask = expand_mask;
    if (instr->def.bit_size == 64) {
       expand_mask &= 0x9;
@@ -1890,72 +1899,35 @@ visit_image_load(isel_context* ctx, nir_intrinsic_instr* instr)
    enum gl_access_qualifier access = nir_intrinsic_access(instr);
    bool disable_wqm = access & ACCESS_SKIP_HELPERS;
 
-   if (dim == GLSL_SAMPLER_DIM_BUF) {
-      Temp vindex = emit_extract_vector(ctx, get_ssa_temp(ctx, instr->src[1].ssa), 0, v1);
+   std::vector<Temp> coords = get_image_coords(ctx, instr);
 
-      aco_opcode opcode;
-      if (!d16) {
-         switch (util_bitcount(dmask)) {
-         case 1: opcode = aco_opcode::buffer_load_format_x; break;
-         case 2: opcode = aco_opcode::buffer_load_format_xy; break;
-         case 3: opcode = aco_opcode::buffer_load_format_xyz; break;
-         case 4: opcode = aco_opcode::buffer_load_format_xyzw; break;
-         default: UNREACHABLE(">4 channel buffer image load");
-         }
-      } else {
-         switch (util_bitcount(dmask)) {
-         case 1: opcode = aco_opcode::buffer_load_format_d16_x; break;
-         case 2: opcode = aco_opcode::buffer_load_format_d16_xy; break;
-         case 3: opcode = aco_opcode::buffer_load_format_d16_xyz; break;
-         case 4: opcode = aco_opcode::buffer_load_format_d16_xyzw; break;
-         default: UNREACHABLE(">4 channel buffer image load");
-         }
-      }
-      aco_ptr<Instruction> load{
-         create_instruction(opcode, Format::MUBUF, 3 + is_sparse + 2 * disable_wqm, 1)};
-      load->operands[0] = Operand(resource);
-      load->operands[1] = Operand(vindex);
-      load->operands[2] = Operand::c32(0);
-      load->definitions[0] = Definition(tmp);
-      load->mubuf().idxen = true;
-      load->mubuf().cache = get_cache_flags(ctx, access, ac_access_type_load);
-      load->mubuf().sync = sync;
-      load->mubuf().tfe = is_sparse;
-      if (load->mubuf().tfe)
-         load->operands[3] = emit_tfe_init(bld, tmp);
-      init_disable_wqm(bld, load->mubuf(), disable_wqm);
-      ctx->block->instructions.emplace_back(std::move(load));
+   aco_opcode opcode;
+   if (instr->intrinsic == nir_intrinsic_bindless_image_fragment_mask_load_amd) {
+      opcode = aco_opcode::image_load;
    } else {
-      std::vector<Temp> coords = get_image_coords(ctx, instr);
+      bool level_zero = nir_src_is_const(instr->src[3]) && nir_src_as_uint(instr->src[3]) == 0;
+      opcode = level_zero ? aco_opcode::image_load : aco_opcode::image_load_mip;
+   }
 
-      aco_opcode opcode;
-      if (instr->intrinsic == nir_intrinsic_bindless_image_fragment_mask_load_amd) {
-         opcode = aco_opcode::image_load;
-      } else {
-         bool level_zero = nir_src_is_const(instr->src[3]) && nir_src_as_uint(instr->src[3]) == 0;
-         opcode = level_zero ? aco_opcode::image_load : aco_opcode::image_load_mip;
-      }
+   Operand vdata = is_sparse ? emit_tfe_init(bld, tmp) : Operand(v1);
+   MIMG_instruction* load =
+      emit_mimg(bld, opcode, {tmp}, resource, Operand(s4), coords, disable_wqm, vdata);
+   load->cache = get_cache_flags(ctx, access, ac_access_type_load);
+   load->a16 = instr->src[1].ssa->bit_size == 16;
+   load->d16 = d16;
+   load->dmask = dmask;
+   load->unrm = true;
+   load->tfe = is_sparse;
 
-      Operand vdata = is_sparse ? emit_tfe_init(bld, tmp) : Operand(v1);
-      MIMG_instruction* load =
-         emit_mimg(bld, opcode, {tmp}, resource, Operand(s4), coords, disable_wqm, vdata);
-      load->cache = get_cache_flags(ctx, access, ac_access_type_load);
-      load->a16 = instr->src[1].ssa->bit_size == 16;
-      load->d16 = d16;
-      load->dmask = dmask;
-      load->unrm = true;
-      load->tfe = is_sparse;
-
-      if (instr->intrinsic == nir_intrinsic_bindless_image_fragment_mask_load_amd) {
-         load->dim = is_array ? ac_image_2darray : ac_image_2d;
-         load->da = is_array;
-         load->sync = memory_sync_info();
-      } else {
-         ac_image_dim sdim = ac_get_image_dim(ctx->options->gfx_level, dim, is_array);
-         load->dim = sdim;
-         load->da = should_declare_array(sdim);
-         load->sync = sync;
-      }
+   if (instr->intrinsic == nir_intrinsic_bindless_image_fragment_mask_load_amd) {
+      load->dim = is_array ? ac_image_2darray : ac_image_2d;
+      load->da = is_array;
+      load->sync = memory_sync_info();
+   } else {
+      ac_image_dim sdim = ac_get_image_dim(ctx->options->gfx_level, dim, is_array);
+      load->dim = sdim;
+      load->da = should_declare_array(sdim);
+      load->sync = sync;
    }
 
    if (is_sparse && instr->def.bit_size == 64) {
@@ -1999,7 +1971,7 @@ visit_image_store(isel_context* ctx, nir_intrinsic_instr* instr)
          nir_scalar comp = nir_scalar_resolved(instr->src[3].ssa, i);
          if (nir_scalar_is_undef(comp)) {
             dmask &= ~BITFIELD_BIT(i);
-         } else if (ctx->options->gfx_level <= GFX11_5) {
+         } else if (ctx->options->gfx_level < GFX12) {
             if (nir_scalar_is_const(comp) && nir_scalar_as_uint(comp) == 0)
                dmask &= ~BITFIELD_BIT(i);
          } else {
@@ -2443,6 +2415,43 @@ visit_load_global(isel_context* ctx, nir_intrinsic_instr* instr)
 }
 
 void
+visit_load_global_tr(isel_context* ctx, nir_intrinsic_instr* instr)
+{
+   Builder bld(ctx->program, ctx->block);
+   unsigned access = nir_intrinsic_access(instr);
+   memory_sync_info sync = get_memory_sync_info(instr, storage_buffer, 0);
+
+   Temp addr, offset;
+   uint32_t const_offset;
+   parse_global(ctx, instr, &addr, &const_offset, &offset);
+   Format format = lower_global_address(ctx, bld, 0, &addr, &const_offset, &offset, &instr->src[1]);
+   assert(format == Format::GLOBAL);
+
+   Temp dst = get_ssa_temp(ctx, &instr->def);
+   /* Note that _b128/_b64 relates to the bit size, not the number of VGPRs written. */
+   aco_opcode op =
+      instr->def.bit_size == 16 ? aco_opcode::global_load_tr_b128 : aco_opcode::global_load_tr_b64;
+   aco_ptr<Instruction> load{create_instruction(op, format, 2, 1)};
+   load->definitions[0] = Definition(dst);
+   if (addr.regClass() == s2) {
+      assert(offset.id() && offset.type() == RegType::vgpr);
+      load->operands[0] = Operand(offset);
+      load->operands[1] = Operand(addr);
+   } else {
+      assert(addr.type() == RegType::vgpr && !offset.id());
+      load->operands[0] = Operand(addr);
+      load->operands[1] = Operand(s1);
+   }
+   load->flatlike().offset = const_offset;
+   load->flatlike().cache = get_cache_flags(ctx, access, ac_access_type_load);
+   load->flatlike().sync = sync;
+   bld.insert(std::move(load));
+   set_wqm(ctx);
+
+   emit_split_vector(ctx, dst, instr->def.num_components);
+}
+
+void
 visit_store_global(isel_context* ctx, nir_intrinsic_instr* instr)
 {
    Builder bld(ctx->program, ctx->block);
@@ -2716,6 +2725,9 @@ visit_load_buffer(isel_context* ctx, nir_intrinsic_instr* intrin)
    /* Swizzled buffer addressing seems to be broken on GFX11 without the idxen bit. */
    bool swizzled = nir_intrinsic_access(intrin) & ACCESS_IS_SWIZZLED_AMD;
    bool idxen = (swizzled && ctx->program->gfx_level >= GFX11) ||
+                /* GFX9 uses IDXEN to select bounds checking behavior */
+                (ctx->program->gfx_level == GFX9 &&
+                 nir_intrinsic_access(intrin) & ACCESS_USES_FORMAT_AMD) ||
                 !nir_src_is_const(intrin->src[3]) || nir_src_as_uint(intrin->src[3]);
    bool v_offset_zero = nir_src_is_const(intrin->src[1]) && !nir_src_as_uint(intrin->src[1]);
    bool s_offset_zero = nir_src_is_const(intrin->src[2]) && !nir_src_as_uint(intrin->src[2]);
@@ -2747,6 +2759,8 @@ visit_load_buffer(isel_context* ctx, nir_intrinsic_instr* intrin)
    info.soffset = s_offset;
    info.const_offset = const_offset;
    info.sync = sync;
+   info.tfe = nir_intrinsic_access(intrin) & ACCESS_SPARSE;
+   info.disable_wqm = nir_intrinsic_access(intrin) & ACCESS_SKIP_HELPERS;
 
    if (intrin->intrinsic == nir_intrinsic_load_typed_buffer_amd) {
       const pipe_format format = nir_intrinsic_format(intrin);
@@ -2802,6 +2816,9 @@ visit_store_buffer(isel_context* ctx, nir_intrinsic_instr* intrin)
    /* Swizzled buffer addressing seems to be broken on GFX11 without the idxen bit. */
    bool swizzled = nir_intrinsic_access(intrin) & ACCESS_IS_SWIZZLED_AMD;
    bool idxen = (swizzled && ctx->program->gfx_level >= GFX11) ||
+                /* GFX9 uses IDXEN to select bounds checking behavior */
+                (ctx->program->gfx_level == GFX9 &&
+                 nir_intrinsic_access(intrin) & ACCESS_USES_FORMAT_AMD) ||
                 !nir_src_is_const(intrin->src[4]) || nir_src_as_uint(intrin->src[4]);
    bool offen = !nir_src_is_const(intrin->src[2]) || nir_src_as_uint(intrin->src[2]);
 
@@ -2880,7 +2897,7 @@ translate_nir_scope(mesa_scope scope)
 }
 
 void
-emit_barrier(isel_context* ctx, nir_intrinsic_instr* instr)
+visit_barrier(isel_context* ctx, nir_intrinsic_instr* instr)
 {
    Builder bld(ctx->program, ctx->block);
 
@@ -2933,9 +2950,15 @@ emit_barrier(isel_context* ctx, nir_intrinsic_instr* instr)
    assert(!(nir_semantics & (NIR_MEMORY_MAKE_AVAILABLE | NIR_MEMORY_MAKE_VISIBLE)));
    assert(exec_scope != scope_workgroup || workgroup_scope_allowed);
 
-   bld.barrier(aco_opcode::p_barrier,
-               memory_sync_info((storage_class)storage, (memory_semantics)semantics, mem_scope),
-               exec_scope);
+   aco_opcode op = aco_opcode::p_barrier;
+   if ((nir_semantics & NIR_MEMORY_CONTROL_ARRIVE_WAIT) == NIR_MEMORY_CONTROL_ARRIVE)
+      op = aco_opcode::p_barrier_signal;
+   if ((nir_semantics & NIR_MEMORY_CONTROL_ARRIVE_WAIT) == NIR_MEMORY_CONTROL_WAIT)
+      op = aco_opcode::p_barrier_wait;
+
+   emit_barrier(bld,
+                memory_sync_info((storage_class)storage, (memory_semantics)semantics, mem_scope),
+                exec_scope, op);
 }
 
 /* The two 32 wide halves of a gfx10+ wave64 LDS instruction might be executed interleaved
@@ -3392,7 +3415,10 @@ visit_store_scratch(isel_context* ctx, nir_intrinsic_instr* instr)
       offset = as_vgpr(ctx, offset);
       for (unsigned i = 0; i < write_count; i++) {
          aco_opcode op = get_buffer_store_op(write_datas[i].bytes());
-         Instruction* mubuf = bld.mubuf(op, rsrc, offset, ctx->program->scratch_offsets.back(),
+         Operand soffset = Operand::c32(0);
+         if (!ctx->program->scratch_offsets.empty())
+            soffset = Operand(ctx->program->scratch_offsets.back());
+         Instruction* mubuf = bld.mubuf(op, rsrc, offset, soffset,
                                         write_datas[i], offsets[i], true);
          mubuf->mubuf().sync = memory_sync_info(storage_scratch, semantic_private);
          enum ac_access_type type =
@@ -3489,8 +3515,8 @@ emit_reduction_instr(isel_context* ctx, aco_opcode aco_op, ReduceOp op, unsigned
    Instruction* reduce = create_instruction(aco_op, Format::PSEUDO_REDUCTION, 3, num_defs);
    reduce->operands[0] = Operand(src);
    /* setup_reduce_temp will update these undef operands if needed */
-   reduce->operands[1] = Operand(RegClass(RegType::vgpr, dst.size()).as_linear());
-   reduce->operands[2] = Operand(v1.as_linear());
+   reduce->operands[1] = Operand(lv1.resize(dst.size() * 4));
+   reduce->operands[2] = Operand(lv1);
    std::copy(defs, defs + num_defs, reduce->definitions.begin());
 
    reduce->reduction().reduce_op = op;
@@ -3733,8 +3759,7 @@ pops_await_overlapped_waves(isel_context* ctx)
    /* Check if there's an overlap in the current wave - otherwise, the wait may result in a hang. */
    const Temp did_overlap =
       bld.sopc(aco_opcode::s_bitcmp1_b32, bld.def(s1, scc), collision, Operand::c32(31));
-   if_context did_overlap_if_context;
-   begin_uniform_if_then(ctx, &did_overlap_if_context, did_overlap);
+   begin_uniform_if_then(ctx, did_overlap);
    bld.reset(ctx->block);
 
    /* Set the packer register - after this, pops_exiting_wave_id can be polled. */
@@ -3793,8 +3818,7 @@ pops_await_overlapped_waves(isel_context* ctx)
 
    /* Await the overlapped waves. */
 
-   loop_context wait_loop_context;
-   begin_loop(ctx, &wait_loop_context);
+   begin_loop(ctx);
    bld.reset(ctx->block);
 
    const Temp exiting_wave_id = bld.pseudo(aco_opcode::p_pops_gfx9_add_exiting_wave_id, bld.def(s1),
@@ -3805,25 +3829,22 @@ pops_await_overlapped_waves(isel_context* ctx)
     */
    const Temp newest_overlapped_wave_exited = bld.sopc(aco_opcode::s_cmp_lt_u32, bld.def(s1, scc),
                                                        newest_overlapped_wave_id, exiting_wave_id);
-   if_context newest_overlapped_wave_exited_if_context;
-   begin_uniform_if_then(ctx, &newest_overlapped_wave_exited_if_context,
-                         newest_overlapped_wave_exited);
+   begin_uniform_if_then(ctx, newest_overlapped_wave_exited);
    emit_loop_break(ctx);
-   begin_uniform_if_else(ctx, &newest_overlapped_wave_exited_if_context);
-   end_uniform_if(ctx, &newest_overlapped_wave_exited_if_context);
+   end_uniform_if(ctx);
    bld.reset(ctx->block);
 
    /* Sleep before rechecking to let overlapped waves run for some time. */
    bld.sopp(aco_opcode::s_sleep, ctx->program->gfx_level >= GFX10 ? UINT16_MAX : 3);
 
-   end_loop(ctx, &wait_loop_context);
+   end_loop(ctx);
    bld.reset(ctx->block);
 
    /* Indicate the wait has been done to subsequent compilation stages. */
    bld.pseudo(aco_opcode::p_pops_gfx9_overlapped_wave_wait_done);
 
-   begin_uniform_if_else(ctx, &did_overlap_if_context);
-   end_uniform_if(ctx, &did_overlap_if_context);
+   begin_uniform_if_else(ctx);
+   end_uniform_if(ctx);
    bld.reset(ctx->block);
 }
 
@@ -3915,8 +3936,8 @@ load_scratch_param(isel_context* ctx, Builder& bld, const parameter_info& param,
       params.max_const_offset = ctx->program->dev.scratch_global_offset_max;
       emit_load(ctx, bld, info, params);
    } else {
-      info.resource = load_scratch_resource(
-         ctx->program, bld, ctx->program->private_segment_buffers.size() - 1, false);
+      info.resource = load_scratch_resource(ctx->program, bld,
+                                            ctx->program->private_segment_buffers.size() - 1, true);
       if (stack_ptr.id()) {
          info.soffset = bld.sop2(aco_opcode::s_add_u32, bld.def(s1), bld.def(s1, scc), stack_ptr,
                                  Operand::c32(-const_offset * ctx->program->wave_size));
@@ -3943,7 +3964,8 @@ store_scratch_param(isel_context* ctx, Builder& bld, const parameter_info& param
                       write_datas, offsets);
 
    if (ctx->program->gfx_level < GFX9) {
-      Temp scratch_rsrc = load_scratch_resource(ctx->program, bld, -1u, false);
+      Temp scratch_rsrc = load_scratch_resource(
+         ctx->program, bld, ctx->program->private_segment_buffers.size() - 1, true);
       for (unsigned i = 0; i < write_count; i++) {
          Temp soffset;
          if (stack_ptr.id()) {
@@ -4028,6 +4050,7 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
    case nir_intrinsic_load_buffer_amd: visit_load_buffer(ctx, instr); break;
    case nir_intrinsic_store_buffer_amd: visit_store_buffer(ctx, instr); break;
    case nir_intrinsic_load_global_amd: visit_load_global(ctx, instr); break;
+   case nir_intrinsic_load_global_tr_amd: visit_load_global_tr(ctx, instr); break;
    case nir_intrinsic_store_global_amd: visit_store_global(ctx, instr); break;
    case nir_intrinsic_global_atomic_amd:
    case nir_intrinsic_global_atomic_swap_amd: visit_global_atomic(ctx, instr); break;
@@ -4035,59 +4058,7 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
    case nir_intrinsic_ssbo_atomic_swap: visit_atomic_ssbo(ctx, instr); break;
    case nir_intrinsic_load_scratch: visit_load_scratch(ctx, instr); break;
    case nir_intrinsic_store_scratch: visit_store_scratch(ctx, instr); break;
-   case nir_intrinsic_barrier: emit_barrier(ctx, instr); break;
-   case nir_intrinsic_load_num_workgroups: {
-      Temp dst = get_ssa_temp(ctx, &instr->def);
-      if (ctx->options->load_grid_size_from_user_sgpr) {
-         bld.copy(Definition(dst), get_arg(ctx, ctx->args->num_work_groups));
-      } else {
-         Temp addr = get_arg(ctx, ctx->args->num_work_groups);
-         assert(addr.regClass() == s2);
-         bld.pseudo(aco_opcode::p_create_vector, Definition(dst),
-                    bld.smem(aco_opcode::s_load_dwordx2, bld.def(s2), addr, Operand::zero()),
-                    bld.smem(aco_opcode::s_load_dword, bld.def(s1), addr, Operand::c32(8)));
-      }
-      emit_split_vector(ctx, dst, 3);
-      break;
-   }
-   case nir_intrinsic_load_workgroup_id: {
-      Temp dst = get_ssa_temp(ctx, &instr->def);
-      if (ctx->stage.hw == AC_HW_COMPUTE_SHADER) {
-         Operand workgroup_id[3];
-         if (ctx->program->gfx_level >= GFX12) {
-            Temp idx = bld.copy(bld.def(s1), Operand(PhysReg(108 + 9 /*ttmp9*/), s1));
-            Temp idy = bld.copy(bld.def(s1), Operand(PhysReg(108 + 7 /*ttmp7*/), s1));
-            workgroup_id[0] = Operand(idx);
-            if (ctx->args->workgroup_ids[2].used) {
-               workgroup_id[1] =
-                  bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), idy,
-                             Operand::zero(), Operand::c32(16u), Operand::zero());
-               workgroup_id[2] =
-                  bld.pseudo(aco_opcode::p_extract, bld.def(s1), bld.def(s1, scc), idy,
-                             Operand::c32(1u), Operand::c32(16u), Operand::zero());
-            } else {
-               workgroup_id[1] = Operand(idy);
-               workgroup_id[2] = Operand::zero();
-            }
-         } else {
-            const struct ac_arg* ids = ctx->args->workgroup_ids;
-            for (unsigned i = 0; i < 3; i++)
-               workgroup_id[i] = ids[i].used ? Operand(get_arg(ctx, ids[i])) : Operand::zero();
-         }
-         bld.pseudo(aco_opcode::p_create_vector, Definition(dst), workgroup_id[0], workgroup_id[1],
-                    workgroup_id[2]);
-         emit_split_vector(ctx, dst, 3);
-      } else {
-         isel_err(&instr->instr, "Unsupported stage for load_workgroup_id");
-      }
-      break;
-   }
-   case nir_intrinsic_load_subgroup_id: {
-      assert(ctx->options->gfx_level >= GFX12 && ctx->stage.hw == AC_HW_COMPUTE_SHADER);
-      bld.sop2(aco_opcode::s_bfe_u32, Definition(get_ssa_temp(ctx, &instr->def)), bld.def(s1, scc),
-               Operand(PhysReg(108 + 8 /*ttmp8*/), s1), Operand::c32(25 | (5 << 16)));
-      break;
-   }
+   case nir_intrinsic_barrier: visit_barrier(ctx, instr); break;
    case nir_intrinsic_ddx:
    case nir_intrinsic_ddy:
    case nir_intrinsic_ddx_fine:
@@ -4336,9 +4307,9 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
          Temp tid = emit_mbcnt(ctx, bld.tmp(v1));
          Temp src_lane = bld.vadd32(bld.def(v1), tid, delta);
 
-         if (ctx->program->gfx_level >= GFX10 && ctx->program->gfx_level <= GFX11_5 &&
+         if (ctx->program->gfx_level >= GFX10 && ctx->program->gfx_level < GFX12 &&
              cluster_size == 32) {
-            /* ds_bpermute is restricted to 32 lanes on GFX10-GFX11.5. */
+            /* ds_bpermute is restricted to 32 lanes on GFX10-GFX11.7. */
             Temp index_x4 =
                bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2u), src_lane);
             tmp = bld.ds(aco_opcode::ds_bpermute_b32, bld.def(v1), index_x4, src);
@@ -4720,7 +4691,7 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
    }
    case nir_intrinsic_terminate:
    case nir_intrinsic_terminate_if: {
-      assert(ctx->cf_info.parent_loop.exit == NULL && "Terminate must not appear in loops.");
+      assert(ctx->loop_stack.empty() && "Terminate must not appear in loops.");
       Operand cond = Operand::c32(-1u);
       if (instr->intrinsic == nir_intrinsic_terminate_if) {
          Temp src = get_ssa_temp(ctx, instr->src[0].ssa);
@@ -4830,6 +4801,12 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
                  bld.def(s1, scc), Operand::c32(nir_intrinsic_call_idx(instr)));
       break;
    }
+   case nir_intrinsic_load_ttmp_register_amd: {
+      assert(ctx->options->gfx_level >= GFX12);
+      Temp dst = get_ssa_temp(ctx, &instr->def);
+      bld.copy(Definition(dst), Operand(PhysReg(108 + nir_intrinsic_base(instr)), s1));
+      break;
+   }
    case nir_intrinsic_load_scalar_arg_amd:
    case nir_intrinsic_load_vector_arg_amd: {
       assert(nir_intrinsic_base(instr) < ctx->args->arg_count);
@@ -4907,8 +4884,8 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
    case nir_intrinsic_export_amd:
    case nir_intrinsic_export_row_amd: {
       unsigned flags = nir_intrinsic_flags(instr);
-      unsigned target = nir_intrinsic_base(instr);
-      unsigned write_mask = nir_intrinsic_write_mask(instr);
+      unsigned target = nir_intrinsic_target(instr);
+      unsigned write_mask = nir_intrinsic_enabled_channels(instr);
 
       /* Mark vertex export block. */
       if (target == V_008DFC_SQ_EXP_POS || target <= V_008DFC_SQ_EXP_NULL)
@@ -4974,7 +4951,7 @@ visit_intrinsic(isel_context* ctx, nir_intrinsic_instr* instr)
    case nir_intrinsic_export_dual_src_blend_amd: {
       Temp val0 = get_ssa_temp(ctx, instr->src[0].ssa);
       Temp val1 = get_ssa_temp(ctx, instr->src[1].ssa);
-      unsigned write_mask = nir_intrinsic_write_mask(instr);
+      unsigned write_mask = nir_intrinsic_enabled_channels(instr);
 
       struct aco_export_mrt mrt0, mrt1;
       for (unsigned i = 0; i < 4; i++) {

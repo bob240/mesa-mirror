@@ -1,5 +1,3 @@
-test_fence_pending_signal_cpu_rewind_plain,Crash
-
 # The tests assumes a dubgroup size >= 16
 test_shader_waveop_maximal_convergence,Fail
 
@@ -10,7 +8,6 @@ test_planar_video_formats,Fail
 test_sample_instructions,Fail
 
 test_sampler_rounding,Fail
-test_view_min_lod,Fail
 
 test_null_descriptor_resinfo_dxbc,Fail
 test_null_descriptor_resinfo_dxil,Fail

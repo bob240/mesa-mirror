@@ -1063,7 +1063,7 @@ d3d12_video_encoder_update_current_encoder_config_state_av1(struct d3d12_video_e
    pD3D12Enc->m_currentEncodeConfig.m_encoderCodecDesc = D3D12_VIDEO_ENCODER_CODEC_AV1;
 
    // Set input format
-   DXGI_FORMAT targetFmt = srcTextureDesc.Format.Format;
+   DXGI_FORMAT targetFmt = d3d12_convert_pipe_video_profile_to_dxgi_format(pD3D12Enc->base.profile);
    if (pD3D12Enc->m_currentEncodeConfig.m_encodeFormatInfo.Format != targetFmt) {
       pD3D12Enc->m_currentEncodeConfig.m_ConfigDirtyFlags |= d3d12_video_encoder_config_dirty_flag_input_format;
 
@@ -1947,14 +1947,14 @@ fill_av1_pic_header(EncodedBitstreamResolvedMetadata &associatedMetadata,
 
    pic_header->frame_type = associatedMetadata.m_associatedEncodeConfig.m_encoderPicParamsDesc.m_AV1PicData.FrameType;
    {
-      UINT EncodeOrderInGop =
-         (associatedMetadata.m_associatedEncodeConfig.m_encoderPicParamsDesc.m_AV1PicData.PictureIndex %
-          associatedMetadata.m_associatedEncodeConfig.m_encoderGOPConfigDesc.m_AV1SequenceStructure.IntraDistance);
+      UINT IntraDistance = associatedMetadata.m_associatedEncodeConfig.m_encoderGOPConfigDesc.m_AV1SequenceStructure.IntraDistance;
+      UINT EncodeOrderInGop = associatedMetadata.m_associatedEncodeConfig.m_encoderPicParamsDesc.m_AV1PicData.PictureIndex;
+      UINT ShowOrderInGop = associatedMetadata.m_associatedEncodeConfig.m_encoderPicParamsDesc.m_AV1PicData.OrderHint;
 
-      UINT ShowOrderInGop =
-         (associatedMetadata.m_associatedEncodeConfig.m_encoderPicParamsDesc.m_AV1PicData.OrderHint %
-          associatedMetadata.m_associatedEncodeConfig.m_encoderGOPConfigDesc.m_AV1SequenceStructure.IntraDistance);
-
+      if (IntraDistance != 0) {
+         EncodeOrderInGop = EncodeOrderInGop % IntraDistance;
+         ShowOrderInGop = ShowOrderInGop % IntraDistance;
+      }
       pic_header->show_frame = (ShowOrderInGop <= EncodeOrderInGop);
    }
 

@@ -6,15 +6,15 @@
 
 #include "tu_formats.h"
 
-#include "fdl/fd6_format_table.h"
-#include "common/freedreno_ubwc.h"
+#include "drm-uapi/drm_fourcc.h"
 
+#include "vk_acceleration_structure.h"
 #include "vk_android.h"
 #include "vk_enum_defines.h"
 #include "vk_util.h"
-#include "vk_acceleration_structure.h"
-#include "drm-uapi/drm_fourcc.h"
 
+#include "common/freedreno_ubwc.h"
+#include "fdl/fd6_format_table.h"
 #include "tu_device.h"
 #include "tu_image.h"
 
@@ -36,9 +36,9 @@ tu6_format_vtx(enum pipe_format format)
 }
 
 static bool
-tu6_format_color_supported(enum pipe_format format)
+tu6_format_color_supported(const struct fd_dev_info *info, enum pipe_format format)
 {
-   return fd6_color_format(format, TILE6_LINEAR) != FMT6_NONE;
+   return fd6_color_format_supported(info, format, TILE6_LINEAR);
 }
 
 struct tu_native_format
@@ -136,9 +136,27 @@ tu_physical_device_get_format_properties(
    const struct vk_format_ycbcr_info *ycbcr_info = vk_format_get_ycbcr_info(vk_format);
 
    bool supported_vtx = tu6_format_vtx_supported(format);
-   bool supported_color = tu6_format_color_supported(format);
+   bool supported_color = tu6_format_color_supported(physical_device->info, format);
    bool supported_tex = fd6_texture_format_supported(physical_device->info, format,
                                                      TILE6_LINEAR, false);
+
+   if ((format == PIPE_FORMAT_R64_UINT || format == PIPE_FORMAT_R64_SINT) &&
+       physical_device->info->props.has_64b_image_atomics) {
+      assert(!(supported_vtx || supported_color || supported_tex));
+      optimal = VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+                VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT |
+                VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      out_properties->linearTilingFeatures = optimal;
+      out_properties->optimalTilingFeatures = optimal;
+      out_properties->bufferFeatures =
+         VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
+         VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_ATOMIC_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+         VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+      return;
+   }
+
    bool is_npot = !util_is_power_of_two_or_zero(desc->block.bits);
 
    if (format == PIPE_FORMAT_NONE ||
@@ -160,10 +178,11 @@ tu_physical_device_get_format_properties(
    if (supported_tex)
       buffer |= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
 
-   /* We don't support D24S8 because copying just one aspect would require a
-    * special codepath and that doesn't seem worth it.
+   /* We don't support depth formats, as HIC would require disabling LRZ on
+    * the CPU.  Additionally, D24S8 would require a special codepath for copying
+    * a single aspect, and that doesn't seem worth it.
     */
-   if (!is_npot && vk_format != VK_FORMAT_D24_UNORM_S8_UINT) {
+   if (!is_npot && !util_format_has_depth(util_format_description(format))) {
       optimal |= VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT;
    }
 
@@ -213,11 +232,18 @@ tu_physical_device_get_format_properties(
 
    if (supported_color) {
       assert(supported_tex);
-      optimal |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
-                 VK_FORMAT_FEATURE_2_BLIT_DST_BIT |
-                 VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
-                 VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
-                 VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      optimal |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
+
+      /* "Compatibility Between SPIR-V Image Formats and Vulkan Formats" doesn't
+       * map any SPIR-V image formats formats to Vulkan depth/stencil formats,
+       * except for "Unknown" which maps to anything with the feature flags set.
+       * Don't bother supporting that unformatted z/s access, either, since
+       * x8_d24 fails and it seems like an unintended corner of the spec.
+       */
+      if (!vk_format_is_depth_or_stencil(vk_format)) {
+         optimal |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT | VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
+                    VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
+      }
 
       buffer |= VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT |
                 VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
@@ -225,8 +251,6 @@ tu_physical_device_get_format_properties(
 
       /* TODO: The blob also exposes these for R16G16_UINT/R16G16_SINT/
        * R32G32_SFLOAT/R32G32B32A32_SFLOAT, but we don't have any tests for those.
-       * The WoA blob on X1 also supports VK_EXT_shader_image_atomic_int64 (for
-       * R64_UINT and R64_SINT).
        */
       if (vk_format == VK_FORMAT_R32_UINT || vk_format == VK_FORMAT_R32_SINT ||
           vk_format == VK_FORMAT_R32_SFLOAT) {
@@ -248,6 +272,50 @@ tu_physical_device_get_format_properties(
       buffer &= VK_FORMAT_FEATURE_2_UNIFORM_TEXEL_BUFFER_BIT;
       optimal &= ~(VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                    VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT);
+   }
+
+   /* Set up QCOM_imgae_processing flags. This matches blob behavior, except
+    * that it advertises box/weighted on NPOT sampleable formats and ASTC_FLOAT
+    * (which we don't advertise yet), and blockmatch/box/weighted on
+    * VK_FORMAT_G8B8G8R8_422_UNORM.
+    */
+   if ((optimal & VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT) &&
+       (!ycbcr_info || ycbcr_info->n_planes == 1) &&
+       !vk_format_is_depth_or_stencil(vk_format)) {
+      int c = util_format_get_first_non_void_channel(desc->format);
+      bool is_8bpc = c != -1 && desc->is_array && desc->channel[c].size == 8;
+
+      if ((is_8bpc && vk_format != VK_FORMAT_B8G8R8A8_UNORM &&
+           vk_format != VK_FORMAT_B8G8R8A8_SNORM &&
+           vk_format != VK_FORMAT_B8G8R8A8_SRGB) ||
+          vk_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+         if (desc->is_unorm &&
+             desc->colorspace != UTIL_FORMAT_COLORSPACE_SRGB)
+            optimal |= VK_FORMAT_FEATURE_2_BLOCK_MATCHING_BIT_QCOM;
+         if ((desc->is_unorm || desc->is_snorm) &&
+             vk_format != VK_FORMAT_R8G8_SNORM) {
+            optimal |= VK_FORMAT_FEATURE_2_BOX_FILTER_SAMPLED_BIT_QCOM;
+            optimal |= VK_FORMAT_FEATURE_2_WEIGHT_SAMPLED_IMAGE_BIT_QCOM;
+         }
+      }
+
+      if (vk_format == VK_FORMAT_B5G6R5_UNORM_PACK16 ||
+          vk_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+          vk_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ||
+          util_format_is_float16(format) ||
+          (util_format_is_compressed(format) &&
+           desc->layout != UTIL_FORMAT_LAYOUT_RGTC &&
+           vk_format != VK_FORMAT_ETC2_R8G8B8A8_UNORM_BLOCK &&
+           vk_format != VK_FORMAT_ETC2_R8G8B8A8_SRGB_BLOCK &&
+           vk_format != VK_FORMAT_EAC_R11G11_UNORM_BLOCK &&
+           vk_format != VK_FORMAT_EAC_R11G11_SNORM_BLOCK)) {
+         optimal |= VK_FORMAT_FEATURE_2_BOX_FILTER_SAMPLED_BIT_QCOM;
+         optimal |= VK_FORMAT_FEATURE_2_WEIGHT_SAMPLED_IMAGE_BIT_QCOM;
+      }
+
+      if (vk_format == VK_FORMAT_R8_UNORM ||
+          vk_format == VK_FORMAT_R16_SFLOAT)
+         optimal |= VK_FORMAT_FEATURE_2_WEIGHT_IMAGE_BIT_QCOM;
    }
 
    /* For the most part, we can do anything with a linear image that we could
@@ -360,6 +428,37 @@ tu_GetPhysicalDeviceFormatProperties2(
             mod_props->drmFormatModifierPlaneCount = tu6_plane_count(format);
             mod_props->drmFormatModifierTilingFeatures =
                pFormatProperties->formatProperties.optimalTilingFeatures;
+         }
+      }
+   }
+
+   VkDrmFormatModifierPropertiesList2EXT *list2 =
+      vk_find_struct(pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+   if (list2) {
+      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
+                             list2->pDrmFormatModifierProperties,
+                             &list2->drmFormatModifierCount);
+
+      if (props3->linearTilingFeatures) {
+         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out, mod_props) {
+            mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+            mod_props->drmFormatModifierPlaneCount = tu6_plane_count(format);
+            mod_props->drmFormatModifierTilingFeatures =
+               props3->linearTilingFeatures;
+         }
+      }
+
+      /* note: ubwc_possible() argument values to be ignored except for format */
+      if (props3->optimalTilingFeatures &&
+          tiling_possible(format) &&
+          ubwc_possible(NULL, format, VK_IMAGE_TYPE_2D, 0, 0, 0,
+                        physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+                        false)) {
+         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out, mod_props) {
+            mod_props->drmFormatModifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
+            mod_props->drmFormatModifierPlaneCount = tu6_plane_count(format);
+            mod_props->drmFormatModifierTilingFeatures =
+               props3->optimalTilingFeatures;
          }
       }
    }

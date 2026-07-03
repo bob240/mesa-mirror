@@ -141,10 +141,9 @@ extern __GLXDRIdisplay *driwindowsCreateDisplay(Display * dpy);
 
 
 #if defined(GLX_DIRECT_RENDERING) && (!defined(GLX_USE_APPLEGL) || defined(GLX_USE_APPLE))
-#ifdef HAVE_LIBDRM
 struct glx_screen *dri3_create_screen(int screen, struct glx_display * priv, bool driver_name_is_inferred, bool *return_zink);
 void dri3_destroy_display(__GLXDRIdisplay * dpy);
-#endif
+
 
 bool dri2CheckSupport(Display *dpy);
 struct glx_screen *dri2CreateScreen(int screen, struct glx_display * priv, bool driver_name_is_inferred);
@@ -756,16 +755,8 @@ extern struct glx_screen *GetGLXScreenConfigs(Display * dpy, int scrn);
 extern struct glx_screen *
 applegl_create_screen(int screen, struct glx_display * priv);
 
-extern struct glx_context *
-applegl_create_context(struct glx_screen *psc,
-			struct glx_config *mode,
-			struct glx_context *shareList, int renderType);
-
 extern int
 applegl_create_display(struct glx_display *display);
-
-extern void *
-applegl_get_proc_address(const char *symbol);
 #endif
 
 extern Bool validate_renderType_against_config(const struct glx_config *config,

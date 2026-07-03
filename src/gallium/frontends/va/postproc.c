@@ -126,8 +126,10 @@ vlVaQueryVideoProcPipelineCaps(VADriverContextP ctx, VAContextID context,
                                                         PIPE_VIDEO_CAP_VPP_BLEND_MODES);
 
    pipeline_cap->blend_flags = 0;
-   if (pipe_blend_modes & PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA)
+   if (!media_only || pipe_blend_modes & PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA)
       pipeline_cap->blend_flags |= VA_BLEND_GLOBAL_ALPHA;
+   if (!media_only || pipe_blend_modes & PIPE_VIDEO_VPP_BLEND_MODE_PREMULTIPLIED_ALPHA)
+      pipeline_cap->blend_flags |= VA_BLEND_PREMULTIPLIED_ALPHA;
 
    vlVaDriver *drv = VL_VA_DRIVER(ctx);
 
@@ -165,7 +167,7 @@ VAStatus
 vlVaQueryVideoProcFilters(VADriverContextP ctx, VAContextID context_id,
                           VAProcFilterType *filters, unsigned int *num_filters)
 {
-   vlVaDriver *drv = VL_VA_DRIVER(ctx);
+   vlVaDriver *drv;
    vlVaContext *context;
    unsigned int num = 0;
 
@@ -174,6 +176,8 @@ vlVaQueryVideoProcFilters(VADriverContextP ctx, VAContextID context_id,
 
    if (!num_filters || !filters)
       return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+   drv = VL_VA_DRIVER(ctx);
 
    mtx_lock(&drv->mutex);
    context = handle_table_get(drv->htab, context_id);
@@ -198,7 +202,7 @@ vlVaQueryVideoProcFilterCaps(VADriverContextP ctx, VAContextID context_id,
                              VAProcFilterType type, void *filter_caps,
                              unsigned int *num_filter_caps)
 {
-   vlVaDriver *drv = VL_VA_DRIVER(ctx);
+   vlVaDriver *drv;
    vlVaContext *context;
    unsigned int i;
    bool supports_filters;
@@ -208,6 +212,8 @@ vlVaQueryVideoProcFilterCaps(VADriverContextP ctx, VAContextID context_id,
 
    if (!filter_caps || !num_filter_caps)
       return VA_STATUS_ERROR_INVALID_PARAMETER;
+
+   drv = VL_VA_DRIVER(ctx);
 
    mtx_lock(&drv->mutex);
    context = handle_table_get(drv->htab, context_id);
@@ -309,7 +315,8 @@ vlVaPostProcCompositor(vlVaDriver *drv,
                                   param->in_color_range, param->out_color_range, &drv->cstate.yuv2rgb);
       } else {
          /* YUV to YUV (convert to RGB for transfer function and primaries) */
-         enum pipe_format rgb_format = PIPE_FORMAT_B8G8R8A8_UNORM;
+         enum pipe_format rgb_format = util_format_get_plane_format(src->buffer_format, 0);
+         assert(!util_format_is_yuv(rgb_format));
          vl_csc_get_rgbyuv_matrix(param->in_matrix_coefficients, src->buffer_format, rgb_format,
                                   param->in_color_range, PIPE_VIDEO_VPP_CHROMA_COLOR_RANGE_FULL,
                                   &drv->cstate.yuv2rgb);
@@ -330,6 +337,7 @@ vlVaPostProcCompositor(vlVaDriver *drv,
    vl_csc_get_primaries_matrix(param->in_color_primaries, param->out_color_primaries,
                                &drv->cstate.primaries);
 
+   drv->cstate.chroma_location = VL_COMPOSITOR_LOCATION_NONE;
    drv->cstate.in_transfer_characteristic = param->in_transfer_characteristics;
    drv->cstate.out_transfer_characteristic = param->out_transfer_characteristics;
 
@@ -337,8 +345,6 @@ vlVaPostProcCompositor(vlVaDriver *drv,
       enum pipe_format format = src_yuv ? src->buffer_format : dst->buffer_format;
       enum pipe_video_vpp_chroma_siting chroma_siting =
          src_yuv ? param->in_chroma_siting : param->out_chroma_siting;
-
-      drv->cstate.chroma_location = VL_COMPOSITOR_LOCATION_NONE;
 
       if (util_format_get_plane_height(format, 1, 4) != 4) {
          if (chroma_siting & PIPE_VIDEO_VPP_CHROMA_SITING_VERTICAL_TOP)
@@ -375,8 +381,13 @@ vlVaPostProcCompositor(vlVaDriver *drv,
       mirror = VL_COMPOSITOR_MIRROR_NONE;
 
    vl_compositor_clear_layers(&drv->cstate);
+
    vl_compositor_set_layer_rotation(&drv->cstate, 0, rotation);
    vl_compositor_set_layer_mirror(&drv->cstate, 0, mirror);
+
+   drv->cstate.layers[0].blend_enabled = param->blend.enabled;
+   drv->cstate.layers[0].blend_mode = param->blend.mode;
+   drv->cstate.layers[0].blend_alpha = param->blend.global_alpha;
 
    if (dst_yuv) {
       if (src_yuv) {
@@ -553,6 +564,8 @@ vlVaHandleVAProcPipelineParameterBufferType(vlVaDriver *drv, vlVaContext *contex
          return VA_STATUS_ERROR_INVALID_PARAMETER;
 
       dst_surface = handle_table_get(drv->htab, param->additional_outputs[0]);
+      if (!dst_surface)
+         return VA_STATUS_ERROR_INVALID_SURFACE;
    }
 
    src_region = vlVaRegionDefault(param->surface_region, src_surface, &def_src_region);
@@ -641,10 +654,12 @@ vlVaHandleVAProcPipelineParameterBufferType(vlVaDriver *drv, vlVaContext *contex
    }
 
    if (param->blend_state) {
-      if (param->blend_state->flags & VA_BLEND_GLOBAL_ALPHA) {
-         vpp.blend.mode = PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA;
-         vpp.blend.global_alpha = param->blend_state->global_alpha;
-      }
+      vpp.blend.enabled = true;
+      vpp.blend.global_alpha = param->blend_state->global_alpha;
+      if (param->blend_state->flags & VA_BLEND_GLOBAL_ALPHA)
+         vpp.blend.mode |= PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA;
+      if (param->blend_state->flags & VA_BLEND_PREMULTIPLIED_ALPHA)
+         vpp.blend.mode |= PIPE_VIDEO_VPP_BLEND_MODE_PREMULTIPLIED_ALPHA;
    }
 
    /* Output background color */
@@ -704,7 +719,7 @@ vlVaHandleVAProcPipelineParameterBufferType(vlVaDriver *drv, vlVaContext *contex
       vpp.out_transfer_characteristics = param->output_color_properties.transfer_characteristics;
       vpp.out_matrix_coefficients = param->output_color_properties.matrix_coefficients;
    } else {
-      vlVaGetColorProperties(param->surface_color_standard, &vpp.out_color_primaries,
+      vlVaGetColorProperties(param->output_color_standard, &vpp.out_color_primaries,
                              &vpp.out_transfer_characteristics, &vpp.out_matrix_coefficients);
    }
 

@@ -730,8 +730,8 @@ draw_textured_quad(struct gl_context *ctx, GLint x, GLint y, GLfloat z,
    GLfloat x0, y0, x1, y1;
    ASSERTED GLsizei maxSize;
    bool normalized = sv[0]->texture->target == PIPE_TEXTURE_2D ||
-                     (sv[0]->texture->target == PIPE_TEXTURE_RECT && st->lower_rect_tex);
-   unsigned cso_state_mask;
+                     (sv[0]->texture->target == PIPE_TEXTURE_RECT && !st->screen->caps.texrect);
+   unsigned invalidate_flags;
 
    assert(sv[0]->texture->target == st->internal_target);
 
@@ -743,18 +743,22 @@ draw_textured_quad(struct gl_context *ctx, GLint x, GLint y, GLfloat z,
    assert(width <= maxSize);
    assert(height <= maxSize);
 
-   cso_state_mask = (CSO_BIT_RASTERIZER |
-                     CSO_BIT_VIEWPORT |
-                     CSO_BIT_FRAGMENT_SAMPLERS |
-                     CSO_BIT_STREAM_OUTPUTS |
-                     CSO_BIT_VERTEX_ELEMENTS |
-                     CSO_BIT_MESH_SHADER |
-                     CSO_BITS_VERTEX_PIPE_SHADERS);
+   invalidate_flags = (ST_INVALIDATE_RASTERIZER |
+                       ST_INVALIDATE_VIEWPORT |
+                       ST_INVALIDATE_FS_SAMPLERS |
+                       ST_INVALIDATE_VERTEX_BUFFERS |
+                       ST_INVALIDATE_MESH_STATE |
+                       ST_INVALIDATE_VS_STATE |
+                       ST_INVALIDATE_FS_STATE |
+                       ST_INVALIDATE_GS_STATE |
+                       ST_INVALIDATE_TCS_STATE |
+                       ST_INVALIDATE_TES_STATE);
    if (write_stencil) {
-      cso_state_mask |= (CSO_BIT_DEPTH_STENCIL_ALPHA |
-                         CSO_BIT_BLEND);
+      invalidate_flags |= (ST_INVALIDATE_DSA |
+                           ST_INVALIDATE_BLEND);
    }
-   cso_save_state(cso, cso_state_mask);
+   /* Save only states that have no st_atom — they can't be re-derived. */
+   cso_save_state(cso, CSO_BIT_STREAM_OUTPUTS);
 
    /* rasterizer state: just scissor */
    {
@@ -923,15 +927,16 @@ draw_textured_quad(struct gl_context *ctx, GLint x, GLint y, GLfloat z,
       }
    }
 
-   /* restore state */
-   /* Unbind all because st/mesa won't do it if the current shader doesn't
-    * use them.
+   /* Unbind sampler views bound directly on the pipe.
+    * Restore atomless states (stream outputs) via CSO.
     */
    cso_restore_state(cso, CSO_UNBIND_FS_SAMPLERVIEWS);
    st->state.num_sampler_views[MESA_SHADER_FRAGMENT] = 0;
 
-   ctx->Array.NewVertexElements = true;
-   ST_SET_STATE2(ctx->NewDriverState, ST_NEW_VERTEX_ARRAYS, ST_NEW_FS_SAMPLER_VIEWS);
+   /* Invalidate all states this meta-op modified. The atoms will
+    * re-derive them from GL state before the next draw.
+    */
+   st_context_invalidate_state(st, invalidate_flags);
 }
 
 
@@ -1119,7 +1124,7 @@ get_color_fp_variant(struct st_context *st)
 
    memset(&key, 0, sizeof(key));
 
-   key.st = st->has_shareable_shaders ? NULL : st;
+   key.st = st->screen->caps.shareable_shaders ? NULL : st;
    key.drawpixels = 1;
    key.scaleAndBias = (ctx->Pixel.RedBias != 0.0 ||
                        ctx->Pixel.RedScale != 1.0 ||
@@ -1152,7 +1157,7 @@ get_color_index_fp_variant(struct st_context *st)
 
    memset(&key, 0, sizeof(key));
 
-   key.st = st->has_shareable_shaders ? NULL : st;
+   key.st = st->screen->caps.shareable_shaders ? NULL : st;
    key.drawpixels = 1;
    /* Since GL is always in RGBA mode MapColorFlag does not
     * affect GL_COLOR_INDEX format.
@@ -1300,7 +1305,7 @@ st_DrawPixels(struct gl_context *ctx, GLint x, GLint y,
       write_depth = GL_TRUE;
 
    if (write_stencil &&
-       !st->has_stencil_export) {
+       !st->screen->caps.shader_stencil_export) {
       /* software fallback */
       draw_stencil_pixels(ctx, x, y, width, height, format, type,
                           unpack, pixels);
@@ -1687,7 +1692,7 @@ st_CopyPixels(struct gl_context *ctx, GLint srcx, GLint srcy,
 
    /* fallback if the driver can't do stencil exports */
    if (type == GL_DEPTH_STENCIL &&
-       !st->has_stencil_export) {
+       !st->screen->caps.shader_stencil_export) {
       st_CopyPixels(ctx, srcx, srcy, width, height, dstx, dsty, GL_STENCIL);
       st_CopyPixels(ctx, srcx, srcy, width, height, dstx, dsty, GL_DEPTH);
       return;
@@ -1695,7 +1700,7 @@ st_CopyPixels(struct gl_context *ctx, GLint srcx, GLint srcy,
 
    /* fallback if the driver can't do stencil exports */
    if (type == GL_STENCIL &&
-       !st->has_stencil_export) {
+       !st->screen->caps.shader_stencil_export) {
       copy_stencil_pixels(ctx, srcx, srcy, width, height, dstx, dsty);
       return;
    }

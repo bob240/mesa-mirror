@@ -138,11 +138,47 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
        physical_dev->renderer_driver_version <
           VN_MAKE_NVIDIA_VERSION(590, 48, 1, 0));
 
+   /* Normally Venus on Nvidia GPUs takes the prime blit path. The exception
+    * is when KWin or any wlroots based compositors are used:
+    * 1. KWin and wlroots based compositors always add LINEAR to dmabuf
+    *    feedback tranches assuming LINEAR can be handled by GPU drivers.
+    * 2. Venus + Virgl only sees the compositor injected LINEAR mod since
+    *    Virgl doesn't support explicit modifiers on the driver side.
+    * 3. Nvidia GPUs doesn't support LINEAR color attachment, and it's too
+    *    late to reject LINEAR mod when the native image path has already
+    *    been taken instead of the prime image path.
+    *
+    * Gamescope requires VK_EXT_physical_device_drm and its runtime doesn't
+    * use standard WSI extensions, so venus can spoof without impacting it.
+    */
+   struct vk_properties *props = &physical_dev->base.vk.properties;
+   const bool is_nvidia = props->vendorID == 0x10de;
+   const char *app_name = physical_dev->instance->base.vk.app_info.app_name;
+   const bool is_gamescope = app_name && strcmp(app_name, "gamescope") == 0;
+   if (is_nvidia && !is_gamescope) {
+      /* Fail same_gpu check on x11. See wsi_device_matches_drm_fd. */
+      physical_dev->base.vk.supported_extensions.EXT_pci_bus_info = false;
+      props->pciDomain = 0;
+      props->pciBus = 0;
+      props->pciDevice = 0;
+      props->pciFunction = 0;
+
+      /* Fail same_gpu check on wayland. See wsi_wl_display_init. */
+      physical_dev->base.vk.supported_extensions.EXT_physical_device_drm =
+         false;
+      props->drmHasPrimary = false;
+      props->drmHasRender = true;
+      props->drmPrimaryMajor = 0;
+      props->drmPrimaryMinor = 0;
+      props->drmRenderMajor = 0;
+      props->drmRenderMinor = 0;
+   }
+
    const VkAllocationCallbacks *alloc =
       &physical_dev->instance->base.vk.alloc;
    VkResult result = wsi_device_init(
       &physical_dev->wsi_device, vn_physical_device_to_handle(physical_dev),
-      vn_wsi_proc_addr, alloc, -1, &physical_dev->instance->dri_options,
+      vn_wsi_proc_addr, alloc, -1, &physical_dev->instance->drirc.options,
       &(struct wsi_device_options){
          .sw_device = use_sw_device,
          .extra_xwayland_image = true,
@@ -214,6 +250,41 @@ vn_wsi_create_image(struct vn_device *dev,
 
    *out_img = img;
    return VK_SUCCESS;
+}
+
+void
+vn_wsi_memory_info_init(struct vn_device_memory *mem,
+                        const VkMemoryAllocateInfo *alloc_info)
+{
+   const VkMemoryDedicatedAllocateInfo *dedicated_info = NULL;
+   const struct wsi_memory_allocate_info *wsi_info = NULL;
+
+   vk_foreach_struct_const(pnext, alloc_info->pNext) {
+      switch ((uint32_t)pnext->sType) {
+      case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
+         dedicated_info = (const void *)pnext;
+         break;
+      case VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA:
+         wsi_info = (const void *)pnext;
+         break;
+      default:
+         break;
+      }
+   }
+
+   /* wsi always uses dedicated allocation */
+   assert(dedicated_info || !wsi_info);
+
+   if (wsi_info && dedicated_info->buffer != VK_NULL_HANDLE) {
+      struct vn_buffer *buf = vn_buffer_from_handle(dedicated_info->buffer);
+      buf->wsi.mem = mem;
+   }
+
+   /* wsi_memory_allocate_info is not chained for prime blit src */
+   if (dedicated_info && dedicated_info->image != VK_NULL_HANDLE) {
+      struct vn_image *img = vn_image_from_handle(dedicated_info->image);
+      mem->dedicated_img = img;
+   }
 }
 
 static uint32_t
@@ -297,7 +368,7 @@ vn_wsi_validate_image_format_info(struct vn_physical_device *physical_dev,
     * both plane counts to 1 while virgl may be involved.
     */
    if (modifier_info &&
-       !physical_dev->instance->enable_wsi_multi_plane_modifiers &&
+       !physical_dev->instance->drirc.performance.enable_wsi_multi_plane_modifiers &&
        modifier_info->drmFormatModifier != DRM_FORMAT_MOD_LINEAR) {
       const uint32_t plane_count = vn_modifier_plane_count(
          physical_dev, info->format, modifier_info->drmFormatModifier);
@@ -314,6 +385,62 @@ vn_wsi_validate_image_format_info(struct vn_physical_device *physical_dev,
    }
 
    return true;
+}
+
+VkResult
+vn_wsi_fence_wait(struct vn_device *dev, struct vn_queue *queue)
+{
+   /* External sync is supported by virtgpu backend but not vtest backend. For
+    * vtest, common wsi will skip the implicit out fence installation due to
+    * the lack of external SYNC_FD semaphore support. So we'll detect async
+    * present thread and properly wait inside the wsi queue submit.
+    */
+   if (dev->renderer->info.has_external_sync ||
+       dev->renderer->info.has_implicit_fencing)
+      return VK_SUCCESS;
+
+   if (!queue->async_present.initialized ||
+       queue->async_present.tid != vn_gettid())
+      return VK_SUCCESS;
+
+   /* lazily create wsi wait fence for present fence waiting */
+   VkDevice dev_handle = vn_device_to_handle(dev);
+   VkResult result;
+   if (queue->async_present.fence == VK_NULL_HANDLE) {
+      const VkFenceCreateInfo create_info = {
+         .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+      };
+      result = vn_CreateFence(dev_handle, &create_info, NULL,
+                              &queue->async_present.fence);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   VkQueue queue_handle = vn_queue_to_handle(queue);
+   result = vn_QueueSubmit(queue_handle, 0, NULL, queue->async_present.fence);
+   if (result != VK_SUCCESS)
+      return result;
+
+   /* Common wsi does queue submit for each chain, so here we can only safely
+    * unlock the queue mutex if presenting to a single chain.
+    */
+   const bool can_unlock_queue =
+      queue->async_present.info->swapchainCount == 1;
+   if (can_unlock_queue)
+      simple_mtx_unlock(&queue->async_present.queue_mutex);
+   vn_wsi_chains_unlock(dev, queue->async_present.info, /*all=*/false);
+
+   result = vn_WaitForFences(dev_handle, 1, &queue->async_present.fence, true,
+                             UINT64_MAX);
+
+   vn_wsi_chains_lock(dev, queue->async_present.info, /*all=*/false);
+   if (can_unlock_queue)
+      simple_mtx_lock(&queue->async_present.queue_mutex);
+
+   if (result != VK_SUCCESS)
+      return result;
+
+   return vn_ResetFences(dev_handle, 1, &queue->async_present.fence);
 }
 
 void
@@ -383,6 +510,9 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
          break;
       case VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR:
          pr = (void *)pnext;
+         /* drop pr when pr->pRegions is NULL */
+         if (!pr->pRegions)
+            pr = NULL;
          break;
       case VK_STRUCTURE_TYPE_PRESENT_ID_KHR:
          id = (void *)pnext;
@@ -418,6 +548,7 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
    /* VK_KHR_incremental_present */
    VkPresentRegionsKHR *_pr;
    VkPresentRegionKHR *_pr_regions;
+   VkRectLayerKHR *_pr_rects;
 
    /* VK_KHR_present_id */
    VkPresentIdKHR *_id;
@@ -460,6 +591,12 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
       vk_multialloc_add(&ma, &_pr, __typeof__(*_pr), 1);
       vk_multialloc_add(&ma, &_pr_regions, __typeof__(*_pr_regions),
                         pr->swapchainCount);
+
+      uint32_t rect_count = 0;
+      for (uint32_t i = 0; i < pr->swapchainCount; i++)
+         rect_count += pr->pRegions[i].rectangleCount;
+
+      vk_multialloc_add(&ma, &_pr_rects, __typeof__(*_pr_rects), rect_count);
    }
    if (id) {
       vk_multialloc_add(&ma, &_id, __typeof__(*_id), 1);
@@ -518,6 +655,15 @@ vn_wsi_clone_present_info(struct vn_device *dev, const VkPresentInfoKHR *pi)
 
    if (pr) {
       typed_memcpy(_pr_regions, pr->pRegions, pr->swapchainCount);
+
+      for (uint32_t i = 0; i < pr->swapchainCount; i++) {
+         VkPresentRegionKHR *_r = &_pr_regions[i];
+         if (_r->rectangleCount > 0) {
+            typed_memcpy(_pr_rects, _r->pRectangles, _r->rectangleCount);
+            _r->pRectangles = _pr_rects;
+            _pr_rects += _r->rectangleCount;
+         }
+      }
 
       *_pr = (VkPresentRegionsKHR){
          .sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR,
@@ -762,18 +908,61 @@ vn_AcquireNextImage2KHR(VkDevice device,
    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
       return vn_error(dev->instance, result);
 
-   /* XXX this relies on renderer side doing implicit fencing */
+   int sync_fd = -1;
+   if (!dev->renderer->info.has_implicit_fencing) {
+      VkDeviceMemory mem_handle =
+         wsi_common_get_memory(pAcquireInfo->swapchain, *pImageIndex);
+      struct vn_device_memory *mem = vn_device_memory_from_handle(mem_handle);
+      struct vn_image *img = mem->dedicated_img;
+
+      if (img->wsi.is_prime_blit_src)
+         mem = img->wsi.blit_mem;
+
+      /* Only image buffer blit is tracked (both cpu and prime), so we use if
+       * condition below for potential new blit path supported on non-Linux
+       * platforms.
+       */
+      if (mem) {
+         sync_fd =
+            vn_renderer_bo_export_sync_file(dev->renderer, mem->base_bo);
+      }
+   }
+
+   int sem_fd = -1, fence_fd = -1;
+   if (sync_fd >= 0) {
+      if (pAcquireInfo->semaphore != VK_NULL_HANDLE &&
+          pAcquireInfo->fence != VK_NULL_HANDLE) {
+         sem_fd = sync_fd;
+         fence_fd = dup(sync_fd);
+         if (fence_fd < 0) {
+            result = errno == EMFILE ? VK_ERROR_TOO_MANY_OBJECTS
+                                     : VK_ERROR_OUT_OF_HOST_MEMORY;
+            close(sync_fd);
+            return vn_error(dev->instance, result);
+         }
+      } else if (pAcquireInfo->semaphore != VK_NULL_HANDLE) {
+         sem_fd = sync_fd;
+      } else {
+         assert(pAcquireInfo->fence != VK_NULL_HANDLE);
+         fence_fd = sync_fd;
+      }
+   }
+
    if (pAcquireInfo->semaphore != VK_NULL_HANDLE) {
       const VkImportSemaphoreFdInfoKHR info = {
          .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
          .semaphore = pAcquireInfo->semaphore,
          .flags = VK_SEMAPHORE_IMPORT_TEMPORARY_BIT,
          .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-         .fd = -1,
+         .fd = sem_fd,
       };
       VkResult ret = vn_ImportSemaphoreFdKHR(device, &info);
-      if (ret != VK_SUCCESS)
-         return vn_error(dev->instance, ret);
+      if (ret == VK_SUCCESS) {
+         sem_fd = -1;
+      } else {
+         result = ret;
+         goto out;
+      }
    }
 
    if (pAcquireInfo->fence != VK_NULL_HANDLE) {
@@ -782,12 +971,22 @@ vn_AcquireNextImage2KHR(VkDevice device,
          .fence = pAcquireInfo->fence,
          .flags = VK_FENCE_IMPORT_TEMPORARY_BIT,
          .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT,
-         .fd = -1,
+         .fd = fence_fd,
       };
       VkResult ret = vn_ImportFenceFdKHR(device, &info);
-      if (ret != VK_SUCCESS)
-         return vn_error(dev->instance, ret);
+      if (ret == VK_SUCCESS) {
+         fence_fd = -1;
+      } else {
+         result = ret;
+         goto out;
+      }
    }
+
+out:
+   if (sem_fd >= 0)
+      close(sem_fd);
+   if (fence_fd >= 0)
+      close(fence_fd);
 
    return vn_result(dev->instance, result);
 }

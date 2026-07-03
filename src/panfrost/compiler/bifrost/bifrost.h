@@ -2,25 +2,7 @@
  * Copyright (C) 2019 Connor Abbott <cwabbott0@gmail.com>
  * Copyright (C) 2019 Lyude Paul <thatslyude@gmail.com>
  * Copyright (C) 2019 Ryan Houdek <Sonicadvance1@gmail.com>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef __bifrost_h__
@@ -34,26 +16,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-#define BIFROST_DBG_MSGS       0x0001
-#define BIFROST_DBG_SHADERS    0x0002
-#define BIFROST_DBG_SHADERDB   0x0004
-#define BIFROST_DBG_VERBOSE    0x0008
-#define BIFROST_DBG_INTERNAL   0x0010
-#define BIFROST_DBG_NOSCHED    0x0020
-#define BIFROST_DBG_INORDER    0x0040
-#define BIFROST_DBG_NOVALIDATE 0x0080
-#define BIFROST_DBG_NOOPT      0x0100
-#define BIFROST_DBG_NOIDVS     0x0200
-#define BIFROST_DBG_NOSB       0x0400
-#define BIFROST_DBG_NOPRELOAD  0x0800
-#define BIFROST_DBG_SPILL      0x1000
-#define BIFROST_DBG_NOPSCHED   0x2000
-#define BIFROST_DBG_NOSSARA    0x4000
-#define BIFROST_DBG_STATSABS   0x8000
-#define BIFROST_DBG_STATSFULL 0x10000
-
-extern unsigned bifrost_debug;
 
 enum bifrost_message_type {
    BIFROST_MESSAGE_NONE = 0,
@@ -553,7 +515,7 @@ struct bifrost_texture_operation {
 
          /* Method to compute LOD value or for a FETCH, the
           * bifrost_texture_fetch component specification */
-         enum bifrost_lod_mode lod_or_fetch : 3;
+         unsigned lod_or_fetch : 3;
 
          /* Reserved */
          unsigned zero : 1;

@@ -78,7 +78,7 @@ nir_intrinsics_c = custom_target(
   depend_files : files('nir_intrinsics.py'),
 )
 
-with_nir_headers_only = (
+with_nir_headers_only = not with_gfx_compute or (
   gallium_drivers == ['d3d12'] and
   get_option('gallium-d3d12-graphics').disabled() and
   not [
@@ -141,6 +141,7 @@ else
   'nir_liveness.c',
   'nir_loop_analyze.c',
   'nir_loop_analyze.h',
+  'nir_lower_abort.c',
   'nir_lower_alu.c',
   'nir_lower_alu_width.c',
   'nir_lower_alpha.c',
@@ -149,7 +150,6 @@ else
   'nir_lower_atomics_to_ssbo.c',
   'nir_lower_bitmap.c',
   'nir_lower_blend.c',
-  'nir_lower_bool_to_bitsize.c',
   'nir_lower_bool_to_float.c',
   'nir_lower_bool_to_int32.c',
   'nir_lower_calls_to_builtins.c',
@@ -253,6 +253,7 @@ else
   'nir_move_output_stores_to_end.c',
   'nir_move_vec_src_uses_to_dest.c',
   'nir_normalize_cubemap_coords.c',
+  'nir_normalize_sin_cos.c',
   'nir_opt_access.c',
   'nir_opt_barriers.c',
   'nir_opt_barycentric.c',
@@ -268,6 +269,7 @@ else
   'nir_opt_dead_cf.c',
   'nir_opt_dead_write_vars.c',
   'nir_opt_find_array_copies.c',
+  'nir_opt_fp_math_ctrl.c',
   'nir_opt_frag_coord_to_pixel_coord.c',
   'nir_opt_fragdepth.c',
   'nir_opt_gcm.c',
@@ -375,7 +377,7 @@ _libnir = static_library(
   'nir',
   [files_libnir, custom_targets_libnir],
   include_directories : [inc_include, inc_src],
-  c_args : [c_msvc_compat_args, no_override_init_args, no_misleading_indentation],
+  c_args : [c_msvc_compat_args, soong_compat_c_args, no_override_init_args, no_misleading_indentation],
   gnu_symbol_visibility : 'hidden',
   dependencies : [idep_compiler, dep_valgrind, idep_mesautil],
   build_by_default : false,
@@ -396,7 +398,7 @@ idep_nir = declare_dependency(
   link_with : _libnir,
 )
 
-if with_tests
+if with_tests and not with_nir_headers_only
   if cc.get_id() == 'msvc' and cc.version().version_compare('< 19.29')
     msvc_designated_initializer = 'cpp_std=c++latest'
   else
@@ -416,10 +418,9 @@ if with_tests
     nir_opt_algebraic_pattern_tests += static_library(
       'nir_opt_algebraic_pattern_test_@0@'.format(i),
       nir_opt_algebraic_pattern_test_cpp,
-      cpp_args : [cpp_msvc_compat_args, msvc_bigobj],
       override_options: [msvc_designated_initializer],
       gnu_symbol_visibility : 'hidden',
-      cpp_args : '-DSUBSET=@0@'.format(i),
+      cpp_args : [cpp_msvc_compat_args, msvc_bigobj, '-DSUBSET=@0@'.format(i)],
       include_directories : [inc_include, inc_src],
       dependencies : [dep_thread, idep_gtest, idep_nir, idep_mesautil],
     )
@@ -438,6 +439,7 @@ if with_tests
           'tests/core_tests.cpp',
           'tests/dce_tests.cpp',
           'tests/format_convert_tests.cpp',
+          'tests/fp_class_tests.cpp',
           'tests/load_store_vectorizer_tests.cpp',
           'tests/loop_analyze_tests.cpp',
           'tests/loop_unroll_tests.cpp',
@@ -448,13 +450,17 @@ if with_tests
           'tests/negative_equal_tests.cpp',
           'tests/nir_algebraic_pattern_test.cpp',
           'tests/opt_if_tests.cpp',
+          'tests/opt_large_constants_tests.cpp',
+          'tests/opt_licm_tests.cpp',
           'tests/opt_loop_tests.cpp',
           'tests/opt_peephole_select.cpp',
           'tests/opt_shrink_vectors_tests.cpp',
           'tests/opt_varyings_tests_bicm_binary_alu.cpp',
+          'tests/opt_varyings_tests_bicm_sysval.cpp',
           'tests/opt_varyings_tests_dead_input.cpp',
           'tests/opt_varyings_tests_dead_output.cpp',
           'tests/opt_varyings_tests_dedup.cpp',
+          'tests/opt_varyings_tests_dedup_multiple.cpp',
           'tests/opt_varyings_tests_prop_const.cpp',
           'tests/opt_varyings_tests_prop_ubo.cpp',
           'tests/opt_varyings_tests_prop_uniform.cpp',
@@ -473,7 +479,7 @@ if with_tests
     ),
     suite : ['compiler', 'nir'],
     protocol : 'gtest',
-    timeout : 60,
+    timeout : 120,
   )
 
   test(

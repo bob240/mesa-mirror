@@ -44,6 +44,8 @@ CDX12EncHMFT::PrepareForEncode( IMFSample *pSample, LPDX12EncodeContext *ppDX12E
    UINT textureHeight = 0u;
    bool bReceivedDirtyRectBlob = false;
    uint32_t dirtyRectFrameNum = UINT32_MAX;
+   bool bReceivedMoveRegionBlob = false;
+   uint32_t moveRegionFrameNum = UINT32_MAX;
    LONGLONG inputSampleTime = 0;
    LONGLONG inputSampleDuration = 0;
 
@@ -323,6 +325,28 @@ CDX12EncHMFT::PrepareForEncode( IMFSample *pSample, LPDX12EncodeContext *ppDX12E
       }
    }
 
+   // Try to get MFSampleExtension_MoveRegions blob only when the HW supports it.
+   if( m_EncoderCapabilities.m_HWSupportMoveRects.bits.supports_precision_full_pixel &&
+       m_EncoderCapabilities.m_HWSupportMoveRects.bits.max_motion_hints > 0 )
+   {
+      UINT32 cMoveRegionBlob = 0;
+      pSample->GetBlobSize( MFSampleExtension_MoveRegions, &cMoveRegionBlob );
+      if( cMoveRegionBlob >= sizeof( MOVEREGION_INFO ) )
+      {
+         if( m_pMoveRegionBlob.size() < cMoveRegionBlob )
+         {
+            m_pMoveRegionBlob.resize( cMoveRegionBlob );
+         }
+         if( S_OK ==
+             pSample->GetBlob( MFSampleExtension_MoveRegions, m_pMoveRegionBlob.data(), cMoveRegionBlob, &cMoveRegionBlob ) )
+         {
+            MOVEREGION_INFO *pMoveRegionInfo = (MOVEREGION_INFO *) m_pMoveRegionBlob.data();
+            moveRegionFrameNum = pMoveRegionInfo->FrameNumber;
+            bReceivedMoveRegionBlob = true;
+         }
+      }
+   }
+
    if( m_pGOPTracker == nullptr )
    {
       CHECKHR_GOTO( CreateGOPTracker( textureWidth, textureHeight ), done );
@@ -469,9 +493,6 @@ CDX12EncHMFT::PrepareForEncode( IMFSample *pSample, LPDX12EncodeContext *ppDX12E
       }
    }
 
-   // pDX12EncodeContext->encoderPicInfo is initialized to zero in DX12EncodeContext constructor already
-   pDX12EncodeContext->encoderPicInfo.base.profile = m_outputPipeProfile;
-
    // Encode region of interest
    // When m_bVideoROIEnabled, app can (or not) set MFSampleExtension_ROIRectangle on separate frames optionally
    if( m_bVideoROIEnabled )
@@ -501,43 +522,15 @@ CDX12EncHMFT::PrepareForEncode( IMFSample *pSample, LPDX12EncodeContext *ppDX12E
 
    pDX12EncodeContext->pVlScreen = m_pVlScreen;   // weakref
 
-   //
-   // Update the encoder priorities (if any set)
-   //
-
-#if 0    // For testing priorities
-   {
-      m_bWorkProcessPrioritySet = ((pipeEncoderInputFenceHandleValue % 2) == 0) ? TRUE : FALSE;
-      m_WorkGlobalPriority = static_cast<D3D12_COMMAND_QUEUE_GLOBAL_PRIORITY>((pipeEncoderInputFenceHandleValue % 14) + 18); // 18-31 range (no hard realtime privileges)
-      m_bWorkGlobalPrioritySet = ((pipeEncoderInputFenceHandleValue % 2) == 0) ? TRUE : FALSE;
-      m_WorkProcessPriority = static_cast<D3D12_COMMAND_QUEUE_PROCESS_PRIORITY>(pipeEncoderInputFenceHandleValue % 2); // 0-1 range
-   }
-#endif   // For testing priorities
-
-   if( m_bWorkProcessPrioritySet || m_bWorkGlobalPrioritySet )
-   {
-      mtx_lock( &m_ContextPriorityMgr.m_lock );
-      int result = 0;
-      for( ID3D12CommandQueue *queue : m_ContextPriorityMgr.m_registeredQueues )
-      {
-         result = m_ContextPriorityMgr.base.set_queue_priority( &m_ContextPriorityMgr.base,
-                                                                queue,
-                                                                reinterpret_cast<uint32_t *>( &m_WorkGlobalPriority ),
-                                                                reinterpret_cast<uint32_t *>( &m_WorkProcessPriority ) );
-      }
-      mtx_unlock( &m_ContextPriorityMgr.m_lock );
-      CHECKBOOL_GOTO( result == 0, MF_E_UNEXPECTED, done );
-
-      // Once set in the underlying pipe context, don't set them again
-      // until they're modified by the CodecAPI SetValue function.
-      m_bWorkProcessPrioritySet = FALSE;
-      m_bWorkGlobalPrioritySet = FALSE;
-   }
-
    // Call the helper for encoder specific work
    pDX12EncodeContext->encoderPicInfo.base.in_fence = pPipeEncoderInputFenceHandle;
    pDX12EncodeContext->encoderPicInfo.base.in_fence_value = pipeEncoderInputFenceHandleValue;
-   CHECKHR_GOTO( PrepareForEncodeHelper( pDX12EncodeContext, bReceivedDirtyRectBlob, dirtyRectFrameNum ), done );
+   CHECKHR_GOTO( PrepareForEncodeHelper( pDX12EncodeContext,
+                                         bReceivedDirtyRectBlob,
+                                         dirtyRectFrameNum,
+                                         bReceivedMoveRegionBlob,
+                                         moveRegionFrameNum ),
+                 done );
 
    // Needs to be run after PrepareForEncodeHelper to know if current frame is used as reference
    // Only allocate reconstructed picture copy buffer if feature is enabled and supported
@@ -588,7 +581,7 @@ CDX12EncHMFT::PrepareForEncode( IMFSample *pSample, LPDX12EncodeContext *ppDX12E
 
       if( m_bSliceGenerationModeSet && pDX12EncodeContext->IsSliceAutoModeEnabled() )
       {
-         num_output_buffers = m_EncoderCapabilities.m_uiMaxHWSupportedMaxSlices;
+         num_output_buffers = std::max( 128u, m_EncoderCapabilities.m_uiMaxHWSupportedMaxSlices );
       }
 
       // Minimum per-slice buffer size to prevent excessively small allocations.

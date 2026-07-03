@@ -38,7 +38,7 @@
 #include "pipe/p_defines.h"
 #include "util/u_thread.h"
 #include "util/list.h"
-#include "util/sha1/sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/vma.h"
 #include "gallivm/lp_bld.h"
 #include "gallivm/lp_bld_misc.h"
@@ -72,6 +72,8 @@ struct llvmpipe_screen
 
    char renderer_string[100];
 
+   unsigned char empty_mesh_payload[16384];
+
    struct disk_cache *disk_shader_cache;
 
 #if defined(HAVE_LIBDRM) && defined(HAVE_LINUX_UDMABUF_H)
@@ -93,13 +95,13 @@ struct llvmpipe_screen
 void
 lp_disk_cache_find_shader(struct llvmpipe_screen *screen,
                           struct lp_cached_code *cache,
-                          unsigned char ir_sha1_cache_key[SHA1_DIGEST_LENGTH]);
+                          unsigned char ir_blake3_cache_key[BLAKE3_KEY_LEN]);
 
 
 void
 lp_disk_cache_insert_shader(struct llvmpipe_screen *screen,
                             struct lp_cached_code *cache,
-                            unsigned char ir_sha1_cache_key[SHA1_DIGEST_LENGTH]);
+                            unsigned char ir_blake3_cache_key[BLAKE3_KEY_LEN]);
 
 bool
 llvmpipe_screen_late_init(struct llvmpipe_screen *screen);

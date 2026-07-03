@@ -170,16 +170,20 @@ update_instr_type(struct hash_table *types, nir_instr *instr, ti_type type)
       case nir_intrinsic_store_scratch:
       case nir_intrinsic_load_shared:
       case nir_intrinsic_store_shared:
+      case nir_intrinsic_load_frag_coord:
          return false;
       case nir_intrinsic_store_global:
          set_type(types, &intr->src[0], type);
          return true;
       case nir_intrinsic_read_first_invocation:
       case nir_intrinsic_read_invocation:
+      case nir_intrinsic_quad_vote_all:
+      case nir_intrinsic_quad_vote_any:
       case nir_intrinsic_quad_broadcast:
       case nir_intrinsic_quad_swap_horizontal:
       case nir_intrinsic_quad_swap_vertical:
       case nir_intrinsic_quad_swap_diagonal:
+      case nir_intrinsic_rotate:
       case nir_intrinsic_shuffle:
       case nir_intrinsic_shuffle_down:
       case nir_intrinsic_shuffle_up:
@@ -276,6 +280,10 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->def, ty);
       break;
    }
+   case nir_intrinsic_load_sample_pos_from_id:
+      set_type(types, &instr->def, TYPE_FLOAT);
+      set_type(types, &instr->src[0], TYPE_UINT);
+      break;
    case nir_intrinsic_load_global_constant:
       set_type(types, &instr->def, TYPE_GENERIC_DATA);
       set_type(types, &instr->src[0], TYPE_UINT);
@@ -342,10 +350,17 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->src[0], TYPE_UINT);
       set_type(types, &instr->src[1], TYPE_UINT);
       break;
+   case nir_intrinsic_load_first_vertex:
+   case nir_intrinsic_load_base_instance:
+   case nir_intrinsic_load_vertex_id:
+   case nir_intrinsic_load_instance_id:
+   case nir_intrinsic_load_primitive_id:
+   case nir_intrinsic_load_layer_id:
    case nir_intrinsic_load_workgroup_id:
    case nir_intrinsic_load_subgroup_id:
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_global_invocation_id:
+   case nir_intrinsic_load_local_invocation_index:
    case nir_intrinsic_load_num_workgroups:
    case nir_intrinsic_load_num_subgroups:
    case nir_intrinsic_load_subgroup_size:
@@ -356,6 +371,7 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       set_type(types, &instr->def, TYPE_UINT);
       break;
    case nir_intrinsic_load_vulkan_descriptor:
+   case nir_intrinsic_load_barycentric_at_sample:
       set_type(types, &instr->src[0], TYPE_UINT);
       set_type(types, &instr->def, TYPE_UINT);
       break;
@@ -380,10 +396,13 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
    case nir_intrinsic_ddy_coarse:
    case nir_intrinsic_ddx_fine:
    case nir_intrinsic_ddy_fine:
+   case nir_intrinsic_load_barycentric_at_offset:
       set_type(types, &instr->src[0], TYPE_FLOAT);
       set_type(types, &instr->def, TYPE_FLOAT);
       break;
    case nir_intrinsic_load_point_coord:
+   case nir_intrinsic_load_sample_pos:
+   case nir_intrinsic_load_frag_coord:
       set_type(types, &instr->def, TYPE_FLOAT);
       break;
    case nir_intrinsic_load_front_face:
@@ -444,6 +463,7 @@ infer_types_from_intrinsic(struct hash_table *types, nir_intrinsic_instr *instr)
       break;
    case nir_intrinsic_read_invocation:
    case nir_intrinsic_quad_broadcast:
+   case nir_intrinsic_rotate:
    case nir_intrinsic_shuffle:
    case nir_intrinsic_shuffle_down:
    case nir_intrinsic_shuffle_up:
@@ -728,8 +748,10 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
    switch (type) {
    case TYPE_FLOAT: {
       double v = nir_src_comp_as_float(*src, comp);
-      if (isinf(v)) {
+      if (v == INFINITY) {
          P(ctx, "(INFINITY");
+      } else if (v == -INFINITY) {
+         P(ctx, "(-INFINITY");
       } else if (isnan(v)) {
          P(ctx, "(NAN");
       } else {
@@ -774,6 +796,9 @@ emit_src_component(struct nir_to_msl_ctx *ctx, nir_src *src, unsigned comp)
    case TYPE_GENERIC_INT:
    case TYPE_GENERIC_INT_OR_BOOL:
       switch (src->ssa->bit_size) {
+      case 1:
+         P(ctx, "bool(");
+         break;
       case 8:
          P(ctx, "uchar(");
          break;

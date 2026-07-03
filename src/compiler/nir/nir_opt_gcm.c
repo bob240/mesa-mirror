@@ -334,10 +334,12 @@ gcm_pin_instructions(nir_function_impl *impl, struct gcm_state *state)
                nir_tex_src *src = &tex->src[i];
                switch (src->src_type) {
                case nir_tex_src_texture_deref:
+               case nir_tex_src_texture_2_deref:
                   if (!tex->texture_non_uniform && !is_binding_uniform(src->src))
                      instr->pass_flags = GCM_INSTR_PINNED;
                   break;
                case nir_tex_src_sampler_deref:
+               case nir_tex_src_sampler_2_deref:
                   if (!tex->sampler_non_uniform && !is_binding_uniform(src->src))
                      instr->pass_flags = GCM_INSTR_PINNED;
                   break;
@@ -368,6 +370,7 @@ gcm_pin_instructions(nir_function_impl *impl, struct gcm_state *state)
             break;
 
          case nir_instr_type_call:
+         case nir_instr_type_cmat_call:
             instr->pass_flags = GCM_INSTR_PINNED;
             break;
 
@@ -621,7 +624,7 @@ gcm_schedule_late_def(nir_def *def, void *void_state)
    nir_block *lca = NULL;
 
    nir_foreach_use(use_src, def) {
-      nir_instr *use_instr = nir_src_parent_instr(use_src);
+      nir_instr *use_instr = nir_src_use_instr(use_src);
 
       gcm_schedule_late_instr(use_instr, state);
 
@@ -645,7 +648,7 @@ gcm_schedule_late_def(nir_def *def, void *void_state)
    }
 
    nir_foreach_if_use(use_src, def) {
-      nir_if *if_stmt = nir_src_parent_if(use_src);
+      nir_if *if_stmt = nir_src_use_if(use_src);
 
       /* For if statements, we consider the block to be the one immediately
        * preceding the if CF node.

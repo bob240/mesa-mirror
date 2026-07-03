@@ -13,11 +13,9 @@
 #include "kk_buffer.h"
 #include "kk_cmd_buffer.h"
 #include "kk_device.h"
-#include "kk_encoder.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
 #include "kk_query_table.h"
-#include "kkcl.h"
 
 struct kk_query_report {
    uint64_t value;
@@ -53,6 +51,79 @@ kk_reports_per_query(struct kk_query_pool *pool)
    }
 }
 
+static uint32_t *
+kk_query_available_map(struct kk_query_pool *pool, uint32_t query)
+{
+   assert(kk_has_available(pool));
+   assert(query < pool->vk.query_count);
+   return (uint32_t *)pool->bo->cpu + query;
+}
+
+static uint64_t
+kk_query_offset(struct kk_query_pool *pool, uint32_t query)
+{
+   assert(query < pool->vk.query_count);
+   return pool->query_start + query * pool->query_stride;
+}
+
+static uint64_t
+kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
+                     uint32_t query)
+{
+   if (pool->oq_queries) {
+      uint16_t *oq_index = kk_pool_oq_index_ptr(pool);
+      return dev->occlusion_queries.bo->gpu +
+             (oq_index[query] * sizeof(uint64_t));
+   } else {
+      return pool->bo->gpu + kk_query_offset(pool, query);
+   }
+}
+
+static uint64_t
+kk_query_available_addr(struct kk_query_pool *pool, uint32_t query)
+{
+   assert(kk_has_available(pool));
+   assert(query < pool->vk.query_count);
+   return pool->bo->gpu + query * sizeof(uint32_t);
+}
+
+static struct kk_query_report *
+kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
+                    uint32_t query)
+{
+   if (pool->oq_queries) {
+      uint64_t *queries = (uint64_t *)(dev->occlusion_queries.bo->cpu);
+      uint16_t *oq_index = kk_pool_oq_index_ptr(pool);
+
+      return (struct kk_query_report *)&queries[oq_index[query]];
+   } else {
+      return (void *)((char *)pool->bo->cpu + kk_query_offset(pool, query));
+   }
+}
+
+static void
+host_zero_queries(struct kk_device *dev, struct kk_query_pool *pool,
+                  uint32_t first_index, uint32_t num_queries,
+                  bool set_available)
+{
+   for (uint32_t i = 0; i < num_queries; i++) {
+      struct kk_query_report *reports =
+         kk_query_report_map(dev, pool, first_index + i);
+
+      uint64_t value = 0;
+      if (kk_has_available(pool)) {
+         uint32_t *available = kk_query_available_map(pool, first_index + i);
+         *available = set_available;
+      } else {
+         value = set_available ? 0 : UINT64_MAX;
+      }
+
+      for (unsigned j = 0; j < kk_reports_per_query(pool); ++j) {
+         reports[j].value = value;
+      }
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
                    const VkAllocationCallbacks *pAllocator,
@@ -73,7 +144,7 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
    /* We place the availability first and then data */
    pool->query_start = 0;
    if (kk_has_available(pool)) {
-      pool->query_start = align(pool->vk.query_count * sizeof(uint64_t),
+      pool->query_start = align(pool->vk.query_count * sizeof(uint32_t),
                                 sizeof(struct kk_query_report));
    }
 
@@ -117,6 +188,9 @@ kk_CreateQueryPool(VkDevice device, const VkQueryPoolCreateInfo *pCreateInfo,
       oq_index[pool->oq_queries++] = index;
    }
 
+   if (pCreateInfo->flags & VK_QUERY_POOL_CREATE_RESET_BIT_KHR)
+      host_zero_queries(dev, pool, 0, pool->vk.query_count, false);
+
    *pQueryPool = kk_query_pool_to_handle(pool);
 
    return result;
@@ -143,109 +217,33 @@ kk_DestroyQueryPool(VkDevice device, VkQueryPool queryPool,
    vk_query_pool_destroy(&dev->vk, pAllocator, &pool->vk);
 }
 
-static uint64_t *
-kk_query_available_map(struct kk_query_pool *pool, uint32_t query)
-{
-   assert(kk_has_available(pool));
-   assert(query < pool->vk.query_count);
-   return (uint64_t *)pool->bo->cpu + query;
-}
-
-static uint64_t
-kk_query_offset(struct kk_query_pool *pool, uint32_t query)
-{
-   assert(query < pool->vk.query_count);
-   return pool->query_start + query * pool->query_stride;
-}
-
-static uint64_t
-kk_query_report_addr(struct kk_device *dev, struct kk_query_pool *pool,
-                     uint32_t query)
-{
-   if (pool->oq_queries) {
-      uint16_t *oq_index = kk_pool_oq_index_ptr(pool);
-      return dev->occlusion_queries.bo->gpu +
-             (oq_index[query] * sizeof(uint64_t));
-   } else {
-      return pool->bo->gpu + kk_query_offset(pool, query);
-   }
-}
-
-static uint64_t
-kk_query_available_addr(struct kk_query_pool *pool, uint32_t query)
-{
-   assert(kk_has_available(pool));
-   assert(query < pool->vk.query_count);
-   return pool->bo->gpu + query * sizeof(uint64_t);
-}
-
-static struct kk_query_report *
-kk_query_report_map(struct kk_device *dev, struct kk_query_pool *pool,
-                    uint32_t query)
-{
-   if (pool->oq_queries) {
-      uint64_t *queries = (uint64_t *)(dev->occlusion_queries.bo->cpu);
-      uint16_t *oq_index = kk_pool_oq_index_ptr(pool);
-
-      return (struct kk_query_report *)&queries[oq_index[query]];
-   } else {
-      return (void *)((char *)pool->bo->cpu + kk_query_offset(pool, query));
-   }
-}
-
 VKAPI_ATTR void VKAPI_CALL
 kk_ResetQueryPool(VkDevice device, VkQueryPool queryPool, uint32_t firstQuery,
                   uint32_t queryCount)
 {
    VK_FROM_HANDLE(kk_device, dev, device);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
-   for (uint32_t i = 0; i < queryCount; i++) {
-      struct kk_query_report *reports =
-         kk_query_report_map(dev, pool, firstQuery + i);
 
-      uint64_t value = 0;
-      if (kk_has_available(pool)) {
-         uint64_t *available = kk_query_available_map(pool, firstQuery + i);
-         *available = 0u;
-      } else {
-         value = UINT64_MAX;
-      }
-
-      for (unsigned j = 0; j < kk_reports_per_query(pool); ++j) {
-         reports[j].value = value;
-      }
-   }
+   host_zero_queries(dev, pool, firstQuery, queryCount, false);
 }
 
-/**
- * Goes through a series of consecutive query indices in the given pool,
- * setting all element values to 0 and emitting them as available.
- */
 static void
 emit_zero_queries(struct kk_cmd_buffer *cmd, struct kk_query_pool *pool,
                   uint32_t first_index, uint32_t num_queries,
                   bool set_available)
 {
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
-   mtl_buffer *buffer = pool->bo->map;
+   struct libkk_reset_query_args info = {
+      .availability = kk_has_available(pool) ? pool->bo->gpu : 0,
+      .results = pool->oq_queries ? dev->occlusion_queries.bo->gpu
+                                  : pool->bo->gpu + pool->query_start,
+      .oq_index = pool->oq_queries ? pool->bo->gpu + pool->query_start : 0,
 
-   for (uint32_t i = 0; i < num_queries; i++) {
-      uint64_t report = kk_query_report_addr(dev, pool, first_index + i);
-
-      uint64_t value = 0;
-      if (kk_has_available(pool)) {
-         uint64_t available = kk_query_available_addr(pool, first_index + i);
-         kk_cmd_write(cmd, buffer, available, set_available);
-      } else {
-         value = set_available ? 0u : UINT64_MAX;
-      }
-
-      /* XXX: is this supposed to happen on the begin? */
-      for (unsigned j = 0; j < kk_reports_per_query(pool); ++j) {
-         kk_cmd_write(cmd, buffer,
-                      report + (j * sizeof(struct kk_query_report)), value);
-      }
-   }
+      .first_query = first_index,
+      .reports_per_query = kk_reports_per_query(pool),
+      .set_available = set_available,
+   };
+   libkk_reset_query_struct(cmd, kk_grid_1d(num_queries), false, info);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -254,13 +252,7 @@ kk_CmdResetQueryPool(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
 {
    VK_FROM_HANDLE(kk_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(kk_query_pool, pool, queryPool);
-   /* Need to flush other availabilities just in case there is a reset after it
-    * was made available but the writes have not propagated yet. Need to avoid
-    * data rances in the writes. This is save to do sice vkCmdResetQueryPool
-    * cannot be called when a render pass is active. */
-   upload_queue_writes(cmd);
    emit_zero_queries(cmd, pool, firstQuery, queryCount, false);
-   upload_queue_writes(cmd);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -297,7 +289,7 @@ kk_CmdEndQuery(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    /* Make the query available */
    if (kk_has_available(pool)) {
       uint64_t addr = kk_query_available_addr(pool, query);
-      kk_cmd_write(cmd, pool->bo->map, addr, true);
+      kk_cmd_write(cmd, (struct libkk_imm_write){addr, true});
    }
 }
 
@@ -306,7 +298,7 @@ kk_query_is_available(struct kk_device *dev, struct kk_query_pool *pool,
                       uint32_t query)
 {
    if (kk_has_available(pool)) {
-      uint64_t *available = kk_query_available_map(pool, query);
+      uint32_t *available = kk_query_available_map(pool, query);
       return p_atomic_read(available) != 0;
    } else {
       const struct kk_query_report *report =
@@ -409,22 +401,16 @@ kk_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPool,
    VK_FROM_HANDLE(kk_buffer, dst_buf, dstBuffer);
    struct kk_device *dev = kk_cmd_buffer_device(cmd);
 
-   struct kk_copy_query_pool_results_info info = {
+   struct libkk_copy_queries_args args = {
       .availability = kk_has_available(pool) ? pool->bo->gpu : 0,
       .results = pool->oq_queries ? dev->occlusion_queries.bo->gpu
                                   : pool->bo->gpu + pool->query_start,
-      .indices = pool->oq_queries ? pool->bo->gpu + pool->query_start : 0,
+      .oq_index = pool->oq_queries ? pool->bo->gpu + pool->query_start : 0,
       .dst_addr = dst_buf->vk.device_address + dstOffset,
       .dst_stride = stride,
       .first_query = firstQuery,
       .flags = flags,
       .reports_per_query = kk_reports_per_query(pool),
-      .query_count = queryCount,
    };
-
-   util_dynarray_append(&cmd->encoder->copy_query_pool_result_infos, info);
-   /* If we are not mid encoder, just upload the writes */
-   enum kk_encoder_type last_used = cmd->encoder->main.last_used;
-   if (last_used == KK_ENC_NONE || last_used == KK_ENC_COMPUTE)
-      upload_queue_writes(cmd);
+   libkk_copy_queries_struct(cmd, kk_grid_1d(queryCount), false, args);
 }

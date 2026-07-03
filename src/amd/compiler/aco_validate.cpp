@@ -11,7 +11,6 @@
 
 #include <array>
 #include <map>
-#include <set>
 #include <vector>
 
 namespace aco {
@@ -70,6 +69,13 @@ validate_ir(Program* program)
          aco_err(program, "%s", out);
          free(out);
 
+         is_valid = false;
+      }
+   };
+   auto check_block = [&program, &is_valid](bool success, const char* msg, Block* block) -> void
+   {
+      if (!success) {
+         aco_err(program, "Error in BB%d: %s", block->index, msg);
          is_valid = false;
       }
    };
@@ -132,6 +138,8 @@ validate_ir(Program* program)
    }
 
    for (Block& block : program->blocks) {
+      int num_p_logical_start = 0;
+      int num_p_logical_end = 0;
       for (aco_ptr<Instruction>& instr : block.instructions) {
 
          /* Check that register assignment and register class are consistent. */
@@ -404,6 +412,8 @@ validate_ir(Program* program)
                check(!valu.opsel[3], "Unexpected opsel for sub-dword definition", instr.get());
          } else if (instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
                     instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
+                    instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+                    instr->opcode == aco_opcode::p_v_fma_mixhi_f16_rtz ||
                     instr->opcode == aco_opcode::v_fma_mix_f32) {
             check(instr->definitions[0].regClass() ==
                      (instr->opcode == aco_opcode::v_fma_mix_f32 ? v1 : v2b),
@@ -519,7 +529,7 @@ validate_ir(Program* program)
                   scalar_mask = 0x5;
 
                if (instr->isDPP())
-                  scalar_mask &= 0x4; /* TODO 0x6 for GFX11.5+ */
+                  scalar_mask &= program->gfx_level >= GFX11_5 ? 0x6 : 0x4;
 
                if (instr->isVOPC() || instr->opcode == aco_opcode::v_readfirstlane_b32 ||
                    instr->opcode == aco_opcode::v_readlane_b32 ||
@@ -628,8 +638,18 @@ validate_ir(Program* program)
 
          switch (instr->format) {
          case Format::PSEUDO: {
-            if (instr->opcode == aco_opcode::p_create_vector ||
-                instr->opcode == aco_opcode::p_start_linear_vgpr) {
+            if (instr->opcode == aco_opcode::p_logical_start) {
+               check(
+                  num_p_logical_end == 0 && instr->operands.empty() && instr->definitions.empty(),
+                  "Invalid p_logical_start", instr.get());
+               num_p_logical_start++;
+            } else if (instr->opcode == aco_opcode::p_logical_end) {
+               check(
+                  num_p_logical_start == 1 && instr->operands.empty() && instr->definitions.empty(),
+                  "Invalid p_logical_end", instr.get());
+               num_p_logical_end++;
+            } else if (instr->opcode == aco_opcode::p_create_vector ||
+                       instr->opcode == aco_opcode::p_start_linear_vgpr) {
                unsigned size = 0;
                for (const Operand& op : instr->operands) {
                   check(op.bytes() < 4 || size % 4 == 0, "Operand is not aligned", instr.get());
@@ -921,7 +941,7 @@ validate_ir(Program* program)
                   if (non_mask_ops > 4) {
                      if (program->gfx_level < GFX11) {
                         check(instr->operands[i].regClass() == v1 ||
-                                 instr->operands[i].regClass() == v1.as_linear(),
+                                 instr->operands[i].regClass() == lv1,
                               "GFX10 MIMG VADDR must be v1 if NSA is used", instr.get());
                      } else {
                         unsigned num_scalar = program->gfx_level >= GFX12 ? (non_mask_ops - 4) : 4;
@@ -931,7 +951,7 @@ validate_ir(Program* program)
                             instr->opcode != aco_opcode::image_bvh8_intersect_ray &&
                             i < 3 + num_scalar) {
                            check(instr->operands[i].regClass() == v1 ||
-                                 instr->operands[i].regClass() == v1.as_linear(),
+                                    instr->operands[i].regClass() == lv1,
                                  "first 4 GFX11 MIMG VADDR must be v1 if NSA is used", instr.get());
                         }
                      }
@@ -991,9 +1011,8 @@ validate_ir(Program* program)
             break;
          }
          case Format::LDSDIR: {
-            check(instr->definitions.size() == 1 &&
-                     (instr->definitions[0].regClass() == v1 ||
-                      instr->definitions[0].regClass() == v1.as_linear()),
+            check(instr->definitions.size() == 1 && (instr->definitions[0].regClass() == v1 ||
+                                                     instr->definitions[0].regClass() == lv1),
                   "LDSDIR must have an v1 definition", instr.get());
             check(instr->operands.size() == 1, "LDSDIR must have an operand", instr.get());
             if (!instr->operands.empty()) {
@@ -1062,6 +1081,20 @@ validate_ir(Program* program)
          }
          default: break;
          }
+      }
+
+      /* Check that we have exactly one p_logical_start and one p_logical_end in each logical block
+       * of the CFG. */
+      check_block(num_p_logical_start <= 1 && num_p_logical_end == num_p_logical_start,
+                  "There must be exactly one p_logical_start and p_logical_end", &block);
+      if (program->progress < CompilationProgress::after_lower_to_hw) {
+         // TODO: this check requires aco_tests to either insert p_logical_start/end or being
+         // skipped check_block(num_p_logical_start == 1 || (block.index != 0 &&
+         // block.logical_preds.empty()),
+         //             "Missing p_logical_start / p_logical_end in logical block", &block);
+         check_block(num_p_logical_start == 0 || block.index == 0 || !block.logical_preds.empty(),
+                     "p_logical_start and p_logical_end are only allowed in logical blocks",
+                     &block);
       }
    }
 
@@ -1137,14 +1170,14 @@ validate_cfg(Program* program)
                      "logical successors must be sorted", &block);
 
       /* critical edges are not allowed */
-      if (block.linear_preds.size() > 1) {
+      if (block.linear_preds.size() > 1)
          for (unsigned pred : block.linear_preds)
             check_block(program->blocks[pred].linear_succs.size() == 1,
                         "linear critical edges are not allowed", &program->blocks[pred]);
+      if (block.logical_preds.size() > 1)
          for (unsigned pred : block.logical_preds)
             check_block(program->blocks[pred].logical_succs.size() == 1,
                         "logical critical edges are not allowed", &program->blocks[pred]);
-      }
    }
 
    return is_valid;
@@ -1348,6 +1381,8 @@ validate_subdword_operand(amd_gfx_level gfx_level, const aco_ptr<Instruction>& i
    if (instr->isVOP3P()) {
       bool fma_mix = instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
                      instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
+                     instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+                     instr->opcode == aco_opcode::p_v_fma_mixhi_f16_rtz ||
                      instr->opcode == aco_opcode::v_fma_mix_f32;
       return instr->valu().opsel_lo[index] == (byte >> 1) &&
              instr->valu().opsel_hi[index] == (fma_mix || (byte >> 1));
@@ -1395,22 +1430,26 @@ validate_subdword_operand(amd_gfx_level gfx_level, const aco_ptr<Instruction>& i
 }
 
 bool
-validate_subdword_definition(amd_gfx_level gfx_level, const aco_ptr<Instruction>& instr)
+validate_subdword_definition(Program* program, const aco_ptr<Instruction>& instr, unsigned idx)
 {
-   Definition def = instr->definitions[0];
+   Definition def = instr->definitions[idx];
    unsigned byte = def.physReg().byte();
 
-   if (instr->isPseudo() && gfx_level >= GFX8)
-      return true;
+   if (instr->isPseudo()) {
+      return byte % get_subdword_definition_caps(program, instr.get(), idx, def.regClass())
+                       .placement_stride ==
+             0;
+   }
    if (instr->isSDWA())
       return byte + instr->sdwa().dst_sel.offset() + instr->sdwa().dst_sel.size() <= 4 &&
              byte % instr->sdwa().dst_sel.size() == 0;
-   if (byte == 2 && can_use_opsel(gfx_level, instr->opcode, -1))
+   if (byte == 2 && can_use_opsel(program->gfx_level, instr->opcode, -1))
       return true;
 
    switch (instr->opcode) {
    case aco_opcode::v_interp_p2_hi_f16:
    case aco_opcode::v_fma_mixhi_f16:
+   case aco_opcode::p_v_fma_mixhi_f16_rtz:
    case aco_opcode::buffer_load_ubyte_d16_hi:
    case aco_opcode::buffer_load_sbyte_d16_hi:
    case aco_opcode::buffer_load_short_d16_hi:
@@ -1433,29 +1472,44 @@ validate_subdword_definition(amd_gfx_level gfx_level, const aco_ptr<Instruction>
    return byte == 0;
 }
 
-unsigned
+struct SubdwordDef {
+   unsigned offset;
+   unsigned bytes;
+};
+
+SubdwordDef
 get_subdword_bytes_written(Program* program, const aco_ptr<Instruction>& instr, unsigned index)
 {
    amd_gfx_level gfx_level = program->gfx_level;
    Definition def = instr->definitions[index];
+   SubdwordDef res;
+   res.offset = def.physReg().byte();
+   res.bytes = def.bytes();
 
    if (instr->isPseudo())
-      return gfx_level >= GFX8 ? def.bytes() : def.size() * 4u;
+      return res;
 
    if (instr->isVALU() || instr->isVINTRP()) {
-      if (instr->isSDWA())
-         return instr->sdwa().dst_sel.size();
+      if (instr->isSDWA()) {
+         res.bytes = instr->sdwa().dst_sel.size();
+         return res;
+      }
 
-      if (instr_is_16bit(gfx_level, instr->opcode))
-         return 2;
+      if (instr_is_16bit(gfx_level, instr->opcode)) {
+         res.bytes = 2;
+         return res;
+      }
 
-      return 4;
+      /* The instruction still might write the upper half. In that case, it's the lower half that
+       * isn't preserved */
+      return {0, 4};
    }
 
-   if (instr->isMIMG()) {
-      assert(instr->mimg().d16);
-      return program->dev.sram_ecc_enabled ? def.size() * 4u : def.bytes();
-   }
+   if (program->dev.sram_ecc_enabled)
+      return {0, def.size() * 4};
+
+   if (instr->isMIMG() && instr->mimg().d16)
+      return res;
 
    switch (instr->opcode) {
    case aco_opcode::buffer_load_ubyte_d16:
@@ -1490,10 +1544,16 @@ get_subdword_bytes_written(Program* program, const aco_ptr<Instruction>& instr, 
    case aco_opcode::global_load_short_d16_hi:
    case aco_opcode::ds_read_u8_d16_hi:
    case aco_opcode::ds_read_i8_d16_hi:
-   case aco_opcode::ds_read_u16_d16_hi: return program->dev.sram_ecc_enabled ? 4 : 2;
+   case aco_opcode::ds_read_u16_d16_hi: {
+      res.bytes = 2;
+      return res;
+   }
    case aco_opcode::buffer_load_format_d16_xyz:
-   case aco_opcode::tbuffer_load_format_d16_xyz: return program->dev.sram_ecc_enabled ? 8 : 6;
-   default: return def.size() * 4;
+   case aco_opcode::tbuffer_load_format_d16_xyz: {
+      res.bytes = 6;
+      return res;
+   }
+   default: return {0, def.size() * 4};
    }
 }
 
@@ -1514,21 +1574,19 @@ validate_instr_defs(Program* program, std::array<unsigned, 2048>& regs,
          if (regs[reg.reg_b + j])
             err |=
                ra_fail(program, loc, assignments[regs[reg.reg_b + j]].defloc,
-                       "Assignment of element %d of %%%d already taken by %%%d from instruction", i,
+                       "Assignment of byte %d of %%%d already taken by %%%d from instruction", j,
                        tmp.id(), regs[reg.reg_b + j]);
          regs[reg.reg_b + j] = tmp.id();
       }
-      if (def.regClass().is_subdword() && def.bytes() < 4) {
-         unsigned written = get_subdword_bytes_written(program, instr, i);
-         /* If written=4, the instruction still might write the upper half. In that case, it's
-          * the lower half that isn't preserved */
-         for (unsigned j = reg.byte() & ~(written - 1); j < written; j++) {
+      if (def.regClass().is_subdword()) {
+         SubdwordDef written = get_subdword_bytes_written(program, instr, i);
+         for (unsigned j = written.offset; j < written.bytes; j++) {
             unsigned written_reg = reg.reg() * 4u + j;
             if (regs[written_reg] && regs[written_reg] != def.tempId())
                err |= ra_fail(program, loc, assignments[regs[written_reg]].defloc,
-                              "Assignment of element %d of %%%d overwrites the full register "
+                              "Assignment of byte %d of %%%d overwrites the full register "
                               "taken by %%%d from instruction",
-                              i, tmp.id(), regs[written_reg]);
+                              j, tmp.id(), regs[written_reg]);
          }
       }
    }
@@ -1555,11 +1613,6 @@ validate_call(Program* program, std::array<unsigned, 2048>& regs,
    RegisterDemand limit = get_addr_regs_from_waves(program, program->min_waves);
    BITSET_DECLARE(preserved_regs, 512);
    instr->call().abi.preservedRegisters(preserved_regs, limit);
-
-   /* TODO: This is a hack. I think the return address should not be precolored to a preserved
-    * register. */
-   BITSET_CLEAR(preserved_regs, instr->definitions[0].physReg().reg());
-   BITSET_CLEAR(preserved_regs, instr->definitions[0].physReg().reg() + 1);
 
    for (unsigned i = 0; i < regs.size(); i++) {
       unsigned temp = regs[i];
@@ -1674,8 +1727,7 @@ validate_ra(Program* program)
             if (def.physReg() == vcc && !program->needs_vcc)
                err |= ra_fail(program, loc, Location(),
                               "Definition %d fixed to vcc but needs_vcc=false", i);
-            if (def.regClass().is_subdword() &&
-                !validate_subdword_definition(program->gfx_level, instr))
+            if (def.regClass().is_subdword() && !validate_subdword_definition(program, instr, i))
                err |= ra_fail(program, loc, Location(), "Definition %d not aligned correctly", i);
             if (!assignments[def.tempId()].firstloc.block)
                assignments[def.tempId()].firstloc = loc;
@@ -1709,7 +1761,7 @@ validate_ra(Program* program)
          for (unsigned i = 0; i < tmp.bytes(); i++) {
             if (regs[reg.reg_b + i]) {
                err |= ra_fail(program, loc, Location(),
-                              "Assignment of element %d of %%%d already taken by %%%d in live-in",
+                              "Assignment of byte %d of %%%d already taken by %%%d in live-in",
                               i, id, regs[reg.reg_b + i]);
             }
             regs[reg.reg_b + i] = id;

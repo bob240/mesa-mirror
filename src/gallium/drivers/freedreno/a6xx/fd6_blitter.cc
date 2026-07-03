@@ -89,8 +89,7 @@ fd6_ifmt(enum a6xx_format fmt)
       return R2D_FLOAT16;
 
    default:
-      UNREACHABLE("bad format");
-      return (enum a6xx_2d_ifmt)0;
+      return R2D_NONE;
    }
 }
 
@@ -111,10 +110,8 @@ ok_dims(const struct pipe_resource *r, const struct pipe_box *b, int lvl)
 }
 
 static bool
-ok_format(enum pipe_format pfmt)
+ok_format(const struct fd_dev_info *info, enum pipe_format pfmt, bool check_a2d)
 {
-   enum a6xx_format fmt = fd6_color_format(pfmt, TILE6_LINEAR);
-
    if (util_format_is_compressed(pfmt))
       return true;
 
@@ -131,7 +128,15 @@ ok_format(enum pipe_format pfmt)
       break;
    }
 
+   if (!fd6_color_format_supported(info, pfmt, TILE6_LINEAR))
+      return false;
+
+   enum a6xx_format fmt = fd6_color_format(pfmt, TILE6_LINEAR);
+
    if (fmt == FMT6_NONE)
+      return false;
+
+   if (check_a2d && (fd6_ifmt(fmt) == R2D_NONE))
       return false;
 
    return true;
@@ -173,7 +178,7 @@ dump_blit_info(const struct pipe_blit_info *info)
 }
 
 static bool
-can_do_blit(const struct pipe_blit_info *info)
+can_do_blit(const struct fd_dev_info *dev_info, const struct pipe_blit_info *info)
 {
    /* I think we can do scaling, but not in z dimension since that would
     * require blending..
@@ -181,8 +186,8 @@ can_do_blit(const struct pipe_blit_info *info)
    fail_if(info->dst.box.depth != info->src.box.depth);
 
    /* Fail if unsupported format: */
-   fail_if(!ok_format(info->src.format));
-   fail_if(!ok_format(info->dst.format));
+   fail_if(!ok_format(dev_info, info->src.format, true));
+   fail_if(!ok_format(dev_info, info->dst.format, true));
 
    /* using the 2d path seems to canonicalize NaNs when the source format
     * is a 16-bit floating point format, likely because it implicitly
@@ -248,7 +253,9 @@ static bool
 can_do_clear(const struct pipe_resource *prsc, unsigned level,
              const struct pipe_box *box)
 {
-   return ok_format(prsc->format) &&
+   struct fd_screen *screen = fd_screen(prsc->screen);
+
+   return ok_format(screen->info, prsc->format, true) &&
           ok_dims(prsc, box, level) &&
           (fd_resource_nr_samples(prsc) == 1);
 
@@ -290,7 +297,8 @@ template <chip CHIP>
 static void
 emit_blit_setup(fd_ncrb<CHIP> &ncrb, enum pipe_format pfmt,
                 bool scissor_enable, union pipe_color_union *color,
-                uint32_t unknown_8c01, enum a6xx_rotation rotate)
+                BITMASK_ENUM(fd_buffer_mask) buffers,
+                enum a6xx_rotation rotate)
 {
    enum a6xx_format fmt = fd6_color_format(pfmt, TILE6_LINEAR);
    bool is_srgb = util_format_is_srgb(pfmt);
@@ -314,7 +322,6 @@ emit_blit_setup(fd_ncrb<CHIP> &ncrb, enum pipe_format pfmt,
    if (CHIP >= A7XX) {
       ncrb.add(TPL1_A2D_BLT_CNTL(CHIP,
          .raw_copy = false,
-         .start_offset_texels = 0,
          .type = A6XX_TEX_2D,
       ));
    }
@@ -341,7 +348,35 @@ emit_blit_setup(fd_ncrb<CHIP> &ncrb, enum pipe_format pfmt,
       .mask = 0xf,
    ));
 
-   ncrb.add(A6XX_RB_A2D_PIXEL_CNTL(.dword = unknown_8c01));
+   enum a6xx_a2d_pixel_op pixel_op = PIXEL_OP_DISABLED;
+   enum adreno_rb_blend_factor color_src_factor = FACTOR_ZERO;
+   enum adreno_rb_blend_factor color_dst_factor = FACTOR_ZERO;
+   enum adreno_rb_blend_factor alpha_src_factor = FACTOR_ZERO;
+   enum adreno_rb_blend_factor alpha_dst_factor = FACTOR_ZERO;
+
+   /* Handle D24S8 blits where we are only updating depth or stencil: */
+   if (pfmt == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
+      buffers &= FD_BUFFER_DEPTH | FD_BUFFER_STENCIL;
+      if (buffers == FD_BUFFER_DEPTH) {
+         /* preserve stencil channel */
+         pixel_op = PIXEL_OP_BLENDING;
+         color_src_factor = FACTOR_ONE;
+         alpha_dst_factor = FACTOR_ONE;
+      } else if (buffers == FD_BUFFER_STENCIL) {
+         /* preserve depth channels */
+         pixel_op = PIXEL_OP_BLENDING;
+         color_dst_factor = FACTOR_ONE;
+         alpha_src_factor = FACTOR_ONE;
+      }
+   }
+
+   ncrb.add(A6XX_RB_A2D_PIXEL_CNTL(
+      .pixel_op = pixel_op,
+      .color_src_factor = color_src_factor,
+      .color_dst_factor = color_dst_factor,
+      .alpha_src_factor = alpha_src_factor,
+      .alpha_dst_factor = alpha_dst_factor,
+   ));
 }
 
 /* nregs: 4 */
@@ -415,7 +450,8 @@ emit_blit_buffer(struct fd_context *ctx, fd_cs &cs, const struct pipe_blit_info 
    dshift = dbox->x & 0x3f;
 
    with_ncrb (cs, 5)
-      emit_blit_setup<CHIP>(ncrb, PIPE_FORMAT_R8_UNORM, false, NULL, 0, ROTATE_0);
+      emit_blit_setup<CHIP>(ncrb, PIPE_FORMAT_R8_UNORM, false, NULL,
+                            FD_BUFFER_ALL, ROTATE_0);
 
    for (unsigned off = 0; off < sbox->width; off += (0x4000 - 0x40)) {
       unsigned soff, doff, w, p;
@@ -478,7 +514,8 @@ clear_ubwc_setup(fd_cs &cs)
    union pipe_color_union color = {};
    fd_ncrb<CHIP> ncrb(cs, 18);
 
-   emit_blit_setup<CHIP>(ncrb, PIPE_FORMAT_R8_UNORM, false, &color, 0, ROTATE_0);
+   emit_blit_setup<CHIP>(ncrb, PIPE_FORMAT_R8_UNORM, false, &color,
+                         FD_BUFFER_ALL, ROTATE_0);
 
    ncrb.add(TPL1_A2D_SRC_TEXTURE_INFO(CHIP));
    ncrb.add(TPL1_A2D_SRC_TEXTURE_SIZE(CHIP));
@@ -701,7 +738,8 @@ emit_blit_texture_setup(fd_cs &cs, const struct pipe_blit_info *info)
       ));
    }
 
-   emit_blit_setup<CHIP>(ncrb, info->dst.format, info->scissor_enable, NULL, 0, rotate);
+   emit_blit_setup<CHIP>(ncrb, info->dst.format, info->scissor_enable, NULL,
+                         FD_BUFFER_ALL, rotate);
 }
 
 template <chip CHIP>
@@ -812,7 +850,8 @@ clear_lrz_setup(fd_cs &cs, struct fd_resource *zsbuf, struct fd_bo *lrz, double 
    union pipe_color_union clear_color = { .f = {depth} };
 
    emit_clear_color<CHIP>(ncrb, PIPE_FORMAT_Z16_UNORM, &clear_color);
-   emit_blit_setup<CHIP>(ncrb, PIPE_FORMAT_Z16_UNORM, false, &clear_color, 0, ROTATE_0);
+   emit_blit_setup<CHIP>(ncrb, PIPE_FORMAT_Z16_UNORM, false, &clear_color,
+                         FD_BUFFER_ALL, ROTATE_0);
 
    ncrb.add(A6XX_RB_A2D_DEST_BUFFER_INFO(
       .color_format = FMT6_16_UNORM,
@@ -967,7 +1006,8 @@ fd6_clear_buffer(struct pipe_context *pctx,
 
    with_ncrb (cs, 9) {
       emit_clear_color(ncrb, dst_fmt, &color);
-      emit_blit_setup<CHIP>(ncrb, dst_fmt, false, &color, 0, ROTATE_0);
+      emit_blit_setup<CHIP>(ncrb, dst_fmt, false, &color,
+                            FD_BUFFER_ALL, ROTATE_0);
    }
 
    /*
@@ -1022,7 +1062,7 @@ template <chip CHIP>
 static void
 clear_surface_setup(fd_cs &cs, struct pipe_surface *psurf,
                     const struct pipe_box *box2d, union pipe_color_union *color,
-                    uint32_t unknown_8c01)
+                    BITMASK_ENUM(fd_buffer_mask) buffers)
 {
    uint32_t nr_samples = fd_resource_nr_samples(psurf->texture);
    fd_ncrb<CHIP> ncrb(cs, 11);
@@ -1039,14 +1079,15 @@ clear_surface_setup(fd_cs &cs, struct pipe_surface *psurf,
    union pipe_color_union clear_color = convert_color(psurf->format, color);
 
    emit_clear_color(ncrb, psurf->format, &clear_color);
-   emit_blit_setup<CHIP>(ncrb, psurf->format, false, &clear_color, unknown_8c01, ROTATE_0);
+   emit_blit_setup<CHIP>(ncrb, psurf->format, false, &clear_color, buffers, ROTATE_0);
 }
 
 template <chip CHIP>
 void
 fd6_clear_surface(struct fd_context *ctx, fd_cs &cs,
                   struct pipe_surface *psurf, const struct pipe_box *box2d,
-                  union pipe_color_union *color, uint32_t unknown_8c01)
+                  union pipe_color_union *color,
+                  BITMASK_ENUM(fd_buffer_mask) buffers)
 {
    if (DEBUG_BLIT) {
       fprintf(stderr, "surface clear:\ndst resource: ");
@@ -1054,7 +1095,7 @@ fd6_clear_surface(struct fd_context *ctx, fd_cs &cs,
       fprintf(stderr, "\n");
    }
 
-   clear_surface_setup<CHIP>(cs, psurf, box2d, color, unknown_8c01);
+   clear_surface_setup<CHIP>(cs, psurf, box2d, color, buffers);
 
    for (unsigned i = psurf->first_layer; i <= psurf->last_layer; i++) {
       with_ncrb (cs, 10)
@@ -1136,7 +1177,7 @@ fd6_clear_texture(struct pipe_context *pctx, struct pipe_resource *prsc,
          .texture = prsc,
    };
 
-   fd6_clear_surface<CHIP>(ctx, cs, &surf, box, &color, 0);
+   fd6_clear_surface<CHIP>(ctx, cs, &surf, box, &color, FD_BUFFER_ALL);
 
    fd6_emit_flushes<CHIP>(batch->ctx, cs,
                           FD6_FLUSH_CCU_COLOR |
@@ -1156,7 +1197,8 @@ fd6_clear_texture(struct pipe_context *pctx, struct pipe_resource *prsc,
 template <chip CHIP>
 static void
 resolve_tile_setup(struct fd_batch *batch, fd_cs &cs, uint32_t base,
-                   struct pipe_surface *psurf, uint32_t unknown_8c01)
+                   struct pipe_surface *psurf,
+                   BITMASK_ENUM(fd_buffer_mask) buffers)
 {
    const struct fd_gmem_stateobj *gmem = batch->gmem_state;
    uint32_t gmem_pitch = gmem->bin_w * batch->framebuffer.samples *
@@ -1176,7 +1218,7 @@ resolve_tile_setup(struct fd_batch *batch, fd_cs &cs, uint32_t base,
    /* Enable scissor bit, which will take into account the window scissor
     * which is set per-tile
     */
-   emit_blit_setup<CHIP>(ncrb, psurf->format, true, NULL, unknown_8c01, ROTATE_0);
+   emit_blit_setup<CHIP>(ncrb, psurf->format, true, NULL, buffers, ROTATE_0);
 
    /* We shouldn't be using GMEM in the layered rendering case: */
    assert(psurf->first_layer == psurf->last_layer);
@@ -1213,9 +1255,10 @@ resolve_tile_setup(struct fd_batch *batch, fd_cs &cs, uint32_t base,
 template <chip CHIP>
 void
 fd6_resolve_tile(struct fd_batch *batch, fd_cs &cs, uint32_t base,
-                 struct pipe_surface *psurf, uint32_t unknown_8c01)
+                 struct pipe_surface *psurf,
+                 BITMASK_ENUM(fd_buffer_mask) buffers)
 {
-   resolve_tile_setup<CHIP>(batch, cs, base, psurf, unknown_8c01);
+   resolve_tile_setup<CHIP>(batch, cs, base, psurf, buffers);
 
    /* sync GMEM writes with CACHE. */
    fd6_cache_inv<CHIP>(batch->ctx, cs);
@@ -1245,7 +1288,7 @@ handle_rgba_blit(struct fd_context *ctx, const struct pipe_blit_info *info)
 
    assert(!(info->mask & PIPE_MASK_ZS));
 
-   if (!can_do_blit(info))
+   if (!can_do_blit(ctx->screen->info, info))
       return false;
 
    struct fd_resource *src = fd_resource(info->src.resource);
@@ -1540,7 +1583,7 @@ fd6_blitter_init(struct pipe_context *pctx)
 FD_GENX(fd6_blitter_init);
 
 unsigned
-fd6_tile_mode_for_format(enum pipe_format pfmt)
+fd6_tile_mode_for_format(const struct fd_dev_info *info, enum pipe_format pfmt)
 {
    if (!util_is_power_of_two_nonzero(util_format_get_blocksize(pfmt)))
       return TILE6_LINEAR;
@@ -1548,7 +1591,7 @@ fd6_tile_mode_for_format(enum pipe_format pfmt)
    /* basically just has to be a format we can blit, so uploads/downloads
     * via linear staging buffer works:
     */
-   if (ok_format(pfmt))
+   if (ok_format(info, pfmt, false))
       return TILE6_3;
 
    return TILE6_LINEAR;
@@ -1557,5 +1600,6 @@ fd6_tile_mode_for_format(enum pipe_format pfmt)
 unsigned
 fd6_tile_mode(const struct pipe_resource *tmpl)
 {
-   return fd6_tile_mode_for_format(tmpl->format);
+   struct fd_screen *screen = fd_screen(tmpl->screen);
+   return fd6_tile_mode_for_format(screen->info, tmpl->format);
 }

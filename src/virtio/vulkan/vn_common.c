@@ -35,6 +35,7 @@ static const struct debug_control vn_debug_options[] = {
    { "no_second_queue", VN_DEBUG_NO_SECOND_QUEUE },
    { "no_ray_tracing", VN_DEBUG_NO_RAY_TRACING },
    { "mem_budget", VN_DEBUG_MEM_BUDGET },
+   { "no_desc_heap", VN_DEBUG_NO_DESC_HEAP },
    { NULL, 0 },
    /* clang-format on */
 };
@@ -258,8 +259,10 @@ vn_relax(struct vn_relax_state *state)
       return;
    }
 
+   state->warn = false;
    if (unlikely(*iter % (1 << warn_order) == 0)) {
       struct vn_instance *instance = state->instance;
+      state->warn = true;
       vn_log(instance, "stuck in %s wait with iter at %d", state->reason_str,
              *iter);
 

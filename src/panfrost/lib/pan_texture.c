@@ -4,29 +4,12 @@
  * Copyright (C) 2018-2019 Alyssa Rosenzweig
  * Copyright (C) 2019-2020 Collabora, Ltd.
  * Copyright (C) 2024 Arm Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
+ * Copyright (C) 2026 Google LLC
+ * SPDX-License-Identifier: MIT
  */
 
 #include "pan_texture.h"
+#include "genxml/gen_macros.h"
 #include "util/macros.h"
 #include "util/u_math.h"
 #include "pan_afbc.h"
@@ -141,7 +124,7 @@ static unsigned
 pan_texture_num_elements(const struct pan_image_view *iview)
 {
    unsigned levels = 1 + iview->last_level - iview->first_level;
-   unsigned layers = 1 + iview->last_layer - iview->first_layer;
+   unsigned layers = pan_image_view_layer_count(iview);
    unsigned nr_samples = pan_image_view_get_nr_samples(iview);
 
    return levels * layers * MAX2(nr_samples, 1);
@@ -180,27 +163,26 @@ GENX(pan_texture_estimate_payload_size)(const struct pan_image_view *iview)
    return element_size * elements;
 }
 
-#if PAN_ARCH < 9
-static void
-pan_emit_bview_surface_with_stride(const struct pan_buffer_view *bview,
-                                   void *payload)
+unsigned
+GENX(pan_texture_get_payload_alignment)(const struct pan_image_view *iview)
 {
-   uint64_t base = bview->base;
+   unsigned alignment;
 
-#if PAN_ARCH >= 5
-   const struct util_format_description *desc =
-      util_format_description(bview->format);
-   if (desc->layout == UTIL_FORMAT_LAYOUT_ASTC)
-      base |= astc_compression_tag(desc);
+#if PAN_ARCH >= 9
+   alignment = pan_alignment(NULL_PLANE);
+   if (pan_format_is_yuv(iview->format) && iview->planes[1].image != NULL)
+      alignment *= 2;
+#elif PAN_ARCH == 7
+   if (pan_format_is_yuv(iview->format) && iview->planes[1].image != NULL)
+      alignment = pan_alignment(MULTIPLANAR_SURFACE);
+   else
+      alignment = pan_alignment(SURFACE_WITH_STRIDE);
+#else
+   alignment = pan_alignment(SURFACE_WITH_STRIDE);
 #endif
 
-   pan_cast_and_pack(payload, SURFACE_WITH_STRIDE, cfg) {
-      cfg.pointer = base;
-      cfg.row_stride = 0;
-      cfg.surface_stride = 0;
-   }
+   return alignment;
 }
-#endif
 
 #if PAN_ARCH >= 9
 
@@ -264,25 +246,55 @@ pan_clump_format(enum pipe_format format)
    /* YUV-sampling has special cases */
    if (pan_format_is_yuv(format)) {
       switch (format) {
+#if PAN_ARCH >= 14
       case PIPE_FORMAT_R8G8_R8B8_UNORM:
       case PIPE_FORMAT_G8R8_B8R8_UNORM:
       case PIPE_FORMAT_R8B8_R8G8_UNORM:
       case PIPE_FORMAT_B8R8_G8R8_UNORM:
       case PIPE_FORMAT_R8_G8B8_422_UNORM:
       case PIPE_FORMAT_R8_B8G8_422_UNORM:
+      case PIPE_FORMAT_Y8_U8V8_422_UNORM:
+      case PIPE_FORMAT_R8_G8B8_420_UNORM:
+      case PIPE_FORMAT_R8_B8G8_420_UNORM:
+      case PIPE_FORMAT_G8_B8R8_420_UNORM:
+      case PIPE_FORMAT_Y8_U8_V8_422_UNORM:
+      case PIPE_FORMAT_R8_G8_B8_420_UNORM:
+      case PIPE_FORMAT_R8_B8_G8_420_UNORM:
+      case PIPE_FORMAT_G8_B8_R8_420_UNORM:
+      case PIPE_FORMAT_R8G8B8_420_UNORM_PACKED:
+         return MALI_CLUMP_FORMAT_RAW8;
+      case PIPE_FORMAT_R10_G10B10_420_UNORM:
+      case PIPE_FORMAT_R10G10B10_420_UNORM_PACKED:
+      case PIPE_FORMAT_R10_G10B10_422_UNORM:
+      case PIPE_FORMAT_X6R10X6G10_X6R10X6B10_422_UNORM:
+         return MALI_CLUMP_FORMAT_R10_PACKED;
+#else
+      case PIPE_FORMAT_R8G8_R8B8_UNORM:
+      case PIPE_FORMAT_G8R8_B8R8_UNORM:
+      case PIPE_FORMAT_R8B8_R8G8_UNORM:
+      case PIPE_FORMAT_B8R8_G8R8_UNORM:
+      case PIPE_FORMAT_R8_G8B8_422_UNORM:
+      case PIPE_FORMAT_R8_B8G8_422_UNORM:
+      case PIPE_FORMAT_Y8_U8V8_422_UNORM:
+      case PIPE_FORMAT_Y8_U8_V8_422_UNORM:
          return MALI_CLUMP_FORMAT_Y8_UV8_422;
       case PIPE_FORMAT_R8_G8B8_420_UNORM:
       case PIPE_FORMAT_R8_B8G8_420_UNORM:
+      case PIPE_FORMAT_G8_B8R8_420_UNORM:
       case PIPE_FORMAT_R8_G8_B8_420_UNORM:
       case PIPE_FORMAT_R8_B8_G8_420_UNORM:
+      case PIPE_FORMAT_G8_B8_R8_420_UNORM:
       case PIPE_FORMAT_R8G8B8_420_UNORM_PACKED:
          return MALI_CLUMP_FORMAT_Y8_UV8_420;
       case PIPE_FORMAT_R10_G10B10_420_UNORM:
       case PIPE_FORMAT_R10G10B10_420_UNORM_PACKED:
          return MALI_CLUMP_FORMAT_Y10_UV10_420;
+      case PIPE_FORMAT_X6G10_X6B10X6R10_420_UNORM:
+         return MALI_CLUMP_FORMAT_YUV420_10X6;
       case PIPE_FORMAT_R10_G10B10_422_UNORM:
       case PIPE_FORMAT_X6R10X6G10_X6R10X6B10_422_UNORM:
          return MALI_CLUMP_FORMAT_Y10_UV10_422;
+#endif /* PAN_ARCH >= 14 */
       default:
          UNREACHABLE("unhandled clump format");
       }
@@ -308,6 +320,23 @@ pan_clump_format(enum pipe_format format)
       return MALI_CLUMP_FORMAT_RAW128;
    default:
       UNREACHABLE("Invalid bpp");
+   }
+}
+
+static enum mali_clump_ordering
+modifier_clump_ordering(uint64_t modifier)
+{
+   switch (modifier) {
+   case DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED:
+      return MALI_CLUMP_ORDERING_TILED_U_INTERLEAVED;
+#if PAN_ARCH >= 10
+   case DRM_FORMAT_MOD_ARM_INTERLEAVED_64K:
+      return MALI_CLUMP_ORDERING_INTERLEAVED_64K;
+#endif
+   case DRM_FORMAT_MOD_LINEAR:
+      return MALI_CLUMP_ORDERING_LINEAR;
+   default:
+      UNREACHABLE("");
    }
 }
 
@@ -410,6 +439,7 @@ emit_generic_plane(const struct pan_image_view *iview, int plane_idx,
    /* 3-planar formats must use Chroma 2p planes for the U V planes. */
    assert(plane_idx == 0 || desc->layout != UTIL_FORMAT_LAYOUT_PLANAR3);
    assert(props->modifier == DRM_FORMAT_MOD_LINEAR ||
+          props->modifier == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K ||
           props->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED);
 
    get_linear_or_u_tiled_plane_props(iview, plane_idx, mip_level,
@@ -417,10 +447,7 @@ emit_generic_plane(const struct pan_image_view *iview, int plane_idx,
                                      &slice_stride, &plane_size);
 
    pan_cast_and_pack(payload, GENERIC_PLANE, cfg) {
-      cfg.clump_ordering =
-         props->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED
-            ? MALI_CLUMP_ORDERING_TILED_U_INTERLEAVED
-            : MALI_CLUMP_ORDERING_LINEAR;
+      cfg.clump_ordering = modifier_clump_ordering(props->modifier);
       cfg.clump_format = pan_clump_format(iview->format);
       PLANE_SET_SIZE(cfg, plane_size);
       cfg.pointer = plane_addr;
@@ -453,6 +480,7 @@ emit_astc_plane(const struct pan_image_view *iview, int plane_idx,
 
    assert(desc->layout == UTIL_FORMAT_LAYOUT_ASTC && desc->block.depth == 1);
    assert(props->modifier == DRM_FORMAT_MOD_LINEAR ||
+          props->modifier == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K ||
           props->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED);
 
    get_linear_or_u_tiled_plane_props(iview, plane_idx, mip_level,
@@ -460,10 +488,7 @@ emit_astc_plane(const struct pan_image_view *iview, int plane_idx,
                                      &slice_stride, &plane_size);
 
 #define ASTC_PLANE_SET_COMMON_PROPS()                                          \
-   cfg.clump_ordering =                                                        \
-      props->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED          \
-         ? MALI_CLUMP_ORDERING_TILED_U_INTERLEAVED                             \
-         : MALI_CLUMP_ORDERING_LINEAR;                                         \
+   cfg.clump_ordering = modifier_clump_ordering(props->modifier);              \
    cfg.decode_hdr = iview->astc.hdr;                                           \
    cfg.decode_wide = wide;                                                     \
    PLANE_SET_SIZE(cfg, plane_size);                                            \
@@ -515,7 +540,7 @@ emit_linear_or_u_tiled_chroma_2p_plane(const struct pan_image_view *iview,
                                        unsigned mip_level,
                                        unsigned layer_or_z_slice, void *payload)
 {
-   const struct util_format_description *desc =
+   ASSERTED const struct util_format_description *desc =
       util_format_description(iview->format);
    const struct pan_image_plane_ref pref1 = pan_image_view_get_plane(iview, 1);
    const struct pan_image_props *props = &pref1.image->props;
@@ -537,13 +562,11 @@ emit_linear_or_u_tiled_chroma_2p_plane(const struct pan_image_view *iview,
 
    assert(desc->layout == UTIL_FORMAT_LAYOUT_PLANAR3);
    assert(props->modifier == DRM_FORMAT_MOD_LINEAR ||
+          props->modifier == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K ||
           props->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED);
 
    pan_cast_and_pack(payload, CHROMA_2P_PLANE, cfg) {
-      cfg.clump_ordering =
-         props->modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED
-            ? MALI_CLUMP_ORDERING_TILED_U_INTERLEAVED
-            : MALI_CLUMP_ORDERING_LINEAR;
+      cfg.clump_ordering = modifier_clump_ordering(props->modifier);
       cfg.clump_format = pan_clump_format(iview->format);
       PLANE_SET_SIZE(cfg, cplane1_size);
       cfg.pointer = cplane1_addr;
@@ -727,11 +750,11 @@ emit_afrc_chroma_2p_plane(const struct pan_image_view *iview,
 {
    const struct pan_afrc_format_info finfo =
       pan_afrc_get_format_info(iview->format);
-   const struct util_format_description *desc =
+   ASSERTED const struct util_format_description *desc =
       util_format_description(iview->format);
    const struct pan_image_plane_ref pref1 =
       pan_image_view_get_plane(iview, 1);
-   const struct pan_image_plane_ref pref2 =
+   ASSERTED const struct pan_image_plane_ref pref2 =
       pan_image_view_get_plane(iview, 2);
 
    assert(pref1.image != NULL && pref2.image != NULL);
@@ -766,6 +789,16 @@ emit_afrc_chroma_2p_plane(const struct pan_image_view *iview,
                        u_minify(props->extent_px.height, mip_level));
       cfg.secondary_pointer = cplane2_addr;
    }
+}
+
+#define emit_interleaved_64k_plane emit_linear_or_u_tiled_plane
+
+static void
+emit_interleaved_64k_chroma_2p_plane(const struct pan_image_view *iview,
+                                     unsigned mip_level,
+                                     unsigned layer_or_z_slice, void *payload)
+{
+   UNREACHABLE("not implemented");
 }
 #endif
 
@@ -1024,6 +1057,7 @@ PAN_TEX_EMIT_HELPER(linear)
 PAN_TEX_EMIT_HELPER(u_tiled)
 PAN_TEX_EMIT_HELPER(afbc)
 #if PAN_ARCH >= 10
+PAN_TEX_EMIT_HELPER(interleaved_64k)
 PAN_TEX_EMIT_HELPER(afrc)
 #endif
 
@@ -1043,9 +1077,19 @@ pan_emit_iview_texture_payload(const struct pan_image_view *iview,
     * into a single plane descriptor.
     */
 
+   unsigned first_layer_or_z_slice = iview->first_layer_or_z_slice;
+
+   /* A 3D view emits a single surface entry at its first Z slice, the slice
+    * count is conveyed through the texture depth.
+    */
+   unsigned last_layer_or_z_slice =
+      iview->dim == MALI_TEXTURE_DIMENSION_3D ? first_layer_or_z_slice
+                                              : iview->last_layer_or_z_slice;
+
 #if PAN_ARCH >= 7
    /* V7 and later treats faces as extra layers */
-   for (int layer = iview->first_layer; layer <= iview->last_layer; ++layer) {
+   for (int layer = first_layer_or_z_slice; layer <= last_layer_or_z_slice;
+        ++layer) {
       for (int sample = 0; sample < nr_samples; ++sample) {
          for (int level = iview->first_level; level <= iview->last_level;
               ++level) {
@@ -1055,17 +1099,17 @@ pan_emit_iview_texture_payload(const struct pan_image_view *iview,
       }
    }
 #else
-   unsigned first_layer = iview->first_layer, last_layer = iview->last_layer;
    unsigned face_count = 1;
 
    if (iview->dim == MALI_TEXTURE_DIMENSION_CUBE) {
-      first_layer /= 6;
-      last_layer /= 6;
+      first_layer_or_z_slice /= 6;
+      last_layer_or_z_slice /= 6;
       face_count = 6;
    }
 
    /* V6 and earlier has a different memory-layout */
-   for (int layer = first_layer; layer <= last_layer; ++layer) {
+   for (int layer = first_layer_or_z_slice; layer <= last_layer_or_z_slice;
+        ++layer) {
       for (int level = iview->first_level; level <= iview->last_level;
            ++level) {
          /* order of face and sample doesn't matter; we can only have multiple
@@ -1154,7 +1198,7 @@ GENX(pan_texture_afbc_reswizzle)(struct pan_image_view *iview)
 static unsigned
 pan_texture_get_array_size(const struct pan_image_view *iview)
 {
-   unsigned array_size = iview->last_layer - iview->first_layer + 1;
+   unsigned array_size = pan_image_view_layer_count(iview);
 
    /* If this is a cubemap, we expect the number of layers to be a multiple
     * of 6.
@@ -1181,6 +1225,22 @@ pan_texture_get_extent(const struct pan_image_view *iview,
       .height = u_minify(iprops->extent_px.height, iview->first_level),
       .depth = u_minify(iprops->extent_px.depth, iview->first_level),
    };
+
+   /* If the image is YUV but the view isn't, adjust the extent to take
+    * subsampling into account.
+    */
+   if (pan_format_is_yuv(iprops->format) && !pan_format_is_yuv(iview->format)) {
+      /* We expect single-plane view if the view doesn't have a YUV format. */
+      assert(pan_image_view_get_plane_mask(iview) == 1);
+
+      const struct pan_image_plane_ref first_plane =
+         pan_image_view_get_first_plane(iview);
+
+      extent_px.width = util_format_get_plane_width(
+         iprops->format, first_plane.plane_idx, extent_px.width);
+      extent_px.height = util_format_get_plane_height(
+         iprops->format, first_plane.plane_idx, extent_px.height);
+   }
 
    if (util_format_is_compressed(iprops->format) &&
        !util_format_is_compressed(iview->format)) {
@@ -1226,6 +1286,9 @@ GENX(pan_sampled_texture_emit)(const struct pan_image_view *iview,
       mali_format = MALI_PACK_FMT(RGBA8_UNORM, RGBA, L);
    }
 
+   if (iview->yuv.override_cr_siting)
+      mali_format = MALI_SET_YUV_CR_SITING(mali_format, iview->yuv.cr_siting);
+
    pan_emit_iview_texture_payload(iview, payload->cpu);
 
    unsigned array_size = pan_texture_get_array_size(iview);
@@ -1255,10 +1318,7 @@ GENX(pan_sampled_texture_emit)(const struct pan_image_view *iview,
 #if PAN_ARCH >= 6
       cfg.surfaces = payload->gpu;
 
-      /* We specify API-level LOD clamps in the sampler descriptor
-       * and use these clamps simply for bounds checking.
-       */
-      cfg.minimum_lod = 0;
+      cfg.minimum_lod = MAX2(0.0f, iview->min_lod - iview->first_level);
       cfg.maximum_lod = cfg.levels - 1;
 #endif
    }
@@ -1272,8 +1332,6 @@ GENX(pan_storage_texture_emit)(const struct pan_image_view *iview,
 {
    pan_image_view_check(iview);
 
-   const struct util_format_description *desc =
-      util_format_description(iview->format);
    const struct pan_image_plane_ref first_plane =
       pan_image_view_get_first_plane(iview);
    const struct pan_image_props *props = &first_plane.image->props;
@@ -1282,12 +1340,11 @@ GENX(pan_storage_texture_emit)(const struct pan_image_view *iview,
    assert(!drm_is_afbc(props->modifier));
    assert(!drm_is_afrc(props->modifier));
 
+   /* Compressed formats can't be used with storage operations */
+   assert(!util_format_is_compressed(iview->format));
+
    uint32_t mali_format =
       GENX(pan_format_from_pipe_format)(iview->format)->hw;
-   if (desc->layout == UTIL_FORMAT_LAYOUT_ASTC && iview->astc.narrow &&
-       desc->colorspace != UTIL_FORMAT_COLORSPACE_SRGB) {
-      mali_format = MALI_PACK_FMT(RGBA8_UNORM, RGBA, L);
-   }
 
    pan_emit_iview_texture_payload(iview, payload->cpu);
 
@@ -1309,7 +1366,7 @@ GENX(pan_storage_texture_emit)(const struct pan_image_view *iview,
       cfg.width = extent_px.width;
       cfg.height = extent_px.height;
       if (iview->dim == MALI_TEXTURE_DIMENSION_3D)
-         cfg.depth = extent_px.depth;
+         cfg.depth = pan_image_view_3d_slice_count(iview);
       else
          cfg.sample_count = props->nr_samples;
       cfg.texel_interleave = (props->modifier != DRM_FORMAT_MOD_LINEAR) ||
@@ -1326,82 +1383,4 @@ GENX(pan_storage_texture_emit)(const struct pan_image_view *iview,
       cfg.swizzle = pan_translate_swizzle_4(rgba_swizzle);
    }
 }
-#endif
-
-#if PAN_ARCH >= 9
-
-void
-GENX(pan_buffer_texture_emit)(const struct pan_buffer_view *bview,
-                              struct mali_buffer_packed *out)
-{
-   unsigned stride = util_format_get_blocksize(bview->format);
-   struct MALI_INTERNAL_CONVERSION conv = {
-      .memory_format = GENX(pan_format_from_pipe_format)(bview->format)->hw,
-      .raw = false,
-   };
-
-   pan_pack(out, BUFFER, cfg) {
-      cfg.type = MALI_DESCRIPTOR_TYPE_BUFFER;
-      cfg.buffer_type = MALI_BUFFER_TYPE_STRUCTURE;
-      cfg.size = bview->width_el * stride;
-      cfg.address = bview->base;
-      cfg.stride = stride;
-      cfg.conversion = conv;
-   }
-}
-
-#elif PAN_ARCH >= 6
-
-void
-GENX(pan_buffer_texture_emit)(const struct pan_buffer_view *bview,
-                              struct mali_attribute_buffer_packed *out_buf,
-                              struct mali_attribute_packed *out_attrib)
-{
-   unsigned stride = util_format_get_blocksize(bview->format);
-   uint32_t hw_fmt = GENX(pan_format_from_pipe_format)(bview->format)->hw;
-
-   pan_pack(out_buf, ATTRIBUTE_BUFFER, cfg) {
-      cfg.type = MALI_ATTRIBUTE_TYPE_1D;
-      cfg.pointer = bview->base;
-      cfg.stride = stride;
-      cfg.size = bview->width_el * stride;
-   }
-
-   pan_pack(out_attrib, ATTRIBUTE, cfg) {
-      cfg.format = hw_fmt;
-      cfg.offset = bview->offset;
-      cfg.offset_enable = bview->offset != 0;
-   }
-}
-
-#else
-
-void
-GENX(pan_buffer_texture_emit)(const struct pan_buffer_view *bview,
-                              struct mali_texture_packed *out,
-                              const struct pan_ptr *payload)
-{
-   uint32_t mali_format = GENX(pan_format_from_pipe_format)(bview->format)->hw;
-   static const unsigned char rgba_swizzle[4] = {
-      PIPE_SWIZZLE_X,
-      PIPE_SWIZZLE_Y,
-      PIPE_SWIZZLE_Z,
-      PIPE_SWIZZLE_W,
-   };
-
-   pan_emit_bview_surface_with_stride(bview, payload->cpu);
-
-   pan_pack(out, TEXTURE, cfg) {
-      cfg.dimension = MALI_TEXTURE_DIMENSION_1D;
-      cfg.format = mali_format;
-      cfg.width = bview->width_el;
-      cfg.height = 1;
-      cfg.sample_count = 1;
-      cfg.swizzle = pan_translate_swizzle_4(rgba_swizzle);
-      cfg.texel_ordering = MALI_TEXTURE_LAYOUT_LINEAR;
-      cfg.levels = 1;
-      cfg.array_size = 1;
-   }
-}
-
 #endif

@@ -44,7 +44,7 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
                            const struct pipe_screen_config *config,
                            int fd)
 {
-   if (ac_query_gpu_info(fd, aws->dev, &aws->info, false) != AC_QUERY_GPU_INFO_SUCCESS) {
+   if (ac_query_gpu_info(fd, aws->dev, &aws->info, false, false) != AC_QUERY_GPU_INFO_SUCCESS) {
       mesa_loge("amdgpu: ac_query_gpu_info failed.\n");
       goto fail;
    }
@@ -57,7 +57,7 @@ static bool do_winsys_init(struct amdgpu_winsys *aws,
 
    aws->check_vm = strstr(debug_get_option("R600_DEBUG", ""), "check_vm") != NULL ||
                   strstr(debug_get_option("AMD_DEBUG", ""), "check_vm") != NULL;
-   aws->noop_cs = aws->info.family_overridden || debug_get_bool_option("RADEON_NOOP", false);
+   aws->noop_cs = debug_get_bool_option("RADEON_NOOP", false);
 #if MESA_DEBUG
    aws->debug_all_bos = debug_get_option_all_bos();
 #endif
@@ -353,9 +353,6 @@ amdgpu_cs_set_pstate(struct radeon_cmdbuf *rcs, enum radeon_ctx_pstate pstate)
 {
    struct amdgpu_cs *acs = amdgpu_cs(rcs);
 
-   if (!acs->aws->info.has_stable_pstate)
-      return false;
-
    uint32_t amdgpu_pstate = radeon_to_amdgpu_pstate(pstate);
    return ac_drm_cs_ctx_stable_pstate(acs->aws->dev, acs->ctx->ctx_handle,
       AMDGPU_CTX_OP_SET_STABLE_PSTATE, amdgpu_pstate, NULL) == 0;
@@ -416,6 +413,25 @@ amdgpu_winsys_create(int fd, const struct pipe_screen_config *config,
    /* Initialize the amdgpu device. This should always return the same pointer
     * for the same fd. */
    r = ac_drm_device_initialize(fd, is_virtio, &drm_major, &drm_minor, &dev);
+   if (r == -EACCES && drmGetNodeTypeFromFd(fd) != DRM_NODE_RENDER) {
+      char *render_device = drmGetRenderDeviceNameFromFd(fd);
+
+      if (render_device) {
+         int render_fd = open(render_device, O_RDWR | O_CLOEXEC);
+
+         if (render_fd >= 0) {
+            r = ac_drm_device_initialize(render_fd, is_virtio, &drm_major, &drm_minor, &dev);
+            close(render_fd);
+            if (r) {
+               mesa_logd("amdgpu: amd%s_device_initialize failed for %s\n",
+                         is_virtio ? "vgpu" : "gpu", render_device);
+            }
+         }
+
+         free(render_device);
+      }
+   }
+
    if (r) {
       mesa_loge("amdgpu: amd%s_device_initialize failed.\n", is_virtio ? "vgpu" : "gpu");
       goto fail;

@@ -15,17 +15,20 @@
 #define PVR_INSTANCE_H
 
 #include "vk_instance.h"
+#include "pvr_drirc.h"
 
 #include <stdint.h>
 
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 
 struct pvr_instance {
    struct vk_instance vk;
 
    uint32_t active_device_count;
 
-   uint8_t driver_build_sha[SHA1_DIGEST_LENGTH];
+   struct pvr_drirc drirc;
+
+   uint8_t driver_build_sha[BLAKE3_KEY_LEN];
 };
 
 VK_DEFINE_HANDLE_CASTS(pvr_instance,

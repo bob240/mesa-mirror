@@ -148,7 +148,9 @@ enum AluSrc {
 impl AluSrc {
     fn from_src(src: Option<&Src>) -> AluSrc {
         if let Some(src) = src {
-            assert!(src.src_swizzle.is_none());
+            assert!(
+                src.src_swizzle.is_none() || src.src_swizzle == SrcSwizzle::Yy
+            );
             // do not assert src_mod, can be encoded by opcode.
 
             match &src.src_ref {
@@ -299,7 +301,7 @@ impl SM20Encoder<'_> {
     }
 
     fn set_reg_src(&mut self, range: Range<usize>, src: &Src) {
-        assert!(src.src_swizzle.is_none());
+        assert!(src.src_swizzle.is_none() || src.src_swizzle == SrcSwizzle::Yy);
         self.set_reg_src_ref(range, &src.src_ref);
     }
 
@@ -1449,7 +1451,7 @@ impl SM20Op for OpF2F {
         e.set_field(23..25, (self.src_type.bits() / 8).ilog2());
         e.set_rnd_mode(49..51, self.rnd_mode);
         e.set_bit(55, self.ftz);
-        e.set_bit(56, self.high);
+        e.set_bit(56, self.src.src_swizzle == SrcSwizzle::Yy);
     }
 }
 
@@ -1468,7 +1470,7 @@ impl SM20Op for OpF2I {
         e.set_field(23..25, (self.src_type.bits() / 8).ilog2());
         e.set_rnd_mode(49..51, self.rnd_mode);
         e.set_bit(55, self.ftz);
-        e.set_bit(56, false); // .high
+        e.set_bit(56, self.src.src_swizzle == SrcSwizzle::Yy);
     }
 }
 
@@ -2309,6 +2311,8 @@ impl SM20Op for OpLd {
     }
 
     fn encode(&self, e: &mut SM20Encoder<'_>) {
+        assert_eq!(self.stride, OffsetStride::X1);
+        assert!(self.pred.is_true());
         match self.access.space {
             MemSpace::Global(addr_type) => {
                 e.set_opcode(SM20Unit::Mem, 0x20);
@@ -2388,6 +2392,7 @@ impl SM20Op for OpSt {
     }
 
     fn encode(&self, e: &mut SM20Encoder<'_>) {
+        assert_eq!(self.stride, OffsetStride::X1);
         match self.access.space {
             MemSpace::Global(addr_type) => {
                 e.set_opcode(SM20Unit::Mem, 0x24);
@@ -2472,6 +2477,7 @@ impl SM20Op for OpAtom {
             panic!("SM20 only supports global atomics");
         };
         assert!(addr_type == MemAddrType::A64);
+        assert_eq!(self.addr_stride, OffsetStride::X1);
 
         if self.dst.is_none() {
             e.set_opcode(SM20Unit::Mem, 0x1);
@@ -2494,7 +2500,7 @@ impl SM20Op for OpAtom {
         e.set_field(5..9, op);
 
         let typ = match self.atom_type {
-            AtomType::F16x2 => panic!("Unsupported atomic type"),
+            AtomType::F16v2 => panic!("Unsupported atomic type"),
             // AtomType::U8 => 0x0_u8,
             // AtomType::I8 => 0x1_u8,
             // AtomType::U16 => 0x2_u8,

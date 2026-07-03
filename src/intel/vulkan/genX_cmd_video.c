@@ -450,7 +450,8 @@ anv_h265_decode_video(struct anv_cmd_buffer *cmd_buffer,
       };
 
       indirect.HCPIndirectBitstreamObjectAccessUpperBound =
-         anv_address_add(src_buffer->address, align64(frame_info->srcBufferRange, 4096));
+         anv_address_add(src_buffer->address,
+                         align64(frame_info->srcBufferRange + frame_info->srcBufferOffset, 4096));
 
       indirect.HCPIndirectCUObjectMemoryAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
          .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
@@ -1346,41 +1347,563 @@ struct av1_refs_info {
    uint8_t frame_type;
    uint32_t frame_width;
    uint32_t frame_height;
+   uint32_t coded_width;       /* To handle super resolution */
    uint8_t default_cdf_index;
 };
 
 static int
 find_cdf_index(const struct anv_video_session *vid,
-               const struct av1_refs_info *refs_info,
                const struct anv_image_view *iv,
                uint32_t array_layer)
 {
-   for (uint32_t i = 0; i < STD_VIDEO_AV1_NUM_REF_FRAMES; i++) {
-      if (vid) {
-         if (!vid->prev_refs[i].iv)
-            continue;
+   for (uint32_t i = 0; i < ANV_VIDEO_AV1_MAX_DPB_SLOTS; i++) {
+      if (!vid->prev_refs[i].iv)
+         continue;
 
-         if (vid->prev_refs[i].iv == iv &&
-             vid->prev_refs[i].array_layer == array_layer)
-            return vid->prev_refs[i].default_cdf_index;
-      } else {
-         if (!refs_info[i].iv)
-            continue;
-
-         if (refs_info[i].iv == iv &&
-             refs_info[i].array_layer == array_layer)
-            return refs_info[i].default_cdf_index;
-      }
+      if (vid->prev_refs[i].iv == iv &&
+          vid->prev_refs[i].array_layer == array_layer)
+         return vid->prev_refs[i].default_cdf_index;
    }
 
    return 0;
 }
 
+#if INTEL_WA_1508208842_GFX_VER
+static void
+anv_av1_decode_dummy(struct anv_cmd_buffer *cmd_buffer)
+{
+   struct anv_video_session *vid = cmd_buffer->video.vid;
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(MI_FORCE_WAKEUP), wake) {
+      wake.HEVCPowerWellControl = true;
+      wake.MaskBits = 768;
+   }
+   anv_batch_emit(&cmd_buffer->batch, GENX(MI_FORCE_WAKEUP), wake) {
+      wake.HEVCPowerWellControl = true;
+      wake.MaskBits = 768;
+   }
+   anv_batch_emit(&cmd_buffer->batch, GENX(MI_FLUSH_DW), flush) {
+      flush.DWordLength = 2;
+      flush.VideoPipelineCacheInvalidate = 1;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_VD_CONTROL_STATE), vd) {
+      vd.VDControlState.PipelineInitialization = 1;
+   }
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_PIPE_MODE_SELECT), sel) {
+      sel.CodecSelect = Decode;
+      sel.MultiEngineMode = SingleEngineMode;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(MFX_WAIT), mfx) {
+      mfx.MFXSyncControlFlag = 1;
+   }
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_SURFACE_STATE), ss) {
+      ss.SurfaceFormat = AVP_PLANAR_420_8;
+      ss.SurfacePitchMinus1 = 127;
+      ss.YOffsetforUCb = 32;
+   };
+
+   bool use_internal_cache_mem = true;
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_PIPE_BUF_ADDR_STATE), buf) {
+      buf.DecodedOutputFrameBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+
+      buf.CurrentFrameMVWriteBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+
+      buf.IntraBCDecodedOutputFrameBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, buf.IntraBCDecodedOutputFrameBufferAddress.bo, 0),
+      };
+
+      if (use_internal_cache_mem) {
+         buf.BitstreamLineRowstoreBufferAddress = (struct anv_address) {
+            NULL,
+            btdl_cache_offset * 64
+         };
+
+         buf.BitstreamLineRowstoreBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1,
+         };
+      } else {
+         buf.BitstreamLineRowstoreBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_BITSTREAM_LINE_ROWSTORE].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_BITSTREAM_LINE_ROWSTORE].offset
+         };
+         buf.BitstreamLineRowstoreBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_BITSTREAM_LINE_ROWSTORE].mem->bo, 0),
+         };
+      }
+
+      buf.BitstreamTileLineRowstoreBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_BITSTREAM_TILE_LINE_ROWSTORE].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_BITSTREAM_TILE_LINE_ROWSTORE].offset
+      };
+
+      buf.BitstreamTileLineRowstoreBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_BITSTREAM_TILE_LINE_ROWSTORE].mem->bo, 0),
+      };
+
+      if (use_internal_cache_mem) {
+         buf.IntraPredictionLineRowstoreBufferAddress = (struct anv_address) {
+            NULL,
+            ipdl_cache_offset * 64
+         };
+         buf.IntraPredictionLineRowstoreBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1
+         };
+      } else {
+         buf.IntraPredictionLineRowstoreBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE].offset
+         };
+         buf.IntraPredictionLineRowstoreBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_LINE_ROWSTORE].mem->bo, 0),
+         };
+      }
+      buf.IntraPredictionTileLineRowstoreBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_TILE_LINE_ROWSTORE].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_TILE_LINE_ROWSTORE].offset
+      };
+
+      buf.IntraPredictionTileLineRowstoreBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_INTRA_PREDICTION_TILE_LINE_ROWSTORE].mem->bo, 0),
+      };
+
+      if (use_internal_cache_mem) {
+         buf.SpatialMotionVectorLineBufferAddress = (struct anv_address) {
+            NULL,
+            smvl_cache_offset * 64
+         };
+         buf.SpatialMotionVectorLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1
+         };
+      } else {
+         buf.SpatialMotionVectorLineBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_LINE].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_LINE].offset
+         };
+         buf.SpatialMotionVectorLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_LINE].mem->bo, 0),
+         };
+      }
+
+      buf.SpatialMotionVectorTileLineBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_TILE_LINE].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_TILE_LINE].offset
+      };
+
+      buf.SpatialMotionVectorTileLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_SPATIAL_MOTION_VECTOR_TILE_LINE].mem->bo, 0),
+      };
+
+      buf.LoopRestorationMetaTileColumnBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_META_TILE_COLUMN].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_META_TILE_COLUMN].offset
+      };
+      buf.LoopRestorationMetaTileColumnBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_META_TILE_COLUMN].mem->bo, 0),
+      };
+
+      buf.LoopRestorationFilterTileLineYBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_Y].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_Y].offset
+      };
+      buf.LoopRestorationFilterTileLineYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_Y].mem->bo, 0),
+      };
+
+      buf.LoopRestorationFilterTileLineUBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_U].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_U].offset
+      };
+
+      buf.LoopRestorationFilterTileLineUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_U].mem->bo, 0),
+      };
+
+      buf.LoopRestorationFilterTileLineVBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_V].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_V].offset
+      };
+
+      buf.LoopRestorationFilterTileLineVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_LINE_V].mem->bo, 0),
+      };
+
+      if (use_internal_cache_mem) {
+         buf.DeblockerFilterLineYBufferAddress = (struct anv_address) {
+            NULL,
+            dfly_cache_offset * 64
+         };
+         buf.DeblockerFilterLineYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1,
+         };
+      } else {
+         buf.DeblockerFilterLineYBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_Y].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_Y].offset
+         };
+         buf.DeblockerFilterLineYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_Y].mem->bo, 0),
+         };
+      }
+
+      if (use_internal_cache_mem) {
+         buf.DeblockerFilterLineUBufferAddress = (struct anv_address) {
+            NULL,
+            dflu_cache_offset * 64
+         };
+         buf.DeblockerFilterLineUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1,
+         };
+      } else {
+         buf.DeblockerFilterLineUBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_U].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_U].offset
+         };
+         buf.DeblockerFilterLineUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_U].mem->bo, 0),
+         };
+      }
+      if (use_internal_cache_mem) {
+         buf.DeblockerFilterLineVBufferAddress = (struct anv_address) {
+            NULL,
+            dflv_cache_offset * 64
+         };
+         buf.DeblockerFilterLineVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1,
+         };
+      } else {
+         buf.DeblockerFilterLineVBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_V].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_V].offset
+         };
+         buf.DeblockerFilterLineVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_LINE_V].mem->bo, 0),
+         };
+      }
+
+      buf.DeblockerFilterTileLineYBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_Y].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_Y].offset
+      };
+      buf.DeblockerFilterTileLineYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_Y].mem->bo, 0),
+      };
+
+      buf.DeblockerFilterTileLineUBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_U].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_U].offset
+      };
+
+      buf.DeblockerFilterTileLineUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_U].mem->bo, 0),
+      };
+
+      buf.DeblockerFilterTileLineVBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_V].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_V].offset
+      };
+      buf.DeblockerFilterTileLineVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_LINE_V].mem->bo, 0),
+      };
+
+      buf.DeblockerFilterTileColumnYBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_Y].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_Y].offset
+      };
+
+      buf.DeblockerFilterTileColumnYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_Y].mem->bo, 0),
+      };
+
+      buf.DeblockerFilterTileColumnUBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_U].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_U].offset
+      };
+
+      buf.DeblockerFilterTileColumnUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_U].mem->bo, 0),
+      };
+      buf.DeblockerFilterTileColumnVBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_V].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_V].offset
+      };
+      buf.DeblockerFilterTileColumnVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DEBLOCKER_FILTER_TILE_COLUMN_V].mem->bo, 0),
+      };
+
+      if (use_internal_cache_mem) {
+         buf.CDEFFilterLineBufferAddress = (struct anv_address) { NULL, cdef_cache_offset * 64};
+         buf.CDEFFilterLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+            .RowStoreScratchBufferCacheSelect = 1,
+         };
+      } else {
+         buf.CDEFFilterLineBufferAddress = (struct anv_address) {
+            vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_LINE].mem->bo,
+            vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_LINE].offset
+         };
+         buf.CDEFFilterLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+            .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_LINE].mem->bo, 0),
+         };
+      }
+
+      buf.CDEFFilterTileLineBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TILE_LINE].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TILE_LINE].offset
+      };
+      buf.CDEFFilterTileLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TILE_LINE].mem->bo, 0),
+      };
+
+      buf.CDEFFilterTileColumnBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TILE_COLUMN].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TILE_COLUMN].offset
+      };
+      buf.CDEFFilterTileColumnBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TILE_COLUMN].mem->bo, 0),
+      };
+
+      buf.CDEFFilterMetaTileLineBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_LINE].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_LINE].offset
+      };
+      buf.CDEFFilterMetaTileLineBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_LINE].mem->bo, 0),
+      };
+
+      buf.CDEFFilterMetaTileColumnBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_COLUMN].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_COLUMN].offset
+      };
+
+      buf.CDEFFilterMetaTileColumnBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_META_TILE_COLUMN].mem->bo, 0),
+      };
+
+      buf.CDEFFilterTopLeftCornerBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TOP_LEFT_CORNER].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TOP_LEFT_CORNER].offset
+      };
+      buf.CDEFFilterTopLeftCornerBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_CDEF_FILTER_TOP_LEFT_CORNER].mem->bo, 0),
+      };
+
+      buf.SuperResTileColumnYBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_Y].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_Y].offset
+      };
+      buf.SuperResTileColumnYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_Y].mem->bo, 0),
+      };
+
+      buf.SuperResTileColumnUBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_U].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_U].offset
+      };
+      buf.SuperResTileColumnUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_U].mem->bo, 0),
+      };
+
+      buf.SuperResTileColumnVBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_V].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_V].offset
+      };
+      buf.SuperResTileColumnVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_SUPER_RES_TILE_COLUMN_V].mem->bo, 0),
+      };
+
+      buf.LoopRestorationFilterTileColumnYBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_Y].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_Y].offset
+      };
+
+      buf.LoopRestorationFilterTileColumnYBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_Y].mem->bo, 0),
+      };
+
+      buf.LoopRestorationFilterTileColumnUBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_U].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_U].offset
+      };
+
+      buf.LoopRestorationFilterTileColumnUBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_U].mem->bo, 0),
+      };
+
+      buf.LoopRestorationFilterTileColumnVBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_V].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_V].offset
+      };
+      buf.LoopRestorationFilterTileColumnVBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_LOOP_RESTORATION_FILTER_TILE_COLUMN_V].mem->bo, 0),
+      };
+
+      buf.ReferencePictureAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+      buf.CollocatedMVTemporalBufferAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+
+      buf.CDFTablesInitializationBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_CDF_DEFAULTS_0 + 3].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_CDF_DEFAULTS_0 + 3].offset
+      };
+
+      buf.CDFTablesInitializationBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, buf.CDFTablesInitializationBufferAddress.bo, 0),
+      };
+
+      buf.CDFTablesBackwardAdaptationBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+      buf.AV1SegmentIDReadBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+      buf.AV1SegmentIDWriteBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+      buf.DecodedFrameStatusErrorBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+
+      buf.DecodedBlockDataStreamoutBufferAddress = (struct anv_address) {
+         vid->vid_mem[ANV_VID_MEM_AV1_DBD_BUFFER].mem->bo,
+         vid->vid_mem[ANV_VID_MEM_AV1_DBD_BUFFER].offset
+      };
+      buf.DecodedBlockDataStreamoutBufferAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, vid->vid_mem[ANV_VID_MEM_AV1_DBD_BUFFER].mem->bo, 0),
+      };
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_IND_OBJ_BASE_ADDR_STATE), ind) {
+      ind.AVPIndirectBitstreamObjectAddressAttributes = (struct GENX(MEMORYADDRESSATTRIBUTES)) {
+         .MOCS = anv_mocs(cmd_buffer->device, NULL, 0),
+      };
+   }
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_PIC_STATE), pic) {
+      pic.FrameWidth = 15;
+      pic.FrameHeight = 15;
+      pic.SequenceChromaSubSamplingFormat = SS_420;
+      pic.SequencePixelBitDepthIdc = SeqPix_8bit;
+      pic.SequenceEnableOrderHintFlag = true;
+      pic.SequenceOrderHintBitsMinus1 = 5;
+
+      pic.SequenceEnableFilterIntraFlag = true;
+      pic.SequenceEnableInterIntraCompoundFlag = true;
+      pic.SequenceEnableMaskedCompoundFlag = true;
+      pic.SequenceEnableJointCompoundFlag = true;
+
+      pic.AllowScreenContentToolsFlag = true;
+      pic.ForceIntegerMVFlag = true;
+      pic.UseCDEFFilterFlag = true;
+      pic.FrameLevelLoopRestorationFilterEnable = true;
+      pic.FrameType = 0;
+      pic.IntraOnlyFlag = true;
+      pic.PrimaryReferenceFrameIdx = 7;
+      pic.BaseQindex = 149;
+      pic.FrameTransformMode = 2;
+
+      pic.ReferenceFrameIdx0 = AV1_INTRA_FRAME;
+      pic.ReferenceFrameIdx1 = AV1_LAST_FRAME;
+      pic.ReferenceFrameIdx2 = AV1_LAST2_FRAME;
+      pic.ReferenceFrameIdx3 = AV1_LAST3_FRAME;
+      pic.ReferenceFrameIdx4 = AV1_GOLDEN_FRAME;
+      pic.ReferenceFrameIdx5 = AV1_BWDREF_FRAME;
+      pic.ReferenceFrameIdx6 = AV1_ALTREF2_FRAME;
+      pic.ReferenceFrameIdx7 = AV1_ALTREF_FRAME;
+
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_INTER_PRED_STATE), inter);
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_SEGMENT_STATE), seg) {
+      seg.SegmentLumaYQMLevel = 15;
+      seg.SegmentChromaUQMLevel = 15;
+      seg.SegmentChromaVQMLevel = 15;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_INLOOP_FILTER_STATE), fil) {
+      fil.LumaYDeblockerFilterLevelVertical = 46;
+      fil.LumaYDeblockerFilterLevelHorizontal = 50;
+
+      fil.ChromaUDeblockerFilterLevel = 52;
+      fil.ChromaVDeblockerFilterLevel = 11;
+
+      fil.DeblockerFilterSharpnessLevel = 2;
+
+      fil.DeblockerFilterRefDeltas0 = 1;
+      fil.DeblockerFilterRefDeltas4 = 63;
+      fil.DeblockerFilterRefDeltas6 = 63;
+      fil.DeblockerFilterRefDeltas7 = 63;
+
+      fil.CDEFYStrength0 = 2;
+      fil.CDEFYStrength1 = 48;
+      fil.CDEFBits = 1;
+      fil.CDEFFilterDmpaingFactorMinus3 = 3;
+
+      fil.CDEFUVStrength0 = 48;
+      fil.CDEFUVStrength1 = 2;
+
+      fil.SuperResUpscaledFrameWidthMinus1 = 15;
+      fil.SuperResDenom = 8;
+
+      fil.FrameLoopRestorationFilterChromaV = 1;
+      fil.LoopRestorationUnitSizeLumaY = 1;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_TILE_CODING), til) {
+      til.NumberofActiveBEPipes = 1;
+      til.IsLastTileofRowFlag = true;
+      til.IsLastTileofColumnFlag = true;
+      til.IsStartTileofTileGroupFlag = true;
+      til.IsEndTileofTileGroupFlag = true;
+      til.IsLastTileofFrameFlag = true;
+      til.DisableFrameContextUpdateFlag = true;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_BSD_OBJECT), bsd) {
+      bsd.TileIndirectBSDDataLength = 80;
+      bsd.TileIndirectDataStartAddress = 61;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(AVP_VD_CONTROL_STATE), vd) {
+      vd.VDControlState.MemoryImplicitFlush = 1;
+   };
+
+   anv_batch_emit(&cmd_buffer->batch, GENX(VD_PIPELINE_FLUSH), vd) {
+      vd.AVPPipelineDone = 1;
+      vd.VDCommandMessageParserDone = 1;
+      vd.AVPPipelineCommandFlush = 1;
+   };
+}
+#endif
+
 static void
 anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
                           const VkVideoDecodeInfoKHR *frame_info,
                           const StdVideoAV1SequenceHeader *seq_hdr,
-                          int tile_idx)
+                          int tile_idx,
+                          uint16_t *tile_col_start_sb,
+                          uint16_t *tile_row_start_sb)
 {
    ANV_FROM_HANDLE(anv_buffer, src_buffer, frame_info->srcBuffer);
    struct anv_video_session *vid = cmd_buffer->video.vid;
@@ -1458,6 +1981,8 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
    ref_info[AV1_INTRA_FRAME].array_layer = dpb_array_layer;
    ref_info[AV1_INTRA_FRAME].frame_width = frameExtent.width;
    ref_info[AV1_INTRA_FRAME].frame_height = frameExtent.height;
+   ref_info[AV1_INTRA_FRAME].coded_width = std_pic_info->flags.use_superres ?
+                                           downscaled_width : frameExtent.width;
 
    if (dpb_img && frame_info->referenceSlotCount) {
       ref_info[AV1_INTRA_FRAME].order_hint = std_pic_info->OrderHint;
@@ -1479,16 +2004,22 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
                vk_find_struct_const(frame_info->pReferenceSlots[j].pNext, VIDEO_DECODE_AV1_DPB_SLOT_INFO_KHR);
             const struct StdVideoDecodeAV1ReferenceInfo *std_ref_info = dpb_slot->pStdReferenceInfo;
 
+            assert (idx >= 0 && idx < ANV_VIDEO_AV1_MAX_DPB_SLOTS);
+
             ref_info[i + 1].idx = idx;
             ref_info[i + 1].frame_type = std_ref_info->frame_type;
             ref_info[i + 1].frame_width = frameExtent.width;
             ref_info[i + 1].frame_height = frameExtent.height;
+            ref_info[i + 1].coded_width = frameExtent.width;
+            /* Recover this reference's coded width from prev_refs */
+            if (vid->prev_refs[idx].coded_width)
+               ref_info[i + 1].coded_width = vid->prev_refs[idx].coded_width;
             ref_info[i + 1].iv = ref_iv;
             ref_info[i + 1].array_layer = ref_array_layer;
             ref_info[i + 1].order_hint = std_ref_info->OrderHint;
             memcpy(ref_info[i + 1].ref_order_hints, std_ref_info->SavedOrderHints, STD_VIDEO_AV1_NUM_REF_FRAMES);
             ref_info[i + 1].disable_frame_end_update_cdf = std_ref_info->flags.disable_frame_end_update_cdf;
-            ref_info[i + 1].default_cdf_index = find_cdf_index(vid, NULL, ref_iv, ref_array_layer);
+            ref_info[i + 1].default_cdf_index = find_cdf_index(vid, ref_iv, ref_array_layer);
          }
       }
    }
@@ -1949,7 +2480,7 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
 
             const struct anv_image_view *ref_iv = ref_info[std_pic_info->primary_ref_frame + 1].iv;
             const uint32_t ref_layer = ref_info[std_pic_info->primary_ref_frame + 1].array_layer;
-            cdf_index = find_cdf_index(vid, NULL, ref_iv, ref_layer);
+            cdf_index = find_cdf_index(vid, ref_iv, ref_layer);
          }
       }
 
@@ -2087,6 +2618,9 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
          std_pic_info->flags.use_ref_frame_mvs &&
          seq_hdr->order_hint_bits_minus_1 + 1) {
 
+      const uint32_t cur_cw = ref_info[AV1_INTRA_FRAME].coded_width;
+#define MFMV_SIZE_OK(R) (ref_info[(R)].coded_width == cur_cw)
+
       assert (seq_hdr->flags.enable_order_hint);
 
       int total = av1_mfmv_stack_size - 1;
@@ -2094,7 +2628,7 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
       if (ref_info[AV1_LAST_FRAME].ref_order_hints[AV1_ALTREF_FRAME - AV1_LAST_FRAME + 1] !=
           ref_info[AV1_GOLDEN_FRAME].order_hint) {
 
-         if (!frame_is_key_or_intra(ref_info[0 + 1].frame_type)) {
+         if (!frame_is_key_or_intra(ref_info[0 + 1].frame_type) && MFMV_SIZE_OK(AV1_LAST_FRAME)) {
             total = av1_mfmv_stack_size;
             mfmv_ref[num_mfmv++] = AV1_LAST_FRAME - AV1_LAST_FRAME;
          }
@@ -2103,14 +2637,16 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
       if (get_relative_dist(av1_pic_info, seq_hdr,
                             ref_info[AV1_BWDREF_FRAME].order_hint,
                             ref_info[AV1_INTRA_FRAME].order_hint) > 0 &&
-          !frame_is_key_or_intra(ref_info[AV1_BWDREF_FRAME - AV1_LAST_FRAME + 1].frame_type)) {
+          !frame_is_key_or_intra(ref_info[AV1_BWDREF_FRAME - AV1_LAST_FRAME + 1].frame_type) &&
+          MFMV_SIZE_OK(AV1_BWDREF_FRAME)) {
          mfmv_ref[num_mfmv++] = AV1_BWDREF_FRAME - AV1_LAST_FRAME;
       }
 
       if (get_relative_dist(av1_pic_info, seq_hdr,
                             ref_info[AV1_ALTREF2_FRAME].order_hint,
                             ref_info[AV1_INTRA_FRAME].order_hint) > 0 &&
-          !frame_is_key_or_intra(ref_info[AV1_ALTREF2_FRAME - AV1_LAST_FRAME + 1].frame_type)) {
+          !frame_is_key_or_intra(ref_info[AV1_ALTREF2_FRAME - AV1_LAST_FRAME + 1].frame_type) &&
+          MFMV_SIZE_OK(AV1_ALTREF2_FRAME)) {
          mfmv_ref[num_mfmv++] = AV1_ALTREF2_FRAME - AV1_LAST_FRAME;
       }
 
@@ -2118,14 +2654,17 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
           get_relative_dist(av1_pic_info, seq_hdr,
                             ref_info[AV1_ALTREF_FRAME].order_hint,
                             ref_info[AV1_INTRA_FRAME].order_hint) > 0 &&
-          !frame_is_key_or_intra(ref_info[AV1_ALTREF_FRAME - AV1_LAST_FRAME + 1].frame_type)) {
+          !frame_is_key_or_intra(ref_info[AV1_ALTREF_FRAME - AV1_LAST_FRAME + 1].frame_type) &&
+          MFMV_SIZE_OK(AV1_ALTREF_FRAME)) {
          mfmv_ref[num_mfmv++] = AV1_ALTREF_FRAME - AV1_LAST_FRAME;
       }
 
       if (num_mfmv < total &&
-          !frame_is_key_or_intra(ref_info[AV1_LAST2_FRAME - AV1_LAST_FRAME + 1].frame_type)) {
+          !frame_is_key_or_intra(ref_info[AV1_LAST2_FRAME - AV1_LAST_FRAME + 1].frame_type) &&
+          MFMV_SIZE_OK(AV1_LAST2_FRAME)) {
          mfmv_ref[num_mfmv++] = AV1_LAST2_FRAME - AV1_LAST_FRAME;
       }
+#undef MFMV_SIZE_OK
    }
 
    assert(num_mfmv <= 7);
@@ -2563,8 +3102,8 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
       til.FrameTileID = tile_idx;
       til.TGTileNum = tile_idx;
       til.TileGroupID = 0;
-      til.TileColumnPositioninSBUnit = std_pic_info->pTileInfo->pMiColStarts[column];
-      til.TileRowPositioninSBUnit = std_pic_info->pTileInfo->pMiRowStarts[row];
+      til.TileColumnPositioninSBUnit = tile_col_start_sb[column];
+      til.TileRowPositioninSBUnit = tile_row_start_sb[row];
       til.TileWidthinSBMinus1 = std_pic_info->pTileInfo->pWidthInSbsMinus1[column];
       til.TileHeightinSBMinus1 = std_pic_info->pTileInfo->pHeightInSbsMinus1[row];
       til.IsLastTileofRowFlag = column == std_pic_info->pTileInfo->TileCols - 1;
@@ -2599,21 +3138,77 @@ anv_av1_decode_video_tile(struct anv_cmd_buffer *cmd_buffer,
       }
    }
 
-   /* Set necessary info from current refs to the prev_refs */
-   for (int i = 0; i < STD_VIDEO_AV1_NUM_REF_FRAMES; ++i) {
-      vid->prev_refs[i].iv = ref_info[i].iv;
-      vid->prev_refs[i].array_layer = ref_info[i].array_layer;
-      vid->prev_refs[i].default_cdf_index =
-         i == 0 ? ref_info[i].default_cdf_index :
-                  find_cdf_index(NULL, ref_info, ref_info[i].iv,
-                                 ref_info[i].array_layer);
+   /* prev_refs is now indexed by DPB slot, so each entry holds the last
+    * frame written to that slot (used both in find_cdf_index
+    * and to keep coded width).
+    */
+   if (frame_info->pSetupReferenceSlot) {
+      int32_t slot = frame_info->pSetupReferenceSlot->slotIndex;
+      if (slot >= 0 && slot < ANV_VIDEO_AV1_MAX_DPB_SLOTS) {
+         vid->prev_refs[slot].iv = ref_info[AV1_INTRA_FRAME].iv;
+         vid->prev_refs[slot].array_layer = ref_info[AV1_INTRA_FRAME].array_layer;
+         vid->prev_refs[slot].coded_width = ref_info[AV1_INTRA_FRAME].coded_width;
+         vid->prev_refs[slot].default_cdf_index =
+            ref_info[AV1_INTRA_FRAME].default_cdf_index;
+      }
+   }
+}
+
+static void
+anv_av1_tiles_info(const VkVideoDecodeInfoKHR *frame_info,
+                   const StdVideoAV1SequenceHeader *seq_hdr,
+                   uint16_t (*tile_col_start_sb)[64],
+                   uint16_t (*tile_row_start_sb)[64])
+{
+   const VkVideoDecodeAV1PictureInfoKHR *av1_pic_info =
+      vk_find_struct_const(frame_info->pNext, VIDEO_DECODE_AV1_PICTURE_INFO_KHR);
+   const StdVideoDecodeAV1PictureInfo *std_pic_info = av1_pic_info->pStdPictureInfo;
+   VkExtent2D frameExtent = frame_info->dstPictureResource.codedExtent;
+
+   int denom = std_pic_info->coded_denom + 9;
+   unsigned downscaled_width = (frameExtent.width * 8 + denom / 2) / denom;
+   unsigned frame_width = std_pic_info->flags.use_superres ? downscaled_width : frameExtent.width;
+
+   unsigned tile_cols = std_pic_info->pTileInfo->TileCols;
+   unsigned tile_rows = std_pic_info->pTileInfo->TileRows;
+   unsigned i = 0;
+
+   if (std_pic_info->pTileInfo->flags.uniform_tile_spacing_flag) {
+      const uint16_t sb_size = seq_hdr->flags.use_128x128_superblock ? 128 : 64;
+      const uint16_t sb_width = DIV_ROUND_UP(frame_width, sb_size);
+      const uint16_t sb_height = DIV_ROUND_UP(frameExtent.height, sb_size);
+      const uint16_t tile_width_sb = DIV_ROUND_UP(sb_width, tile_cols);
+      const uint16_t tile_height_sb = DIV_ROUND_UP(sb_height, tile_rows);
+
+      (*tile_col_start_sb)[0] = 0;
+      for (i = 1; i < tile_cols; ++i)
+         (*tile_col_start_sb)[i] = (*tile_col_start_sb)[i - 1] + tile_width_sb;
+      (*tile_col_start_sb)[i] = sb_width;
+
+      (*tile_row_start_sb)[0] = 0;
+      for (i = 1; i < tile_rows; ++i)
+         (*tile_row_start_sb)[i] = (*tile_row_start_sb)[i - 1] + tile_height_sb;
+      (*tile_row_start_sb)[i] = sb_height;
+   } else {
+      (*tile_col_start_sb)[0] = 0;
+      assert(std_pic_info->pTileInfo->pMiColStarts[0] == 0);
+      for (i = 0; i < tile_cols; ++i)
+         (*tile_col_start_sb)[i + 1] = (*tile_col_start_sb)[i] +
+                                       std_pic_info->pTileInfo->pWidthInSbsMinus1[i] + 1;
+
+      (*tile_row_start_sb)[0] = 0;
+      assert(std_pic_info->pTileInfo->pMiRowStarts[0] == 0);
+      for (i = 0; i < tile_rows; ++i)
+         (*tile_row_start_sb)[i + 1] = (*tile_row_start_sb)[i] +
+                                       std_pic_info->pTileInfo->pHeightInSbsMinus1[i] + 1;
    }
 }
 
 static void
 anv_av1_calculate_xstep_qn(struct anv_cmd_buffer *cmd_buffer,
                            const VkVideoDecodeInfoKHR *frame_info,
-                           const StdVideoAV1SequenceHeader *seq_hdr)
+                           const StdVideoAV1SequenceHeader *seq_hdr,
+                           uint16_t *tile_col_start_sb)
 {
    const VkVideoDecodeAV1PictureInfoKHR *av1_pic_info =
       vk_find_struct_const(frame_info->pNext, VIDEO_DECODE_AV1_PICTURE_INFO_KHR);
@@ -2666,18 +3261,18 @@ anv_av1_calculate_xstep_qn(struct anv_cmd_buffer *cmd_buffer,
             chroma_x0_qn[j] = x0;
 
          if (!last_col) {
-            tile_col_end_sb = std_pic_info->pTileInfo->pMiColStarts[j + 1];
+            tile_col_end_sb = tile_col_start_sb[j + 1];
          } else {
-            tile_col_end_sb = std_pic_info->pTileInfo->pMiColStarts[tile_cols - 1] +
+            tile_col_end_sb = tile_col_start_sb[tile_cols - 1] +
                               std_pic_info->pTileInfo->pWidthInSbsMinus1[tile_cols - 1];
          }
 
 
-         int32_t mi_col_end = tile_col_end_sb >> mib_size_log2;
+         int32_t mi_col_end = tile_col_end_sb << mib_size_log2;
          mi_col_end = MIN2(mi_col_end, mi_cols);
 
          int32_t downscaled_x1 = mi_col_end << (av1_mi_size_log2 - ssx);
-         int32_t downscaled_x0 = std_pic_info->pTileInfo->pMiColStarts[j] << mib_size_log2 << (av1_mi_size_log2 - ssx);
+         int32_t downscaled_x0 = tile_col_start_sb[j] << mib_size_log2 << (av1_mi_size_log2 - ssx);
 
          int32_t src_w = downscaled_x1 - downscaled_x0;
          int32_t upscaled_x0 = (downscaled_x0 * denom) / 8;
@@ -2706,12 +3301,23 @@ anv_av1_decode_video(struct anv_cmd_buffer *cmd_buffer,
    struct vk_video_session_parameters *params = cmd_buffer->video.params;
    const StdVideoAV1SequenceHeader *seq_hdr;
 
+   uint16_t tile_col_start_sb[64] = { 0, };
+   uint16_t tile_row_start_sb[64] = { 0, };
+
    vk_video_get_av1_parameters(&vid->vk, params, frame_info, &seq_hdr);
 
-   anv_av1_calculate_xstep_qn(cmd_buffer, frame_info, seq_hdr);
+   anv_av1_tiles_info(frame_info, seq_hdr, &tile_col_start_sb, &tile_row_start_sb);
+   anv_av1_calculate_xstep_qn(cmd_buffer, frame_info, seq_hdr, tile_col_start_sb);
 
-   for (unsigned t = 0; t < av1_pic_info->tileCount; t++)
-      anv_av1_decode_video_tile(cmd_buffer, frame_info, seq_hdr, t);
+#if INTEL_WA_1508208842_GFX_VER
+   if (intel_needs_workaround(cmd_buffer->device->info, 1508208842))
+      anv_av1_decode_dummy(cmd_buffer);
+#endif
+
+   for (unsigned t = 0; t < av1_pic_info->tileCount; t++) {
+      anv_av1_decode_video_tile(cmd_buffer, frame_info, seq_hdr, t,
+                                tile_col_start_sb, tile_row_start_sb);
+   }
 }
 #endif
 
@@ -3342,12 +3948,6 @@ anv_vp9_decode_video(struct anv_cmd_buffer *cmd_buffer,
          pic.SegmentationUpdateMap = segmentation->flags.segmentation_update_map;
          pic.SegmentIDStreamOutEnable = pic.SegmentationUpdateMap;
 
-         if (!segmentation->flags.segmentation_update_map)
-            pic.SegmentIDStreamInEnable = true;
-         else if (segmentation->flags.segmentation_temporal_update)
-            pic.SegmentIDStreamInEnable = true;
-
-         pic.SegmentIDStreamOutEnable = segmentation->flags.segmentation_update_map;
          pic.SegmentIDStreamInEnable = !segmentation->flags.segmentation_update_map ||
                                        segmentation->flags.segmentation_temporal_update;
       }

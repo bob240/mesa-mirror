@@ -455,7 +455,7 @@ Core Mesa environment variables
 
    If set, overrides the global search-directories used when searching for
    drirc config files. The user-local one will still be used. Mostly useful for
-   internal debugging.
+   internal debugging. Multiple entries must be separated by ``:``.
 
 NIR passes environment variables
 --------------------------------
@@ -638,9 +638,6 @@ Intel driver environment variables
    ``sf``
       emit messages about the strips & fans unit (for old gens, includes
       the SF program)
-   ``shader-print``
-      allow developer print traces added by `brw_nir_printf` to be
-      printed out on the console
    ``soft64``
       enable implementation of software 64bit floating point support
    ``sparse``
@@ -915,8 +912,11 @@ Intel driver environment variables
 
 .. envvar:: MDA_OUTPUT_DIR
 
-   Directory where the mda.tar files generated when using INTEL_DEBUG=mda are
-   going to be written to.  If not set, use the current directory.
+   Directory where the mda.tar files generated when using INTEL_DEBUG=mda or ANV_DEBUG=shader-dump are
+   going to be written to. If set, use that directory. If not set, create and
+   use a ``NAME_PID_mda`` subdirectory, where ``NAME`` is the process name and
+   ``PID`` is the process ID. If directory creation fails, use the current
+   directory.
 
 .. envvar:: MDA_PREFIX
 
@@ -937,10 +937,12 @@ Anvil(ANV) driver environment variables
 
   ``bindless``
     Forces all descriptor sets to use the internal :ref:`Bindless model`
+  ``desc-dirty``
+    Print out what dirties descriptors
+  ``experimental``
+    Enable experimental features
   ``no-gpl``
     Disables `VK_KHR_graphics_pipeline_library` support
-  ``no-secondary-call``
-    Disables secondary command buffer calls
   ``no-sparse``
     Disables sparse support
   ``sparse-trtt``
@@ -953,6 +955,12 @@ Anvil(ANV) driver environment variables
     Emits dummy (MI_STORE_DATA_IMM) instructions containing the shader
     source hash, preceding shader programming instructions (internal
     shaders & ray-tracing shaders are omitted)
+  ``no-slab``
+    Disables the slab subsystem, which optimizes memory usage by allowing
+    application buffers to share GEM buffers.
+  ``shader-print``
+    Allow developer print traces added by `brw_nir_printf` to be
+    printed out on the console
 
    If defined to ``1`` or ``true``, this will prevent usage of self
    modifying command buffers to implement ``vkCmdExecuteCommands``. As
@@ -998,18 +1006,22 @@ Anvil(ANV) driver environment variables
    advertised queues to include 1 queue with compute-only support, and
    it would override the number of graphics+compute queues to be 0.
 
-.. envvar:: ANV_SPARSE
+.. envvar:: ANV_SYS_MEM_LIMIT
 
-   By default, the sparse resources feature is enabled. However, if set to 0,
-   false, or no, it will be disabled.
-   Platforms older than Tiger Lake do not support this feature.
+   Changes the amount of system memory that is available for graphics usage in
+   the Vulkan system memory heap. The variable accepts an integer from 10 to
+   100, which represents the percentage of system memory that will be used as
+   the host memory heap size. The default value is 75 if the system has more
+   than 4GB of system RAM, 50 otherwise.
 
-.. envvar:: ANV_SPARSE_USE_TRTT
+   Note that this memory is shared between the application's Vulkan allocations
+   and the system's general needs. If a value too close to 100 is set and fully
+   used, the driver may not have enough memory for its data structures and the
+   application may fail to perform system allocations (e.g., malloc()), which
+   may lead to errors or excessive memory swapping.
 
-   On platforms supported by Xe KMD (Lunar Lake and newer) this parameter
-   changes the implementation of sparse resources feature.
-   For i915 there is no option, sparse resources is always implemented with
-   TRTT.
+   This option can also be used to limit memory usage by memory-hungry
+   applications.
 
 Hasvk driver environment variables
 ---------------------------------------
@@ -1356,6 +1368,14 @@ LLVMpipe driver environment variables
    turns off threading completely. The default value is the number of
    CPU cores present.
 
+.. envvar:: LP_CONTEXT_RESET_FILE
+
+   a file path. If set, contexts using the LOSE_CONTEXT_ON_RESET strategy will
+   check it for the presence and modification time of a file and trigger an
+   emulated device reset if they were created before the last modification time.
+
+   Currently not available on Windows.
+
 VMware SVGA driver environment variables
 ----------------------------------------
 
@@ -1419,7 +1439,7 @@ RADV driver environment variables
    a comma-separated list of named flags, which do various things:
 
    ``llvm``
-      enable LLVM compiler backend
+      enable LLVM compiler backend. Only available in debug builds.
    ``allbos``
       force all allocated buffers to be referenced in submissions
    ``bo_history``
@@ -1437,6 +1457,9 @@ RADV driver environment variables
    ``forcecompress``
       Enables DCC,FMASK,CMASK,HTILE in situations where the driver supports it
       but normally does not deem it beneficial.
+   ``fullsync``
+      synchronize all pending work after all draws/dispatches (this includes
+      syncshaders but also flushes all caches)
    ``hang``
       enable GPU hangs detection and dump a report to
       $HOME/radv_dumps_<pid>_<time> if a GPU hang is detected
@@ -1450,8 +1473,6 @@ RADV driver environment variables
       disable dithering for alpha to coverage
    ``nobinning``
       disable primitive binning
-   ``nobolist``
-      disable the global BO list when no features require it
    ``nocache``
       disable shaders cache
    ``nocompute``
@@ -1485,6 +1506,8 @@ RADV driver environment variables
       don't mitigate SMEM memory access issues on GFX6-7
    ``notccompatcmask``
       disable TC-compat CMASK for MSAA surfaces
+   ``notmz``
+      disable TMZ (trusted memory zone) support
    ``noumr``
       disable UMR dumps during GPU hang detection (only with
       :envvar:`RADV_DEBUG` = ``hang``)
@@ -1543,6 +1566,28 @@ RADV driver environment variables
       Enable tracking of VA ranges for radv_build_is_valid_va.
    ``vm``
       add a gap between all VA allocations to check for page faults
+   ``nocachecompat``
+      disable changes to code generation which increases shader cache compatiblity
+      between devices
+   ``noheap``
+      disable VK_EXT_descriptor_heap
+
+.. envvar:: RADV_QUEUE_DISABLE
+
+   a comma-separated list of named queues to disable for testing purposes:
+
+   ``gfx``
+      disable the general/gfx queue
+   ``compute``
+      disable the compute queue
+   ``vdec``
+      disable the video decode queue
+   ``venc``
+      disable the video encode queue
+   ``transfer``
+      disable the transfer queue
+   ``sparse``
+      disable the sparse queue
 
 .. envvar:: RADV_FORCE_VRS
 
@@ -1565,15 +1610,14 @@ RADV driver environment variables
       enable DCC for MSAA images
    ``dmashaders``
       upload shaders to invisible VRAM (might be useful for non-resizable BAR systems)
-   ``emulate_rt``
-      forces ray-tracing to be emulated in software on GFX10_3+ and enables
-      rt extensions with older hardware.
    ``gewave32``
       enable wave32 for vertex/tess/geometry shaders (GFX10+)
-   ``hic``
-      enable experimental implementation of VK_EXT_host_image_copy (GFX10+)
    ``localbos``
       enable local BOs
+   ``lowlatencydec``
+      Enable low latency decoding
+   ``lowlatencyenc``
+      Enable low latency encoding
    ``nggc``
       enable NGG culling for GFX11+
    ``nircache``
@@ -1584,10 +1628,28 @@ RADV driver environment variables
       disable optimizations that get enabled when all VRAM is CPU visible.
    ``pswave32``
       enable wave32 for pixel shaders (GFX10+)
+   ``rtcps``
+      enable CPS lowering mode instead of function calls for RT
    ``rtwave64``
       enable wave64 for ray tracing shaders (GFX10+)
    ``sam``
       enable optimizations to move more driver internal objects to VRAM.
+
+   Note that bfloat16, emulate_rt, hic, sparse, transfer_queue, video_decode
+   and video_encode are deprecated and RADV_EXPERIMENTAL should be
+   used instead.
+
+.. envvar:: RADV_EXPERIMENTAL
+
+   a comma-separated list of named flags, which do various things:
+
+   ``bfloat16``
+      enable bfloat16 cooperative matrix support on GFX11-11.5
+   ``emulate_rt``
+      forces ray-tracing to be emulated in software on GFX10_3+ and enables
+      rt extensions with older hardware.
+   ``hic``
+      enable experimental implementation of VK_EXT_host_image_copy on GFX10
    ``sparse``
       enable experimental sparse binding and sparse residency on GPUs where we don't support it by default (pre Polaris)
    ``transfer_queue``
@@ -1604,7 +1666,7 @@ RADV driver environment variables
 .. envvar:: RADV_THREAD_TRACE_BUFFER_SIZE
 
    set the SQTT/RGP buffer size in bytes (default value is 32MiB, the buffer is
-   automatically resized if too small)
+   automatically resized if too small, except for per-submit captures)
 
 .. envvar:: RADV_THREAD_TRACE_CACHE_COUNTERS
 
@@ -1614,9 +1676,73 @@ RADV driver environment variables
 
    enable/disable SQTT/RGP instruction timing (enabled by default)
 
+.. envvar:: RADV_THREAD_TRACE_INSTRUCTION_TIMING_SE_MASK
+
+   set the SQTT/RGP instruction timing SE mask (default value is 0xFFFFFFFF,
+   which means all SE are included)
+
 .. envvar:: RADV_THREAD_TRACE_QUEUE_EVENTS
 
    enable/disable SQTT/RGP queue events (enabled by default)
+
+.. envvar:: RADV_CACHE_COUNTERS_BUFFER_SIZE
+
+   set the SQTT/RGP cache counters buffer size in bytes (default value is
+   32MiB, the buffer is automatically resized if too small, except for
+   per-submit captures)
+
+.. envvar:: RADV_SPM_COUNTERS_CONFIG
+
+   path to a config file listing custom SPM counters to collect when
+   capturing an RGP trace (``MESA_VK_TRACE=rgp``). Supported on
+   GFX10 and newer. The user is responsible for selecting block and
+   event IDs that are valid on the target ASIC.
+
+   File format (line-based)::
+
+      # comments start with '#'; C-style /* ... */ blocks are also allowed
+
+      [NAME]
+      # one or more HW counter lines:
+      COUNTER_NAME=BLOCK,EVENT_ID,INSTANCE,OP
+      ...
+
+   Section header:
+
+   * ``[NAME]`` opens a new group named ``NAME``.
+
+   ``NAME`` may optionally be wrapped in double or single quotes, which
+   lets it contain ``]`` or other characters that would otherwise be
+   reserved::
+
+      ["Memory (%)"]
+
+   HW counter line (``COUNTER_NAME=BLOCK,EVENT_ID,INSTANCE,OP``):
+
+   * ``BLOCK`` is the textual block name (e.g. ``SQ_WGP``, ``GL2C``).
+   * ``EVENT_ID`` is decimal or hex (``0x...``).
+   * ``INSTANCE`` is a decimal index or the keyword ``ALL`` to expand to
+     every hardware instance of the block.
+   * ``OP`` (``sum``, ``max`` or ``avg``) selects how the per-instance
+     values are aggregated for that counter. ``avg`` first sums the
+     per-instance values like ``sum`` and then divides by the number
+     of instances the line expanded to, which is useful when the
+     resulting value is later compared against a single-instance
+     baseline (e.g. ``CPF_PERF_SEL_STAT_BUSY``).
+
+   Each HW counter is auto-promoted to a pass-through derived item
+   shown in RGP under its group, with the same name as the counter.
+
+   Example (one group, one counter per HW instance)::
+
+      [Cache]
+      TCP_PERF_SEL_REQ=SQ_WGP,0x3,ALL,sum
+      TCP_PERF_SEL_REQ_MISS=SQ_WGP,0x12,ALL,sum
+      GL2C_PERF_SEL_REQ=GL2C,0x3,ALL,sum
+      GL2C_PERF_SEL_MISS=GL2C,0x2b,ALL,sum
+
+   Limits (per trace): up to 8 groups and 48 items total; up to 16
+   items per group.
 
 .. envvar:: RADV_TRAP_HANDLER
 
@@ -1741,6 +1867,8 @@ RadeonSI driver environment variables
       Disable DPBB. Overrules the dpbb enable option.
    ``noefc``
       Disable hardware based encoder color format conversion
+   ``lowlatencydec``
+      Enable low latency decoding
    ``lowlatencyenc``
       Enable low latency encoding
    ``notiling``
@@ -2135,6 +2263,21 @@ PowerVR driver environment variables
    ``no_pred_cf``
       No predicated execution in CF.
 
+   ``alloc_extra_vtxins``
+      Allocates additional vertex input registers.
+
+   ``int_smp``
+      Enable integer coordinate support for sampler instructions.
+
+   ``global_shmem``
+      Force spill shared memory to global memory.
+
+   ``ra_force_spill``
+      Force spilling of temps during register allocation.
+
+   ``ra_skip_opt``
+      Skip attempting to allocate temps with the optimal amount during RA.
+
 .. envvar:: PCO_SKIP_PASSES
 
    A comma-separated list of passes to skip.
@@ -2164,6 +2307,8 @@ PowerVR driver environment variables
       Print verbose IR.
    ``ra``
       Print register alloc info.
+   ``stats``
+      Print shader stats.
 
 .. envvar:: PCO_COLOR
 
@@ -2186,12 +2331,102 @@ i915 driver environment variables
 
    Dump all commands going to the hardware.
 
+Turnip driver environment variables
+-----------------------------------
+
+.. envvar:: TU_DEBUG
+
+   A comma-separated list of named flags for the Turnip driver:
+
+   ``nobin``
+      Disable hardware binning.
+   ``sysmem``
+      Force sysmem rendering.
+   ``gmem``
+      Force gmem rendering.
+   ``forcebin``
+      Force hardware binning.
+   ``noubwc``
+      Disable UBWC compression.
+   ``perfc``
+      Enable ``VK_KHR_performance_query`` support.
+   ``nolrz``
+      Disable LRZ.
+   ``nolrzfc``
+      Disable LRZ fast-clear.
+   ``flushall``
+      Flush all caches before each draw, dispatch, blit, etc.
+   ``syncdraw``
+      Wait for GPU to finish after each draw, dispatch, blit, etc.
+   ``rast_order``
+      Force enable rast order access as described in ``VK_EXT_rasterization_order_attachment_access``.
+   ``unaligned_store``
+      Force all GMEM stores to be unaligned.
+   ``dynamic``
+      Force translate old renderpasses into dynamic renderpasses.
+   ``3d_load``
+      Force GMEM loads via 3D engine.
+   ``fdm``
+      Force enable fragment density map for all renderpasses.
+   ``noconcurrentresolves``
+      Disable concurrent resolves.
+   ``noconcurrentunresolves``
+      Disable concurrent unresolves.
+   ``nobinmerging``
+      Disable bin merging (used for FDM).
+   ``perfcraw``
+      Enable raw performance counters.
+   ``fdmoffset``
+      Force enable FDM offset (set to 0).
+   ``check_cmd_buffer_status``
+      Check that command buffers are done executing on destruction.
+   ``nofdm``
+      Force disable FDM.
+   ``nocb``
+      Disable concurrent binning.
+   ``forcecb``
+      Force enable concurrent binning.
+
 Freedreno driver environment variables
 --------------------------------------
 
 .. envvar:: FD_MESA_DEBUG
 
    Debug flags for the Freedreno driver.
+
+IR3 shader debug environment variables
+--------------------------------------
+
+.. envvar:: IR3_SHADER_DEBUG
+
+   A comma-separated list of named flags for the IR3 shader compiler:
+
+   ``nouboopt``
+      Disable lowering UBO to uniform.
+   ``nofp16``
+      Don't lower mediump to fp16.
+   ``nocache``
+      Disable shader cache.
+   ``spillall``
+      Spill as much as possible to test the spiller.
+   ``nopreamble``
+      Disable the preamble pass.
+   ``fullsync``
+      Add (sy) + (ss) after each cat5/cat6.
+   ``fullnop``
+      Add nops before each instruction.
+   ``nopreamble``
+      Disable the preamble pass.
+   ``noearlypreamble``
+      Disable early preambles.
+   ``nodescprefetch``
+      Disable descriptor prefetch optimization.
+   ``expandrpt``
+      Expand rptN instructions.
+   ``noaliastex``
+      Don't use alias.tex
+   ``noaliasrt``
+      Don't use alias.rt
 
 ----
 

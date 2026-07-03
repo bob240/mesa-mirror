@@ -115,8 +115,6 @@ spec@arb_enhanced_layouts@linker@component-layout@vs-to-fs,Fail
 spec@arb_map_buffer_alignment@arb_map_buffer_alignment-map-invalidate-range,Fail
 spec@arb_occlusion_query@occlusion_query_order,Fail
 spec@arb_point_sprite@arb_point_sprite-interactions 1.0,Fail
-spec@arb_separate_shader_objects@400 combinations by location,Fail
-spec@arb_separate_shader_objects@400 combinations by name,Fail
 spec@arb_texture_rectangle@1-1-linear-texture,Fail
 spec@arb_timer_query@query gl_timestamp,Fail
 spec@arb_transform_feedback3@gl_skipcomponents1-1,Fail
@@ -130,8 +128,6 @@ spec@arb_transform_feedback3@gl_skipcomponents4,Fail
 spec@arb_transform_feedback_instanced@draw-auto instanced,Fail
 spec@arb_vertex_type_2_10_10_10_rev@attrib-p-type-size-match,Fail
 spec@egl 1.4@eglterminate then unbind context,Fail
-spec@egl_khr_gl_image@egl_khr_gl_renderbuffer_image-clear-shared-image gl_depth_component24,Fail
-spec@egl_khr_gl_image@egl_khr_gl_renderbuffer_image-clear-shared-image gl_rgba,Fail
 spec@egl_khr_surfaceless_context@viewport,Fail
 spec@egl_mesa_configless_context@basic,Fail
 spec@ext_framebuffer_object@fbo-alphatest-nocolor,Fail
@@ -238,6 +234,7 @@ spec@arb_uniform_buffer_object@execution@shared-array-struct-array-struct,Fail
 spec@arb_uniform_buffer_object@execution@std140-array-struct-array-struct,Fail
 
 # uprev Piglit in Mesa
+spec@!opengl 1.1@large-tex,Fail
 spec@arb_framebuffer_object@execution@msaa-alpha-to-coverage_alpha-to-one_write-z,Fail
 spec@arb_framebuffer_object@execution@msaa-alpha-to-coverage_alpha-to-one,Fail
 spec@arb_framebuffer_object@execution@msaa-alpha-to-one,Fail
@@ -391,7 +388,6 @@ dEQP-GLES31.functional.atomic_counter.get_branch.8_counters_1_call_10_threads,Fa
 dEQP-GLES31.functional.atomic_counter.get_branch.8_counters_5_calls_1_thread,Fail
 dEQP-GLES31.functional.atomic_counter.get_dec.1_counter_100_calls_1_thread,Fail
 dEQP-GLES31.functional.atomic_counter.get_dec.1_counter_1_call_10_threads,Fail
-dEQP-GLES31.functional.atomic_counter.get_dec.1_counter_1_call_1_thread,Fail
 dEQP-GLES31.functional.atomic_counter.get_dec.1_counter_1_call_5000_threads,Fail
 dEQP-GLES31.functional.atomic_counter.get_dec.1_counter_5_calls_1_thread,Fail
 dEQP-GLES31.functional.atomic_counter.get_dec.4_counters_1_call_10_threads,Fail
@@ -761,8 +757,10 @@ dEQP-GLES31.functional.shaders.builtin_functions.common.frexp.vec3_lowp_compute,
 dEQP-GLES31.functional.shaders.builtin_functions.common.frexp.vec4_mediump_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.intbitstofloat.int_highp_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.intbitstofloat.ivec3_highp_compute,Fail
+dEQP-GLES31.functional.shaders.builtin_functions.common.isinf.float_mediump_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.isinf.vec4_highp_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.isnan.float_highp_compute,Fail
+dEQP-GLES31.functional.shaders.builtin_functions.common.isnan.float_mediump_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.ldexp.float_highp_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.ldexp.float_mediump_compute,Fail
 dEQP-GLES31.functional.shaders.builtin_functions.common.ldexp.vec2_highp_compute,Fail

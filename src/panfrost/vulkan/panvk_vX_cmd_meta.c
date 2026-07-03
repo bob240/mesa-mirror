@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "panvk_buffer.h"
 #include "panvk_cmd_meta.h"
 #include "panvk_entrypoints.h"
 #include "panvk_meta.h"
@@ -51,6 +52,12 @@ meta_compute_start(struct panvk_cmd_buffer *cmdbuf,
    save_ctx->push_constants = cmdbuf->state.push_constants;
    save_ctx->cs.shader = cmdbuf->state.compute.shader;
    save_ctx->cs.desc = cmdbuf->state.compute.cs.desc;
+#if PAN_ARCH >= 10
+   save_ctx->cond_render_enabled = cmdbuf->state.cond_render.enabled;
+   save_ctx->cond_render_inherited = cmdbuf->state.cond_render.inherited;
+   cmdbuf->state.cond_render.enabled = false;
+   cmdbuf->state.cond_render.inherited = false;
+#endif
 
 #if PAN_ARCH >= 10
    panvk_per_arch(panvk_instr_begin_work)(PANVK_SUBQUEUE_COMPUTE, cmdbuf,
@@ -85,6 +92,10 @@ meta_compute_end(struct panvk_cmd_buffer *cmdbuf,
 
    cmdbuf->state.compute.shader = save_ctx->cs.shader;
    cmdbuf->state.compute.cs.desc = save_ctx->cs.desc;
+#if PAN_ARCH >= 10
+   cmdbuf->state.cond_render.enabled = save_ctx->cond_render_enabled;
+   cmdbuf->state.cond_render.inherited = save_ctx->cond_render_inherited;
+#endif
    compute_state_set_dirty(cmdbuf, CS);
    compute_state_set_dirty(cmdbuf, DESC_STATE);
 }
@@ -124,6 +135,12 @@ meta_gfx_start(struct panvk_cmd_buffer *cmdbuf,
    gfx_state_set_dirty(cmdbuf, OQ);
 
    cmdbuf->state.gfx.vk_meta = true;
+#if PAN_ARCH >= 10
+   save_ctx->cond_render_enabled = cmdbuf->state.cond_render.enabled;
+   save_ctx->cond_render_inherited = cmdbuf->state.cond_render.inherited;
+   cmdbuf->state.cond_render.enabled = false;
+   cmdbuf->state.cond_render.inherited = false;
+#endif
 
 #if PAN_ARCH >= 10
    panvk_per_arch(panvk_instr_begin_work)(PANVK_SUBQUEUE_VERTEX_TILER, cmdbuf,
@@ -195,6 +212,10 @@ meta_gfx_end(struct panvk_cmd_buffer *cmdbuf,
    gfx_state_set_dirty(cmdbuf, RENDER_STATE);
 
    cmdbuf->state.gfx.vk_meta = false;
+#if PAN_ARCH >= 10
+   cmdbuf->state.cond_render.enabled = save_ctx->cond_render_enabled;
+   cmdbuf->state.cond_render.inherited = save_ctx->cond_render_inherited;
+#endif
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -236,19 +257,31 @@ panvk_per_arch(CmdClearAttachments)(VkCommandBuffer commandBuffer,
    struct vk_meta_rendering_info render = {
       .view_mask = cmdbuf->state.gfx.render.view_mask,
       .samples = cmdbuf->state.gfx.render.fb.nr_samples,
-      .color_attachment_count = cmdbuf->state.gfx.render.fb.info.rt_count,
       .depth_attachment_format = cmdbuf->state.gfx.render.z_attachment.fmt,
       .stencil_attachment_format = cmdbuf->state.gfx.render.s_attachment.fmt,
    };
-   for (uint32_t i = 0; i < render.color_attachment_count; i++) {
-       render.color_attachment_formats[i] =
-          cmdbuf->state.gfx.render.color_attachments.fmts[i];
-       render.color_attachment_write_masks[i] =
-          VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+   for (uint32_t i = 0; i < MAX_RTS; i++) {
+      if (!(cmdbuf->state.gfx.render.bound_attachments &
+            MESA_VK_RP_ATTACHMENT_COLOR_BIT(i)))
+         continue;
+
+      render.color_attachment_count =
+         MAX2(render.color_attachment_count, i + 1);
+      render.color_attachment_formats[i] =
+         cmdbuf->state.gfx.render.color_attachments.fmts[i];
+      render.color_attachment_write_masks[i] =
+         VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
    }
 
    meta_gfx_start(cmdbuf, &save);
+#if PAN_ARCH >= 10
+   /* CmdClearAttachments IS affected by conditional rendering, so restore
+    * the state that meta_gfx_start disabled.
+    */
+   cmdbuf->state.cond_render.enabled = save.cond_render_enabled;
+   cmdbuf->state.cond_render.inherited = save.cond_render_inherited;
+#endif
    vk_meta_clear_attachments(&cmdbuf->vk, &dev->meta, &render, attachmentCount,
                              pAttachments, rectCount, pRects);
    meta_gfx_end(cmdbuf, &save);
@@ -437,13 +470,49 @@ panvk_per_arch(CmdFillBuffer)(VkCommandBuffer commandBuffer, VkBuffer dstBuffer,
                               uint32_t data)
 {
    VK_FROM_HANDLE(panvk_cmd_buffer, cmdbuf, commandBuffer);
-   struct panvk_device *dev = to_panvk_device(cmdbuf->vk.base.device);
-   struct panvk_cmd_meta_compute_save_ctx save = {0};
+   VK_FROM_HANDLE(panvk_buffer, buffer, dstBuffer);
+   struct panvk_physical_device *phys_dev =
+      to_panvk_physical_device(cmdbuf->vk.base.device->physical);
 
-   meta_compute_start(cmdbuf, &save);
-   vk_meta_fill_buffer(&cmdbuf->vk, &dev->meta, dstBuffer, dstOffset, fillSize,
-                       data);
-   meta_compute_end(cmdbuf, &save);
+   uint64_t addr = panvk_buffer_gpu_ptr(buffer, dstOffset);
+   uint64_t range = panvk_buffer_range(buffer, dstOffset, fillSize) & ~3ULL;
+   if (!range)
+      return;
+
+   const uint32_t max_wg = phys_dev->vk.properties.maxComputeWorkGroupCount[0];
+   struct panvk_precomp_ctx ctx = panvk_per_arch(precomp_cs)(cmdbuf);
+
+   const bool uint4_path =
+      util_is_aligned(addr, 16) && util_is_aligned(range, 16);
+   const uint32_t elem_size = uint4_path ? 16 : 4;
+   const uint32_t wg_bytes = 32 * elem_size;
+
+   while (range >= wg_bytes) {
+      const uint32_t wgs = MIN2(range / wg_bytes, max_wg);
+      const uint64_t bulk = (uint64_t)wgs * wg_bytes;
+
+      if (uint4_path) {
+         panlib_fill_uint4(&ctx, panlib_1d(wgs), PANLIB_BARRIER_NONE, addr,
+                           data, data, data, data);
+      } else {
+         panlib_fill(&ctx, panlib_1d(wgs), PANLIB_BARRIER_NONE, addr, data);
+      }
+
+      addr += bulk;
+      range -= bulk;
+   }
+
+   if (range) {
+      const uint32_t tail = range / elem_size;
+
+      if (uint4_path) {
+         panlib_fill_uint4_scalar(&ctx, panlib_1d(tail), PANLIB_BARRIER_NONE,
+                                  addr, data, data, data, data);
+      } else {
+         panlib_fill_scalar(&ctx, panlib_1d(tail), PANLIB_BARRIER_NONE, addr,
+                            data);
+      }
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -572,81 +641,10 @@ panvk_per_arch(CmdCopyImage2)(VkCommandBuffer commandBuffer,
    }
 }
 
-static bool
-panvk_image_has_afbc(struct panvk_image *img, VkImageSubresourceRange range)
-{
-   VkImageAspectFlags aspect_mask =
-      vk_image_expand_aspect_mask(&img->vk, range.aspectMask);
-   u_foreach_bit(aspect, aspect_mask) {
-      unsigned plane_index = panvk_plane_index(img, 1u << aspect);
-      struct panvk_image_plane *plane = &img->planes[plane_index];
-
-      if (drm_is_afbc(plane->image.props.modifier))
-         return true;
-   }
-
-   return false;
-}
-
-static bool
-panvk_acquire_unmodified(const VkImageMemoryBarrier2 *barrier)
-{
-   if (barrier->srcQueueFamilyIndex != VK_QUEUE_FAMILY_EXTERNAL &&
-       barrier->srcQueueFamilyIndex != VK_QUEUE_FAMILY_FOREIGN_EXT)
-      return false;
-
-   const VkExternalMemoryAcquireUnmodifiedEXT *acquire_unmodified =
-      vk_find_struct_const(barrier->pNext,
-                           EXTERNAL_MEMORY_ACQUIRE_UNMODIFIED_EXT);
-   return acquire_unmodified &&
-          acquire_unmodified->acquireUnmodifiedMemory == VK_TRUE;
-}
-
-/* TODO: pass less data than what's in a VkImageMemoryBarrier2 */
-
-struct panvk_image_layout_transition_handler {
-   void (*cmd)(VkCommandBuffer cmdbuf, const VkImageMemoryBarrier2 *barrier);
-   VkPipelineStageFlags2 stages;
-   VkAccessFlags2 access;
-};
-
-static struct panvk_image_layout_transition_handler
-panvk_get_image_layout_transition_handler(const VkImageMemoryBarrier2 *barrier)
-{
-   if (barrier->oldLayout == barrier->newLayout ||
-       panvk_acquire_unmodified(barrier))
-      return (struct panvk_image_layout_transition_handler){0};
-
-   return (struct panvk_image_layout_transition_handler){0};
-}
-
-void
-panvk_per_arch(transition_image_layout_sync_scope)(
-   const VkImageMemoryBarrier2 *barrier,
-   VkPipelineStageFlags2 *out_stages, VkAccessFlags2 *out_access)
-{
-   struct panvk_image_layout_transition_handler handler =
-      panvk_get_image_layout_transition_handler(barrier);
-
-   *out_stages = handler.stages;
-   *out_access = handler.access;
-}
-
-void
-panvk_per_arch(cmd_transition_image_layout)(
-   VkCommandBuffer cmdbuf, const VkImageMemoryBarrier2 *barrier)
-{
-   struct panvk_image_layout_transition_handler handler =
-      panvk_get_image_layout_transition_handler(barrier);
-
-   if (handler.cmd)
-      handler.cmd(cmdbuf, barrier);
-}
-
 void
 panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
 {
-   struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
+   struct pan_fb_layout *fb = &cmdbuf->state.gfx.render.fb.layout;
    bool needs_resolve = false;
 
    unsigned bound_atts = cmdbuf->state.gfx.render.bound_attachments;
@@ -738,12 +736,12 @@ panvk_per_arch(cmd_meta_resolve_attachments)(struct panvk_cmd_buffer *cmdbuf)
       .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
       .renderArea =
          {
-            .offset.x = fbinfo->draw_extent.minx,
-            .offset.y = fbinfo->draw_extent.miny,
+            .offset.x = fb->render_area_px.min_x,
+            .offset.y = fb->render_area_px.min_y,
             .extent.width =
-               fbinfo->draw_extent.maxx - fbinfo->draw_extent.minx + 1,
+               fb->render_area_px.max_x - fb->render_area_px.min_x + 1,
             .extent.height =
-               fbinfo->draw_extent.maxy - fbinfo->draw_extent.miny + 1,
+               fb->render_area_px.max_y - fb->render_area_px.min_y + 1,
          },
       .layerCount = cmdbuf->state.gfx.render.layer_count,
       .viewMask = cmdbuf->state.gfx.render.view_mask,

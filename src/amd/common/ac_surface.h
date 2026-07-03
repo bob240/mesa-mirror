@@ -8,7 +8,7 @@
 #define AC_SURFACE_H
 
 #include "amd_family.h"
-#include "util/format/u_format.h"
+#include "util/format/u_formats.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -219,7 +219,7 @@ struct gfx9_meta_equation {
    } u;
 };
 
-struct gfx12_hiz_his_layout {
+struct gfx12_hiz_layout {
    uint64_t offset;
    uint32_t size;
    uint16_t width_in_tiles;
@@ -307,7 +307,7 @@ struct gfx9_surf_layout {
          uint16_t stencil_epitch;   /* gfx9 only, not on gfx10 */
          uint8_t stencil_swizzle_mode;
 
-         struct gfx12_hiz_his_layout hiz, his;
+         struct gfx12_hiz_layout hiz;
 
          /* For HTILE VRS. (only Gfx103-Gfx11) */
          struct gfx9_meta_equation htile_equation;
@@ -558,6 +558,9 @@ struct ac_surface_copy_region {
 
    uint64_t mem_row_pitch;
    uint64_t mem_slice_pitch;
+
+   bool is_stencil_only;
+   bool memcpy;
 };
 
 bool ac_surface_copy_mem_to_surface(struct ac_addrlib *addrlib, const struct radeon_info *info,

@@ -122,12 +122,22 @@ VkResult pvr_CreateDescriptorSetLayout(
    uint32_t dynamic_buffer_count = 0;
    uint32_t descriptor_count = 0;
    VkResult result = VK_SUCCESS;
+   const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags_create_info =
+      NULL;
+   VkDescriptorBindingFlags *binding_flags = NULL;
 
    assert(pCreateInfo->sType ==
           VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
 
    vk_foreach_struct_const (ext, pCreateInfo->pNext) {
-      vk_debug_ignored_stype(ext->sType);
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO:
+         binding_flags_create_info =
+            (const VkDescriptorSetLayoutBindingFlagsCreateInfo *)ext;
+         break;
+      default:
+         vk_debug_ignored_stype(ext->sType);
+      }
    }
 
    for (unsigned u = 0; u < pCreateInfo->bindingCount; ++u) {
@@ -143,7 +153,9 @@ VkResult pvr_CreateDescriptorSetLayout(
 
    result = vk_create_sorted_bindings(pCreateInfo->pBindings,
                                       pCreateInfo->bindingCount,
-                                      &bindings);
+                                      &bindings,
+                                      binding_flags_create_info,
+                                      &binding_flags);
 
    if (result != VK_SUCCESS)
       return vk_error(device, result);
@@ -178,16 +190,6 @@ VkResult pvr_CreateDescriptorSetLayout(
    layout->immutable_sampler_count = immutable_sampler_count;
    layout->immutable_samplers = immutable_samplers;
 
-   const VkDescriptorSetLayoutBindingFlagsCreateInfo *binding_flags_create_info =
-      vk_find_struct_const(pCreateInfo->pNext,
-                           DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO);
-
-   if (binding_flags_create_info && !binding_flags_create_info->bindingCount)
-      binding_flags_create_info = NULL;
-
-   assert(!binding_flags_create_info ||
-          binding_flags_create_info->bindingCount == binding_count);
-
    unsigned dynamic_buffer_idx = 0;
    for (unsigned b = 0; b < pCreateInfo->bindingCount; ++b) {
       const VkDescriptorSetLayoutBinding *binding = &bindings[b];
@@ -214,9 +216,7 @@ VkResult pvr_CreateDescriptorSetLayout(
 
       layout_binding->type = binding->descriptorType;
 
-      layout_binding->flags = binding_flags_create_info
-                                 ? binding_flags_create_info->pBindingFlags[b]
-                                 : 0;
+      layout_binding->flags = binding_flags ? binding_flags[b] : 0;
 
       layout_binding->descriptor_count = binding->descriptorCount;
       layout_binding->stage_flags = binding->stageFlags;
@@ -240,6 +240,7 @@ VkResult pvr_CreateDescriptorSetLayout(
    assert(dynamic_buffer_count == dynamic_buffer_idx);
 
    free(bindings);
+   free(binding_flags);
 
    *pSetLayout = pvr_descriptor_set_layout_to_handle(layout);
 

@@ -29,8 +29,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #include "vk_debug.h"
 
-#include "build_helpers.h"
-#include "build_interface.h"
+#include "bvh_defines.h"
+#define VK_USED_BUILD_FLAGS RADV_ENCODE_TRIANGLES_GFX12_BUILD_FLAGS
+#include "bvh_helpers.h"
 #include "encode.h"
 #include "invocation_cluster.h"
 
@@ -44,7 +45,7 @@ layout(push_constant) uniform CONSTS
 void
 main()
 {
-   bool is_retry = VK_BUILD_FLAG(RADV_BUILD_FLAG_BATCH_COMPRESS_TRIANGLES_RETRY);
+   bool is_retry = RADV_TEST_BUILD_FLAG_BATCH_COMPRESS_TRIANGLES_RETRY;
 
    uint32_t global_id = gl_GlobalInvocationID.x;
 
@@ -328,9 +329,23 @@ main()
                vertex_used[i] = false;
          }
       } else {
-         uint32_t chosen_invocation =
-            findMSB(radv_ballot(cluster, !assigned && required_bit_size == min_required_bit_size));
-         if (cluster.invocation_index != chosen_invocation && !assigned) {
+         uint32_t candidate_mask = radv_ballot(cluster, !assigned && required_bit_size == min_required_bit_size);
+
+         /* Always choose a quad as the first node to make sure that a potential single triangle node will have the
+          * highest hw_node_index.
+          */
+         if (assigned_mask == 0) {
+            uint32_t quad_mask = radv_ballot(cluster, !assigned && pair_index_node_index1 != RADV_BVH_INVALID_NODE);
+            if (quad_mask != 0) {
+               uint32_t combined_mask = candidate_mask & quad_mask;
+               if (combined_mask != 0)
+                  candidate_mask = combined_mask;
+               else
+                  candidate_mask = quad_mask;
+            }
+         }
+
+         if (cluster.invocation_index != findMSB(candidate_mask) && !assigned) {
             vertex_indices = UNASSIGNED_VERTEX_INDICES;
             for (uint32_t i = 0; i < 6; i++)
                vertex_used[i] = false;

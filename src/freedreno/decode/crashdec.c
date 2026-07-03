@@ -33,6 +33,8 @@ static uint64_t fault_iova;
 static bool has_fault_iova;
 static int lookback = 20;
 
+static unsigned gmu_offset = 0;
+
 struct cffdec_options options = {
    .draw_filter = -1,
 };
@@ -427,7 +429,7 @@ valid_header(uint32_t pkt)
  * looks for "IB" type packets and logs the target cmdstream buffers.
  */
 static void
-parse_ibs(uint32_t *dwords, uint32_t sizedwords)
+parse_ibs(const uint32_t *dwords, uint32_t sizedwords)
 {
    int dwords_left = sizedwords;
    uint32_t count = 0; /* dword count including packet header */
@@ -691,7 +693,7 @@ decode_gmu_registers(void)
       reg_buf.regs[reg_buf.count].value = value;
       reg_buf.count++;
 
-      if (regacc_push(&r, offset / 4, value)) {
+      if (regacc_push(&r, (offset / 4) + gmu_offset, value)) {
          printf("\t%08"PRIx64"\t", r.value);
          dump_register(&r);
       }
@@ -1100,23 +1102,38 @@ decode(void)
    while ((line = popline())) {
       printf("%s", line);
       if (startswith(line, "kernel:")) {
+         unsigned major, minor;
          char *release = NULL;
 
          parseline(line, "kernel: %ms", &release);
          strncpy((char *)snapshot_linux.release, release, sizeof(snapshot_linux.release) - 1);
          free(release);
+
+         /* Extract the kernel version.  The offset of GMU regs was
+          * shifted in v6.19 as gen8 support was added.  For backwards
+          * compatibility with earlier kernels, we need to add an
+          * offset.
+          */
+         parseline(line, "kernel: %u.%u", &major, &minor);
+         if ((major < 6) || ((major == 6) && (minor < 19)))
+            gmu_offset = 0x1a800;
       } else if (startswith(line, "time:")) {
          double time;
 
          parseline(line, "time: %d", &time);
          snapshot_linux.seconds = (uint32_t)time;
       } else if (startswith(line, "revision:")) {
-         unsigned core, major, minor, patchid;
+         if (strstr(line, ".")) {
+            unsigned core, major, minor, patchid;
 
-         parseline(line, "revision: %u (%u.%u.%u.%u)", &options.dev_id.gpu_id,
-                   &core, &major, &minor, &patchid);
+            parseline(line, "revision: %u (%u.%u.%u.%u)", &options.dev_id.gpu_id,
+                      &core, &major, &minor, &patchid);
 
-         options.dev_id.chip_id = (core << 24) | (major << 16) | (minor << 8) | patchid;
+            options.dev_id.chip_id = (core << 24) | (major << 16) | (minor << 8) | patchid;
+         } else {
+            parseline(line, "revision: %u (%x)", &options.dev_id.gpu_id,
+                      &options.dev_id.chip_id);
+         }
          options.info = fd_dev_info_raw(&options.dev_id);
          if (!options.info) {
             printf("Unsupported device\n");
@@ -1276,6 +1293,10 @@ main(int argc, char **argv)
          break;
       case 'f':
          in = fopen(optarg, "r");
+         if (!in) {
+            perror("fopen");
+            return 1;
+         }
          break;
       case 'l':
          lookback = atoi(optarg);

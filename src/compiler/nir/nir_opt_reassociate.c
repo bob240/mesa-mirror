@@ -203,7 +203,7 @@ can_reassociate(nir_alu_instr *alu)
 
    return (props & NIR_OP_IS_2SRC_COMMUTATIVE) &&
           ((props & NIR_OP_IS_ASSOCIATIVE) ||
-           (!nir_alu_instr_is_exact(alu) && (props & NIR_OP_IS_INEXACT_ASSOCIATIVE)));
+           (!nir_alu_instr_no_reassoc(alu) && (props & NIR_OP_IS_INEXACT_ASSOCIATIVE)));
 }
 
 /*
@@ -227,6 +227,7 @@ build_chain(struct chain *c, nir_scalar def, unsigned reserved_count)
       unsigned reserved_plus_remaining = reserved_count + remaining;
 
       if (nir_scalar_is_alu(src) && nir_scalar_alu_op(src) == alu->op &&
+          can_reassociate(nir_def_as_alu(src.def)) &&
           list_is_singular(&src.def->uses) &&
           c->length + reserved_plus_remaining + 2 <= MAX_CHAIN_LENGTH) {
 

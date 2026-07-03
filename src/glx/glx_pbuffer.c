@@ -203,7 +203,7 @@ DestroyDRIDrawable(Display *dpy, GLXDrawable drawable)
 }
 
 /* TODO: delete these after more refactoring */
-#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL)
+#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL) && !defined(GLX_USE_WINDOWSGL)
 int
 dri3_get_buffer_age(__GLXDRIdrawable *pdraw);
 int
@@ -262,7 +262,7 @@ __glXGetDrawableAttribute(Display * dpy, GLXDrawable drawable,
    if (!opcode)
       return 0;
 
-#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL)
+#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL) && !defined(GLX_USE_WINDOWSGL)
    pdraw = GetGLXDRIDrawable(dpy, drawable);
 
    if (attribute == GLX_BACK_BUFFER_AGE_EXT) {
@@ -498,6 +498,7 @@ CreateDrawable(Display *dpy, struct glx_config *config,
       else
          glxCode = X_GLXDestroyWindow;
       protocolDestroyDrawable(dpy, xid, glxCode);
+      DestroyGLXDrawable(dpy, xid);
       xid = None;
    }
 
@@ -897,6 +898,7 @@ glXCreateWindow(Display * dpy, GLXFBConfig config, Window win,
    }
 
    if (visinfo->visualid != XVisualIDFromVisual(xwattr.visual)) {
+      free(visinfo);
       __glXSendError(dpy, BadMatch, 0, X_GLXCreateWindow, true);
       return None;
    }
@@ -1012,6 +1014,7 @@ glXCreateGLXPixmap(Display * dpy, XVisualInfo * vis, Pixmap pixmap)
       if (!CreateDRIDrawable(dpy, config, pixmap, xid, GLX_PIXMAP_BIT,
                              NULL, 0)) {
          protocolDestroyDrawable(dpy, xid, X_GLXDestroyGLXPixmap);
+         DestroyGLXDrawable(dpy, xid);
          xid = None;
       }
    } while (0);

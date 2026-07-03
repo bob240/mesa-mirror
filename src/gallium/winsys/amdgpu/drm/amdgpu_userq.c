@@ -7,6 +7,7 @@
 #include "amdgpu_bo.h"
 #include "amdgpu_cs.h"
 #include "ac_linux_drm.h"
+#include "ac_pm4.h"
 #include "sid.h"
 #include "util/log.h"
 
@@ -320,7 +321,7 @@ amdgpu_userq_submit_cs_preamble_ib_once(struct radeon_cmdbuf *rcs, struct ac_pm4
    amdgpu_pkt_add_dw(PKT3(PKT3_INDIRECT_BUFFER, 2, 0));
    amdgpu_pkt_add_dw(amdgpu_bo_get_va(userq->cs_preamble_ib_bo));
    amdgpu_pkt_add_dw(amdgpu_bo_get_va(userq->cs_preamble_ib_bo) >> 32);
-   amdgpu_pkt_add_dw(pm4->ndw | S_3F3_INHERIT_VMID_MQD_GFX(1));
+   amdgpu_pkt_add_dw(pm4->ndw | S_3F3_INHERIT_VMID_PFP(1));
    amdgpu_pkt_end();
 
    simple_mtx_unlock(&userq->lock);
@@ -367,7 +368,7 @@ amdgpu_userq_f32_init_reg_shadowing(struct radeon_cmdbuf *rcs, struct ac_pm4_sta
    amdgpu_pkt_add_dw(PKT3(PKT3_INDIRECT_BUFFER, 2, 0));
    amdgpu_pkt_add_dw(amdgpu_bo_get_va(userq->f32_shadowing_ib_bo));
    amdgpu_pkt_add_dw(amdgpu_bo_get_va(userq->f32_shadowing_ib_bo) >> 32);
-   amdgpu_pkt_add_dw(pm4->ndw | S_3F3_INHERIT_VMID_MQD_GFX(1));
+   amdgpu_pkt_add_dw(pm4->ndw | S_3F3_INHERIT_VMID_PFP(1));
    amdgpu_pkt_end();
 
    simple_mtx_unlock(&userq->lock);

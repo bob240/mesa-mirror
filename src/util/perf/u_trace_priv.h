@@ -39,6 +39,12 @@
 extern "C" {
 #endif
 
+enum u_tracepoint_type {
+   u_tracepoint_type_begin_range,
+   u_tracepoint_type_end_range,
+   u_tracepoint_type_marker,
+};
+
 /**
  * Tracepoint descriptor.
  */
@@ -63,6 +69,9 @@ struct u_tracepoint {
     * to event->set_stage_iid().
     */
    uint16_t tp_idx;
+
+   enum u_tracepoint_type type;
+
    void (*print)(FILE *out, const void *payload, const void *indirect);
    void (*print_json)(FILE *out, const void *payload, const void *indirect);
 #ifdef HAVE_PERFETTO
@@ -76,6 +85,9 @@ struct u_tracepoint {
                     const void *payload,
                     const void *indirect);
 #endif
+   uint32_t (*fuzzy_hash)(const void *key);
+   bool (*fuzzy_equals)(const void *a, const void *b);
+   void (*print_fuzzy_hash_args)(FILE *out, const void *payload);
 };
 
 /**

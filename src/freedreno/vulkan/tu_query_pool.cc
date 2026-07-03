@@ -7,23 +7,22 @@
  */
 
 #include "tu_query_pool.h"
+#include "perfcntrs/freedreno_perfcntr.h"
 
 #include <fcntl.h>
 
 #include "nir/nir_builder.h"
 #include "util/os_time.h"
-
 #include "vk_acceleration_structure.h"
 #include "vk_util.h"
 
+#include "bvh/tu_bvh_defines.h"
+#include "common/freedreno_gpu_event.h"
 #include "tu_buffer.h"
-#include "bvh/tu_build_interface.h"
 #include "tu_cmd_buffer.h"
 #include "tu_cs.h"
 #include "tu_device.h"
 #include "tu_rmv.h"
-
-#include "common/freedreno_gpu_event.h"
 
 #define NSEC_PER_SEC 1000000000ull
 #define WAIT_TIMEOUT 5
@@ -258,6 +257,27 @@ compare_perfcntr_pass(const void *a, const void *b)
           ((struct tu_perf_query_raw_data *)b)->pass;
 }
 
+static void
+tu_query_pool_destroy(struct tu_device *device, struct tu_query_pool *pool,
+                      const VkAllocationCallbacks *pAllocator)
+{
+   if (is_perf_query_raw(pool)) {
+      struct tu_perf_query_raw *perf_query = &pool->perf_query.raw;
+
+      for (uint32_t i = 0; i < perf_query->counter_index_count; i++)
+         fd_perfcntr_release(device->perfcntrs, perf_query->data[i].counter);
+   } else if (is_perf_query_raw(pool)) {
+      struct tu_perf_query_derived *perf_query = &pool->perf_query.derived;
+      struct fd_derived_counter_collection *collection = perf_query->collection;
+
+      fd_release_derived_counter_collection(device->perfcntrs, collection);
+   }
+
+   if (pool->bo)
+      tu_bo_finish(device, pool->bo);
+   vk_query_pool_destroy(&device->vk, pAllocator, &pool->vk);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateQueryPool(VkDevice _device,
                    const VkQueryPoolCreateInfo *pCreateInfo,
@@ -340,38 +360,25 @@ tu_CreateQueryPool(VkDevice _device,
 
       perf_query->counter_index_count = perf_query_info->counterIndexCount;
 
-      /* Build all perf counters data that is requested, so we could get
-       * correct group id, countable id, counter register and pass index with
-       * only a counter index provided by applications at each command submit.
-       *
-       * Also, since this built data will be sorted by pass index later, we
-       * should keep the original indices and store perfcntrs results according
-       * to them so apps can get correct results with their own indices.
-       */
-      uint32_t regs[perf_query->perf_group_count], pass[perf_query->perf_group_count];
-      memset(regs, 0x00, perf_query->perf_group_count * sizeof(regs[0]));
-      memset(pass, 0x00, perf_query->perf_group_count * sizeof(pass[0]));
-
       for (uint32_t i = 0; i < perf_query->counter_index_count; i++) {
          uint32_t gid = 0, cid = 0;
 
          perfcntr_index(perf_query->perf_group, perf_query->perf_group_count,
                         perf_query_info->pCounterIndices[i], &gid, &cid);
 
-         perf_query->data[i].gid = gid;
-         perf_query->data[i].cid = cid;
          perf_query->data[i].app_idx = i;
 
-         /* When a counter register is over the capacity(num_counters),
-          * reset it for next pass.
-          */
-         if (regs[gid] < perf_query->perf_group[gid].num_counters) {
-            perf_query->data[i].cntr_reg = regs[gid]++;
-            perf_query->data[i].pass = pass[gid];
-         } else {
-            perf_query->data[i].pass = ++pass[gid];
-            perf_query->data[i].cntr_reg = regs[gid] = 0;
-            regs[gid]++;
+         const struct fd_perfcntr_group *group = &perf_query->perf_group[gid];
+         const struct fd_perfcntr_countable *countable = &group->countables[cid];
+
+         perf_query->data[i].countable = countable;
+         perf_query->data[i].counter =
+            fd_perfcntr_reserve(device->perfcntrs, group, countable);
+
+         if (!perf_query->data[i].counter) {
+            tu_query_pool_destroy(device, pool, pAllocator);
+            return vk_errorf(device, VK_ERROR_FEATURE_NOT_PRESENT, "No raw perf counters available in group %s",
+                             group->name);
          }
       }
 
@@ -398,26 +405,22 @@ tu_CreateQueryPool(VkDevice _device,
          collection->counters[i] = perf_query->derived_counters[counter_index];
       }
 
-      fd_generate_derived_counter_collection(&device->physical_device->dev_id, collection);
+      fd_reserve_derived_counter_collection(device->perfcntrs, collection);
       slot_size += sizeof(struct perfcntr_query_slot) * collection->num_enabled_perfcntrs;
    }
 
    VkResult result = tu_bo_init_new_cached(device, &pool->vk.base, &pool->bo,
          pCreateInfo->queryCount * slot_size, TU_BO_ALLOC_NO_FLAGS, "query pool");
    if (result != VK_SUCCESS) {
-      vk_query_pool_destroy(&device->vk, pAllocator, &pool->vk);
+      tu_query_pool_destroy(device, pool, pAllocator);
       return result;
    }
 
    result = tu_bo_map(device, pool->bo, NULL);
    if (result != VK_SUCCESS) {
-      tu_bo_finish(device, pool->bo);
-      vk_query_pool_destroy(&device->vk, pAllocator, &pool->vk);
+      tu_query_pool_destroy(device, pool, pAllocator);
       return result;
    }
-
-   /* Initialize all query statuses to unavailable */
-   memset(pool->bo->map, 0, pool->bo->size);
 
    pool->size = pCreateInfo->queryCount;
    pool->query_stride = slot_size;
@@ -442,8 +445,7 @@ tu_DestroyQueryPool(VkDevice _device,
 
    TU_RMV(resource_destroy, device, pool);
 
-   tu_bo_finish(device, pool->bo);
-   vk_query_pool_destroy(&device->vk, pAllocator, &pool->vk);
+   tu_query_pool_destroy(device, pool, pAllocator);
 }
 
 static uint32_t
@@ -539,6 +541,18 @@ is_pipeline_query_with_compute_stage(uint32_t pipeline_statistics)
 {
    return pipeline_statistics &
           VK_QUERY_PIPELINE_STATISTIC_COMPUTE_SHADER_INVOCATIONS_BIT;
+}
+
+template <chip CHIP>
+static inline void
+emit_counter_barrier(struct tu_cs *cs)
+{
+   tu_cs_emit_wfi(cs);
+
+   if (CHIP >= A8XX) {
+      tu_cs_emit_pkt7(cs, CP_BARRIER, 1);
+      tu_cs_emit(cs, 1);
+   }
 }
 
 /* Wait on the the availability status of a query up until a timeout. */
@@ -662,10 +676,7 @@ get_query_pool_results(struct tu_device *device,
             }
 
             if (is_perf_query_raw(pool)) {
-               struct tu_perf_query_raw *perf_query = &pool->perf_query.raw;
-               struct tu_perf_query_raw_data *data = &perf_query->data[k];
-               VkPerformanceCounterStorageKHR storage =
-                  fd_perfcntr_type_to_vk_storage[perf_query->perf_group[data->gid].countables[data->cid].query_type];
+               VkPerformanceCounterStorageKHR storage = VK_PERFORMANCE_COUNTER_STORAGE_UINT64_KHR;
                write_performance_query_value_cpu(result_base, k, storage, result);
             } else if (is_perf_query_derived(pool)) {
                struct tu_perf_query_derived *perf_query = &pool->perf_query.derived;
@@ -1060,6 +1071,7 @@ emit_begin_occlusion_query(struct tu_cmd_buffer *cmdbuf,
     */
    struct tu_cs *cs = cmdbuf->state.pass ? &cmdbuf->draw_cs : &cmdbuf->cs;
    cmdbuf->state.occlusion_query_may_be_running = true;
+   cmdbuf->state.dirty |= TU_CMD_DIRTY_DISABLE_FS | TU_CMD_DIRTY_LRZ;
 
    uint64_t begin_iova = occlusion_query_iova(pool, query, begin);
 
@@ -1165,7 +1177,7 @@ emit_begin_stat_query(struct tu_cmd_buffer *cmdbuf,
       tu_emit_event_write<CHIP>(cmdbuf, cs, FD_START_COMPUTE_CTRS);
    }
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
    tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(IAVERTICES)) |
@@ -1174,12 +1186,13 @@ emit_begin_stat_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_qw(cs, begin_iova);
 }
 
+template <chip CHIP>
 static void
 emit_perfcntrs_pass_start(bool has_pred_bit, struct tu_cs *cs, uint32_t pass)
 {
    tu_cs_emit_pkt7(cs, CP_REG_TEST, 1);
    tu_cs_emit(cs, A6XX_CP_REG_TEST_0_REG(
-                        REG_A6XX_CP_SCRATCH(PERF_CNTRS_REG)) |
+                        tu_scratch_reg<CHIP>(PERF_CNTRS_REG).reg) |
                   A6XX_CP_REG_TEST_0_BIT(pass) |
                   (has_pred_bit ?
                      A6XX_CP_REG_TEST_0_PRED_BIT(TU_PREDICATE_PERFCNTRS) : 0) |
@@ -1222,13 +1235,13 @@ emit_begin_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
     *     stream below CP_COND_REG_EXEC.
     */
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    /* Keep preemption disabled for the duration of this query. This way
     * changes in perfcounter values should only apply to work done during
     * this query.
     */
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
       tu_cs_emit_pkt7(cs, CP_SCOPE_CNTL, 1);
       tu_cs_emit(cs, CP_SCOPE_CNTL_0(.disable_preemption = true,
                                      .scope = INTERRUPTS).value);
@@ -1242,21 +1255,23 @@ emit_begin_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
 
          if (data->pass != 0)
             tu_cond_exec_end(cs);
-         emit_perfcntrs_pass_start(has_pred_bit, cs, data->pass);
+         emit_perfcntrs_pass_start<CHIP>(has_pred_bit, cs, data->pass);
       }
 
-      const struct fd_perfcntr_counter *counter =
-            &perf_query->perf_group[data->gid].counters[data->cntr_reg];
-      const struct fd_perfcntr_countable *countable =
-            &perf_query->perf_group[data->gid].countables[data->cid];
+      tu_cs_emit_pkt4(cs, data->counter->select_reg, 1);
+      tu_cs_emit(cs, data->countable->selector);
 
-      tu_cs_emit_pkt4(cs, counter->select_reg, 1);
-      tu_cs_emit(cs, countable->selector);
+      for (unsigned s = 0; s < ARRAY_SIZE(data->counter->slice_select_regs); s++) {
+         if (!data->counter->slice_select_regs[s])
+            break;
+         tu_cs_emit_pkt4(cs, data->counter->slice_select_regs[s], 1);
+         tu_cs_emit(cs, data->countable->selector);
+      }
    }
    tu_cond_exec_end(cs);
 
    last_pass = ~0;
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    for (uint32_t i = 0; i < perf_query->counter_index_count; i++) {
       struct tu_perf_query_raw_data *data = &perf_query->data[i];
@@ -1266,11 +1281,10 @@ emit_begin_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
 
          if (data->pass != 0)
             tu_cond_exec_end(cs);
-         emit_perfcntrs_pass_start(has_pred_bit, cs, data->pass);
+         emit_perfcntrs_pass_start<CHIP>(has_pred_bit, cs, data->pass);
       }
 
-      const struct fd_perfcntr_counter *counter =
-            &perf_query->perf_group[data->gid].counters[data->cntr_reg];
+      const struct fd_perfcntr_counter *counter = data->counter;
 
       uint64_t begin_iova = perf_query_iova(pool, query, begin, data->app_idx);
 
@@ -1291,13 +1305,13 @@ emit_begin_perf_query_derived(struct tu_cmd_buffer *cmdbuf,
    struct tu_cs *cs = cmdbuf->state.pass ? &cmdbuf->draw_cs : &cmdbuf->cs;
    struct tu_perf_query_derived *perf_query = &pool->perf_query.derived;
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    /* Keep preemption disabled for the duration of this query. This way
     * changes in perfcounter values should only apply to work done during
     * this query.
     */
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
       tu_cs_emit_pkt7(cs, CP_SCOPE_CNTL, 1);
       tu_cs_emit(cs, CP_SCOPE_CNTL_0(.disable_preemption = true,
                                      .scope = INTERRUPTS).value);
@@ -1309,9 +1323,16 @@ emit_begin_perf_query_derived(struct tu_cmd_buffer *cmdbuf,
 
       tu_cs_emit_pkt4(cs, counter->select_reg, 1);
       tu_cs_emit(cs, countable);
+
+      for (unsigned s = 0; s < ARRAY_SIZE(counter->slice_select_regs); s++) {
+         if (!counter->slice_select_regs[s])
+            break;
+         tu_cs_emit_pkt4(cs, counter->slice_select_regs[s], 1);
+         tu_cs_emit(cs, countable);
+      }
    }
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    /* Collect the enabled perfcntrs. Emit CP_ALWAYS_COUNT collection last, if necessary. */
    for (uint32_t i = 0; i < perf_query->collection->num_enabled_perfcntrs; ++i) {
@@ -1383,7 +1404,7 @@ emit_begin_prim_generated_query(struct tu_cmd_buffer *cmdbuf,
 
    tu_emit_event_write<CHIP>(cmdbuf, cs, FD_START_PRIMITIVE_CTRS);
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
    tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(CINVOCATIONS)) |
@@ -1539,7 +1560,7 @@ emit_end_occlusion_query(struct tu_cmd_buffer *cmdbuf,
                                        .write_accum_sample_count_diff = true).value);
       tu_cs_emit_qw(cs, begin_iova);
 
-      tu_cs_emit_wfi(cs);
+      emit_counter_barrier<CHIP>(cs);
 
       if (cmdbuf->device->physical_device->info->props.has_generic_clear) {
          /* If the next renderpass uses the same depth attachment, clears it
@@ -1557,6 +1578,7 @@ emit_end_occlusion_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_qw(epilogue_cs, 0x1);
 
    cmdbuf->state.occlusion_query_may_be_running = false;
+   cmdbuf->state.dirty |= TU_CMD_DIRTY_DISABLE_FS | TU_CMD_DIRTY_LRZ;
 }
 
 /* PRIMITIVE_CTRS is used for two distinct queries:
@@ -1651,7 +1673,7 @@ emit_end_stat_query(struct tu_cmd_buffer *cmdbuf,
       tu_emit_event_write<CHIP>(cmdbuf, cs, FD_STOP_COMPUTE_CTRS);
    }
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
    tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(IAVERTICES)) |
@@ -1705,7 +1727,7 @@ emit_end_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
    /* Wait for the profiled work to finish so that collected counter values
     * are as accurate as possible.
     */
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    for (uint32_t i = 0; i < perf_query->counter_index_count; i++) {
       struct tu_perf_query_raw_data *data = &perf_query->data[i];
@@ -1715,11 +1737,10 @@ emit_end_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
 
          if (data->pass != 0)
             tu_cond_exec_end(cs);
-         emit_perfcntrs_pass_start(has_pred_bit, cs, data->pass);
+         emit_perfcntrs_pass_start<CHIP>(has_pred_bit, cs, data->pass);
       }
 
-      const struct fd_perfcntr_counter *counter =
-            &perf_query->perf_group[data->gid].counters[data->cntr_reg];
+      const struct fd_perfcntr_counter *counter = data->counter;
 
       end_iova = perf_query_iova(pool, query, end, data->app_idx);
 
@@ -1731,7 +1752,7 @@ emit_end_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
    tu_cond_exec_end(cs);
 
    last_pass = ~0;
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    for (uint32_t i = 0; i < perf_query->counter_index_count; i++) {
       struct tu_perf_query_raw_data *data = &perf_query->data[i];
@@ -1742,7 +1763,7 @@ emit_end_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
 
          if (data->pass != 0)
             tu_cond_exec_end(cs);
-         emit_perfcntrs_pass_start(has_pred_bit, cs, data->pass);
+         emit_perfcntrs_pass_start<CHIP>(has_pred_bit, cs, data->pass);
       }
 
       result_iova = query_result_iova(pool, query, struct perfcntr_query_slot,
@@ -1768,7 +1789,7 @@ emit_end_perf_query_raw(struct tu_cmd_buffer *cmdbuf,
    /* This reverts the preemption disablement done at the start
     * of the query.
     */
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
       tu_cs_emit_pkt7(cs, CP_SCOPE_CNTL, 1);
       tu_cs_emit(cs, CP_SCOPE_CNTL_0(.disable_preemption = false,
                                      .scope = INTERRUPTS).value);
@@ -1796,7 +1817,7 @@ emit_end_perf_query_derived(struct tu_cmd_buffer *cmdbuf,
    /* Wait for the profiled work to finish so that collected counter values
     * are as accurate as possible.
     */
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    /* Collect the enabled perfcntrs. Emit CP_ALWAYS_COUNT collection first, if necessary. */
    if (perf_query->collection->cp_always_count_enabled) {
@@ -1822,7 +1843,7 @@ emit_end_perf_query_derived(struct tu_cmd_buffer *cmdbuf,
       tu_cs_emit_qw(cs, end_iova);
    }
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    for (uint32_t i = 0; i < perf_query->collection->num_enabled_perfcntrs; ++i) {
       uint64_t result_iova = perf_query_derived_perfcntr_iova(pool, query, result, i);
@@ -1845,7 +1866,7 @@ emit_end_perf_query_derived(struct tu_cmd_buffer *cmdbuf,
    /* This reverts the preemption disablement done at the start
     * of the query.
     */
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
       tu_cs_emit_pkt7(cs, CP_SCOPE_CNTL, 1);
       tu_cs_emit(cs, CP_SCOPE_CNTL_0(.disable_preemption = false,
                                      .scope = INTERRUPTS).value);
@@ -1884,7 +1905,7 @@ emit_end_xfb_query(struct tu_cmd_buffer *cmdbuf,
    tu_cs_emit_regs(cs, VPC_SO_QUERY_BASE(CHIP, .qword = end_iova));
    tu_emit_event_write<CHIP>(cmdbuf, cs, FD_WRITE_PRIMITIVE_COUNTS);
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
    tu_emit_event_write<CHIP>(cmdbuf, cs, FD_CACHE_CLEAN);
 
    /* Set the count of written primitives */
@@ -1936,7 +1957,7 @@ emit_end_prim_generated_query(struct tu_cmd_buffer *cmdbuf,
                              CP_COND_REG_EXEC_0_BINNING);
    }
 
-   tu_cs_emit_wfi(cs);
+   emit_counter_barrier<CHIP>(cs);
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
    tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(COUNTER_REG(CINVOCATIONS)) |
@@ -2085,7 +2106,7 @@ tu_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
        * there's a better solution that allows all 48 bits of precision
        * because CP_EVENT_WRITE doesn't support 64-bit timestamps.
        */
-      tu_cs_emit_wfi(cs);
+      emit_counter_barrier<CHIP>(cs);
    }
 
    tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
@@ -2206,16 +2227,14 @@ tu_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
          for (int j = 0; j < group[i].num_countables; j++) {
             vk_outarray_append_typed(VkPerformanceCounterKHR, &out, counter) {
                counter->scope = VK_PERFORMANCE_COUNTER_SCOPE_COMMAND_BUFFER_KHR;
-               counter->unit =
-                     fd_perfcntr_type_to_vk_unit[group[i].countables[j].query_type];
-               counter->storage =
-                     fd_perfcntr_type_to_vk_storage[group[i].countables[j].query_type];
+               counter->unit = VK_PERFORMANCE_COUNTER_UNIT_GENERIC_KHR;
+               counter->storage = VK_PERFORMANCE_COUNTER_STORAGE_UINT64_KHR;
 
-               unsigned char sha1_result[SHA1_DIGEST_LENGTH];
-               _mesa_sha1_compute(group[i].countables[j].name,
+               unsigned char blake3_result[BLAKE3_KEY_LEN];
+               _mesa_blake3_compute(group[i].countables[j].name,
                                   strlen(group[i].countables[j].name),
-                                  sha1_result);
-               memcpy(counter->uuid, sha1_result, sizeof(counter->uuid));
+                                  blake3_result);
+               memcpy(counter->uuid, blake3_result, sizeof(counter->uuid));
             }
 
             vk_outarray_append_typed(VkPerformanceCounterDescriptionKHR, &out_desc, desc) {
@@ -2243,10 +2262,10 @@ tu_EnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR(
             counter->unit = fd_perfcntr_type_to_vk_unit[derived_counter->type];
             counter->storage = fd_perfcntr_type_to_vk_storage[derived_counter->type];
 
-            unsigned char sha1_result[SHA1_DIGEST_LENGTH];
-            _mesa_sha1_compute(derived_counter->name, strlen(derived_counter->name),
-                               sha1_result);
-            memcpy(counter->uuid, sha1_result, sizeof(counter->uuid));
+            unsigned char blake3_result[BLAKE3_KEY_LEN];
+            _mesa_blake3_compute(derived_counter->name, strlen(derived_counter->name),
+                               blake3_result);
+            memcpy(counter->uuid, blake3_result, sizeof(counter->uuid));
          }
 
          vk_outarray_append_typed(VkPerformanceCounterDescriptionKHR, &out_desc, desc) {
@@ -2288,7 +2307,14 @@ tu_GetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR(
       }
 
       for (uint32_t i = 0; i < group_count; i++) {
-         n_passes = DIV_ROUND_UP(counters_requested[i], group[i].num_counters);
+         /* Some counters may be unavailable at the time the query is
+          * created due to runtime factors (pps/fdperf using some counters,
+          * autotune or other queries, etc).  But we don't know that up
+          * front.
+          */
+         uint32_t available_counters = group[i].num_counters;
+
+         n_passes = DIV_ROUND_UP(counters_requested[i], available_counters);
          *pNumPasses = MAX2(*pNumPasses, n_passes);
       }
    } else {

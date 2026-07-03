@@ -7,10 +7,12 @@
  */
 
 #include "si_query.h"
+#include "gfx/si_gfx.h"
 #include "si_build_pm4.h"
 
 #include "amd/common/sid.h"
 #include "si_pipe.h"
+#include "ac_cmdbuf_cp.h"
 #include "util/os_time.h"
 #include "util/u_memory.h"
 #include "util/u_suballoc.h"
@@ -844,7 +846,7 @@ static void si_query_hw_do_emit_start(struct si_context *sctx, struct si_query_h
          /* Clear the emulated counter end value. We don't clear start because it's unused. */
          va += si_query_pipestat_end_dw_offset(sctx->screen, query->index) * 4;
 
-         ac_emit_cp_write_data_imm(&cs->current, V_370_PFP, va, 0);
+         ac_emit_cp_write_data_imm(&cs->current, V_371_PREFETCH_PARSER, va, 0);
 
          sctx->num_pipeline_stat_emulated_queries++;
       } else {
@@ -895,15 +897,12 @@ static void si_update_hw_pipeline_stats(struct si_context *sctx, unsigned type, 
       sctx->num_hw_pipestat_streamout_queries += diff;
 
       /* Enable/disable pipeline stats if we have any queries. */
-      if (diff == 1 && sctx->num_hw_pipestat_streamout_queries == 1) {
-         sctx->barrier_flags &= ~SI_BARRIER_EVENT_PIPELINESTAT_STOP;
-         sctx->barrier_flags |= SI_BARRIER_EVENT_PIPELINESTAT_START;
-         si_mark_atom_dirty(sctx, &sctx->atoms.s.barrier);
-      } else if (diff == -1 && sctx->num_hw_pipestat_streamout_queries == 0) {
-         sctx->barrier_flags &= ~SI_BARRIER_EVENT_PIPELINESTAT_START;
-         sctx->barrier_flags |= SI_BARRIER_EVENT_PIPELINESTAT_STOP;
-         si_mark_atom_dirty(sctx, &sctx->atoms.s.barrier);
-      }
+      if (diff == 1 && sctx->num_hw_pipestat_streamout_queries == 1)
+         si_clear_and_set_barrier_flags(sctx, SI_BARRIER_EVENT_PIPELINESTAT_STOP,
+                                        SI_BARRIER_EVENT_PIPELINESTAT_START);
+      else if (diff == -1 && sctx->num_hw_pipestat_streamout_queries == 0)
+         si_clear_and_set_barrier_flags(sctx, SI_BARRIER_EVENT_PIPELINESTAT_START,
+                                        SI_BARRIER_EVENT_PIPELINESTAT_STOP);
    }
 }
 
@@ -1086,7 +1085,7 @@ static void si_emit_query_predication(struct si_context *ctx, unsigned index)
       struct gfx11_sh_query *gfx10_query = (struct gfx11_sh_query *)query;
       struct gfx11_sh_query_buffer *qbuf, *first, *last;
 
-      op = PRED_OP(PREDICATION_OP_PRIMCOUNT);
+      op = S_201_PRED_OP(PREDICATION_OP_PRIMCOUNT);
 
       /* if true then invert, see GL_ARB_conditional_render_inverted */
       if (!invert)
@@ -1134,17 +1133,17 @@ static void si_emit_query_predication(struct si_context *ctx, unsigned index)
       struct si_query_buffer *qbuf;
 
       if (query->workaround_buf) {
-         op = PRED_OP(PREDICATION_OP_BOOL64);
+         op = S_201_PRED_OP(PREDICATION_OP_BOOL64);
       } else {
          switch (query->b.type) {
          case PIPE_QUERY_OCCLUSION_COUNTER:
          case PIPE_QUERY_OCCLUSION_PREDICATE:
          case PIPE_QUERY_OCCLUSION_PREDICATE_CONSERVATIVE:
-            op = PRED_OP(PREDICATION_OP_ZPASS);
+            op = S_201_PRED_OP(PREDICATION_OP_ZPASS);
             break;
          case PIPE_QUERY_SO_OVERFLOW_PREDICATE:
          case PIPE_QUERY_SO_OVERFLOW_ANY_PREDICATE:
-            op = PRED_OP(PREDICATION_OP_PRIMCOUNT);
+            op = S_201_PRED_OP(PREDICATION_OP_PRIMCOUNT);
             invert = !invert;
             break;
          default:
@@ -1610,9 +1609,8 @@ static void si_query_hw_get_result_resource(struct si_context *sctx, struct si_q
       break;
    }
 
-   sctx->barrier_flags |= SI_BARRIER_INV_SMEM | SI_BARRIER_INV_VMEM |
-                          (sctx->gfx_level <= GFX8 ? SI_BARRIER_INV_L2 : 0);
-   si_mark_atom_dirty(sctx, &sctx->atoms.s.barrier);
+   si_set_barrier_flags(sctx, SI_BARRIER_INV_SMEM | SI_BARRIER_INV_VMEM |
+                                 (sctx->gfx_level <= GFX8 ? SI_BARRIER_INV_L2 : 0));
 
    for (qbuf = &query->buffer; qbuf; qbuf = qbuf_prev) {
       if (query->b.type != PIPE_QUERY_TIMESTAMP) {
@@ -1708,10 +1706,8 @@ static void si_render_condition(struct pipe_context *ctx, struct pipe_query *que
 
          /* Settings this in the render cond atom is too late,
           * so set it here. */
-         if (sctx->gfx_level <= GFX8 || sctx->screen->info.cp_sdma_ge_use_system_memory_scope) {
-            sctx->barrier_flags |= SI_BARRIER_WB_L2 | SI_BARRIER_PFP_SYNC_ME;
-            si_mark_atom_dirty(sctx, &sctx->atoms.s.barrier);
-         }
+         if (sctx->gfx_level <= GFX8 || sctx->screen->info.cp_sdma_ge_use_system_memory_scope)
+            si_set_barrier_flags(sctx, SI_BARRIER_WB_L2 | SI_BARRIER_PFP_SYNC_ME);
 
          sctx->render_cond_enabled = old_render_cond_enabled;
       }

@@ -15,7 +15,7 @@
 #include "util/u_transfer.h"
 #include "util/u_blend.h"
 
-#include "tgsi/tgsi_parse.h"
+#include "nir/tgsi_to_nir.h"
 
 #include "util/detect.h"
 
@@ -30,7 +30,6 @@
 #include "r300_texture.h"
 #include "r300_vs.h"
 #include "compiler/r300_nir.h"
-#include "compiler/nir_to_rc.h"
 
 /* r300_state: Functions used to initialize state context by translating
  * Gallium state objects into semi-native r300 state objects. */
@@ -147,7 +146,8 @@ void r300_set_clip_discard_distance(struct r300_context *r300, float distance)
         r300->min_clip_discard_distance_watermark = MIN2(distance, 6.0f);
     }
 
-    float new_distance = MAX2(distance, r300->min_clip_discard_distance_watermark);
+    float new_distance = distance > 0.0f ?
+        MAX2(distance, r300->min_clip_discard_distance_watermark) : 0.0f;
 
     if (r300->current_clip_discard_distance != new_distance) {
         r300->current_clip_discard_distance = new_distance;
@@ -676,7 +676,6 @@ static void r300_set_blend_color(struct pipe_context* pipe,
         (struct r300_blend_color_state*)r300->blend_color_state.state;
     struct pipe_blend_color c;
     struct pipe_surface *cb;
-    float tmp;
     CB_LOCALS;
 
     state->state = *color; /* Save it, so that we can reuse it in set_fb_state */
@@ -705,13 +704,68 @@ static void r300_set_blend_color(struct pipe_context* pipe,
             c.color[2] = c.color[3];
             break;
 
+#if UTIL_ARCH_BIG_ENDIAN
+        case PIPE_FORMAT_A8R8G8B8_UNORM: {
+            /* A8R8G8B8 constant-color blending consumes the register lanes
+             * in a different order from pipe RGBA. Program the inverse
+             * order so GL_CONSTANT_COLOR sees pipe RGBA.
+             */
+            float r = c.color[0];
+            float g = c.color[1];
+            float b = c.color[2];
+            float a = c.color[3];
+            c.color[0] = g;
+            c.color[1] = r;
+            c.color[2] = a;
+            c.color[3] = b;
+            break;
+        }
+
         case PIPE_FORMAT_R8G8B8A8_UNORM:
         case PIPE_FORMAT_R8G8B8X8_UNORM:
         case PIPE_FORMAT_R10G10B10A2_UNORM:
-            tmp = c.color[0];
+        case PIPE_FORMAT_B5G6R5_UNORM: {
+            /* These formats consume constant-color register lanes in A,R,G,B
+             * order. Program the inverse order so constant blend factors see
+             * pipe RGBA/RGB.
+             */
+            float r = c.color[0];
+            float g = c.color[1];
+            float b = c.color[2];
+            float a = c.color[3];
+            c.color[0] = g;
+            c.color[1] = b;
+            c.color[2] = a;
+            c.color[3] = r;
+            break;
+        }
+
+        case PIPE_FORMAT_B5G5R5A1_UNORM:
+        case PIPE_FORMAT_B5G5R5X1_UNORM: {
+            /* 1555 colorbuffer blending consumes the constant color in
+             * colorbuffer-lane order. Match the B5G5R5* output swizzle so
+             * GL_CONSTANT_COLOR blending sees pipe RGBA.
+             */
+            float r = c.color[0];
+            float g = c.color[1];
+            float b = c.color[2];
+            float a = c.color[3];
+            c.color[0] = g;
+            c.color[1] = r;
+            c.color[2] = a;
+            c.color[3] = b;
+            break;
+        }
+#else
+        case PIPE_FORMAT_R8G8B8A8_UNORM:
+        case PIPE_FORMAT_R8G8B8X8_UNORM:
+        case PIPE_FORMAT_R10G10B10A2_UNORM: {
+            float tmp = c.color[0];
             c.color[0] = c.color[2];
             c.color[2] = tmp;
             break;
+        }
+#endif
 
         default:;
         }
@@ -980,6 +1034,10 @@ void r300_mark_fb_state_dirty(struct r300_context *r300,
         r300_mark_atom_dirty(r300, &r300->fb_state_pipelined);
     }
 
+    if (r300->query_current) {
+        r300_mark_atom_dirty(r300, &r300->query_start);
+    }
+
     /* Now compute the fb_state atom size. */
     r300->fb_state.size = 2 + (8 * state->nr_cbufs);
 
@@ -999,6 +1057,44 @@ void r300_mark_fb_state_dirty(struct r300_context *r300,
     }
 
     /* The size of the rest of atoms stays the same. */
+}
+
+void
+r300_framebuffer_init(struct pipe_context *pctx, const struct pipe_framebuffer_state *fb, struct pipe_surface **cbufs, struct pipe_surface **zsbuf)
+{
+   if (fb) {
+      for (unsigned i = 0; i < fb->nr_cbufs; i++) {
+         if (cbufs[i] && pipe_surface_equal(&fb->cbufs[i], cbufs[i]))
+            continue;
+
+         struct pipe_surface *psurf = fb->cbufs[i].texture ? r300_create_surface(pctx, fb->cbufs[i].texture, &fb->cbufs[i]) : NULL;
+         if (cbufs[i])
+            pipe_surface_unref(pctx, &cbufs[i], r300_surface_destroy);
+         cbufs[i] = psurf;
+      }
+
+      for (unsigned i = fb->nr_cbufs; i < PIPE_MAX_COLOR_BUFS; i++) {
+         if (cbufs[i])
+            pipe_surface_unref(pctx, &cbufs[i], r300_surface_destroy);
+         cbufs[i] = NULL;
+      }
+
+      if (*zsbuf && pipe_surface_equal(&fb->zsbuf, *zsbuf))
+         return;
+      struct pipe_surface *zsurf = fb->zsbuf.texture ? r300_create_surface(pctx, fb->zsbuf.texture, &fb->zsbuf) : NULL;
+      if (*zsbuf)
+         pipe_surface_unref(pctx, zsbuf, r300_surface_destroy);
+      *zsbuf = zsurf;
+   } else {
+      for (unsigned i = 0; i < PIPE_MAX_COLOR_BUFS; i++) {
+         if (cbufs[i])
+            pipe_surface_unref(pctx, &cbufs[i], r300_surface_destroy);
+         cbufs[i] = NULL;
+      }
+      if (*zsbuf)
+         pipe_surface_unref(pctx, zsbuf, r300_surface_destroy);
+      *zsbuf = NULL;
+   }
 }
 
 static void
@@ -1036,7 +1132,7 @@ r300_set_framebuffer_state(struct pipe_context* pipe,
             }
         } else {
             /* We don't bind another zbuffer, so lock the current one. */
-            pipe_surface_reference(&r300->locked_zbuffer, r300->fb_zsbuf);
+            pipe_surface_reference(&r300->locked_zbuffer, r300->fb_zsbuf, pipe, r300_surface_destroy);
         }
     } else if (r300->locked_zbuffer) {
         /* We have a locked zbuffer now, what are we gonna do? */
@@ -1059,7 +1155,7 @@ r300_set_framebuffer_state(struct pipe_context* pipe,
         r300_mark_atom_dirty(r300, &r300->dsa_state);
     }
 
-    util_framebuffer_init(pipe, state, r300->fb_cbufs, &r300->fb_zsbuf);
+    r300_framebuffer_init(pipe, state, r300->fb_cbufs, &r300->fb_zsbuf);
     util_copy_framebuffer_state(r300->fb_state.state, state);
 
     /* DXTC blits require that blocks are 2x1 or 4x1 pixels, but
@@ -1103,7 +1199,7 @@ r300_set_framebuffer_state(struct pipe_context* pipe,
     r300_set_blend_color(pipe, &((struct r300_blend_color_state*)r300->blend_color_state.state)->state);
 
     if (unlock_zbuffer) {
-        pipe_surface_reference(&r300->locked_zbuffer, NULL);
+        pipe_surface_reference(&r300->locked_zbuffer, NULL, pipe, r300_surface_destroy);
     }
 
     r300_mark_fb_state_dirty(r300, R300_CHANGED_FB_STATE);
@@ -1189,8 +1285,9 @@ static void* r300_create_fs_state(struct pipe_context* pipe,
         }
     } else {
        assert(fs->state.type == PIPE_SHADER_IR_TGSI);
-       /* we need to keep a local copy of the tokens */
-       fs->state.tokens = tgsi_dup_tokens(fs->state.tokens);
+       /* Convert to NIR. */
+       fs->state.ir.nir = tgsi_to_nir(fs->state.tokens, pipe->screen, false);
+       fs->state.type = PIPE_SHADER_IR_NIR;
     }
 
     /* Precompile the fragment shader at creation time to avoid jank at runtime.
@@ -1201,7 +1298,7 @@ static void* r300_create_fs_state(struct pipe_context* pipe,
 
     if (fs->state.type == PIPE_SHADER_IR_NIR) {
         /* Pick something for the shadow samplers so that we have somewhat reliable shader stats later. */
-        nir_foreach_function_impl(impl, shader->ir.nir) {
+        nir_foreach_function_impl(impl, fs->state.ir.nir) {
             nir_foreach_block_safe(block, impl) {
                 nir_foreach_instr_safe(instr, block) {
                     if (instr->type != nir_instr_type_tex)
@@ -1289,11 +1386,7 @@ static void r300_delete_fs_state(struct pipe_context* pipe, void* shader)
         free(tmp->error);
         FREE(tmp);
     }
-    if (fs->state.type == PIPE_SHADER_IR_NIR) {
-        ralloc_free(fs->state.ir.nir);
-    } else {
-        FREE((void*)fs->state.tokens);
-    }
+    ralloc_free(fs->state.ir.nir);
     FREE(shader);
 }
 
@@ -1503,8 +1596,8 @@ static void* r300_create_rs_state(struct pipe_context* pipe,
 
     /* Build the two command buffers for polygon offset setup. */
     if (polygon_offset_enable) {
-        float scale = state->offset_scale * 12;
-        float offset = state->offset_units * 4;
+        float scale = state->offset_scale * 16 * 12;
+        float offset = state->offset_units * 256 * 2;
 
         BEGIN_CB(rs->cb_poly_offset_zb16, 5);
         OUT_CB_REG_SEQ(R300_SU_POLY_OFFSET_FRONT_SCALE, 4);
@@ -1515,6 +1608,7 @@ static void* r300_create_rs_state(struct pipe_context* pipe,
         END_CB;
 
         offset = state->offset_units * 2;
+        scale = state->offset_scale * 12;
 
         BEGIN_CB(rs->cb_poly_offset_zb24, 5);
         OUT_CB_REG_SEQ(R300_SU_POLY_OFFSET_FRONT_SCALE, 4);
@@ -2054,7 +2148,8 @@ static void* r300_create_vertex_elements_state(struct pipe_context* pipe,
 
     /* R300 Programmable Stream Control (PSC) doesn't support 0 vertex elements. */
     if (!count) {
-        dummy_attrib.src_format = PIPE_FORMAT_R8G8B8A8_UNORM;
+        /* Keep the dummy format 32-bit so the big-endian VAP path accepts it. */
+        dummy_attrib.src_format = PIPE_FORMAT_R32_FLOAT;
         attribs = &dummy_attrib;
         count = 1;
     } else if (count > 16) {
@@ -2121,31 +2216,28 @@ static void* r300_create_vs_state(struct pipe_context* pipe,
     /* Copy state directly into shader. */
     vs->state = *shader;
 
-    if (vs->state.type == PIPE_SHADER_IR_NIR) {
-        r300_optimize_nir(shader->ir.nir, r300->screen);
+    /* Always convert TGSI input to NIR up front */
+    if (vs->state.type == PIPE_SHADER_IR_TGSI) {
+       vs->state.ir.nir = tgsi_to_nir(vs->state.tokens, pipe->screen, false);
+       vs->state.type = PIPE_SHADER_IR_NIR;
+    }
 
+    if (r300->screen->caps.has_tcl) {
+        r300_optimize_nir(vs->state.ir.nir, r300->screen);
         /* R300/R400 can not do any kind of control flow, so abort early here. */
-        if (!r300->screen->caps.is_r500 && r300->screen->caps.has_tcl) {
-            char *msg = r300_check_control_flow(shader->ir.nir);
+        if (!r300->screen->caps.is_r500) {
+            char *msg = r300_check_control_flow(vs->state.ir.nir);
             if (msg && shader->report_compile_error) {
                 fprintf(stderr, "r300 VP: Compiler error: %s\n", msg);
                 ((struct pipe_shader_state *)shader)->error_message = strdup(msg);
-                ralloc_free(shader->ir.nir);
+                ralloc_free(vs->state.ir.nir);
                 FREE(vs);
                 return NULL;
             }
         }
-
-       struct r300_fragment_program_external_state state = {};
-       vs->state.tokens = nir_to_rc(shader->ir.nir, pipe->screen, state);
-    } else {
-       assert(vs->state.type == PIPE_SHADER_IR_TGSI);
-       /* we need to keep a local copy of the tokens */
-       vs->state.tokens = tgsi_dup_tokens(vs->state.tokens);
     }
 
-    if (!vs->first)
-        vs->first = vs->shader = CALLOC_STRUCT(r300_vertex_shader_code);
+    vs->first = vs->shader = CALLOC_STRUCT(r300_vertex_shader_code);
     if (r300->screen->caps.has_tcl) {
         r300_translate_vertex_shader(r300, vs);
     } else {
@@ -2168,6 +2260,27 @@ static void* r300_create_vs_state(struct pipe_context* pipe,
     return vs;
 }
 
+void r300_mark_vs_code_dirty(struct r300_context *r300)
+{
+    struct r300_vertex_shader *vs = r300_vs(r300);
+    unsigned fc_op_dwords = r300->screen->caps.is_r500 ? 3 : 2;
+
+    r300_mark_atom_dirty(r300, &r300->vs_state);
+    r300->vs_state.size = vs->shader->code.length + 9 +
+            (R300_VS_MAX_FC_OPS * fc_op_dwords + 4);
+
+    r300_mark_atom_dirty(r300, &r300->vs_constants);
+    r300->vs_constants.size =
+            2 +
+            (vs->shader->externals_count ? vs->shader->externals_count * 4 + 3 : 0) +
+            (vs->shader->immediates_count ? vs->shader->immediates_count * 4 + 3 : 0);
+
+    ((struct r300_constant_buffer*)r300->vs_constants.state)->remap_table =
+            vs->shader->code.constants_remap_table;
+
+    r300_mark_atom_dirty(r300, &r300->pvs_flush);
+}
+
 static void r300_bind_vs_state(struct pipe_context* pipe, void* shader)
 {
     struct r300_context* r300 = r300_context(pipe);
@@ -2186,21 +2299,7 @@ static void r300_bind_vs_state(struct pipe_context* pipe, void* shader)
     r300_mark_atom_dirty(r300, &r300->rs_block_state); /* Will be updated before the emission. */
 
     if (r300->screen->caps.has_tcl) {
-        unsigned fc_op_dwords = r300->screen->caps.is_r500 ? 3 : 2;
-        r300_mark_atom_dirty(r300, &r300->vs_state);
-        r300->vs_state.size = vs->shader->code.length + 9 +
-			(R300_VS_MAX_FC_OPS * fc_op_dwords + 4);
-
-        r300_mark_atom_dirty(r300, &r300->vs_constants);
-        r300->vs_constants.size =
-                2 +
-                (vs->shader->externals_count ? vs->shader->externals_count * 4 + 3 : 0) +
-                (vs->shader->immediates_count ? vs->shader->immediates_count * 4 + 3 : 0);
-
-        ((struct r300_constant_buffer*)r300->vs_constants.state)->remap_table =
-                vs->shader->code.constants_remap_table;
-
-        r300_mark_atom_dirty(r300, &r300->pvs_flush);
+        r300_mark_vs_code_dirty(r300);
     } else {
         draw_bind_vertex_shader(r300->draw,
                 (struct draw_vertex_shader*)vs->draw_vs);
@@ -2224,9 +2323,10 @@ static void r300_delete_vs_state(struct pipe_context* pipe, void* shader)
     } else {
         draw_delete_vertex_shader(r300->draw,
                 (struct draw_vertex_shader*)vs->draw_vs);
+        FREE(vs->first);
     }
 
-    FREE((void*)vs->state.tokens);
+    ralloc_free(vs->state.ir.nir);
     FREE(shader);
 }
 

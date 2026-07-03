@@ -1,23 +1,6 @@
 /*
  * Copyright © 2017 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included
- * in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include <stdio.h>
@@ -128,21 +111,33 @@ can_fast_clear_color(struct iris_context *ice,
    if (!iris_is_color_fast_clear_compatible(ice, res->surf.format, color))
       return false;
 
-   /* The RENDER_SURFACE_STATE page for TGL says:
+   /* From the TGL PRM Vol. 9, "Render Target Fast Clear":
     *
-    *   For an 8 bpp surface with NUM_MULTISAMPLES = 1, Surface Width not
-    *   multiple of 64 pixels and more than 1 mip level in the view, Fast Clear
-    *   is not supported when AUX_CCS_E is set in this field.
+    *   SW needs to disable Render Target Fast clear for surface type = 2D,
+    *   surface format = 8 bpp, tile format = TYS pr TY, Mip is not aligned to
+    *   32x4 pixels
     *
-    * The granularity of a fast-clear is one CCS element. For an 8 bpp primary
-    * surface, this maps to 32px x 4rows. Due to the surface layout parameters,
-    * if LOD0's width isn't a multiple of 64px, LOD1 and LOD2+ will share CCS
-    * elements. Assuming LOD2 exists, don't fast-clear any level above LOD0
-    * to avoid stomping on other LODs.
+    * This can also be found in the ACM PRMs and it seems to be applicable
+    * according to test results.
     */
-   if (level > 0 && util_format_get_blocksizebits(p_res->format) == 8 &&
-       p_res->width0 % 64) {
-      return false;
+   if (util_format_get_blocksizebits(p_res->format) == 8) {
+      if (level - res->surf.miptail_start_level >= 5) {
+         /* If miptails are in use, avoid using slot 5 or anything afterwards.
+          * According to icl_std_y_2d_miptail_offset_el[], this slot offsets
+          * 16 pixels into the miptail.
+          */
+         return false;
+      }
+
+      if (level > 0 && p_res->width0 % 64 &&
+          res->surf.image_alignment_el.w % 32) {
+         /* The granularity of a fast-clear is one CCS element. For an 8 bpp
+          * primary surface, this maps to 32px x 4rows.  Due to the surface
+          * layout parameters, if LOD0's width isn't a multiple of 64px, LOD1
+          * and LOD2+ will share CCS elements.
+          */
+         return false;
+      }
    }
 
    /* Wa_18020603990 - slow clear surfaces up to 256x256, 32bpp. */
@@ -151,6 +146,24 @@ can_fast_clear_color(struct iris_context *ice,
           res->surf.logical_level0_px.w <= 256 &&
           res->surf.logical_level0_px.h <= 256)
          return false;
+   }
+
+   /* BSpec 46969 (r45602) tells us that we get no fast-clears for 3D:
+    *
+    *   3D/Volumetric surfaces do not support Fast Clear operation.
+    *
+    * BLORP has a workaround for Y-tiled surfaces, but not Ys-tiled ones. If
+    * the entire surface is being cleared, we could teach BLORP to clear it.
+    * For now, just keep things simple and reject fast clears. HW doesn't
+    * support compression on 64bpp+ formats anyway and iris doesn't enable
+    * compression for 32bpp formats.
+    */
+   if (devinfo->verx10 == 120 &&
+       res->surf.tiling == ISL_TILING_ICL_Ys &&
+       res->surf.dim == ISL_SURF_DIM_3D) {
+      assert(isl_format_get_layout(res->surf.format)->bpb <= 16);
+      perf_debug(&ice->dbg, "Ys + 3D on gfx12.0. Slow clearing surface.");
+      return false;
    }
 
    /* On gfx12.0, CCS fast clears don't seem to cover the correct portion of
@@ -353,17 +366,38 @@ fast_clear_color(struct iris_context *ice,
                                  PIPE_CONTROL_RENDER_TARGET_FLUSH);
    }
 
-   /* Update the clear color now that previous rendering is complete. */
-   if (color_changed && res->aux.clear_color_bo)
-      iris_resource_update_indirect_color(batch, res);
+   if (color_changed) {
+      if (devinfo->ver <= 12) {
+         /* A new clear color may require partial resolves later on. */
+         ice->state.dirty |= IRIS_DIRTY_RENDER_RESOLVES_AND_FLUSHES |
+                             IRIS_DIRTY_COMPUTE_RESOLVES_AND_FLUSHES;
+         ice->state.stage_dirty |= IRIS_ALL_STAGE_DIRTY_BINDINGS;
+      }
 
-   /* If the buffer is already in ISL_AUX_STATE_CLEAR, the clear is redundant
-    * and can be skipped.
+      if (devinfo->ver >= 20) {
+         /* The clear pixel is updated by hardware during fast clears. */
+         assert(batch->screen->isl_dev.ss.clear_color_state_size == 0);
+         assert(batch->screen->isl_dev.ss.clear_value_size == 0);
+      } else if (devinfo->ver >= 11) {
+         /* Update dwords used for rendering and sampling. */
+         assert(batch->screen->isl_dev.ss.clear_color_state_size > 0);
+         iris_resource_update_indirect_color(batch, res);
+      } else {
+         /* We've flagged surface states with inline clear colors as dirty. */
+         assert(batch->screen->isl_dev.ss.clear_value_size > 0);
+         assert(ice->state.stage_dirty & IRIS_ALL_STAGE_DIRTY_BINDINGS);
+      }
+   }
+
+   /* If the clear color is up-to-date and the buffer is already in
+    * ISL_AUX_STATE_CLEAR, the clear is redundant and can be skipped.
     */
    const enum isl_aux_state aux_state =
       iris_resource_get_aux_state(res, level, box->z);
-   if (box->depth == 1 && aux_state == ISL_AUX_STATE_CLEAR)
+   if ((devinfo->ver < 20 || !color_changed) &&
+       box->depth == 1 && aux_state == ISL_AUX_STATE_CLEAR) {
       return;
+   }
 
    iris_batch_sync_region_start(batch);
 
@@ -434,13 +468,10 @@ fast_clear_color(struct iris_context *ice,
 
    iris_batch_sync_region_end(batch);
 
-   iris_resource_set_aux_state(ice, res, level, box->z,
-                               box->depth, devinfo->ver < 20 ?
+   iris_resource_set_aux_state(ice, res, level, box->z, box->depth,
+                               devinfo->ver < 20 || res->surf.samples > 1 ?
                                ISL_AUX_STATE_CLEAR :
                                ISL_AUX_STATE_COMPRESSED_NO_CLEAR);
-   ice->state.dirty |= IRIS_DIRTY_RENDER_BUFFER;
-   ice->state.stage_dirty |= IRIS_ALL_STAGE_DIRTY_BINDINGS;
-   return;
 }
 
 static void
@@ -615,7 +646,8 @@ fast_clear_depth(struct iris_context *ice,
                iris_resource_get_aux_state(res, res_level, layer);
 
             if (aux_state != ISL_AUX_STATE_CLEAR &&
-                aux_state != ISL_AUX_STATE_COMPRESSED_CLEAR) {
+                aux_state != ISL_AUX_STATE_COMPRESSED_CLEAR &&
+                aux_state != ISL_AUX_STATE_COMPRESSED_HIER_DEPTH) {
                /* This slice doesn't have any fast-cleared bits. */
                continue;
             }
@@ -675,9 +707,17 @@ fast_clear_depth(struct iris_context *ice,
       }
    }
 
-   iris_resource_set_aux_state(ice, res, level, box->z, box->depth,
-                               devinfo->ver < 20 ? ISL_AUX_STATE_CLEAR :
-                               ISL_AUX_STATE_COMPRESSED_NO_CLEAR);
+   if (res->aux.usage == ISL_AUX_USAGE_HIZ_CCS_WT)
+      iris_resource_set_aux_state(
+         ice, res, level, box->z, box->depth,
+         (devinfo->ver >= 20 ? ISL_AUX_STATE_COMPRESSED_NO_CLEAR :
+          ISL_AUX_STATE_COMPRESSED_CLEAR));
+   else
+      iris_resource_set_aux_state(
+         ice, res, level, box->z, box->depth,
+         (devinfo->ver >= 20 ? ISL_AUX_STATE_COMPRESSED_HIER_DEPTH :
+          ISL_AUX_STATE_CLEAR));
+
    ice->state.dirty |= IRIS_DIRTY_DEPTH_BUFFER;
    ice->state.stage_dirty |= IRIS_ALL_STAGE_DIRTY_BINDINGS;
 }
@@ -788,6 +828,8 @@ clear_depth_stencil(struct iris_context *ice,
 static void
 iris_clear(struct pipe_context *ctx,
            unsigned buffers,
+           uint32_t color_clear_mask,
+           uint8_t stencil_clear_mask,
            const struct pipe_scissor_state *scissor_state,
            const union pipe_color_union *p_color,
            double depth,

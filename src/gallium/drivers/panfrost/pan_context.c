@@ -3,26 +3,7 @@
  * © Copyright 2018 Alyssa Rosenzweig
  * Copyright © 2014-2017 Broadcom
  * Copyright (C) 2017 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
+ * SPDX-License-Identifier: MIT
  */
 
 #include <errno.h>
@@ -47,7 +28,6 @@
 #include "util/u_surface.h"
 #include "util/u_upload_mgr.h"
 #include "util/u_vbuf.h"
-#include "util/perf/cpu_trace.h"
 
 #include "compiler/pan_compiler.h"
 #include "compiler/nir/nir_serialize.h"
@@ -55,15 +35,21 @@
 #include "pan_device.h"
 #include "pan_fence.h"
 #include "pan_screen.h"
+#include "pan_trace.h"
 #include "pan_util.h"
+
+#include "util/u_trace_gallium.h"
+#include "panfrost_tracepoints.h"
+#include "panfrost_perfetto.h"
 
 static void
 panfrost_clear(struct pipe_context *pipe, unsigned buffers,
+               uint32_t color_clear_mask, uint8_t stencil_clear_mask,
                const struct pipe_scissor_state *scissor_state,
                const union pipe_color_union *color, double depth,
                unsigned stencil)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_CONTEXT);
 
    if (!panfrost_render_condition_check(pan_context(pipe)))
       return;
@@ -108,7 +94,7 @@ void
 panfrost_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
                unsigned flags)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_CONTEXT);
 
    struct panfrost_context *ctx = pan_context(pipe);
    struct panfrost_device *dev = pan_device(pipe->screen);
@@ -120,6 +106,11 @@ panfrost_flush(struct pipe_context *pipe, struct pipe_fence_handle **fence,
       struct pipe_fence_handle *f = panfrost_fence_create(ctx);
       pipe->screen->fence_reference(pipe->screen, fence, NULL);
       *fence = f;
+   }
+
+   if (dev->arch >= 10) {
+      u_trace_context_process(&ctx->trace_context,
+                              !!(flags & PIPE_FLUSH_END_OF_FRAME));
    }
 
    if (dev->debug & PAN_DBG_TRACE)
@@ -267,7 +258,7 @@ panfrost_set_shader_images(struct pipe_context *pctx,
          pipe_resource_reference(&ctx->images[shader][i].resource, NULL);
       }
 
-      ctx->image_mask[shader] &= ~(((1ull << count) - 1) << start_slot);
+      ctx->image_mask[shader] &= ~(BITFIELD64_MASK(count) << start_slot);
       return;
    }
 
@@ -292,7 +283,7 @@ panfrost_set_shader_images(struct pipe_context *pctx,
    /* Bind start_slot...start_slot+count */
    for (int i = 0; i < count; i++) {
       const struct pipe_image_view *image = &iviews[i];
-      SET_BIT(ctx->image_mask[shader], 1 << (start_slot + i), image->resource);
+      SET_BIT(ctx->image_mask[shader], BITFIELD64_BIT(start_slot + i), image->resource);
       if (!image->resource) {
          util_copy_image_view(&ctx->images[shader][start_slot + i], NULL);
          continue;
@@ -302,7 +293,7 @@ panfrost_set_shader_images(struct pipe_context *pctx,
 
    /* Unbind start_slot+count...start_slot+count+unbind_num_trailing_slots */
    for (int i = 0; i < unbind_num_trailing_slots; i++) {
-      SET_BIT(ctx->image_mask[shader], 1 << (start_slot + count + i), NULL);
+      SET_BIT(ctx->image_mask[shader], BITFIELD64_BIT(start_slot + count + i), NULL);
       util_copy_image_view(&ctx->images[shader][start_slot + count + i], NULL);
    }
 }
@@ -548,13 +539,102 @@ panfrost_render_condition(struct pipe_context *pipe, struct pipe_query *query,
    ctx->cond_mode = mode;
 }
 
+/*
+ * u_trace callbacks for GPU timestamp recording. Internally we use the
+ * mechanism used to implement PIPE_QUERY_TIMESTAMP. read_ts waits for the BO
+ * to be idle before reading the raw hardware counter and converting it to
+ * nanoseconds.
+ */
+static bool
+panfrost_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
+                         uint64_t offset_B, uint32_t flags)
+{
+   struct panfrost_trace_cs_info *cs_info = cs;
+   struct panfrost_batch *batch = cs_info->batch;
+   struct panfrost_resource *rsrc = pan_resource((struct pipe_resource *)timestamps);
+   struct panfrost_screen *screen = pan_screen(batch->ctx->base.screen);
+
+   screen->vtbl.emit_trace_ts(batch, rsrc, offset_B, cs_info->sb_wait_mask);
+   return true;
+}
+
+/* Called at tracepoint emit time (during batch recording) to copy indirect
+ * dispatch parameters into the u_trace indirects buffer.
+ *
+ * src_buffer is NULL and src_offset_B is an absolute GPU address. We emit CS
+ * instructions to copy at GPU execution time.
+ */
+static void
+panfrost_trace_capture_data(struct u_trace *ut, void *cs,
+                            void *dst_buffer, uint64_t dst_offset_B,
+                            void *src_buffer, uint64_t src_offset_B,
+                            uint32_t size_B)
+{
+   assert(!src_buffer);
+
+   struct panfrost_trace_cs_info *cs_info = cs;
+   struct panfrost_batch *batch = cs_info->batch;
+   struct panfrost_screen *screen = pan_screen(batch->ctx->base.screen);
+   struct panfrost_resource *dst_rsrc =
+      pan_resource((struct pipe_resource *)dst_buffer);
+
+   screen->vtbl.emit_trace_copy(batch, dst_rsrc, dst_offset_B, src_offset_B, size_B);
+}
+
+static const void *
+panfrost_trace_get_data(struct u_trace_context *utctx, void *buffer,
+                        uint64_t offset_B, uint32_t size_B)
+{
+   struct panfrost_resource *rsrc =
+      pan_resource((struct pipe_resource *)buffer);
+
+   panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
+
+   if (panfrost_bo_mmap(rsrc->bo))
+      return NULL;
+
+   return (const uint8_t *)rsrc->bo->ptr.cpu + offset_B;
+}
+
+static uint64_t
+panfrost_trace_read_ts(struct u_trace_context *utctx, void *timestamps,
+                       uint64_t offset_B, uint32_t flags, void *flush_data)
+{
+   struct panfrost_context *ctx = pan_context((struct pipe_context *)utctx->pctx);
+   struct panfrost_device *dev = pan_device(ctx->base.screen);
+   struct panfrost_resource *rsrc =
+      pan_resource((struct pipe_resource *)timestamps);
+
+   if (!dev->kmod.dev->props.timestamp_frequency)
+      return U_TRACE_NO_TIMESTAMP;
+
+   panfrost_bo_wait(rsrc->bo, INT64_MAX, false);
+
+   if (panfrost_bo_mmap(rsrc->bo))
+      return U_TRACE_NO_TIMESTAMP;
+
+   const uint64_t *ts =
+      (const uint64_t *)((const uint8_t *)rsrc->bo->ptr.cpu + offset_B);
+
+   if (*ts == U_TRACE_NO_TIMESTAMP)
+      return U_TRACE_NO_TIMESTAMP;
+
+   return pan_gpu_time_to_ns(dev, *ts);
+}
+
 static void
 panfrost_destroy(struct pipe_context *pipe)
 {
+   PAN_TRACE_FUNC(PAN_TRACE_GL_CONTEXT);
+
    struct panfrost_context *panfrost = pan_context(pipe);
    struct panfrost_device *dev = pan_device(pipe->screen);
 
    pan_screen(pipe->screen)->vtbl.context_cleanup(panfrost);
+
+   if (dev->arch >= 10) {
+      u_trace_context_fini(&panfrost->trace_context);
+   }
 
    u_printf_destroy(&panfrost->printf.ctx);
    panfrost_bo_unreference(panfrost->printf.bo);
@@ -980,7 +1060,8 @@ panfrost_fence_server_sync(struct pipe_context *pctx,
 {
    struct panfrost_device *dev = pan_device(pctx->screen);
    struct panfrost_context *ctx = pan_context(pctx);
-   int fd = -1, ret;
+   ASSERTED int ret;
+   int fd = -1;
    assert(!value);
 
    ret = drmSyncobjExportSyncFile(panfrost_device_fd(dev), f->syncobj, &fd);
@@ -1000,6 +1081,8 @@ static const struct debug_named_value panfrost_prio_options[] = {
 struct pipe_context *
 panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
 {
+   PAN_TRACE_FUNC(PAN_TRACE_GL_CONTEXT);
+
    struct panfrost_context *ctx = rzalloc(NULL, struct panfrost_context);
 
    if (!ctx)
@@ -1140,6 +1223,18 @@ panfrost_create_context(struct pipe_screen *screen, void *priv, unsigned flags)
       goto failed;
 
    u_printf_init(&ctx->printf.ctx, ctx->printf.bo, ctx->printf.bo->ptr.cpu);
+
+   if (dev->arch >= 10) {
+      panfrost_gpu_tracepoint_config_variable();
+      u_trace_pipe_context_init(&ctx->trace_context, gallium,
+                                sizeof(uint64_t),
+                                3 * sizeof(uint32_t),
+                                panfrost_trace_record_ts,
+                                panfrost_trace_read_ts,
+                                panfrost_trace_capture_data,
+                                panfrost_trace_get_data,
+                                NULL);
+   }
 
    ret = pan_screen(screen)->vtbl.context_init(ctx);
 

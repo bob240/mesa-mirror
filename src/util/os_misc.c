@@ -33,6 +33,7 @@
 #include "ralloc.h"
 #include "simple_mtx.h"
 #include "u_debug.h"
+#include "u_math.h"
 
 #include <stdarg.h>
 
@@ -56,8 +57,8 @@
 #if DETECT_OS_ANDROID
 #  define LOG_TAG "MESA"
 #  include <unistd.h>
-#  include <log/log.h>
-#  include <cutils/properties.h>
+#  include <android/log.h>
+#  include <sys/system_properties.h>
 #elif DETECT_OS_LINUX || DETECT_OS_CYGWIN || DETECT_OS_SOLARIS || DETECT_OS_HURD || DETECT_OS_MANAGARM
 #  include <unistd.h>
 #elif DETECT_OS_OPENBSD || DETECT_OS_FREEBSD
@@ -132,7 +133,7 @@ os_log_message(const char *message)
    fputs(message, fout);
    fflush(fout);
 #  if DETECT_OS_ANDROID
-   LOG_PRI(ANDROID_LOG_ERROR, LOG_TAG, "%s", message);
+   __android_log_write(ANDROID_LOG_ERROR, LOG_TAG, message);
 #  endif
 #endif
 }
@@ -147,8 +148,8 @@ os_log_message(const char *message)
  * all property names.
  */
 #if ANDROID_API_LEVEL >= 26
-#undef PROPERTY_KEY_MAX
-#define PROPERTY_KEY_MAX 128
+#undef PROP_NAME_MAX
+#define PROP_NAME_MAX 128
 #endif /* ANDROID_API_LEVEL >= 26 */
 
 /**
@@ -174,9 +175,9 @@ os_log_message(const char *message)
 static char *
 os_get_android_option(const char *name)
 {
-   static thread_local char os_android_option_value[PROPERTY_VALUE_MAX];
-   char key[PROPERTY_KEY_MAX];
-   char *p = key, *end = key + PROPERTY_KEY_MAX;
+   static thread_local char os_android_option_value[PROP_VALUE_MAX];
+   char key[PROP_NAME_MAX];
+   char *p = key, *end = key + PROP_NAME_MAX;
    /* add "mesa." prefix if necessary: */
    if (strstr(name, "MESA_") != name)
       p += strlcpy(p, "mesa.", end - p);
@@ -191,12 +192,12 @@ os_get_android_option(const char *name)
 
    /* prefixes to search sorted by preference */
    const char *prefices[] = { "debug.", "vendor.", "" };
-   char full_key[PROPERTY_KEY_MAX];
+   char full_key[PROP_NAME_MAX];
    int len = 0;
    for (int i = 0; i < ARRAY_SIZE(prefices); i++) {
-      strlcpy(full_key, prefices[i], PROPERTY_KEY_MAX);
-      strlcat(full_key, key, PROPERTY_KEY_MAX);
-      len = property_get(full_key, os_android_option_value, NULL);
+      strlcpy(full_key, prefices[i], PROP_NAME_MAX);
+      strlcat(full_key, key, PROP_NAME_MAX);
+      len = __system_property_get(full_key, os_android_option_value);
       if (len > 0)
          return os_android_option_value;
    }

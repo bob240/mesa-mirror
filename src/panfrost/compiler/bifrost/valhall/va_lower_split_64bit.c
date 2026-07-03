@@ -1,25 +1,7 @@
 /*
  * Copyright (C) 2021 Collabora Ltd.
  * Copyright (C) 2025 Arm Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "bi_builder.h"
@@ -44,14 +26,18 @@ lower_split_src(bi_context *ctx, bi_instr *I, unsigned s, bi_instr** lut)
       return;
    }
 
-   /* Check if the source regs are already coming from a split. */
-   bi_index* src_a = &I->src[s];
-   bi_index* src_b = &I->src[s + 1];
+   /* Check if the source regs are already coming from a split/collect pair. */
+   bi_index *src_a = &I->src[s];
+   bi_index *src_b = &I->src[s + 1];
    if (bi_is_ssa(*src_a) && bi_is_ssa(*src_b)) {
-      bi_instr* src_ins_a = lut[src_a->value];
-      bi_instr* src_ins_b = lut[src_b->value];
-      if (src_ins_a->op == BI_OPCODE_SPLIT_I32 && src_ins_a == src_ins_b)
-         return;
+      bi_instr *src_ins_a = lut[src_a->value];
+      bi_instr *src_ins_b = lut[src_b->value];
+      if (src_ins_a->op == BI_OPCODE_SPLIT_I32 && src_ins_a == src_ins_b) {
+         bi_index split_src = src_ins_a->src[0];
+         if (!bi_is_ssa(split_src) ||
+             lut[split_src.value]->op == BI_OPCODE_COLLECT_I32)
+            return;
+      }
    }
 
    /* Allocate temporary before the instruction */
@@ -94,7 +80,9 @@ va_lower_split_64bit(bi_context *ctx)
 
          struct va_src_info info = va_src_info(I->op, s);
 
-         if (info.size == VA_SIZE_64)
+         /* Only split if the instruction expects 64-bit inputs as two separate
+          * sources. */
+         if (info.size == VA_SIZE_64 && bi_count_read_registers(I, s) == 1)
             lower_split_src(ctx, I, s, lut);
       }
    }

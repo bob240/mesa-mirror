@@ -6,13 +6,13 @@
  */
 
 #include "radv_descriptor_pool.h"
+#include "tools/radv_rmv.h"
 #include "radv_buffer.h"
 #include "radv_descriptor_set.h"
 #include "radv_descriptors.h"
 #include "radv_device.h"
 #include "radv_entrypoints.h"
 #include "radv_physical_device.h"
-#include "radv_rmv.h"
 
 #include "vk_log.h"
 
@@ -57,7 +57,7 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
    const struct radv_physical_device *pdev = radv_device_physical(device);
    struct radv_descriptor_pool *pool;
    uint64_t size = sizeof(struct radv_descriptor_pool);
-   uint64_t bo_size = 0, bo_count = 0, range_count = 0;
+   uint64_t bo_size = 0, range_count = 0;
    VkResult result = VK_SUCCESS;
 
    const VkMutableDescriptorTypeCreateInfoEXT *mutable_info =
@@ -81,9 +81,6 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
 
    uint64_t num_16byte_descriptors = 0;
    for (unsigned i = 0; i < pCreateInfo->poolSizeCount; ++i) {
-      bo_count += radv_descriptor_type_buffer_count(pCreateInfo->pPoolSizes[i].type) *
-                  pCreateInfo->pPoolSizes[i].descriptorCount;
-
       switch (pCreateInfo->pPoolSizes[i].type) {
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
@@ -123,7 +120,7 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
                   num_16byte_descriptors += pCreateInfo->pPoolSizes[i].descriptorCount;
             }
          } else {
-            const uint32_t max_desc_size = pdev->use_fmask ? 64 : 32;
+            const uint32_t max_desc_size = radv_get_sampled_image_desc_size(pdev);
             bo_size += max_desc_size * pCreateInfo->pPoolSizes[i].descriptorCount;
          }
          break;
@@ -146,7 +143,6 @@ radv_create_descriptor_pool(struct radv_device *device, const VkDescriptorPoolCr
 
    if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT)) {
       size += pCreateInfo->maxSets * sizeof(struct radv_descriptor_set);
-      size += sizeof(struct radeon_winsys_bo *) * bo_count;
       size += sizeof(struct radv_descriptor_range) * range_count;
    }
 

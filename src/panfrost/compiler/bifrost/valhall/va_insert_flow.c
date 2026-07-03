@@ -1,28 +1,12 @@
 /*
  * Copyright (C) 2022 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (C) 2026 Arm Ltd.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "panfrost/lib/pan_props.h"
 
+#include "bi_debug.h"
 #include "bi_builder.h"
 #include "va_compiler.h"
 #include "valhall_enums.h"
@@ -128,13 +112,11 @@ bi_is_memory_access(const bi_instr *I)
       break;
    }
 
-   /* UBOs are read-only so there are no ordering constriants */
-   if (I->seg == BI_SEG_UBO)
-      return false;
-
    switch (bi_get_opcode_props(I)->message) {
    case BIFROST_MESSAGE_LOAD:
    case BIFROST_MESSAGE_STORE:
+      /* UBOs are read-only so there are no ordering constraints */
+      return I->seg != BI_SEG_UBO;
    case BIFROST_MESSAGE_ATOMIC:
       return true;
    default:

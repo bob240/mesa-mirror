@@ -42,11 +42,11 @@ find_continue_block(nir_loop *loop)
    nir_block *prev_block =
       nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
 
-   assert(header_block->predecessors.entries == 2);
+   assert(nir_block_num_preds(header_block) == 2);
 
-   set_foreach(&header_block->predecessors, pred_entry) {
-      if (pred_entry->key != prev_block)
-         return (nir_block *)pred_entry->key;
+   nir_foreach_pred(pred, header_block) {
+      if (pred != prev_block)
+         return pred;
    }
 
    UNREACHABLE("Continue block not found!");
@@ -143,13 +143,13 @@ opt_peel_loop_initial_if(nir_loop *loop)
       nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
 
    /* It would be insane if this were not true */
-   assert(_mesa_set_search(&header_block->predecessors, prev_block));
+   assert(nir_block_has_pred(header_block, prev_block));
 
    /* The loop must have exactly one continue block which could be a block
     * ending in a continue instruction or the "natural" continue from the
     * last block in the loop back to the top.
     */
-   if (header_block->predecessors.entries != 2)
+   if (nir_block_num_preds(header_block) != 2)
       return false;
 
    nir_cf_node *if_node = nir_cf_node_next(&header_block->cf_node);
@@ -284,7 +284,7 @@ is_trivial_bcsel(const nir_instr *instr, bool allow_non_phi_src)
       return false;
 
    for (unsigned i = 0; i < 3; i++) {
-      if (!nir_alu_src_is_trivial_ssa(bcsel, i) ||
+      if (!nir_alu_has_trivial_src(bcsel, i) ||
           nir_def_block(bcsel->src[i].src.ssa) != instr->block)
          return false;
 
@@ -375,13 +375,13 @@ opt_split_alu_of_phi(nir_builder *b, nir_loop *loop, nir_opt_if_options options)
       nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
 
    /* It would be insane if this were not true */
-   assert(_mesa_set_search(&header_block->predecessors, prev_block));
+   assert(nir_block_has_pred(header_block, prev_block));
 
    /* The loop must have exactly one continue block which could be a block
     * ending in a continue instruction or the "natural" continue from the
     * last block in the loop back to the top.
     */
-   if (header_block->predecessors.entries != 2)
+   if (nir_block_num_preds(header_block) != 2)
       return false;
 
    nir_block *continue_block = find_continue_block(loop);
@@ -479,7 +479,7 @@ opt_split_alu_of_phi(nir_builder *b, nir_loop *loop, nir_opt_if_options options)
             continue;
 
          nir_src *use = list_first_entry(&alu->def.uses, nir_src, use_link);
-         if (nir_src_is_if(use) || !is_trivial_bcsel(nir_src_parent_instr(use), true))
+         if (nir_src_is_if(use) || !is_trivial_bcsel(nir_src_use_instr(use), true))
             continue;
       }
 
@@ -514,13 +514,7 @@ opt_split_alu_of_phi(nir_builder *b, nir_loop *loop, nir_opt_if_options options)
       /* Modify all readers of the original ALU instruction to read the
        * result of the phi.
        */
-      nir_def_rewrite_uses(&alu->def,
-                           &phi->def);
-
-      /* Since the original ALU instruction no longer has any readers, just
-       * remove it.
-       */
-      nir_instr_remove_v(&alu->instr);
+      nir_def_replace(&alu->def, &phi->def);
       nir_instr_free(&alu->instr);
 
       progress = true;
@@ -611,13 +605,13 @@ opt_simplify_bcsel_of_phi(nir_builder *b, nir_loop *loop)
       nir_cf_node_as_block(nir_cf_node_prev(&loop->cf_node));
 
    /* It would be insane if this were not true */
-   assert(_mesa_set_search(&header_block->predecessors, prev_block));
+   assert(nir_block_has_pred(header_block, prev_block));
 
    /* The loop must have exactly one continue block which could be a block
     * ending in a continue instruction or the "natural" continue from the
     * last block in the loop back to the top.
     */
-   if (header_block->predecessors.entries != 2)
+   if (nir_block_num_preds(header_block) != 2)
       return false;
 
    /* We can move any bcsel that can guaranteed to execut on every iteration
@@ -679,13 +673,7 @@ opt_simplify_bcsel_of_phi(nir_builder *b, nir_loop *loop)
       /* Modify all readers of the bcsel instruction to read the result of
        * the phi.
        */
-      nir_def_rewrite_uses(&bcsel->def,
-                           &phi->def);
-
-      /* Since the original bcsel instruction no longer has any readers,
-       * just remove it.
-       */
-      nir_instr_remove_v(&bcsel->instr);
+      nir_def_replace(&bcsel->def, &phi->def);
       nir_instr_free(&bcsel->instr);
 
       progress = true;
@@ -694,11 +682,20 @@ opt_simplify_bcsel_of_phi(nir_builder *b, nir_loop *loop)
    return progress;
 }
 
+/* Checks whether the block is empty except for load_const instructions. */
 static bool
-is_block_empty(nir_block *block)
+is_block_empty_or_constant(nir_block *block)
 {
-   return nir_cf_node_is_last(&block->cf_node) &&
-          exec_list_is_empty(&block->instr_list);
+   if (!nir_cf_node_is_last(&block->cf_node))
+      return false;
+
+   nir_foreach_instr(instr, block) {
+      if (instr->type != nir_instr_type_load_const &&
+          instr->type != nir_instr_type_undef)
+         return false;
+   }
+
+   return true;
 }
 
 /* Walk all the phis in the block immediately following the if statement and
@@ -744,8 +741,8 @@ static bool
 opt_if_simplification(nir_builder *b, nir_if *nif)
 {
    /* Only simplify if the then block is empty and the else block is not. */
-   if (!is_block_empty(nir_if_first_then_block(nif)) ||
-       is_block_empty(nir_if_first_else_block(nif)))
+   if (!is_block_empty_or_constant(nir_if_first_then_block(nif)) ||
+       is_block_empty_or_constant(nir_if_first_else_block(nif)))
       return false;
 
    /* Insert the inverted instruction and rewrite the condition. */
@@ -770,8 +767,13 @@ opt_if_simplification(nir_builder *b, nir_if *nif)
    rewrite_phi_predecessor_blocks(nif, then_block, else_block, else_block,
                                   then_block);
 
-   /* Finally, move the else block to the then block. */
+   /* Move potential load_const before the if. */
    nir_cf_list tmp;
+   nir_cf_extract(&tmp, nir_before_cf_list(&nif->then_list),
+                  nir_after_cf_list(&nif->then_list));
+   nir_cf_reinsert(&tmp, nir_before_cf_node(&nif->cf_node));
+
+   /* Finally, move the else block to the then block. */
    nir_cf_extract(&tmp, nir_before_cf_list(&nif->else_list),
                   nir_after_cf_list(&nif->else_list));
    nir_cf_reinsert(&tmp, nir_before_cf_list(&nif->then_list));
@@ -820,11 +822,11 @@ opt_if_phi_is_condition(nir_builder *b, nir_if *nif)
             break;
       }
       if (then_val == T && else_val == F) {
-         nir_def_rewrite_uses(&phi->def, cond);
+         nir_def_replace(&phi->def, cond);
          progress = true;
       } else if (then_val == F && else_val == T) {
          b->cursor = nir_before_cf_node(&nif->cf_node);
-         nir_def_rewrite_uses(&phi->def, nir_inot(b, cond));
+         nir_def_replace(&phi->def, nir_inot(b, cond));
          progress = true;
       }
    }
@@ -964,10 +966,10 @@ propagate_condition_eval(nir_builder *b, nir_if *nif, nir_src *use_src,
 static bool
 can_propagate_through_alu(nir_src *src, bool ignore_bcsel)
 {
-   if (nir_src_parent_instr(src)->type != nir_instr_type_alu)
+   if (nir_src_use_instr(src)->type != nir_instr_type_alu)
       return false;
 
-   nir_alu_instr *alu = nir_instr_as_alu(nir_src_parent_instr(src));
+   nir_alu_instr *alu = nir_instr_as_alu(nir_src_use_instr(src));
    switch (alu->op) {
    case nir_op_ior:
    case nir_op_iand:
@@ -999,7 +1001,7 @@ evaluate_condition_use(nir_builder *b, nir_if *nif, nir_src *use_src,
    const bool ignore_bcsel = branch != either_branch;
    if (!nir_src_is_if(use_src) && can_propagate_through_alu(use_src,
                                                             ignore_bcsel)) {
-      nir_alu_instr *alu = nir_instr_as_alu(nir_src_parent_instr(use_src));
+      nir_alu_instr *alu = nir_instr_as_alu(nir_src_use_instr(use_src));
 
       nir_foreach_use_including_if_safe(alu_use, &alu->def) {
          progress |= propagate_condition_eval(b, nif, use_src, alu_use, alu,
@@ -1017,7 +1019,7 @@ opt_if_evaluate_condition_use(nir_builder *b, nir_if *nif)
 
    /* Evaluate any uses of the if condition inside the if branches */
    nir_foreach_use_including_if_safe(use_src, nif->condition.ssa) {
-      if (!(nir_src_is_if(use_src) && nir_src_parent_if(use_src) == nif))
+      if (!(nir_src_is_if(use_src) && nir_src_use_if(use_src) == nif))
          progress |= evaluate_condition_use(b, nif, use_src, false, either_branch);
    }
 
@@ -1038,7 +1040,7 @@ opt_if_evaluate_condition_use(nir_builder *b, nir_if *nif)
        * replace instances of x as well.
        */
       nir_foreach_use_including_if_safe(use_src, alu->src[0].src.ssa) {
-         if (nir_src_is_if(use_src) || nir_src_parent_instr(use_src) != &alu->instr)
+         if (nir_src_is_if(use_src) || nir_src_use_instr(use_src) != &alu->instr)
             progress |= evaluate_condition_use(b, nif, use_src, true, either_branch);
       }
 
@@ -1074,7 +1076,7 @@ opt_if_evaluate_condition_use(nir_builder *b, nir_if *nif)
                 nir_src_num_components(alu_src->src[0].src) == 1) {
                nir_foreach_use_including_if_safe(use_src, alu_src->src[0].src.ssa) {
                   if (nir_src_is_if(use_src) ||
-                      nir_src_parent_instr(use_src) != &alu_src->instr) {
+                      nir_src_use_instr(use_src) != &alu_src->instr) {
                      progress |= evaluate_condition_use(b, nif, use_src,
                                                         !invert, branch);
                   }
@@ -1098,8 +1100,8 @@ rewrite_comp_uses_within_if(nir_builder *b, nir_if *nif, bool invert,
 
    nir_def *new_ssa = NULL;
    nir_foreach_use_safe(use, scalar.def) {
-      if (nir_src_parent_instr(use)->block->index < first->index ||
-          nir_src_parent_instr(use)->block->index > last->index)
+      if (nir_src_use_instr(use)->block->index < first->index ||
+          nir_src_use_instr(use)->block->index > last->index)
          continue;
 
       /* Only rewrite users which use only the new component. This is to avoid a
@@ -1277,12 +1279,16 @@ opt_if_phi_src_unused(nir_builder *b, nir_if *nif)
 }
 
 static void
-rewrite_phi_uses(nir_phi_instr *phi, nir_if *prev_if, nir_if *next_if)
+rewrite_phi_uses(nir_phi_instr *phi, nir_if *prev_if, nir_if *next_if,
+                 bool inverse)
 {
    nir_def *then_src =
       nir_phi_get_src_from_block(phi, nir_if_last_then_block(prev_if))->src.ssa;
    nir_def *else_src =
       nir_phi_get_src_from_block(phi, nir_if_last_else_block(prev_if))->src.ssa;
+
+   if (inverse)
+      SWAP(then_src, else_src);
 
    /* Rewrite all uses inside the next IF with either then_src or else_src. */
    nir_foreach_use_including_if_safe(use, &phi->def) {
@@ -1312,6 +1318,30 @@ rewrite_phi_uses(nir_phi_instr *phi, nir_if *prev_if, nir_if *next_if)
 }
 
 static bool
+srcs_equal_or_logical_inverse(nir_src src1, nir_src src2, bool *inverse)
+{
+   *inverse = false;
+   if (nir_srcs_equal(src1, src2))
+      return true;
+
+   nir_alu_instr *alu;
+
+   alu = nir_src_as_alu(src1);
+   if (alu != NULL && alu->op == nir_op_inot) {
+      *inverse = nir_srcs_equal(alu->src[0].src, src2);
+      return *inverse;
+   }
+
+   alu = nir_src_as_alu(src2);
+   if (alu != NULL && alu->op == nir_op_inot) {
+      *inverse = nir_srcs_equal(alu->src[0].src, src1);
+      return *inverse;
+   }
+
+   return false;
+}
+
+static bool
 opt_if_merge(nir_if *nif)
 {
    nir_block *next_blk = nir_cf_node_cf_tree_next(&nif->cf_node);
@@ -1319,7 +1349,9 @@ opt_if_merge(nir_if *nif)
       return false;
 
    nir_if *next_if = nir_block_get_following_if(next_blk);
-   if (!next_if || !nir_srcs_equal(nif->condition, next_if->condition))
+   bool inverse = false;
+   if (!next_if || !srcs_equal_or_logical_inverse(nif->condition,
+                                                  next_if->condition, &inverse))
       return false;
 
    /* This optimization isn't made to work in this case and
@@ -1353,7 +1385,7 @@ opt_if_merge(nir_if *nif)
        * with the phi source from the respective branch leg of the
        * previous IF.
        */
-      rewrite_phi_uses(phi, nif, next_if);
+      rewrite_phi_uses(phi, nif, next_if, inverse);
    }
 
    /* Here we merge two consecutive ifs that have the same condition e.g:
@@ -1372,14 +1404,17 @@ opt_if_merge(nir_if *nif)
     * Note: This only merges if-statements when the block between them is
     * empty except for phis.
     */
-   simple_merge_if(nif, next_if, true, true);
-   simple_merge_if(nif, next_if, false, false);
+   simple_merge_if(nif, next_if, true, !inverse);
+   simple_merge_if(nif, next_if, false, inverse);
 
    nir_block *new_then_block = nir_if_last_then_block(nif);
    nir_block *new_else_block = nir_if_last_else_block(nif);
 
    nir_block *old_then_block = nir_if_last_then_block(next_if);
    nir_block *old_else_block = nir_if_last_else_block(next_if);
+
+   if (inverse)
+      SWAP(new_then_block, new_else_block);
 
    /* Rewrite the predecessor block for any phis following the second
     * if-statement.

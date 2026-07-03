@@ -26,6 +26,7 @@ static const nvk_mme_builder_func mme_builders[NVK_MME_COUNT] = {
    [NVK_MME_DRAW_INDEXED_INDIRECT]         = nvk_mme_draw_indexed_indirect,
    [NVK_MME_DRAW_INDIRECT_COUNT]           = nvk_mme_draw_indirect_count,
    [NVK_MME_DRAW_INDEXED_INDIRECT_COUNT]   = nvk_mme_draw_indexed_indirect_count,
+   [NVK_MME_BEGIN_COND_RENDER]             = nvk_mme_begin_cond_render,
    [NVK_MME_ADD_CS_INVOCATIONS]            = nvk_mme_add_cs_invocations,
    [NVK_MME_DISPATCH_INDIRECT]             = nvk_mme_dispatch_indirect,
    [NVK_MME_WRITE_CS_INVOCATIONS]          = nvk_mme_write_cs_invocations,
@@ -36,6 +37,10 @@ static const nvk_mme_builder_func mme_builders[NVK_MME_COUNT] = {
    [NVK_MME_SET_CONSERVATIVE_RASTER_STATE] = nvk_mme_set_conservative_raster_state,
    [NVK_MME_SET_VIEWPORT_MIN_MAX_Z]        = nvk_mme_set_viewport_min_max_z,
    [NVK_MME_SET_Z_CLAMP]                   = nvk_mme_set_z_clamp,
+   [NVK_MME_SET_STATISTICS_COUNTERS]       = nvk_mme_set_statistics_counters,
+   [NVK_MME_DRAW_MESH]                     = nvk_mme_draw_mesh,
+   [NVK_MME_DRAW_MESH_INDIRECT]            = nvk_mme_draw_mesh_indirect,
+   [NVK_MME_DRAW_MESH_INDIRECT_COUNT]      = nvk_mme_draw_mesh_indirect_count,
 };
 
 static const struct nvk_mme_test_case *mme_tests[NVK_MME_COUNT] = {
@@ -44,6 +49,7 @@ static const struct nvk_mme_test_case *mme_tests[NVK_MME_COUNT] = {
    [NVK_MME_SET_TESS_PARAMS]               = nvk_mme_set_tess_params_tests,
    [NVK_MME_SET_SHADING_RATE_CONTROL]      = nvk_mme_set_shading_rate_control_tests,
    [NVK_MME_SET_ANTI_ALIAS]                = nvk_mme_set_anti_alias_tests,
+   [NVK_MME_SET_STATISTICS_COUNTERS]       = nvk_mme_set_statistics_counters_tests,
 };
 
 uint32_t *
@@ -79,9 +85,11 @@ nvk_mme_test_state_state(void *_ts, uint16_t addr)
    /* First, look backwards through the expected data that we've already
     * written.  This ensures that mthd() impacts state().
     */
-   for (int32_t i = ts->ei - 1; i >= 0; i--) {
-      if (ts->test->expected[i].mthd == addr)
-         return ts->test->expected[i].data;
+   if (ts->test->expected != NULL) {
+      for (int32_t i = ts->ei - 1; i >= 0; i--) {
+         if (ts->test->expected[i].mthd == addr)
+            return ts->test->expected[i].data;
+      }
    }
 
    /* Now look at init.  We assume the init data is unique */

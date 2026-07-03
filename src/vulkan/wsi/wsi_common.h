@@ -62,6 +62,9 @@ struct wsi_device {
    VkPhysicalDeviceMemoryProperties memory_props;
    uint32_t queue_family_count;
    uint64_t queue_supports_blit;
+   uint64_t queue_supports_timestamps;
+   float timestamp_period;
+   uint32_t timestamp_bits;
 
    VkPhysicalDeviceDrmPropertiesEXT drm_info;
    VkPhysicalDevicePCIBusInfoPropertiesEXT pci_bus_info;
@@ -71,6 +74,15 @@ struct wsi_device {
 
    bool has_import_memory_host;
    bool has_timeline_semaphore;
+   bool has_host_query_reset;
+
+   /** Whether the device uses 32bpp formats for 24bpp
+    *
+    * If true, VkImages created with R8G8B8/B8G8R8 formats will be
+    * exported as 32bpp to the window system, as if they were B8G8R8A8
+    * or R8G8B8A8
+    */
+   bool emulate_24as32;
 
    /** Indicates if wsi_image_create_info::scanout is supported
     *
@@ -157,7 +169,7 @@ struct wsi_device {
     * In this case, we have to create an extra timeline semaphore
     * to be able to synchronize with the WSI present semaphore being unsignalled.
     * This requires VK_KHR_timeline_semaphore. */
-   bool khr_present_wait;
+   bool has_present_wait;
 
    struct {
       /* Don't use the commit-timing protocol for pacing */
@@ -201,28 +213,38 @@ struct wsi_device {
    WSI_CB(CmdPipelineBarrier);
    WSI_CB(CmdCopyImage);
    WSI_CB(CmdCopyImageToBuffer);
+   WSI_CB(CmdResetQueryPool);
+   WSI_CB(ResetQueryPoolEXT);
+   WSI_CB(CmdWriteTimestamp);
    WSI_CB(CreateBuffer);
    WSI_CB(CreateCommandPool);
    WSI_CB(CreateFence);
    WSI_CB(CreateImage);
+   WSI_CB(CreateQueryPool);
    WSI_CB(CreateSemaphore);
    WSI_CB(DestroyBuffer);
    WSI_CB(DestroyCommandPool);
    WSI_CB(DestroyFence);
    WSI_CB(DestroyImage);
+   WSI_CB(DestroyQueryPool);
    WSI_CB(DestroySemaphore);
    WSI_CB(EndCommandBuffer);
    WSI_CB(FreeMemory);
    WSI_CB(FreeCommandBuffers);
    WSI_CB(GetBufferMemoryRequirements);
+   WSI_CB(GetCalibratedTimestampsKHR);
    WSI_CB(GetFenceStatus);
    WSI_CB(GetImageDrmFormatModifierPropertiesEXT);
    WSI_CB(GetImageMemoryRequirements);
    WSI_CB(GetImageSubresourceLayout);
    WSI_CB(GetMemoryFdKHR);
+   WSI_CB(GetPhysicalDeviceCalibrateableTimeDomainsKHR);
+   WSI_CB(GetPhysicalDeviceProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties);
    WSI_CB(GetPhysicalDeviceFormatProperties2);
    WSI_CB(GetPhysicalDeviceImageFormatProperties2);
+   WSI_CB(GetPhysicalDeviceQueueFamilyProperties);
+   WSI_CB(GetQueryPoolResults);
    WSI_CB(GetSemaphoreFdKHR);
    WSI_CB(ResetFences);
    WSI_CB(QueueSubmit2);
@@ -241,6 +263,7 @@ typedef PFN_vkVoidFunction (VKAPI_PTR *WSI_FN_GetPhysicalDeviceProcAddr)(VkPhysi
 struct wsi_device_options {
    bool sw_device;
    bool extra_xwayland_image;
+   bool emulate_24as32;
 };
 
 VkResult
@@ -315,7 +338,22 @@ VkImageUsageFlags
 wsi_caps_get_image_usage(void);
 
 bool
+wsi_instance_supports_google_display_timing(const struct vk_instance *instance);
+
+bool
 wsi_device_supports_explicit_sync(struct wsi_device *device);
+
+static inline VkImageUsageFlags2KHR
+vk_swapchain_usage_flags(const VkSwapchainCreateInfoKHR *info)
+{
+   const VkImageUsageFlags2CreateInfoKHR *usage2 =
+      vk_find_struct_const(info->pNext,
+                           IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR);
+   if (usage2)
+      return usage2->usage;
+   else
+      return info->imageUsage;
+}
 
 #define wsi_common_vk_warn_once(warning) \
    do { \

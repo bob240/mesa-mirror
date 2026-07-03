@@ -316,15 +316,11 @@ CreateContext(Display *dpy, int generic_id, struct glx_config *config,
    }
 
    gc = NULL;
-#if defined(GLX_USE_APPLEGL) && !defined(GLX_USE_APPLE)
-   gc = applegl_create_context(psc, config, shareList, renderType);
-#else
    if (allowDirect && psc->vtable->create_context)
       gc = psc->vtable->create_context(psc, config, shareList, renderType);
-#ifdef GLX_INDIRECT_RENDERING
+#if defined(GLX_INDIRECT_RENDERING) && (!defined(GLX_USE_APPLEGL) || defined(GLX_USE_APPLE))
    if (!gc)
       gc = indirect_create_context(psc, config, shareList, renderType);
-#endif
 #endif
    if (!gc)
       return NULL;
@@ -670,7 +666,7 @@ glXSwapBuffers(Display * dpy, GLXDrawable drawable)
 
    gc = __glXGetCurrentContext();
 
-#if defined(GLX_DIRECT_RENDERING) && (!defined(GLX_USE_APPLEGL) || defined(GLX_USE_APPLE))
+#if defined(GLX_DIRECT_RENDERING)
    {
       __GLXDRIdrawable *pdraw = GetGLXDRIDrawable(dpy, drawable);
 
@@ -2338,7 +2334,7 @@ static const struct name_address_pair GLX_functions[] = {
    GLX_FUNCTION(glXQueryCurrentRendererStringMESA),
 
    /*** GLX_MESA_gl_interop ***/
-#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL)
+#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL) && !defined(GLX_USE_WINDOWSGL)
    GLX_FUNCTION2(glXGLInteropQueryDeviceInfoMESA, MesaGLInteropGLXQueryDeviceInfo),
    GLX_FUNCTION2(glXGLInteropExportObjectMESA, MesaGLInteropGLXExportObject),
    GLX_FUNCTION2(glXGLInteropFlushObjectsMESA, MesaGLInteropGLXFlushObjects),
@@ -2381,11 +2377,6 @@ _GLX_PUBLIC void (*glXGetProcAddressARB(const GLubyte * procName)) (void)
    if (f == NULL)
       f = (gl_function) _mesa_glapi_get_proc_address((const char *) procName);
 
-#ifdef GLX_USE_APPLEGL
-   if (f == NULL)
-      f = applegl_get_proc_address((const char *) procName);
-#endif
-
    return f;
 }
 
@@ -2403,7 +2394,7 @@ GLX_ALIAS(__GLXextFuncPtr, glXGetProcAddress,
           (const GLubyte * procName),
           (procName), glXGetProcAddressARB)
 
-#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL)
+#if defined(GLX_DIRECT_RENDERING) && !defined(GLX_USE_APPLEGL) && !defined(GLX_USE_WINDOWSGL)
 
 PUBLIC int
 MesaGLInteropGLXQueryDeviceInfo(Display *dpy, GLXContext context,

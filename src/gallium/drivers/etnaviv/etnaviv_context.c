@@ -33,6 +33,7 @@
 #include "etnaviv_debug.h"
 #include "etnaviv_emit.h"
 #include "etnaviv_fence.h"
+#include "etnaviv_format.h"
 #include "etnaviv_ml.h"
 #include "etnaviv_query.h"
 #include "etnaviv_query_acc.h"
@@ -116,7 +117,7 @@ etna_context_destroy(struct pipe_context *pctx)
    if (ctx->flush_resources)
       _mesa_set_destroy(ctx->flush_resources, NULL);
 
-   util_copy_framebuffer_state(&ctx->framebuffer_s, NULL);
+   util_copy_framebuffer_state(&ctx->framebuffer_s.base, NULL);
 
    if (ctx->blitter)
       util_blitter_destroy(ctx->blitter);
@@ -172,6 +173,12 @@ etna_get_vs(struct etna_context *ctx, struct etna_shader_key* const key)
 {
    const struct etna_shader_variant *old = ctx->shader.vs;
 
+   key->tex_is_128bit = ctx->tex_is_128bit[MESA_SHADER_VERTEX];
+
+   if (key->tex_is_128bit)
+      for (unsigned i = 0; i < ctx->screen->specs.vertex_sampler_count; i++)
+         key->sampler_companion[i] = ctx->sampler_companion[MESA_SHADER_VERTEX][i];
+
    ctx->shader.vs = etna_shader_variant(ctx->shader.bind_vs, key, &ctx->base.debug, true);
 
    if (!ctx->shader.vs)
@@ -188,13 +195,23 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
 {
    const struct etna_shader_variant *old = ctx->shader.fs;
 
-   /* update the key if we need to run nir_lower_sample_tex_compare(..). */
-   if (ctx->screen->info->halti < 2 &&
-       (ctx->dirty & (ETNA_DIRTY_SAMPLERS | ETNA_DIRTY_SAMPLER_VIEWS))) {
+   /* update the key if we need to run nir_lower_sample_tex_compare(..).
+    * halti < 2 has no HW shadow compare. halti >= 2 has it, but depth32f is
+    * emulated as D24S8 and the float compare ref must not be clamped to the
+    * D24 range, so it must compare in the shader (and not clamp the ref). */
+   if (ctx->dirty & (ETNA_DIRTY_SAMPLERS | ETNA_DIRTY_SAMPLER_VIEWS)) {
 
       for (unsigned int i = 0; i < ctx->num_fragment_sampler_views; i++) {
          if (ctx->sampler[i]->compare_mode == PIPE_TEX_COMPARE_NONE)
             continue;
+
+         const bool emulated_z32f = format_is_emulated_z32f(ctx->sampler_view[i]->format);
+
+         if (ctx->screen->info->halti >= 2 && !emulated_z32f)
+            continue;
+
+         if (emulated_z32f)
+            key->shadow_compare_no_clamp = 1;
 
          key->has_sample_tex_compare = 1;
          key->num_texture_states = ctx->num_fragment_sampler_views;
@@ -207,6 +224,12 @@ etna_get_fs(struct etna_context *ctx, struct etna_shader_key* const key)
          key->tex_compare_func[i] = ctx->sampler[i]->compare_func;
       }
    }
+
+   key->tex_is_128bit = ctx->tex_is_128bit[MESA_SHADER_FRAGMENT];
+
+   if (key->tex_is_128bit)
+      for (unsigned i = 0; i < ctx->screen->specs.fragment_sampler_count; i++)
+         key->sampler_companion[i] = ctx->sampler_companion[MESA_SHADER_FRAGMENT][i];
 
    ctx->shader.fs = etna_shader_variant(ctx->shader.bind_fs, key, &ctx->base.debug, true);
 
@@ -276,19 +299,9 @@ etna_reset_gpu_state(struct etna_context *ctx)
       etna_set_state(stream, VIVS_SH_CONFIG, VIVS_SH_CONFIG_RTNE_ROUNDING);
    }
 
-   if (VIV_FEATURE(screen, ETNA_FEATURE_MSAA_FRAGMENT_OPERATION)) {
+   if (VIV_FEATURE(screen, ETNA_FEATURE_MSAA_FRAGMENT_OPERATION))
       etna_set_state(stream, VIVS_PS_MSAA_CONFIG, 0x6fffffff & 0xf70fffff & 0xfff6ffff &
                                                   0xfffff6ff & 0xffffff7f);
-
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(0), 0x6e80e680);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(1), 0x2ac42a4c);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(2), 0x15fb5d3b);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(3), 0x9d7391f7);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(4), 0x08e691f7);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(5), 0x4ca25d3b);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(6), 0xbf512a4c);
-      etna_set_state(stream, VIVS_PS_ALPHA_TO_COVERAGE_DITHER(7), 0x37d9e680);
-   }
 
    if (VIV_FEATURE(screen, ETNA_FEATURE_BUG_FIXES18))
       etna_set_state(stream, VIVS_GL_BUG_FIXES, 0x6);
@@ -331,6 +344,7 @@ etna_reset_gpu_state(struct etna_context *ctx)
    ctx->dirty_sampler_views = ~0L;
    ctx->prev_active_samplers = ~0L;
    ctx->needs_gpu_state_reset = false;
+   ctx->alpha_coverage_dither_emitted = false;
 }
 
 static void
@@ -352,7 +366,7 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    struct etna_context *ctx = etna_context(pctx);
    struct etna_screen *screen = ctx->screen;
-   struct pipe_framebuffer_state *pfb = &ctx->framebuffer_s;
+   struct pipe_framebuffer_state *pfb = &ctx->framebuffer_s.base;
    uint32_t draw_mode;
    unsigned i;
 
@@ -426,10 +440,26 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    if (screen->info->halti >= 5)
       key.flatshade = ctx->rasterizer->flatshade;
 
-    for (i = 0; i < pfb->nr_cbufs; i++) {
-       if (pfb->cbufs[i].texture)
-         key.frag_rb_swap |= !!translate_pe_format_rb_swap(pfb->cbufs[i].format) << i;
-    }
+   /* On LINEAR_PE GPUs rendering directly to a linear shared resource,
+    * use shader-based R/B swap so bytes in memory have the correct order
+    * for external consumers. This avoids a dedicated flush-time blit.
+    * Per-RT bitmask so MRT with mixed shared/non-shared targets works. */
+   if (VIV_FEATURE(screen, ETNA_FEATURE_LINEAR_PE)) {
+      for (i = 0; i < pfb->nr_cbufs; i++) {
+         if (pfb->cbufs[i].texture) {
+            struct etna_resource *rsc = etna_resource(pfb->cbufs[i].texture);
+            if (rsc->shared && rsc->layout == ETNA_LAYOUT_LINEAR &&
+                translate_pe_format_rb_swap(pfb->cbufs[i].format)) {
+               key.frag_rb_swap |= (1 << i);
+            }
+         }
+      }
+   }
+
+   key.rt_is_128bit = ctx->framebuffer_s.rt_is_128bit;
+   key.has_128bit_rt = !!key.rt_is_128bit;
+   for (i = 0; i < ARRAY_SIZE(key.rt_companion); i++)
+      key.rt_companion[i] = ctx->framebuffer_s.rt_companion[i];
 
    if (!etna_get_vs(ctx, &key) || !etna_get_fs(ctx, &key)) {
       BUG("compiled shaders are not okay");
@@ -463,7 +493,7 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
       }
    }
 
-   if (ctx->dirty & ETNA_DIRTY_SHADER) {
+   if (ctx->dirty & (ETNA_DIRTY_SHADER | ETNA_DIRTY_CONSTBUF)) {
       /* Mark constant buffers as being read */
       u_foreach_bit(i, ctx->constant_buffer[MESA_SHADER_VERTEX].enabled_mask)
          resource_read(ctx, ctx->constant_buffer[MESA_SHADER_VERTEX].cb[i].buffer);
@@ -570,10 +600,17 @@ etna_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
 
    for (i = 0; i < pfb->nr_cbufs; i++) {
       if (pfb->cbufs[i].texture) {
+         struct etna_resource *rsc = etna_resource(pfb->cbufs[i].texture);
          struct etna_resource *res = etna_resource_get_render_compatible(pctx, pfb->cbufs[i].texture);
          struct etna_resource_level *level = &res->levels[pfb->cbufs[i].level];
 
          etna_resource_level_mark_changed(level);
+
+         /* PE rendered directly to the shared buffer (no render shadow).
+          * If the shader swapped R/B, data is in native byte order.
+          * Otherwise it's in PE-internal order (BGRA for RB_SWAP formats). */
+         if (rsc->shared && res == rsc)
+            rsc->shared_native_order = !!(key.frag_rb_swap & (1 << i));
       }
    }
 
@@ -737,11 +774,8 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
 
    pctx->destroy = etna_context_destroy;
    pctx->draw_vbo = etna_draw_vbo;
-   pctx->ml_operation_supported = etna_ml_operation_supported;
-   pctx->ml_subgraph_create = etna_ml_subgraph_create;
    pctx->ml_subgraph_invoke = etna_ml_subgraph_invoke;
    pctx->ml_subgraph_read_output = etna_ml_subgraph_read_outputs;
-   pctx->ml_subgraph_destroy = etna_ml_subgraph_destroy;
    pctx->flush = etna_context_flush;
    pctx->set_debug_callback = etna_set_debug_callback;
    pctx->create_fence_fd = etna_create_fence_fd;
@@ -767,6 +801,8 @@ etna_context_create(struct pipe_screen *pscreen, void *priv, unsigned flags)
       ctx->blitter = util_blitter_create(pctx);
       if (!ctx->blitter)
          goto fail;
+
+      ctx->blitter->use_single_triangle = true;
    }
 
    slab_create_child(&ctx->transfer_pool, &screen->transfer_pool);

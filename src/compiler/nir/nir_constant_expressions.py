@@ -91,6 +91,42 @@ constant_denorm_flush_to_zero(nir_const_value *value, unsigned bit_size)
     }
 }
 
+static double
+get_float_source(nir_const_value value, unsigned execution_mode, unsigned bit_size)
+{
+    if (nir_is_denorm_flush_to_zero(execution_mode, bit_size))
+        constant_denorm_flush_to_zero(&value, bit_size);
+
+    return nir_const_value_as_float(value, bit_size);
+}
+
+/**
+ * Properly rounds and handles denorms for intermediate results. Useful for
+ * fused opcodes that want to behave exactly like the unfused variants, e.g.
+ * fmad.
+ */
+static double
+handle_intermediate_float_result(double value, unsigned execution_mode, unsigned bit_size)
+{
+    nir_const_value const_val;
+    switch(bit_size) {
+    case 64:
+        const_val.f64 = value;
+        break;
+    case 32:
+        const_val.f32 = value;
+        break;
+    case 16:
+        if (nir_is_rounding_mode_rtz(execution_mode, 16)) {
+            const_val.u16 = _mesa_float_to_float16_rtz(value);
+        } else {
+            const_val.u16 = _mesa_float_to_float16_rtne(value);
+        }
+    }
+
+    return get_float_source(const_val, execution_mode, bit_size);
+}
+
 /**
  * Evaluate one component of packSnorm4x8.
  */
@@ -389,10 +425,7 @@ typedef float float16_t;
 typedef float float32_t;
 typedef double float64_t;
 typedef bool bool1_t;
-typedef bool bool8_t;
-typedef bool bool16_t;
 typedef bool bool32_t;
-typedef bool bool64_t;
 
 static inline bool
 util_add_check_overflow_int1_t(int1_t a, int1_t b)
@@ -448,18 +481,15 @@ struct ${type}${width}_vec {
    % for j in range(op.num_inputs):
       % if op.input_sizes[j] == 0:
          <% continue %>
-      % elif "src" + str(j) not in op.const_expr:
-         ## Avoid unused variable warnings
-         <% continue %>
-      %endif
+      % endif
 
       const struct ${input_types[j]}_vec src${j} = {
       % for k in range(op.input_sizes[j]):
          % if input_types[j] == "int1":
              /* 1-bit integers use a 0/-1 convention */
              -(int1_t)_src[${j}][${k}].b,
-         % elif input_types[j] == "float16":
-            _mesa_half_to_float(_src[${j}][${k}].u16),
+         % elif type_base_type(input_types[j]) == "float":
+            get_float_source(_src[${j}][${k}], execution_mode, ${type_size(input_types[j])}),
          % else:
             _src[${j}][${k}].${get_const_field(input_types[j])},
          % endif
@@ -481,15 +511,12 @@ struct ${type}${width}_vec {
          % for j in range(op.num_inputs):
             % if op.input_sizes[j] != 0:
                <% continue %>
-            % elif "src" + str(j) not in op.const_expr:
-               ## Avoid unused variable warnings
-               <% continue %>
             % elif input_types[j] == "int1":
                /* 1-bit integers use a 0/-1 convention */
                const int1_t src${j} = -(int1_t)_src[${j}][_i].b;
-            % elif input_types[j] == "float16":
-               const float src${j} =
-                  _mesa_half_to_float(_src[${j}][_i].u16);
+            % elif type_base_type(input_types[j]) == "float":
+               const ${input_types[j]}_t src${j} =
+                  get_float_source(_src[${j}][_i], execution_mode, ${type_size(input_types[j])});
             % else:
                const ${input_types[j]}_t src${j} =
                   _src[${j}][_i].${get_const_field(input_types[j])};

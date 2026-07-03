@@ -1,32 +1,48 @@
-VK_KHR_relaxed_block_layout on pvr
-VK_KHR_storage_buffer_storage_class on pvr
-VK_EXT_external_memory_acquire_unmodified on panvk
-VK_EXT_discard_rectangles on NVK
-VK_KHR_present_id on HoneyKrisp
-VK_KHR_present_id2 on HoneyKrisp
-VK_KHR_present_wait on HoneyKrisp
-VK_KHR_present_wait2 on HoneyKrisp
-VK_KHR_maintenance10 on ANV, NVK, RADV
-VK_EXT_shader_uniform_buffer_unsized_array on ANV, HK, NVK, RADV
-VK_EXT_device_memory_report on panvk
-VK_VALVE_video_encode_rgb_conversion on radv
-VK_EXT_custom_resolve on RADV
-GL_EXT_shader_pixel_local_storage on Panfrost v6+
-VK_EXT_image_drm_format_modifier on panvk/v7
-VK_KHR_sampler_ycbcr_conversion on panvk/v7
-sparseResidencyImage2D on panvk v10+
-sparseResidencyStandard2DBlockShape on panvk v10+
-VK_KHR_surface_maintenance1 promotion everywhere EXT is exposed
-VK_KHR_swapchain_maintenance1 promotion everywhere EXT is exposed
-VK_KHR_dynamic_rendering on PowerVR
-VK_EXT_multisampled_render_to_single_sampled on panvk
-VK_KHR_pipeline_binary on HoneyKrisp
-VK_KHR_incremental_present on pvr
-VK_KHR_xcb_surface on pvr
-VK_KHR_xlib_surface on pvr
-VK_KHR_robustness2 on panvk v10+
-VK_KHR_robustness2 on HoneyKrisp
-VK_KHR_robustness2 on hasvk
-VK_KHR_robustness2 on NVK
-VK_KHR_robustness2 on Turnip
-VK_KHR_robustness2 on lavapipe
+cl_khr_subgroup_rotate on radeonsi
+cl_khr_subgroup_rotate on iris
+VK_EXT_shader_uniform_buffer_unsized_array on panvk
+VK_KHR_shader_constant_data on RADV
+VK_EXT_dynamic_rendering_unused_attachments on panvk
+protectedMemory support on RADV/GFX10+ and VEGA10
+VK_KHR_performance_query on RADV/GFX11
+VK_EXT_conservative_rasterization on panvk
+shaderImageGatherExtended on pvr
+static C++ stdlib required on rusticl to workaround applications using their own C++ stdlib
+VK_EXT_pipeline_protected_access on RADV
+VK_EXT_extended_dynamic_state3 on panvk
+GL_ARB_texture_query_lod on panfrost/v9+
+VK_KHR_maintenance11 on RADV
+OpenCL 3.1 support for rusticl on asahi, iris, radeonsi, llvmpipe and zink
+VK_KHR_workgroup_memory_explicit_layout on pvr
+VK_KHR_maintenance5 on pvr
+VK_KHR_shader_fma on RADV
+VK_EXT_shader_split_barrier on RADV/GFX12
+VK_KHR_shader_fma on nvk
+Support for G1-Ultra, G1-Premium and G1-Pro GPUs on Panfrost and PanVK
+VK_EXT_shader_atomic_float on nvk
+VK_{KHR,EXT}_index_type_uint8 on pvr
+VK_EXT_debug_marker in vulkan runtime
+VK_EXT_mesh_shader on NVK
+VK_KHR_device_fault on RADV
+VK_GOOGLE_display_timing for KHR_display on anv, panvk, pvr, radv, tu, v3dv
+VK_KHR_shader_abort on RADV
+VK_KHR_shader_fma on panvk
+VK_NV_shader_atomic_float16_vector on NVK
+VK_KHR_compute_shader_derivatives on panvk
+VK_EXT_shader_subgroup_ballot on pvr
+VK_EXT_shader_subgroup_vote on pvr
+VK_KHR_shader_subgroup_rotate on pvr
+VK_KHR_shader_subgroup_uniform_control_flow on pvr
+VK_EXT_subgroup_size_control on pvr
+VK_EXT_rasterization_order_attachment_access on panvk
+VK_ARM_rasterization_order_attachment_access on panvk
+GL_OES_texture_float on etnaviv/HALF_FLOAT
+GL_ARB_texture_float on etnaviv/HALF_FLOAT
+VK_NVX_binary_import on NVK
+VK_EXT_image_sliced_view_of_3d on panvk
+VK_EXT_shader_tile_image on panvk
+VK_KHR_internally_synchronized_queues on panvk
+VK_KHR_workgroup_memory_explicit_layout on panvk
+VK_EXT_device_memory_report on pvr
+VK_EXT_descriptor_heap enabled by default on anv, RADV
+VK_EXT_device_address_binding_report on panvk

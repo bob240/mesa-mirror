@@ -726,6 +726,13 @@ build_explicit_io_load(nir_builder *b, nir_intrinsic_instr *intrin,
       }
       break;
 
+   case nir_intrinsic_load_deref_transpose_amd:
+      if (mode != nir_var_mem_global)
+         UNREACHABLE("Unsupported explicit IO variable mode");
+      assert(addr_format == nir_address_format_64bit_global);
+      op = nir_intrinsic_load_global_transpose_amd;
+      break;
+
    default:
       UNREACHABLE("Invalid intrinsic");
    }
@@ -1110,9 +1117,9 @@ build_explicit_io_atomic(nir_builder *b, nir_intrinsic_instr *intrin,
    if (addr_shift.shift)
       nir_intrinsic_set_offset_shift(atomic, addr_shift.shift);
 
-   assert(intrin->def.num_components == 1);
-   nir_def_init(&atomic->instr, &atomic->def, 1,
-                intrin->def.bit_size);
+   atomic->num_components = intrin->def.num_components;
+   nir_def_init(&atomic->instr, &atomic->def,
+                intrin->def.num_components, intrin->def.bit_size);
 
    assert(atomic->def.bit_size % 8 == 0);
 
@@ -1482,7 +1489,8 @@ nir_lower_explicit_io_instr(nir_builder *b,
       break;
    }
 
-   case nir_intrinsic_load_deref_block_intel: {
+   case nir_intrinsic_load_deref_block_intel:
+   case nir_intrinsic_load_deref_transpose_amd: {
       nir_io_offset addr = build_addr(b, intrin, base_addr, addr_format, 0,
                                       align_mul, align_offset);
       nir_def *value = build_explicit_io_load(b, intrin, addr, addr_format,
@@ -1690,7 +1698,7 @@ lower_explicit_io_array_length(nir_builder *b, nir_intrinsic_instr *intrin,
       offset = addr_to_offset(b, addr, addr_format);
       nir_def *index = addr_to_index(b, addr, addr_format);
       unsigned access = nir_intrinsic_access(intrin);
-      size = nir_get_ssbo_size(b, index, .access = access);
+      size = nir_get_ssbo_size(b, 32, index, .access = access);
       break;
    }
 
@@ -1760,6 +1768,7 @@ nir_lower_explicit_io_impl(nir_function_impl *impl, nir_variable_mode modes,
             case nir_intrinsic_store_deref:
             case nir_intrinsic_load_deref_block_intel:
             case nir_intrinsic_store_deref_block_intel:
+            case nir_intrinsic_load_deref_transpose_amd:
             case nir_intrinsic_deref_atomic:
             case nir_intrinsic_deref_atomic_swap: {
                nir_deref_instr *deref = nir_src_as_deref(intrin->src[0]);

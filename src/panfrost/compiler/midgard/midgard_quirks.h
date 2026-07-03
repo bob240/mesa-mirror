@@ -1,28 +1,12 @@
 /*
  * Copyright (C) 2019 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef __MDG_QUIRKS_H
 #define __MDG_QUIRKS_H
+
+#include "panfrost/model/pan_model.h"
 
 /* Model-specific quirks requiring compiler workarounds/etc. Quirks
  * may be errata requiring a workaround, or features. We're trying to be
@@ -71,9 +55,9 @@
 #define MIDGARD_NO_AUTO32 (1 << 6)
 
 static inline unsigned
-midgard_get_quirks(unsigned gpu_id)
+midgard_get_quirks(uint64_t gpu_id)
 {
-   switch (gpu_id >> 16) {
+   switch (pan_prod_id(gpu_id)) {
    case 0x600:
       return MIDGARD_OLD_BLEND | MIDGARD_BROKEN_BLEND_LOADS |
              MIDGARD_BROKEN_LOD | MIDGARD_NO_UPPER_ALU | MIDGARD_NO_OOO |

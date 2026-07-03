@@ -21,7 +21,11 @@
  * IN THE SOFTWARE.
  */
 
-#include "v3dv_private.h"
+#include "v3dv_device.h"
+#include "v3dv_image.h"
+#include "v3dv_cmd_buffer.h"
+#include "v3dv_version_dispatch.h"
+#include "vk_format.h"
 #include "v3dv_format_table.h"
 #include "v3dvx_format_table.h"
 
@@ -380,12 +384,12 @@ v3dX(get_hw_clear_color)(const VkClearColorValue *color,
    break;
    case V3D_INTERNAL_TYPE_16UI:
    case V3D_INTERNAL_TYPE_16I:
-      if (format->unorm) {
+      if (format->sw_unorm) {
          util_pack_color(color->float32, PIPE_FORMAT_R16G16B16A16_UNORM, &uc);
          memcpy(hw_color, uc.ui, internal_size);
          return;
       }
-      if (format->snorm) {
+      if (format->sw_snorm) {
          util_pack_color(color->float32, PIPE_FORMAT_R16G16B16A16_SNORM, &uc);
          memcpy(hw_color, uc.ui, internal_size);
          return;

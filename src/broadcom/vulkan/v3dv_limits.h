@@ -24,6 +24,14 @@
 #define V3DV_LIMITS_H
 
 #include "drm-uapi/v3d_drm.h"
+#include "util/detect_os.h"
+
+#if DETECT_OS_ANDROID
+#define V3DV_MAX_QUEUES 4
+#else
+#define V3DV_MAX_QUEUES 1
+#endif
+
 
 /* From vulkan spec "If the multiple viewports feature is not enabled,
  * scissorCount must be 1", ditto for viewportCount. For now we don't support
@@ -37,7 +45,7 @@
 
 #define MAX_SETS 16
 
-#define MAX_PUSH_CONSTANTS_SIZE 128
+#define MAX_PUSH_CONSTANTS_SIZE 256
 
 #define MAX_SAMPLED_IMAGES 16
 #define MAX_STORAGE_IMAGES 4
@@ -97,5 +105,18 @@
 #define PAGE_UB_ROWS_TIMES_1_5 ((PAGE_UB_ROWS * 3) >> 1)
 #define PAGE_CACHE_UB_ROWS (V3D_PAGE_CACHE_SIZE / V3D_UIFBLOCK_ROW_SIZE)
 #define PAGE_CACHE_MINUS_1_5_UB_ROWS (PAGE_CACHE_UB_ROWS - PAGE_UB_ROWS_TIMES_1_5)
+
+/* Pre-generating packets needs to consider changes in packet sizes across hw
+ * versions. Keep things simple and allocate enough space for any supported
+ * version. We ensure the size is large enough through static asserts.
+ */
+#define V3DV_TEXTURE_SHADER_STATE_LENGTH 32
+#define V3DV_SAMPLER_STATE_LENGTH 24
+#define V3DV_BLEND_CFG_LENGTH 5
+#define V3DV_CFG_BITS_LENGTH 4
+#define V3DV_GL_SHADER_STATE_RECORD_LENGTH 36
+#define V3DV_VCM_CACHE_SIZE_LENGTH 2
+#define V3DV_GL_SHADER_STATE_ATTRIBUTE_RECORD_LENGTH 16
+#define V3DV_STENCIL_CFG_LENGTH 6
 
 #endif /* V3DV_LIMITS_H */

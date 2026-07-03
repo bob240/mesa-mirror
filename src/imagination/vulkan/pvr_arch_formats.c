@@ -59,6 +59,14 @@
       .bind = FLAGS_##bind_,                               \
    }
 
+#define FORMAT_YCBCR(vk, tex_fmt)                          \
+   [PIPE_FORMAT_##vk] = {                                  \
+      .tex_format = ROGUE_TEXSTATE_FORMAT_##tex_fmt,       \
+      .depth_tex_format = ROGUE_TEXSTATE_FORMAT_INVALID,   \
+      .stencil_tex_format = ROGUE_TEXSTATE_FORMAT_INVALID, \
+      .bind = FLAGS__T__,                                  \
+   }
+
 #define FORMAT_COMPRESSED(vk, tex_fmt)                          \
    [PIPE_FORMAT_##vk] = {                                       \
       .tex_format = ROGUE_TEXSTATE_FORMAT_COMPRESSED_##tex_fmt, \
@@ -97,11 +105,11 @@ static const struct pvr_format pvr_format_table[] = {
    FORMAT(R8G8B8A8_SRGB,       U8U8U8U8,     _TR_),
    FORMAT(B8G8R8A8_UNORM,      U8U8U8U8,     VTR_),
    FORMAT(B8G8R8A8_SRGB,       U8U8U8U8,     _TR_),
-   FORMAT(RGBA8888_UNORM,      U8U8U8U8,     VTR_),
-   FORMAT(RGBA8888_SNORM,      S8S8S8S8,     VTR_),
-   FORMAT(RGBA8888_UINT,       U8U8U8U8,     VTR_),
-   FORMAT(RGBA8888_SINT,       S8S8S8S8,     VTR_),
-   FORMAT(RGBA8888_SRGB,       U8U8U8U8,     _TR_),
+   FORMAT(A8B8G8R8_UNORM,      U8U8U8U8,     VTR_),
+   FORMAT(A8B8G8R8_SNORM,      S8S8S8S8,     VTR_),
+   FORMAT(A8B8G8R8_UINT,       U8U8U8U8,     VTR_),
+   FORMAT(A8B8G8R8_SINT,       S8S8S8S8,     VTR_),
+   FORMAT(A8B8G8R8_SRGB,       U8U8U8U8,     _TR_),
    FORMAT(B10G10R10A2_USCALED, INVALID,      V___),
    FORMAT(B10G10R10A2_SSCALED, INVALID,      V___),
    FORMAT(R10G10B10A2_UNORM,   A2R10B10G10,  VTRI),
@@ -157,9 +165,12 @@ static const struct pvr_format pvr_format_table[] = {
    FORMAT_COMPRESSED(ETC2_R11_SNORM, EAC_R11_SIGNED),
    FORMAT_COMPRESSED(ETC2_RG11_UNORM, EAC_RG11_UNSIGNED),
    FORMAT_COMPRESSED(ETC2_RG11_SNORM, EAC_RG11_SIGNED),
+   FORMAT_YCBCR(G8_B8R8_420_UNORM, YVU420_2PLANE),
+   FORMAT_YCBCR(G8_B8_R8_420_UNORM, YUV420_3PLANE),
 };
 /* clang-format on */
 
+#undef FORMAT_YCBCR
 #undef FORMAT
 #undef FORMAT_DEPTH_STENCIL
 #undef FORMAT_COMPRESSED
@@ -202,11 +213,11 @@ static const struct pvr_pbe_format pvr_pbe_format_table[] = {
    FORMAT(R8G8B8A8_SRGB, U8U8U8U8, F16),
    FORMAT(B8G8R8A8_UNORM, U8U8U8U8, U8),
    FORMAT(B8G8R8A8_SRGB, U8U8U8U8, F16),
-   FORMAT(RGBA8888_UNORM, U8U8U8U8, U8),
-   FORMAT(RGBA8888_SNORM, S8S8S8S8, S8),
-   FORMAT(RGBA8888_UINT, U8U8U8U8, UINT8),
-   FORMAT(RGBA8888_SINT, S8S8S8S8, SINT8),
-   FORMAT(RGBA8888_SRGB, U8U8U8U8, F16),
+   FORMAT(A8B8G8R8_UNORM, U8U8U8U8, U8),
+   FORMAT(A8B8G8R8_SNORM, S8S8S8S8, S8),
+   FORMAT(A8B8G8R8_UINT, U8U8U8U8, UINT8),
+   FORMAT(A8B8G8R8_SINT, S8S8S8S8, SINT8),
+   FORMAT(A8B8G8R8_SRGB, U8U8U8U8, F16),
    FORMAT(B10G10R10A2_USCALED, INVALID, INVALID),
    FORMAT(B10G10R10A2_SSCALED, INVALID, INVALID),
    FORMAT(R10G10B10A2_UNORM, A2R10B10G10, F16),

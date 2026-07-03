@@ -33,6 +33,7 @@
 #include "common/intel_aux_map.h"
 #include "util/anon_file.h"
 #include "util/futex.h"
+#include "util/os_mman.h"
 
 #ifdef HAVE_VALGRIND
 #define VG_NOACCESS_READ(__ptr) ({                       \
@@ -72,16 +73,7 @@
  * block (8k) allocator, which operates out of a bo.  Allocation is done by
  * either pulling a block from the free list or growing the used range of the
  * bo.  Growing the range may run out of space in the bo which we then need to
- * grow.  Growing the bo is tricky in a multi-threaded, lockless environment:
- * we need to keep all pointers and contents in the old map valid.  GEM bos in
- * general can't grow, but we use a trick: we create a memfd and use ftruncate
- * to grow it as necessary.  We mmap the new size and then create a gem bo for
- * it using the new gem userptr ioctl.  Without heavy-handed locking around
- * our allocation fast-path, there isn't really a way to munmap the old mmap,
- * so we just keep it around until garbage collection time.  While the block
- * allocator is lockless for normal operations, we block other threads trying
- * to allocate while we're growing the map.  It shouldn't happen often, and
- * growing is fast anyway.
+ * grow.
  *
  * At the next level we can use various sub-allocators.  The state pool is a
  * pool of smaller, fixed size objects, which operates much like the block
@@ -1242,7 +1234,16 @@ anv_state_reserved_array_pool_free(struct anv_state_reserved_array_pool *pool,
    simple_mtx_lock(&pool->mutex);
    BITSET_SET(pool->states, idx);
    simple_mtx_unlock(&pool->mutex);
- }
+}
+
+void
+anv_state_reserved_array_pool_index_free(struct anv_state_reserved_array_pool *pool,
+                                         uint32_t index)
+{
+   simple_mtx_lock(&pool->mutex);
+   BITSET_SET(pool->states, index);
+   simple_mtx_unlock(&pool->mutex);
+}
 
 void
 anv_bo_pool_init(struct anv_bo_pool *pool, struct anv_device *device,
@@ -1368,7 +1369,7 @@ anv_scratch_pool_finish(struct anv_device *device, struct anv_scratch_pool *pool
 
    for (unsigned i = 0; i < 16; i++) {
       if (pool->surf_states[i].map != NULL) {
-         anv_state_pool_free(&device->scratch_surface_state_pool,
+         anv_state_pool_free(anv_device_get_scratch_surface_state_pool(device),
                              pool->surf_states[i]);
       }
    }
@@ -1464,7 +1465,7 @@ anv_scratch_pool_get_surf(struct anv_device *device,
    struct anv_address addr = { .bo = bo };
 
    struct anv_state state =
-      anv_state_pool_alloc(&device->scratch_surface_state_pool,
+      anv_state_pool_alloc(anv_device_get_scratch_surface_state_pool(device),
                            device->isl_dev.ss.size, 64);
 
    isl_surf_usage_flags_t usage =
@@ -1483,12 +1484,32 @@ anv_scratch_pool_get_surf(struct anv_device *device,
 
    uint32_t current = p_atomic_cmpxchg(&pool->surfs[bucket], 0, state.offset);
    if (current) {
-      anv_state_pool_free(&device->scratch_surface_state_pool, state);
+      anv_state_pool_free(anv_device_get_scratch_surface_state_pool(device), state);
       return current;
    } else {
       pool->surf_states[bucket] = state;
       return state.offset;
    }
+}
+
+uint32_t
+anv_shader_get_scratch_surf(struct anv_batch *batch,
+                            struct anv_device *device,
+                            mesa_shader_stage stage,
+                            uint32_t total_scratch,
+                            bool protected)
+{
+   if (total_scratch == 0)
+      return 0;
+
+   struct anv_scratch_pool *pool = protected ?
+      &device->protected_scratch_pool : &device->scratch_pool;
+   struct anv_bo *bo =
+      anv_scratch_pool_alloc(device, pool, stage, total_scratch);
+   anv_reloc_list_add_bo(batch->relocs, bo);
+   uint32_t ret = anv_scratch_pool_get_surf(device, pool, total_scratch);
+
+   return ret >> ANV_SCRATCH_SPACE_SHIFT;
 }
 
 VkResult
@@ -1615,40 +1636,6 @@ anv_bo_vma_alloc_or_close(struct anv_device *device,
    return VK_SUCCESS;
 }
 
-enum intel_device_info_mmap_mode
-anv_bo_get_mmap_mode(struct anv_device *device, struct anv_bo *bo)
-{
-   enum anv_bo_alloc_flags alloc_flags = bo->alloc_flags;
-
-   if (device->info->has_set_pat_uapi)
-      return anv_device_get_pat_entry(device, alloc_flags)->mmap;
-
-   if (anv_physical_device_has_vram(device->physical)) {
-      if ((alloc_flags & ANV_BO_ALLOC_NO_LOCAL_MEM) ||
-          (alloc_flags & ANV_BO_ALLOC_IMPORTED))
-         return INTEL_DEVICE_INFO_MMAP_MODE_WB;
-
-      return INTEL_DEVICE_INFO_MMAP_MODE_WC;
-   }
-
-   /* gfx9 atom */
-   if (!device->info->has_llc) {
-      /* user wants a cached and coherent memory but to achieve it without
-       * LLC in older platforms DRM_IOCTL_I915_GEM_SET_CACHING needs to be
-       * supported and set.
-       */
-      if (alloc_flags & ANV_BO_ALLOC_HOST_CACHED)
-         return INTEL_DEVICE_INFO_MMAP_MODE_WB;
-
-      return INTEL_DEVICE_INFO_MMAP_MODE_WC;
-   }
-
-   if (alloc_flags & (ANV_BO_ALLOC_SCANOUT | ANV_BO_ALLOC_EXTERNAL))
-      return INTEL_DEVICE_INFO_MMAP_MODE_WC;
-
-   return INTEL_DEVICE_INFO_MMAP_MODE_WB;
-}
-
 VkResult
 anv_device_alloc_bo(struct anv_device *device,
                     const char *name,
@@ -1709,16 +1696,18 @@ anv_device_alloc_bo(struct anv_device *device,
     * MTL(Xe KMD only)/LNL platforms, which incur largest perf penalty from
     * page misses.
     */
-   if (align64(size, 2 * 1024 * 1024) <= (size * 4 / 3) &&
-       anv_device_has_perf_improvement_with_2mb_pages_oversubscription(device))
-      size = align64(size, 2 * 1024 * 1024);
-   /* bos larger than 1MB can't be allocated with slab but to reduce pages we
-    * could align size to 64k pages to gain performance with minimum memory
-    * waste.
-    */
-   else if ((size > (1 * 1024 * 1024)) &&
-            anv_device_has_perf_improvement_with_64k_pages(device))
-      size = align64(size, 64 * 1024);
+   if (!ANV_DEBUG(NO_ALLOC_OVER_SUBSCRIPTION)) {
+      if (align64(size, 2 * 1024 * 1024) <= (size * 4 / 3) &&
+          anv_device_has_perf_improvement_with_2mb_pages_oversubscription(device))
+         size = align64(size, 2 * 1024 * 1024);
+      /* bos larger than 1MB can't be allocated with slab but to reduce pages we
+       * could align size to 64k pages to gain performance with minimum memory
+       * waste.
+       */
+      else if ((size > (1 * 1024 * 1024)) &&
+               anv_device_has_perf_improvement_with_64k_pages(device))
+         size = align64(size, 64 * 1024);
+   }
 
    const struct intel_memory_class_instance *regions[2];
    uint32_t nregions = 0;
@@ -1806,6 +1795,46 @@ anv_device_alloc_bo(struct anv_device *device,
    return VK_SUCCESS;
 }
 
+static VkResult
+map_placed_addr_slab(struct anv_device *device,
+                     struct anv_bo *bo,
+                     uint64_t offset,
+                     size_t size,
+                     void *placed_addr,
+                     void **map_out)
+{
+   int prime_handle = anv_gem_handle_to_fd(device, bo->gem_handle);
+   VkResult result = VK_SUCCESS;
+
+   if (prime_handle < 0) {
+      return vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED,
+                       "anv_gem_handle_to_fd() before mmap failed: %m");
+   }
+
+   offset += (bo->offset - bo->slab_parent->offset);
+   void *map = os_mmap(placed_addr,
+                       size,
+                       PROT_READ | PROT_WRITE,
+                       MAP_FIXED | MAP_SHARED,
+                       prime_handle,
+                       offset);
+   if (map == MAP_FAILED) {
+      result = vk_errorf(device, VK_ERROR_MEMORY_MAP_FAILED, "mmap failed: %m");
+      goto end;
+   }
+
+   assert(placed_addr == NULL || map == placed_addr);
+   assert(map != NULL);
+   VG(VALGRIND_MALLOCLIKE_BLOCK(map, size, 0, 1));
+
+   if (map_out)
+      *map_out = map;
+
+end:
+   close(prime_handle);
+   return result;
+}
+
 VkResult
 anv_device_map_bo(struct anv_device *device,
                   struct anv_bo *bo,
@@ -1820,6 +1849,9 @@ anv_device_map_bo(struct anv_device *device,
    struct anv_bo *real = anv_bo_get_real(bo);
    uint64_t offset_adjustment = 0;
    if (real != bo) {
+      if (placed_addr)
+         return map_placed_addr_slab(device, bo, offset, size, placed_addr, map_out);
+
       offset += (bo->offset - real->offset);
 
       const uint64_t page_size = device->physical->page_size;
@@ -1829,9 +1861,6 @@ anv_device_map_bo(struct anv_device *device,
          offset_adjustment = offset - munmap_offset;
          size += offset_adjustment;
          offset = munmap_offset;
-
-         if (placed_addr)
-            placed_addr -= offset_adjustment;
       }
 
       assert((offset & (page_size - 1)) == 0);

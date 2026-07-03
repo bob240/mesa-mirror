@@ -45,7 +45,7 @@ static void
 debug_callback(void *priv, enum nir_spirv_debug_level debuglevel, size_t offset,
                const char *message)
 {
-   fprintf(stderr, "<%d> at %ld %s\n", debuglevel, offset, message);
+   fprintf(stderr, "<%d> at %zu %s\n", debuglevel, offset, message);
 }
 
 static int
@@ -69,6 +69,13 @@ static void
 optimize(nir_shader *nir)
 {
    msl_preprocess_nir(nir);
+   msl_preprocess_nir_workarounds(nir, 0);
+
+   nir_lower_compute_system_values_options csv_options = {
+      .has_base_global_invocation_id = 0,
+      .has_base_workgroup_id = true,
+   };
+   NIR_PASS(_, nir, nir_lower_compute_system_values, &csv_options);
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
@@ -166,8 +173,8 @@ main(int argc, char **argv)
       fprintf(stderr, "Couldn't guess shader stage from %s\n", argv[1]);
       return 4;
    }
-   nir_shader *shader = spirv_to_nir(words, nwords, NULL, 0, stage, "main",
-                                     &options, &nir_options);
+   nir_shader *shader =
+      spirv_to_nir(words, nwords, NULL, stage, "main", &options, &nir_options);
    if (!shader) {
       fprintf(stderr, "Compilation failed!\n");
       return 3;
@@ -177,7 +184,11 @@ main(int argc, char **argv)
    optimize(shader);
    nir_print_shader(shader, stdout);
 
-   char *msl_text = nir_to_msl(shader, shader, 0u);
+   struct nir_to_msl_options translate_options = {
+      .mem_ctx = shader,
+      .disabled_workarounds = 0u,
+   };
+   char *msl_text = nir_to_msl(shader, &translate_options);
 
    fputs(msl_text, stdout);
 

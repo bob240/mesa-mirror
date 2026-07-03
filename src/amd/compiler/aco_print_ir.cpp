@@ -8,7 +8,7 @@
 #include "aco_ir.h"
 
 #include "common/ac_shader_util.h"
-#include "common/sid.h"
+#include "common/amdgfxregs.h"
 
 #include <array>
 
@@ -148,8 +148,15 @@ print_definition(const Definition* definition, FILE* output, unsigned flags)
 {
    if (!(flags & print_no_ssa))
       print_reg_class(definition->regClass(), output);
-   if (definition->isPrecise())
-      fprintf(output, "(precise)");
+
+   if (definition->isNoContract() || definition->isNoReassoc()) {
+      if (!definition->isNoContract())
+         fprintf(output, "(no-reassoc)");
+      else if (!definition->isNoReassoc())
+         fprintf(output, "(no-contract)");
+      else
+         fprintf(output, "(precise)");
+   }
    if (definition->isInfPreserve() || definition->isNaNPreserve() || definition->isSZPreserve()) {
       fprintf(output, "(");
       if (definition->isSZPreserve())
@@ -597,6 +604,8 @@ print_instr_format_specific(enum amd_gfx_level gfx_level, const Instruction* ins
          fprintf(output, " null");
       else if (exp.dest >= V_008DFC_SQ_EXP_POS && exp.dest <= V_008DFC_SQ_EXP_POS + 3)
          fprintf(output, " pos%d", exp.dest - V_008DFC_SQ_EXP_POS);
+      else if (exp.dest == V_008DFC_SQ_EXP_PRIM)
+         fprintf(output, " prim");
       else if (exp.dest >= V_008DFC_SQ_EXP_PARAM && exp.dest <= V_008DFC_SQ_EXP_PARAM + 31)
          fprintf(output, " param%d", exp.dest - V_008DFC_SQ_EXP_PARAM);
       break;
@@ -826,7 +835,7 @@ print_vopd_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* o
 }
 
 static void
-print_block_kind(uint16_t kind, FILE* output)
+print_block_kind(uint32_t kind, FILE* output)
 {
    if (kind & block_kind_uniform)
       fprintf(output, "uniform, ");
@@ -836,10 +845,10 @@ print_block_kind(uint16_t kind, FILE* output)
       fprintf(output, "loop-preheader, ");
    if (kind & block_kind_loop_header)
       fprintf(output, "loop-header, ");
+   else if (kind & block_kind_loop_latch)
+      fprintf(output, "loop-latch, ");
    if (kind & block_kind_loop_exit)
       fprintf(output, "loop-exit, ");
-   if (kind & block_kind_continue)
-      fprintf(output, "continue, ");
    if (kind & block_kind_break)
       fprintf(output, "break, ");
    if (kind & block_kind_branch)
@@ -1044,7 +1053,9 @@ aco_print_instr(enum amd_gfx_level gfx_level, const Instruction* instr, FILE* ou
 
       if (instr->opcode == aco_opcode::v_fma_mix_f32 ||
           instr->opcode == aco_opcode::v_fma_mixlo_f16 ||
-          instr->opcode == aco_opcode::v_fma_mixhi_f16) {
+          instr->opcode == aco_opcode::v_fma_mixhi_f16 ||
+          instr->opcode == aco_opcode::p_v_fma_mixlo_f16_rtz ||
+          instr->opcode == aco_opcode::p_v_fma_mixhi_f16_rtz) {
          const VALU_instruction& vop3p = instr->valu();
          abs = vop3p.abs;
          neg = vop3p.neg;

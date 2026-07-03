@@ -36,6 +36,7 @@
  */
 
 #include "si_pipe.h"
+#include "gfx/si_gfx.h"
 #include "si_build_pm4.h"
 #include "sid.h"
 #include "util/format/u_format.h"
@@ -46,19 +47,6 @@
 
 #include "ac_descriptors.h"
 
-/* NULL image and buffer descriptor for textures (alpha = 1) and images
- * (alpha = 0).
- *
- * For images, all fields must be zero except for the swizzle, which
- * supports arbitrary combinations of 0s and 1s. The texture type must be
- * any valid type (e.g. 1D). If the texture type isn't set, the hw hangs.
- */
-static uint32_t null_texture_descriptor[8] = {
-   0, 0, 0, S_008F1C_DST_SEL_W(V_008F1C_SQ_SEL_1) | S_008F1C_TYPE(V_008F1C_SQ_RSRC_IMG_1D)
-};
-
-static uint32_t null_image_descriptor[8] = {0};
-
 static uint64_t si_desc_extract_buffer_address(const uint32_t *desc)
 {
    uint64_t va = desc[0] | ((uint64_t)G_008F04_BASE_ADDRESS_HI(desc[1]) << 32);
@@ -67,19 +55,6 @@ static uint64_t si_desc_extract_buffer_address(const uint32_t *desc)
    va <<= 16;
    va = (int64_t)va >> 16;
    return va;
-}
-
-static void si_init_descriptor_list(uint32_t *desc_list, unsigned element_dw_size,
-                                    unsigned num_elements, const uint32_t *null_descriptor)
-{
-   int i;
-
-   /* Initialize the array to NULL descriptors if the element size is 8. */
-   if (null_descriptor) {
-      assert(element_dw_size % 8 == 0);
-      for (i = 0; i < num_elements * element_dw_size / 8; i++)
-         memcpy(desc_list + i * 8, null_descriptor, 8 * 4);
-   }
 }
 
 static void si_init_descriptors(struct si_descriptors *desc, short shader_userdata_rel_index,
@@ -325,16 +300,6 @@ void si_set_mutable_tex_desc_fields(struct si_screen *sscreen, struct si_texture
       state[4] &= C_008F20_PITCH;
       state[4] |= S_008F20_PITCH(epitch);
    }
-
-   if (tex->swap_rgb_to_bgr) {
-      unsigned swizzle_x = G_008F1C_DST_SEL_X(state[3]);
-      unsigned swizzle_z = G_008F1C_DST_SEL_Z(state[3]);
-
-      state[3] &= C_008F1C_DST_SEL_X;
-      state[3] |= S_008F1C_DST_SEL_X(swizzle_z);
-      state[3] &= C_008F1C_DST_SEL_Z;
-      state[3] |= S_008F1C_DST_SEL_Z(swizzle_x);
-   }
 }
 
 static void si_set_sampler_state_desc(struct si_sampler_state *sstate,
@@ -359,7 +324,7 @@ static void si_set_sampler_view_desc(struct si_context *sctx, struct si_sampler_
 
    if (tex->buffer.b.b.target == PIPE_BUFFER) {
       memcpy(desc, sview->state, 8 * 4);
-      memcpy(desc + 8, null_texture_descriptor, 4 * 4); /* Disable FMASK. */
+      memset(desc + 8, 0, 4 * 4); /* Disable FMASK. */
       si_set_buf_desc_address(&tex->buffer, sview->base.u.buf.offset, desc);
       return;
    }
@@ -383,7 +348,7 @@ static void si_set_sampler_view_desc(struct si_context *sctx, struct si_sampler_
       memcpy(desc + 8, sview->fmask_state, 8 * 4);
    } else {
       /* Disable FMASK and bind sampler state in [12:15]. */
-      memcpy(desc + 8, null_texture_descriptor, 4 * 4);
+      memset(desc + 8, 0, 4 * 4);
 
       if (sstate)
          si_set_sampler_state_desc(sstate, sview, tex, desc + 12);
@@ -415,9 +380,9 @@ static void si_reset_sampler_view_slot(struct si_samplers *samplers, unsigned sl
                                        uint32_t * restrict desc)
 {
    pipe_sampler_view_reference(&samplers->views[slot], NULL);
-   memcpy(desc, null_texture_descriptor, 8 * 4);
+   memset(desc, 0, 8 * 4);
    /* Only clear the lower dwords of FMASK. */
-   memcpy(desc + 8, null_texture_descriptor, 4 * 4);
+   memset(desc + 8, 0, 4 * 4);
    /* Re-set the sampler state if we are transitioning from FMASK. */
    if (samplers->sampler_states[slot])
       si_set_sampler_state_desc(samplers->sampler_states[slot], NULL, NULL, desc + 12);
@@ -639,7 +604,7 @@ static void si_disable_shader_image(struct si_context *ctx, unsigned shader, uns
       pipe_resource_reference(&images->views[slot].resource, NULL);
       images->needs_color_decompress_mask &= ~(1 << slot);
 
-      memcpy(descs->list + desc_slot * 8, null_image_descriptor, 8 * 4);
+      memset(descs->list + desc_slot * 8, 0, 8 * 4);
       images->enabled_mask &= ~(1u << slot);
       images->display_dcc_store_mask &= ~(1u << slot);
       ctx->descriptors_dirty |= 1u << si_sampler_and_image_descriptors_idx(shader);
@@ -1029,6 +994,7 @@ static void si_init_buffer_resources(struct si_context *sctx,
             PIPE_SWIZZLE_W,
          },
       .gfx10_oob_select = V_008F0C_OOB_SELECT_RAW,
+      .has_desc_resource_level = sctx->screen->info.compiler_info.has_desc_resource_level,
    };
 
    /* Initialize buffer descriptors, so that we don't have to do it at bind time. */
@@ -1476,6 +1442,7 @@ void si_set_ring_buffer(struct si_context *sctx, uint slot, struct pipe_resource
          .stride = stride,
          .swizzle_enable = swizzle_enable,
          .gfx10_oob_select = V_008F0C_OOB_SELECT_DISABLED,
+         .has_desc_resource_level = sctx->screen->info.compiler_info.has_desc_resource_level,
          .index_stride = index_stride,
          .element_size = element_size,
          .add_tid = add_tid,
@@ -1855,8 +1822,8 @@ static void si_upload_bindless_descriptor(struct si_context *sctx, unsigned desc
    data = desc->list + desc_slot_offset;
    va = desc->gpu_address + desc_slot_offset * 4;
 
-   si_cp_write_data(sctx, desc->buffer, va - desc->buffer->gpu_address, num_dwords * 4, V_370_TC_L2,
-                    V_370_ME, data);
+   si_cp_write_data(sctx, desc->buffer, va - desc->buffer->gpu_address, num_dwords * 4, V_371_TC_L2,
+                    V_371_MICRO_ENGINE, data);
 }
 
 static void si_upload_bindless_descriptors(struct si_context *sctx)
@@ -1867,8 +1834,7 @@ static void si_upload_bindless_descriptors(struct si_context *sctx)
    /* Wait for graphics/compute to be idle before updating the resident
     * descriptors directly in memory, in case the GPU is using them.
     */
-   sctx->barrier_flags |= SI_BARRIER_SYNC_PS | SI_BARRIER_SYNC_CS;
-   si_emit_barrier_direct(sctx);
+   si_emit_barrier_direct(sctx, SI_BARRIER_SYNC_PS | SI_BARRIER_SYNC_CS);
 
    util_dynarray_foreach (&sctx->resident_tex_handles, struct si_texture_handle *, tex_handle) {
       unsigned desc_slot = (*tex_handle)->desc_slot;
@@ -1890,6 +1856,7 @@ static void si_upload_bindless_descriptors(struct si_context *sctx)
       (*img_handle)->desc_dirty = false;
    }
 
+   assert(sctx->dirty_atoms & si_get_atom_bit(sctx, &sctx->atoms.s.barrier));
    /* Invalidate scalar L0 because the cache doesn't know that L2 changed. */
    sctx->barrier_flags |= SI_BARRIER_INV_SMEM;
 
@@ -2620,7 +2587,6 @@ static uint64_t si_create_texture_handle(struct pipe_context *ctx, struct pipe_s
       return 0;
 
    memset(desc_list, 0, sizeof(desc_list));
-   si_init_descriptor_list(&desc_list[0], 16, 1, null_texture_descriptor);
 
    sstate = ctx->create_sampler_state(ctx, state);
    if (!sstate) {
@@ -2757,7 +2723,6 @@ static uint64_t si_create_image_handle(struct pipe_context *ctx, const struct pi
       return 0;
 
    memset(desc_list, 0, sizeof(desc_list));
-   si_init_descriptor_list(&desc_list[0], 8, 2, null_image_descriptor);
 
    si_set_shader_image_desc(sctx, view, false, &desc_list[0], &desc_list[8]);
 
@@ -2963,9 +2928,9 @@ void si_init_all_descriptors(struct si_context *sctx)
 
       int j;
       for (j = 0; j < SI_NUM_IMAGE_SLOTS; j++)
-         memcpy(desc->list + j * 8, null_image_descriptor, 8 * 4);
+         memset(desc->list + j * 8, 0, 8 * 4);
       for (; j < SI_NUM_IMAGE_SLOTS + SI_NUM_SAMPLERS * 2; j++)
-         memcpy(desc->list + j * 8, null_texture_descriptor, 8 * 4);
+         memset(desc->list + j * 8, 0, 8 * 4);
    }
 
    si_init_buffer_resources(sctx, &sctx->internal_bindings, &sctx->descriptors[SI_DESCS_INTERNAL],

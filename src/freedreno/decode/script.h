@@ -37,14 +37,23 @@ __attribute__((weak))
 void script_draw(const char *primtype, uint32_t nindx);
 
 __attribute__((weak))
-void script_packet(uint32_t *dwords, uint32_t sizedwords,
+void script_packet(const uint32_t *dwords, uint32_t sizedwords,
                    struct rnn *rnn,
                    struct rnndomain *dom);
 
 __attribute__((weak))
-const char * internal_packet(uint32_t *dwords, uint32_t sizedwords,
+const char * internal_packet(const uint32_t *dwords, uint32_t sizedwords,
                              struct rnn *rnn,
                              struct rnndomain *dom);
+
+__attribute__((weak))
+bool script_show_descriptor(const uint32_t *dwords,
+                            uint32_t sizedwords,
+                            int base, int idx,
+                            const char *type,
+                            const char *pm4_pkt,
+                            struct rnn *rnn,
+                            struct rnndomain *dom);
 
 /* maybe at some point it is interesting to add additional script
  * hooks for CP_EVENT_WRITE, etc?

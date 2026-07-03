@@ -128,6 +128,7 @@ hk_cmd_buffer_dirty_render_pass(struct hk_cmd_buffer *cmd)
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_ENABLES);
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_EQUATIONS);
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_WRITE_MASKS);
+   BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_CB_BLEND_ADVANCED);
 
    /* These depend on the depth/stencil format */
    BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_DS_DEPTH_TEST_ENABLE);
@@ -2796,7 +2797,7 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
        IS_DIRTY(CB_LOGIC_OP_ENABLE) || IS_DIRTY(CB_WRITE_MASKS) ||
        IS_DIRTY(CB_COLOR_WRITE_ENABLES) || IS_DIRTY(CB_ATTACHMENT_COUNT) ||
        IS_DIRTY(CB_BLEND_ENABLES) || IS_DIRTY(CB_BLEND_EQUATIONS) ||
-       IS_DIRTY(CB_BLEND_CONSTANTS) ||
+       IS_DIRTY(CB_BLEND_CONSTANTS) || IS_DIRTY(CB_BLEND_ADVANCED) ||
        desc->root_dirty /* for pipeline stats */ || true) {
 
       unsigned tib_sample_mask = BITFIELD_MASK(dyn->ms.rasterization_samples);
@@ -2890,32 +2891,32 @@ hk_flush_dynamic_state(struct hk_cmd_buffer *cmd, struct hk_cs *cs,
          if (!dyn->cb.attachments[i].blend_enable) {
             key.epilog.blend.rt[i] = (struct agx_blend_rt_key){
                .colormask = write_mask,
-               .rgb_func = PIPE_BLEND_ADD,
-               .alpha_func = PIPE_BLEND_ADD,
-               .rgb_src_factor = PIPE_BLENDFACTOR_ONE,
-               .alpha_src_factor = PIPE_BLENDFACTOR_ONE,
-               .rgb_dst_factor = PIPE_BLENDFACTOR_ZERO,
-               .alpha_dst_factor = PIPE_BLENDFACTOR_ZERO,
+               .mode = agx_pack_blend_standard(
+                  PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+                  PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO),
             };
+         } else if (cb->color_blend_op >= VK_BLEND_OP_ZERO_EXT) {
+            key.epilog.blend.rt[i] = (struct agx_blend_rt_key){
+               .colormask = write_mask,
+               .advanced_blend = 1,
+               .mode = agx_pack_blend_advanced(
+                  vk_advanced_blend_op_to_pipe(cb->color_blend_op),
+                  vk_blend_overlap_to_pipe(cb->blend_overlap),
+                  cb->src_premultiplied, cb->dst_premultiplied,
+                  cb->clamp_results),
+            };
+
+            assert(cb->clamp_results == false);
          } else {
             key.epilog.blend.rt[i] = (struct agx_blend_rt_key){
                .colormask = write_mask,
-
-               .rgb_src_factor =
+               .mode = agx_pack_blend_standard(
+                  vk_blend_op_to_pipe(cb->color_blend_op),
                   vk_blend_factor_to_pipe(cb->src_color_blend_factor),
-
-               .rgb_dst_factor =
                   vk_blend_factor_to_pipe(cb->dst_color_blend_factor),
-
-               .rgb_func = vk_blend_op_to_pipe(cb->color_blend_op),
-
-               .alpha_src_factor =
+                  vk_blend_op_to_pipe(cb->alpha_blend_op),
                   vk_blend_factor_to_pipe(cb->src_alpha_blend_factor),
-
-               .alpha_dst_factor =
-                  vk_blend_factor_to_pipe(cb->dst_alpha_blend_factor),
-
-               .alpha_func = vk_blend_op_to_pipe(cb->alpha_blend_op),
+                  vk_blend_factor_to_pipe(cb->dst_alpha_blend_factor)),
             };
          }
       }
@@ -3212,6 +3213,9 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_graphics_state *gfx = &cmd->state.gfx;
    struct hk_api_shader *gs = gfx->shaders[MESA_SHADER_GEOMETRY];
 
+   if (!IS_SHADER_DIRTY(VERTEX) && !IS_SHADER_DIRTY(GEOMETRY))
+      return;
+
    /* If there's an application geometry shader, there's nothing to un/bind */
    if (gs && !gs->is_passthrough)
       return;
@@ -3221,28 +3225,36 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    uint32_t xfb_outputs = last_sw->info.xfb_info.output_count;
    bool needs_gs = xfb_outputs;
 
-   /* If we already have a matching GS configuration, we're done */
-   if ((gs != NULL) == needs_gs)
-      return;
-
    /* If we don't need a GS but we do have a passthrough, unbind it */
-   if (gs) {
-      assert(!needs_gs && gs->is_passthrough);
-      hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, NULL);
+   if (!needs_gs) {
+      if (gs != NULL) {
+         assert(gs->is_passthrough);
+         hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, NULL);
+      }
       return;
    }
 
    /* Else, we need to bind a passthrough GS */
-   size_t key_size =
-      sizeof(struct hk_passthrough_gs_key) + nir_xfb_info_size(xfb_outputs);
-   struct hk_passthrough_gs_key *key = alloca(key_size);
+   size_t key_size = poly_passthrough_gs_key_size(xfb_outputs);
+   struct poly_passthrough_gs_key *key = alloca(key_size);
 
-   *key = (struct hk_passthrough_gs_key){
+   *key = (struct poly_passthrough_gs_key){
       .prim = u_decomposed_prim(hk_gs_in_prim(cmd)),
       .outputs = last_sw->b.info.outputs,
       .clip_distance_array_size = last_sw->info.clip_distance_array_size,
       .cull_distance_array_size = last_sw->info.cull_distance_array_size,
    };
+
+   for (uint32_t i = 0; i < NUM_TOTAL_VARYING_SLOTS; i++) {
+      key->output_components[i] =
+         nir_slot_num_components(i, MESA_SHADER_VERTEX);
+      if (key->output_components[i] == 0)
+         key->output_components[i] = 4;
+
+      /* We don't care about VS varying types in AGX, just set everything to
+       * uint32 to improve cache hits. */
+      key->output_types[i] = nir_type_uint32;
+   }
 
    if (xfb_outputs) {
       typed_memcpy(key->xfb_stride, last_sw->info.xfb_stride,
@@ -3255,7 +3267,7 @@ hk_handle_passthrough_gs(struct hk_cmd_buffer *cmd, struct agx_draw draw)
    struct hk_device *dev = hk_cmd_buffer_device(cmd);
    perf_debug(cmd, "Binding passthrough GS for%s\n", xfb_outputs ? " XFB" : "");
 
-   gs = hk_meta_shader(dev, hk_nir_passthrough_gs, key, key_size);
+   gs = hk_meta_shader(dev, poly_nir_passthrough_gs, key, key_size);
    gs->is_passthrough = true;
    hk_cmd_bind_graphics_shader(cmd, MESA_SHADER_GEOMETRY, gs);
 }

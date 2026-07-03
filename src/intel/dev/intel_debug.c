@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "dev/intel_debug.h"
+#include "dev/intel_device_info.h"
 #include "util/macros.h"
 #include "util/u_debug.h"
 #include "util/u_math.h"
@@ -107,6 +108,8 @@ static const struct debug_control_bitset debug_control[] = {
    OPT1("bvh_tlas_ir_hdr",   DEBUG_BVH_TLAS_IR_HDR),
    OPT1("bvh_blas_ir_as",    DEBUG_BVH_BLAS_IR_AS),
    OPT1("bvh_tlas_ir_as",    DEBUG_BVH_TLAS_IR_AS),
+   OPT1("bvh_pcrel_map",     DEBUG_BVH_PCREL_MAP),
+   OPT1("bvh_update_as",     DEBUG_BVH_UPDATE_AS),
    OPT1("bvh_no_build",      DEBUG_BVH_NO_BUILD),
    OPT1("task",              DEBUG_TASK),
    OPT1("mesh",              DEBUG_MESH),
@@ -213,7 +216,7 @@ uint64_t intel_debug_batch_frame_stop = -1;
 
 uint32_t intel_debug_bkp_before_draw_count = 0;
 uint32_t intel_debug_bkp_after_draw_count = 0;
-uint32_t intel_shader_dump_filter = 0;
+uint64_t intel_shader_dump_filter = 0;
 
 uint32_t intel_debug_bkp_before_dispatch_count = 0;
 uint32_t intel_debug_bkp_after_dispatch_count = 0;
@@ -302,6 +305,36 @@ process_intel_debug_variable_once(void)
    BITSET_CLEAR(intel_debug, DEBUG_NO32);
 }
 
+static const struct debug_named_value use_jay_options[] = {
+   { "vs",  BITFIELD_BIT(MESA_SHADER_VERTEX),    "Use jay for vertex shaders"   },
+   { "tes", BITFIELD_BIT(MESA_SHADER_TESS_EVAL), "Use jay for tessellation evaluation shaders" },
+   { "fs",  BITFIELD_BIT(MESA_SHADER_FRAGMENT),  "Use jay for fragment shaders" },
+   { "cs",  BITFIELD_BIT(MESA_SHADER_COMPUTE),   "Use jay for compute shaders"  },
+   { "all", BITFIELD_BIT(MESA_SHADER_VERTEX) |
+            BITFIELD_BIT(MESA_SHADER_TESS_EVAL) |
+            BITFIELD_BIT(MESA_SHADER_FRAGMENT) |
+            BITFIELD_BIT(MESA_SHADER_COMPUTE),   "Use jay for supported shader stages"  },
+   DEBUG_NAMED_VALUE_END
+};
+
+DEBUG_GET_ONCE_FLAGS_OPTION(use_jay, "INTEL_JAY", use_jay_options, 0);
+static int use_jay = 0;
+
+bool
+intel_use_jay(const struct intel_device_info *devinfo, mesa_shader_stage stage)
+{
+   if (stage == MESA_SHADER_KERNEL)
+      stage = MESA_SHADER_COMPUTE;
+
+   return devinfo->ver == 20 && (use_jay & BITFIELD_BIT(stage));
+}
+
+bool
+intel_use_jay_any_stage(const struct intel_device_info *devinfo)
+{
+   return devinfo->ver == 20 && use_jay;
+}
+
 void
 process_intel_debug_variable(void)
 {
@@ -309,4 +342,6 @@ process_intel_debug_variable(void)
 
    call_once(&process_intel_debug_variable_flag,
              process_intel_debug_variable_once);
+
+   use_jay = debug_get_option_use_jay();
 }

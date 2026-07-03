@@ -270,7 +270,7 @@ struct agx_uncompiled_shader {
    mesa_shader_stage type;
    struct blob early_serialized_nir;
    struct blob serialized_nir;
-   uint8_t nir_sha1[SHA1_DIGEST_LENGTH];
+   uint8_t nir_blake3[BLAKE3_KEY_LEN];
 
    struct {
       uint64_t inputs_flat_shaded;
@@ -877,6 +877,8 @@ struct agx_screen {
 
    /* Lock to protect syncobj usage vs. destruction in context destroy */
    struct u_rwlock destroy_lock;
+
+   float heap_memory_percent;
 };
 
 static inline struct agx_screen *

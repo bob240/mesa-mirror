@@ -12,11 +12,13 @@
 #include <gtest/gtest.h>
 
 #include "tensorflow/lite/c/c_api.h"
+#include "tensorflow/lite/c/c_api_experimental.h"
 #include "tensorflow/lite/c/common.h"
 
 #include <fcntl.h>
 #include "test_executor.h"
 #include "tflite-schema-v2.15.0_generated.h"
+#include "tflite-ref-ops.h"
 
 #include "util/os_misc.h"
 
@@ -428,6 +430,8 @@ run_model(TfLiteModel *model, enum executor executor, void ***input, size_t *num
    TfLiteDelegate *delegate = NULL;
    TfLiteInterpreterOptions *options = TfLiteInterpreterOptionsCreate();
 
+   tflite_register_ref_ops(options);
+
    if (executor == EXECUTOR_NPU) {
       load_delegate();
       delegate = tflite_plugin_create_delegate(NULL, NULL, 0, NULL);
@@ -436,10 +440,10 @@ run_model(TfLiteModel *model, enum executor executor, void ***input, size_t *num
 
    TfLiteInterpreterOptionsSetErrorReporter(options, tflite_error_cb, NULL);
 
-   TfLiteInterpreter *interpreter = TfLiteInterpreterCreate(model, options);
+   TfLiteInterpreter *interpreter = TfLiteInterpreterCreateWithSelectedOps(model, options);
    assert(interpreter);
 
-   TfLiteInterpreterAllocateTensors(interpreter);
+   EXPECT_EQ(TfLiteInterpreterAllocateTensors(interpreter), kTfLiteOk);
 
    *num_inputs = TfLiteInterpreterGetInputTensorCount(interpreter);
    if (*input == NULL)
@@ -449,6 +453,9 @@ run_model(TfLiteModel *model, enum executor executor, void ***input, size_t *num
       std::ostringstream input_cache;
       input_cache << cache_dir << "/" << "input-" << i << ".data";
 
+      if (input_tensor->allocation_type != kTfLiteArenaRw)
+         continue;
+      
       if ((*input)[i] == NULL) {
          if (cache_is_enabled())
             (*input)[i] = read_buf(input_cache.str().c_str(), NULL);
@@ -519,8 +526,15 @@ run_model(TfLiteModel *model, enum executor executor, void ***input, size_t *num
       }
 
       switch (output_tensor->type) {
+      case kTfLiteInt32:
+      case kTfLiteUInt32:
       case kTfLiteFloat32: {
          (*output_sizes)[i] = output_tensor->bytes / 4;
+         break;
+      }
+      case kTfLiteInt16:
+      case kTfLiteUInt16: {
+         (*output_sizes)[i] = output_tensor->bytes / 2;
          break;
       }
       default: {

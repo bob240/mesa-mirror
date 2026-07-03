@@ -284,12 +284,12 @@ lower_shader_system_values(struct nir_builder *builder, nir_instr *instr,
       nir_imm_int(builder, 0),
       .desc_set = conf->runtime_data_cbv.register_space,
       .binding = conf->runtime_data_cbv.base_shader_register,
-      .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+      .desc_type = nir_descriptor_type_uniform_buffer);
 
    nir_def *load_desc = nir_load_vulkan_descriptor(
       builder, nir_address_format_num_components(ubo_format),
       nir_address_format_bit_size(ubo_format),
-      index, .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+      index, .desc_type = nir_descriptor_type_uniform_buffer);
 
    nir_def *load_data = nir_load_ubo(
       builder, 
@@ -371,12 +371,12 @@ lower_load_push_constant(struct nir_builder *builder, nir_instr *instr,
       nir_address_format_bit_size(ubo_format),
       nir_imm_int(builder, 0),
       .desc_set = data->desc_set, .binding = data->binding,
-      .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+      .desc_type = nir_descriptor_type_uniform_buffer);
 
    nir_def *load_desc = nir_load_vulkan_descriptor(
       builder, nir_address_format_num_components(ubo_format),
       nir_address_format_bit_size(ubo_format),
-      index, .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+      index, .desc_type = nir_descriptor_type_uniform_buffer);
 
    nir_def *offset = intrin->src[0].ssa;
    nir_def *load_data = nir_load_ubo(
@@ -465,12 +465,12 @@ lower_yz_flip(struct nir_builder *builder, nir_instr *instr,
          nir_imm_int(builder, 0),
          .desc_set = rt_conf->runtime_data_cbv.register_space,
          .binding = rt_conf->runtime_data_cbv.base_shader_register,
-         .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+         .desc_type = nir_descriptor_type_uniform_buffer);
 
       nir_def *load_desc = nir_load_vulkan_descriptor(
          builder, nir_address_format_num_components(ubo_format),
          nir_address_format_bit_size(ubo_format),
-         index, .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+         index, .desc_type = nir_descriptor_type_uniform_buffer);
 
       dyn_yz_flip_mask =
          nir_load_ubo(builder, 1, 32,
@@ -620,12 +620,12 @@ write_pntc_with_pos(nir_builder *b, nir_instr *instr, void *_data)
       nir_imm_int(b, 0),
       .desc_set = data->conf->runtime_data_cbv.register_space,
       .binding = data->conf->runtime_data_cbv.base_shader_register,
-      .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+      .desc_type = nir_descriptor_type_uniform_buffer);
 
    nir_def *load_desc = nir_load_vulkan_descriptor(
       b, nir_address_format_num_components(ubo_format),
       nir_address_format_bit_size(ubo_format),
-      index, .desc_type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
+      index, .desc_type = nir_descriptor_type_uniform_buffer);
 
    nir_def *transform = nir_channels(b,
                                          nir_load_ubo(b, 4, 32,
@@ -804,30 +804,26 @@ dxil_spirv_nir_link(nir_shader *nir, nir_shader *prev_stage_nir,
             NIR_PASS(_, nir, dxil_spirv_compute_pntc);
             metadata->requires_runtime_data = true;
          }
+
+         dxil_nir_propagate_interp_to_outputs(prev_stage_nir, nir);
       }
 
       NIR_PASS(_, nir, dxil_nir_kill_undefined_varyings, prev_stage_nir->info.outputs_written, prev_stage_nir->info.patch_outputs_written, NULL);
       NIR_PASS(_, prev_stage_nir, dxil_nir_kill_unused_outputs, nir->info.inputs_read, nir->info.patch_inputs_read, NULL);
 
-      dxil_reassign_driver_locations(nir, nir_var_shader_in, prev_stage_nir->info.outputs_written, NULL);
-      dxil_reassign_driver_locations(prev_stage_nir, nir_var_shader_out, nir->info.inputs_read, NULL);
-
+      /* Tess metadata flows TCS->TES so the placeholder helper below knows
+       * the per-vertex input array length, and TCS gets the domain config. */
       if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
          assert(prev_stage_nir->info.stage == MESA_SHADER_TESS_CTRL);
          nir->info.tess.tcs_vertices_out = prev_stage_nir->info.tess.tcs_vertices_out;
          prev_stage_nir->info.tess = nir->info.tess;
 
-         for (uint32_t i = 0; i < 2; ++i) {
-            unsigned loc = i == 0 ? VARYING_SLOT_TESS_LEVEL_OUTER : VARYING_SLOT_TESS_LEVEL_INNER;
-            nir_variable *var = nir_find_variable_with_location(nir, nir_var_shader_in, loc);
-            if (!var) {
-               var = nir_variable_create(nir, nir_var_shader_in, glsl_array_type(glsl_float_type(), i == 0 ? 4 : 2, 0), i == 0 ? "outer" : "inner");
-               var->data.location = loc;
-               var->data.patch = true;
-               var->data.compact = true;
-            }
-         }
+         /* Pad TES input signature so HS<->DS match for D3D12 pipeline validation. */
+         dxil_nir_pad_tes_input_signature(nir, prev_stage_nir);
       }
+
+      dxil_reassign_driver_locations(nir, nir_var_shader_in, prev_stage_nir->info.outputs_written, NULL);
+      dxil_reassign_driver_locations(prev_stage_nir, nir_var_shader_out, nir->info.inputs_read, NULL);
    }
 
    glsl_type_singleton_decref();
@@ -919,6 +915,7 @@ dxil_spirv_nir_passes(nir_shader *nir,
       .point_coord = true,
       .front_face = true,
       .layer_id = true,
+      .primitive_id = nir->info.stage == MESA_SHADER_FRAGMENT,
    };
    NIR_PASS(_, nir, nir_lower_sysvals_to_varyings, &sysvals_to_varyings);
 

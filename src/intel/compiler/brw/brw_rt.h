@@ -1,24 +1,6 @@
 /*
  * Copyright © 2020 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #pragma once
@@ -36,7 +18,7 @@ extern "C" {
 #define BRW_RT_SBT_HANDLE_SIZE 32
 
 /** RT_DISPATCH_GLOBALS size (see gen_rt.xml) */
-#define BRW_RT_DISPATCH_GLOBALS_SIZE 72
+#define BRW_RT_DISPATCH_GLOBALS_SIZE 80
 
 /** RT_DISPATCH_GLOBALS alignment
  *
@@ -50,6 +32,9 @@ extern "C" {
 
 /** Stride of the resume SBT */
 #define BRW_BTD_RESUME_SBT_STRIDE 8
+
+/** Root node offset for BVH */
+#define BRW_RT_ROOT_NODE_OFFSET 256
 
 /* Vulkan always uses exactly two levels of BVH: world and object.  At the API
  * level, these are referred to as top and bottom.
@@ -191,6 +176,10 @@ struct brw_rt_raygen_trampoline_params {
     (BRW_RT_SIZEOF_RAY + BRW_RT_SIZEOF_TRAV_STACK) * BRW_RT_MAX_BVH_LEVELS + \
     (BRW_RT_MAX_BVH_LEVELS % 2 ? 32 : 0))
 
+#define BRW_RT_SIZEOF_SHADOW_RAY_QUERY  \
+   (BRW_RT_SIZEOF_HIT_INFO * 2 + \
+    (BRW_RT_SIZEOF_RAY + BRW_RT_SIZEOF_TRAV_STACK) * BRW_RT_MAX_BVH_LEVELS)
+
 #define BRW_RT_SIZEOF_HW_STACK \
    (BRW_RT_SIZEOF_HIT_INFO * 2 + \
     BRW_RT_SIZEOF_RAY * BRW_RT_MAX_BVH_LEVELS + \
@@ -273,19 +262,42 @@ brw_rt_ray_queries_stack_ids_per_dss(const struct intel_device_info *devinfo)
     *    "For Sync Ray tracing (i.e. using RayQueries), SW must allocate
     *    space assuming 2K StackIDs"
     */
-   return 2048;
+   uint32_t num_stack_id_per_dss = 2048;
+
+   /* Wa_14021821874, Wa_14018813551, Wa_14026600921:
+    *
+    * "StackIDControlOverride_RTGlobals = 0 (i.e. 2k)". We
+    * already set stack size per ray to 64 in brw_nir_lower_rt_intrinsics
+    * as the workaround also requires.
+    */
+   if (intel_needs_workaround(devinfo, 14021821874) ||
+       intel_needs_workaround(devinfo, 14018813551) ||
+       intel_needs_workaround(devinfo, 14026600921))
+      num_stack_id_per_dss = 2048;
+
+   return num_stack_id_per_dss;
 }
 
 static inline uint32_t
-brw_rt_ray_queries_stacks_offset(uint32_t num_queries)
+brw_rt_ray_queries_shadow_stack_size(const struct intel_device_info *devinfo)
 {
-   return BRW_RT_DISPATCH_GLOBALS_ALIGN << util_logbase2_ceil(num_queries);
+   /* Maximum slice/subslice/EU ID can be computed from the max_scratch_ids
+    * which includes all the threads.
+    */
+   uint32_t max_eu_id = devinfo->max_scratch_ids[MESA_SHADER_COMPUTE];
+   uint32_t max_simd_size = 32;
+   return max_eu_id * max_simd_size * BRW_RT_SIZEOF_SHADOW_RAY_QUERY;
 }
 
 static inline uint32_t
-brw_rt_ray_queries_stacks_stride(const struct intel_device_info *devinfo)
+brw_rt_ray_queries_shadow_stacks_size(const struct intel_device_info *devinfo,
+                                      uint32_t ray_queries)
 {
-   return align(brw_rt_ray_queries_hw_stacks_size(devinfo), 4096);
+   /* Don't bother a shadow stack if we only have a single query. We can
+    * directly write in the HW buffer.
+    */
+   return (ray_queries > 1 ? ray_queries : 0) * brw_rt_ray_queries_shadow_stack_size(devinfo) +
+          ray_queries * 4; /* Ctrl + Level data */
 }
 
 #ifdef __cplusplus

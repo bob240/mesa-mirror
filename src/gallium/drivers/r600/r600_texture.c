@@ -80,13 +80,13 @@ bool r600_prepare_for_dma_blit(struct r600_common_context *rctx,
 }
 
 /* Same as resource_copy_region, except that both upsampling and downsampling are allowed. */
-static void r600_copy_region_with_blit(struct pipe_context *pipe,
-				       struct pipe_resource *dst,
-                                       unsigned dst_level,
-                                       unsigned dstx, unsigned dsty, unsigned dstz,
-                                       struct pipe_resource *src,
-                                       unsigned src_level,
-                                       const struct pipe_box *src_box)
+void r600_copy_region_with_blit(struct pipe_context *pipe,
+				struct pipe_resource *dst,
+				unsigned dst_level,
+				unsigned dstx, unsigned dsty, unsigned dstz,
+				struct pipe_resource *src,
+				unsigned src_level,
+				const struct pipe_box *src_box)
 {
 	struct pipe_blit_info blit;
 
@@ -1573,7 +1573,6 @@ struct pipe_surface *r600_create_surface_custom(struct pipe_context *pipe,
 
 	pipe_reference_init(&surface->reference, 1);
 	pipe_resource_reference(&surface->texture, texture);
-	surface->context = pipe;
 	surface->format = templ->format;
 	surface->level = templ->level;
 	surface->first_layer = templ->first_layer;

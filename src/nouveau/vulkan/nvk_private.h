@@ -33,7 +33,7 @@
 #define NVK_MAX_DISCARD_RECTANGLES 8
 
 #define NVK_SPARSE_ADDR_SPACE_SIZE (1ull << 39)
-#define NVK_MAX_BUFFER_SIZE (1ull << 31)
+#define NVK_MAX_BUFFER_SIZE (1ull << 32)
 #define NVK_MAX_SHARED_SIZE (48 * 1024)
 
 /* Max size of a bound cbuf */
@@ -41,6 +41,10 @@
 
 #define NVK_MAX_IMAGE_PLANES 3
 #define NVK_MAX_SAMPLER_PLANES 2
+
+#define NVK_HW_ROOT_TABLE_SIZE 256
+#define NVK_HW_ROOT_TABLE_FIRST_CB 24
+#define NVK_HW_ROOT_TABLE_COUNT 8
 
 /* Device Generated Commands */
 #define NVK_DGC_ALIGN 0x100

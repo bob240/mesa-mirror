@@ -2,26 +2,7 @@
  * Copyright (C) 2019-2020 Collabora, Ltd.
  * Copyright (C) 2019 Alyssa Rosenzweig
  * Copyright (C) 2014-2017 Broadcom
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
+ * SPDX-License-Identifier: MIT
  */
 
 #include <assert.h>
@@ -32,9 +13,9 @@
 #include "util/rounding.h"
 #include "util/u_framebuffer.h"
 #include "util/u_pack_color.h"
-#include "util/perf/cpu_trace.h"
 #include "pan_bo.h"
 #include "pan_context.h"
+#include "pan_trace.h"
 #include "pan_util.h"
 
 #define foreach_batch(ctx, idx)                                                \
@@ -109,6 +90,9 @@ panfrost_batch_init(struct panfrost_context *ctx,
 
    panfrost_batch_add_surface(batch, &batch->key.zsbuf);
 
+   if (dev->arch >= 10)
+      u_trace_init(&batch->trace, &ctx->trace_context);
+
    return screen->vtbl.init_batch(batch);
 }
 
@@ -151,6 +135,9 @@ panfrost_batch_cleanup(struct panfrost_context *ctx,
    util_unreference_framebuffer_state(&batch->key);
 
    util_dynarray_fini(&batch->bos);
+
+   if (dev->arch >= 10)
+      u_trace_fini(&batch->trace);
 
    memset(batch, 0, sizeof(*batch));
    BITSET_CLEAR(ctx->batches.active, batch_idx);
@@ -544,13 +531,13 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
       rts[i].format = surf->format;
       rts[i].dim = MALI_TEXTURE_DIMENSION_2D;
       rts[i].last_level = rts[i].first_level = surf->level;
-      rts[i].first_layer = surf->first_layer;
-      rts[i].last_layer = surf->last_layer;
+      rts[i].first_layer_or_z_slice = surf->first_layer;
+      rts[i].last_layer_or_z_slice = surf->last_layer;
       panfrost_set_image_view_planes(&rts[i], surf->texture);
       rts[i].nr_samples =
          surf->nr_samples ?: MAX2(surf->texture->nr_samples, 1);
       memcpy(rts[i].swizzle, id_swz, sizeof(rts[i].swizzle));
-      fb->rts[i].crc_valid = &prsrc->valid.crc;
+      fb->rts[i].crc_state = &prsrc->crc_state;
       fb->rts[i].view = &rts[i];
 
       /* Preload if the RT is read or updated */
@@ -572,13 +559,11 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
       if (util_format_has_depth(fdesc)) {
          z_rsrc = pan_resource(surf->texture);
 
-         zs->format = surf->format == PIPE_FORMAT_Z32_FLOAT_S8X24_UINT
-                         ? PIPE_FORMAT_Z32_FLOAT
-                         : surf->format;
+         zs->format = z_rsrc->image.props.format;
          zs->dim = MALI_TEXTURE_DIMENSION_2D;
          zs->last_level = zs->first_level = surf->level;
-         zs->first_layer = surf->first_layer;
-         zs->last_layer = surf->last_layer;
+         zs->first_layer_or_z_slice = surf->first_layer;
+         zs->last_layer_or_z_slice = surf->last_layer;
          zs->planes[0] = (struct pan_image_plane_ref){
             .image = &z_rsrc->image,
             .plane_idx = 0,
@@ -598,8 +583,8 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
             s->format = PIPE_FORMAT_S8_UINT;
             s->dim = MALI_TEXTURE_DIMENSION_2D;
             s->last_level = s->first_level = surf->level;
-            s->first_layer = surf->first_layer;
-            s->last_layer = surf->last_layer;
+            s->first_layer_or_z_slice = surf->first_layer;
+            s->last_layer_or_z_slice = surf->last_layer;
             s->planes[0] = (struct pan_image_plane_ref){
                .image = &s_rsrc->image,
                .plane_idx = 0,
@@ -615,8 +600,8 @@ panfrost_batch_to_fb_info(const struct panfrost_batch *batch,
          s->format = surf->format;
          s->dim = MALI_TEXTURE_DIMENSION_2D;
          s->last_level = s->first_level = surf->level;
-         s->first_layer = surf->first_layer;
-         s->last_layer = surf->last_layer;
+         s->first_layer_or_z_slice = surf->first_layer;
+         s->last_layer_or_z_slice = surf->last_layer;
          s->planes[0] = (struct pan_image_plane_ref){
             .image = &s_rsrc->image,
             .plane_idx = 0,
@@ -696,7 +681,7 @@ static void
 panfrost_batch_submit(struct panfrost_context *ctx,
                       struct panfrost_batch *batch)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_JOB);
 
    struct pipe_screen *pscreen = ctx->base.screen;
    struct panfrost_screen *screen = pan_screen(pscreen);
@@ -740,6 +725,9 @@ panfrost_batch_submit(struct panfrost_context *ctx,
    if (ret)
       mesa_loge("panfrost_batch_submit failed: %d\n", ret);
 
+   if (pan_device(ctx->base.screen)->arch >= 10)
+      u_trace_flush(&batch->trace, NULL, U_TRACE_FRAME_UNKNOWN, false);
+
    /* We must reset the damage info of our render targets here even
     * though a damage reset normally happens when the DRI layer swaps
     * buffers. That's because there can be implicit flushes the GL
@@ -767,7 +755,7 @@ void
 panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
 {
    assert(reason);
-   MESA_TRACE_SCOPE("%s reason=\"%s\"", __func__, reason);
+   PAN_TRACE_SCOPE(PAN_TRACE_GL_JOB, "%s reason=\"%s\"", __func__, reason);
    perf_debug(ctx, "Flushing everything due to: %s", reason);
 
    struct panfrost_batch *batch = panfrost_get_batch_for_fbo(ctx);
@@ -780,6 +768,9 @@ panfrost_flush_all_batches(struct panfrost_context *ctx, const char *reason)
       if (ctx->batches.slots[i].seqnum)
          panfrost_batch_submit(ctx, &ctx->batches.slots[i]);
    }
+
+   if (pan_device(ctx->base.screen)->arch >= 10)
+      u_trace_context_process(&ctx->trace_context, false);
 }
 
 void
@@ -787,13 +778,15 @@ panfrost_flush_writer(struct panfrost_context *ctx,
                       struct panfrost_resource *rsrc, const char *reason)
 {
    assert(reason);
-   MESA_TRACE_SCOPE("%s reason=\"%s\"", __func__, reason);
+   PAN_TRACE_SCOPE(PAN_TRACE_GL_JOB, "%s reason=\"%s\"", __func__, reason);
 
    struct hash_entry *entry = _mesa_hash_table_search(ctx->writers, rsrc);
 
    if (entry) {
       perf_debug(ctx, "Flushing writer due to: %s", reason);
       panfrost_batch_submit(ctx, entry->data);
+      if (pan_device(ctx->base.screen)->arch >= 10)
+         u_trace_context_process(&ctx->trace_context, false);
    }
 }
 
@@ -803,7 +796,7 @@ panfrost_flush_batches_accessing_rsrc(struct panfrost_context *ctx,
                                       const char *reason)
 {
    assert(reason);
-   MESA_TRACE_SCOPE("%s reason=\"%s\"", __func__, reason);
+   PAN_TRACE_SCOPE(PAN_TRACE_GL_JOB, "%s reason=\"%s\"", __func__, reason);
 
    unsigned i;
    foreach_batch(ctx, i) {
@@ -815,6 +808,8 @@ panfrost_flush_batches_accessing_rsrc(struct panfrost_context *ctx,
       perf_debug(ctx, "Flushing user due to: %s", reason);
       panfrost_batch_submit(ctx, batch);
    }
+   if (pan_device(ctx->base.screen)->arch >= 10)
+      u_trace_context_process(&ctx->trace_context, false);
 }
 
 bool

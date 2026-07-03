@@ -58,7 +58,11 @@ static bool pvr_can_present_on_device(VkPhysicalDevice pdevice, int fd)
       return false;
    /* Allow on-device presentation for all devices with bus type PLATFORM.
     * Other device types such as PCI or USB should use the PRIME blit path. */
-   return device->bustype == DRM_BUS_PLATFORM;
+   bool match = device->bustype == DRM_BUS_PLATFORM;
+
+   drmFreeDevice(&device);
+
+   return match;
 }
 
 VkResult pvr_wsi_init(struct pvr_physical_device *pdevice)
@@ -70,12 +74,12 @@ VkResult pvr_wsi_init(struct pvr_physical_device *pdevice)
                             pvr_wsi_proc_addr,
                             &pdevice->vk.instance->alloc,
                             pdevice->ws->display_fd,
-                            NULL,
+                            &pdevice->instance->drirc.options,
                             &(struct wsi_device_options){ .sw_device = false });
    if (result != VK_SUCCESS)
       return result;
 
-   pdevice->wsi_device.supports_modifiers = false;
+   pdevice->wsi_device.supports_modifiers = true;
    pdevice->wsi_device.can_present_on_device = pvr_can_present_on_device;
    pdevice->vk.wsi_device = &pdevice->wsi_device;
 

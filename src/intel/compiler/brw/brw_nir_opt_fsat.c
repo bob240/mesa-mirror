@@ -144,7 +144,7 @@ verify_users(nir_instr_worklist *sources, struct set *verified_phis,
          return false;
 
       nir_foreach_use(use, src_def) {
-         nir_instr *user_instr = nir_src_parent_instr(use);
+         nir_instr *user_instr = nir_src_use_instr(use);
 
          if (user_instr->type == nir_instr_type_phi) {
             nir_instr_worklist_push_tail(sources, user_instr);
@@ -235,6 +235,7 @@ brw_nir_opt_fsat(nir_shader *shader)
                 * the move.
                 */
                alu->op = nir_op_mov;
+               alu->fp_math_ctrl = nir_op_valid_fp_math_ctrl(alu->op, alu->fp_math_ctrl);
                progress_impl = true;
             }
          }

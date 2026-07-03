@@ -81,13 +81,9 @@ enum pipe_video_profile
 enum pipe_video_cap
 {
    PIPE_VIDEO_CAP_SUPPORTED = 0,
-   PIPE_VIDEO_CAP_NPOT_TEXTURES = 1,
    PIPE_VIDEO_CAP_MAX_WIDTH = 2,
    PIPE_VIDEO_CAP_MAX_HEIGHT = 3,
-   PIPE_VIDEO_CAP_PREFERRED_FORMAT = 4,
    PIPE_VIDEO_CAP_SUPPORTS_PROGRESSIVE = 6,
-   PIPE_VIDEO_CAP_MAX_LEVEL = 8,
-   PIPE_VIDEO_CAP_STACKED_FRAMES = 9,
    PIPE_VIDEO_CAP_MAX_MACROBLOCKS = 10,
    PIPE_VIDEO_CAP_MAX_TEMPORAL_LAYERS = 11,
    PIPE_VIDEO_CAP_SKIP_CLEAR_SURFACE = 12,
@@ -340,6 +336,7 @@ enum pipe_video_vpp_blend_mode
 {
    PIPE_VIDEO_VPP_BLEND_MODE_NONE = 0x0,
    PIPE_VIDEO_VPP_BLEND_MODE_GLOBAL_ALPHA = 0x1,
+   PIPE_VIDEO_VPP_BLEND_MODE_PREMULTIPLIED_ALPHA = 0x2,
 };
 
 /* To be used for VPP state*/
@@ -472,6 +469,8 @@ enum pipe_video_cap_slice_structure
    *  for all slices except for the last one, which must be equal or smaller
    *  to the previous slices. */
    PIPE_VIDEO_CAP_SLICE_STRUCTURE_EQUAL_MULTI_ROWS = 0x00000020,
+   /* Driver supports PIPE_VIDEO_SLICE_MODE_AUTO. */
+   PIPE_VIDEO_CAP_SLICE_STRUCTURE_AUTO = 0x00000040,
 };
 
 enum pipe_video_enc_intra_refresh_mode

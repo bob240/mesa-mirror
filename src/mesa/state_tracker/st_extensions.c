@@ -206,8 +206,10 @@ void st_init_limits(struct pipe_screen *screen,
    for (sh = 0; sh < MESA_SHADER_MESH_STAGES; ++sh) {
       struct gl_program_constants *pc = &c->Program[sh];
 
-      if (!screen->shader_caps[sh].max_instructions)
+      if (!screen->shader_caps[sh].max_instructions) {
+         pc->MaxTextureImageUnits = 0;
          continue;
+      }
 
       pc->MaxTextureImageUnits =
          _min(screen->shader_caps[sh].max_texture_samplers,
@@ -639,7 +641,8 @@ void st_init_limits(struct pipe_screen *screen,
    c->ShaderSubgroupSupportedStages =
       mesa_to_gl_stages(screen->caps.shader_subgroup_supported_stages);
    c->ShaderSubgroupSupportedFeatures =
-      screen->caps.shader_subgroup_supported_features;
+      screen->caps.shader_subgroup_supported_features &
+         BITFIELD_MASK(PIPE_SHADER_SUBGROUP_NUM_FEATURES);
    c->ShaderSubgroupQuadAllStages =
       screen->caps.shader_subgroup_quad_all_stages;
 }
@@ -1182,6 +1185,10 @@ void st_init_extensions(struct pipe_screen *screen,
    init_format_extensions(screen, extensions, depthstencil_mapping,
                           ARRAY_SIZE(depthstencil_mapping), PIPE_TEXTURE_2D,
                           PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_SAMPLER_VIEW);
+
+   if (!screen->caps.native_fp32_depth)
+      extensions->ARB_depth_buffer_float = GL_FALSE;
+
    init_format_extensions(screen, extensions, texture_mapping,
                           ARRAY_SIZE(texture_mapping), PIPE_TEXTURE_2D,
                           PIPE_BIND_SAMPLER_VIEW);
@@ -1223,7 +1230,7 @@ void st_init_extensions(struct pipe_screen *screen,
 
    consts->AllowGLSLBuiltinVariableRedeclaration = options->allow_glsl_builtin_variable_redeclaration;
 
-   consts->dri_config_options_sha1 = options->config_options_sha1;
+   consts->dri_config_options_blake3 = options->config_options_blake3;
 
    consts->AllowGLSLCrossStageInterpolationMismatch = options->allow_glsl_cross_stage_interpolation_mismatch;
 
@@ -1341,6 +1348,7 @@ void st_init_extensions(struct pipe_screen *screen,
 
    consts->ForceIntegerTexNearest = options->force_integer_tex_nearest;
 
+   consts->ForceExplicitUniformLocZero = options->force_explicit_uniform_loc_zero;
    consts->VendorOverride = options->force_gl_vendor;
    consts->RendererOverride = options->force_gl_renderer;
 
@@ -1551,6 +1559,9 @@ void st_init_extensions(struct pipe_screen *screen,
    if (options->allow_glsl_120_subset_in_110)
       consts->AllowGLSL120SubsetIn110 = GL_TRUE;
 
+   if (options->allow_glsl_embedded_structure_declarations)
+      consts->AllowGLSLEmbeddedStructureDeclarations = GL_TRUE;
+
    if (options->allow_glsl_builtin_const_expression)
       consts->AllowGLSLBuiltinConstantExpression = GL_TRUE;
 
@@ -1722,7 +1733,7 @@ void st_init_extensions(struct pipe_screen *screen,
             max_variable_threads_per_block;
 
          extensions->ARB_compute_variable_group_size =
-            max_variable_threads_per_block > 0;
+            max_variable_threads_per_block >= 512;
       }
    }
 

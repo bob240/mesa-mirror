@@ -1,31 +1,10 @@
-/**************************************************************************
- *
+/*
  * Copyright 2018-2019 Alyssa Rosenzweig
  * Copyright 2018-2019 Collabora, Ltd.
  * Copyright © 2015 Intel Corporation
  * All Rights Reserved.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the
- * "Software"), to deal in the Software without restriction, including
- * without limitation the rights to use, copy, modify, merge, publish,
- * distribute, sub license, and/or sell copies of the Software, and to
- * permit persons to whom the Software is furnished to do so, subject to
- * the following conditions:
- *
- * The above copyright notice and this permission notice (including the
- * next paragraph) shall be included in all copies or substantial portions
- * of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
- * OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
- * IN NO EVENT SHALL VMWARE AND/OR ITS SUPPLIERS BE LIABLE FOR
- * ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
- * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
- * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
- *
- **************************************************************************/
+ * SPDX-License-Identifier: MIT
+ */
 
 #ifndef PAN_DEVICE_H
 #define PAN_DEVICE_H
@@ -188,7 +167,7 @@ panfrost_device_fd(const struct panfrost_device *dev)
    return dev->kmod.dev->fd;
 }
 
-static inline uint32_t
+static inline uint64_t
 panfrost_device_gpu_id(const struct panfrost_device *dev)
 {
    return dev->kmod.dev->props.gpu_id;
@@ -197,13 +176,13 @@ panfrost_device_gpu_id(const struct panfrost_device *dev)
 static inline uint32_t
 panfrost_device_gpu_prod_id(const struct panfrost_device *dev)
 {
-   return dev->kmod.dev->props.gpu_id >> 16;
+   return pan_prod_id(dev->kmod.dev->props.gpu_id);
 }
 
 static inline uint32_t
 panfrost_device_gpu_rev(const struct panfrost_device *dev)
 {
-   return dev->kmod.dev->props.gpu_id & BITFIELD_MASK(16);
+   return pan_rev(dev->kmod.dev->props.gpu_id);
 }
 
 static inline int

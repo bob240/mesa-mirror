@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2023 Amazon.com, Inc. or its affiliates
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "pan_mod_conv_cso.h"
@@ -201,8 +183,10 @@ panfrost_create_afbc_size_shader(struct panfrost_screen *screen,
    unsigned align = key->afbc.align;
    struct panfrost_device *dev = pan_device(&screen->base);
 
+   const nir_shader_compiler_options *compiler_options =
+      pan_get_nir_shader_compiler_options(dev->arch, false);
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, pan_get_nir_shader_compiler_options(dev->arch),
+      MESA_SHADER_COMPUTE, compiler_options,
       "panfrost_afbc_size(uncompressed_size=%u, align=%u)",
       key->afbc.uncompressed_size, align);
 
@@ -238,9 +222,10 @@ panfrost_create_afbc_pack_shader(struct panfrost_screen *screen,
 {
    unsigned align = key->afbc.align;
    struct panfrost_device *dev = pan_device(&screen->base);
+   const nir_shader_compiler_options *compiler_options =
+      pan_get_nir_shader_compiler_options(dev->arch, false);
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, pan_get_nir_shader_compiler_options(dev->arch),
-      "panfrost_afbc_pack");
+      MESA_SHADER_COMPUTE, compiler_options, "panfrost_afbc_pack");
 
    panfrost_afbc_add_info_ubo(pack, b);
 
@@ -283,9 +268,10 @@ panfrost_create_mtk_tiled_detile_shader(
 {
    const struct panfrost_device *device = &screen->dev;
    bool tint_yuv = (device->debug & PAN_DBG_YUV) != 0;
+   const nir_shader_compiler_options *compiler_options =
+      pan_get_nir_shader_compiler_options(device->arch, false);
    nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_COMPUTE, pan_get_nir_shader_compiler_options(device->arch),
-      "panfrost_mtk_detile");
+      MESA_SHADER_COMPUTE, compiler_options, "panfrost_mtk_detile");
    b.shader->info.workgroup_size[0] = 4;
    b.shader->info.workgroup_size[1] = 16;
    b.shader->info.workgroup_size[2] = 1;

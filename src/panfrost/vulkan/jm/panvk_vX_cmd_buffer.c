@@ -6,24 +6,7 @@
  * Copyright © 2016 Bas Nieuwenhuizen
  * Copyright © 2015 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "genxml/gen_macros.h"
@@ -33,7 +16,7 @@
 #include "panvk_cmd_buffer.h"
 #include "panvk_cmd_desc_state.h"
 #include "panvk_cmd_draw.h"
-#include "panvk_cmd_fb_preload.h"
+#include "panvk_cmd_frame_shaders.h"
 #include "panvk_cmd_pool.h"
 #include "panvk_cmd_push_constant.h"
 #include "panvk_device.h"
@@ -54,14 +37,22 @@
 static VkResult
 panvk_cmd_prepare_fragment_job(struct panvk_cmd_buffer *cmdbuf, uint64_t fbd)
 {
-   const struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
+   const struct pan_fb_layout *fb = &cmdbuf->state.gfx.render.fb.layout;
    struct panvk_batch *batch = cmdbuf->cur_batch;
    struct pan_ptr job_ptr = panvk_cmd_alloc_desc(cmdbuf, FRAGMENT_JOB);
 
    if (!job_ptr.gpu)
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
-   GENX(pan_emit_fragment_job_payload)(fbinfo, fbd, job_ptr.cpu);
+   pan_section_pack(job_ptr.cpu, FRAGMENT_JOB, PAYLOAD, payload) {
+      assert(pan_fb_bbox_is_valid(fb->tiling_area_px));
+      payload.bound_min_x = fb->tiling_area_px.min_x >> MALI_TILE_SHIFT;
+      payload.bound_min_y = fb->tiling_area_px.min_y >> MALI_TILE_SHIFT;
+      payload.bound_max_x = fb->tiling_area_px.max_x >> MALI_TILE_SHIFT;
+      payload.bound_max_y = fb->tiling_area_px.max_y >> MALI_TILE_SHIFT;
+
+      payload.framebuffer = fbd;
+   }
 
    pan_section_pack(job_ptr.cpu, FRAGMENT_JOB, HEADER, header) {
       header.type = MALI_JOB_TYPE_FRAGMENT;
@@ -81,8 +72,6 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
 
    if (!batch)
       return;
-
-   struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
 
    assert(batch);
 
@@ -137,20 +126,37 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
    if (batch->tls.cpu)
       GENX(pan_emit_tls)(&batch->tlsinfo, batch->tls.cpu);
 
-   if (batch->fb.desc.cpu) {
+   if (batch->fb.desc.cpu &&
+       (cmdbuf->cur_batch->vtc_jc.first_tiler ||
+        cmdbuf->state.gfx.render.fb.needs_store)) {
       panvk_per_arch(cmd_select_tile_size)(cmdbuf);
 
-      /* At this point, we should know sample count and the tile size should have
-       * been calculated */
-      assert(fbinfo->nr_samples > 0 && fbinfo->tile_size > 0);
+      /* At this point, we should know sample count and the tile size should
+       * have been calculated
+       */
+      const struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
+      assert(render->fb.layout.sample_count > 0);
+      assert(render->fb.layout.tile_size_px > 0);
 
-      fbinfo->sample_positions =
-         dev->sample_positions->addr.dev +
-         pan_sample_positions_offset(pan_sample_pattern(fbinfo->nr_samples));
-      fbinfo->first_provoking_vertex =
-         cmdbuf->state.gfx.render.first_provoking_vertex != U_TRISTATE_NO;
+      const uint8_t sample_count = render->fb.layout.sample_count;
+      struct pan_fb_desc_info fbd_info = {
+         .fb = &render->fb.layout,
+         .load = render->fb.needs_load ? &render->fb.load :
+                                         &render->fb.spill.load,
+         .store = render->fb.needs_store ? &render->fb.store :
+                                           &render->fb.spill.store,
+         .sample_pos_array_pointer = dev->sample_positions->addr.dev +
+            pan_sample_positions_offset(pan_sample_pattern(sample_count)),
+         .provoking_vertex_first =
+            cmdbuf->state.gfx.render.first_provoking_vertex != U_TRISTATE_NO,
+         .tls = &batch->tlsinfo,
+         .tiler_ctx = &batch->tiler.ctx,
+      };
 
-      VkResult result = panvk_per_arch(cmd_fb_preload)(cmdbuf, fbinfo);
+      struct pan_fb_frame_shaders fs;
+      VkResult result = panvk_per_arch(cmd_get_frame_shaders)(
+         cmdbuf, &render->fb.layout, fbd_info.load,
+         render->fb.needs_store ? &render->fb.resolve : NULL, &fs);
       if (result != VK_SUCCESS)
          return;
 
@@ -160,25 +166,39 @@ panvk_per_arch(cmd_close_batch)(struct panvk_cmd_buffer *cmdbuf)
          util_bitcount(view_mask) :
          batch->fb.layer_count;
 
+      const bool has_zs_ext = pan_fb_has_zs(&render->fb.layout);
       for (uint32_t i = 0; i < enabled_layer_count; i++) {
          uint32_t layer_id = (view_mask != 0) ? u_bit_scan(&view_mask) : i;
          VkResult result;
-
-         uint64_t fbd = batch->fb.desc.gpu + (batch->fb.desc_stride * layer_id);
 
          result = panvk_per_arch(cmd_prepare_tiler_context)(cmdbuf, layer_id);
          if (result != VK_SUCCESS)
             break;
 
-         fbd |= GENX(pan_emit_fbd)(
-            &cmdbuf->state.gfx.render.fb.info, layer_id, &batch->tlsinfo,
-            &batch->tiler.ctx,
-            batch->fb.desc.cpu + (batch->fb.desc_stride * layer_id));
+         const struct pan_ptr fbd =
+            pan_ptr_offset(batch->fb.desc, batch->fb.desc_stride * layer_id);
+         uint64_t tagged_fbd_ptr = fbd.gpu;
 
-         result = panvk_cmd_prepare_fragment_job(cmdbuf, fbd);
+         fbd_info.layer = layer_id;
+         fbd_info.frame_shaders = fs;
+         fbd_info.frame_shaders.dcd_pointer += layer_id * 3 * pan_size(DRAW);
+
+         const struct pan_fb_descs fb_descs = {
+            .fbd = fbd.cpu,
+            .zs_crc = has_zs_ext ? fbd.cpu + pan_size(FRAMEBUFFER) : NULL,
+            .rts = has_zs_ext ? fbd.cpu + pan_size(FRAMEBUFFER) +
+                                   pan_size(ZS_CRC_EXTENSION)
+                              : fbd.cpu + pan_size(FRAMEBUFFER),
+         };
+         tagged_fbd_ptr |= GENX(pan_emit_fb_desc)(&fbd_info, &fb_descs);
+
+         result = panvk_cmd_prepare_fragment_job(cmdbuf, tagged_fbd_ptr);
          if (result != VK_SUCCESS)
             break;
       }
+
+      /* We've now done the load.  Everything from now on should spill */
+      cmdbuf->state.gfx.render.fb.needs_load = false;
    }
 
    cmdbuf->cur_batch = NULL;
@@ -192,9 +212,10 @@ panvk_per_arch(cmd_alloc_fb_desc)(struct panvk_cmd_buffer *cmdbuf)
    if (batch->fb.desc.gpu)
       return VK_SUCCESS;
 
-   const struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
-   bool has_zs_ext = fbinfo->zs.view.zs || fbinfo->zs.view.s;
-   batch->fb.layer_count = cmdbuf->state.gfx.render.layer_count;
+   struct panvk_rendering_state *render = &cmdbuf->state.gfx.render;
+   const struct pan_fb_layout *fb = &render->fb.layout;
+   bool has_zs_ext = pan_fb_has_zs(fb);
+   batch->fb.layer_count = render->layer_count;
    unsigned fbd_size = pan_size(FRAMEBUFFER);
 
    if (has_zs_ext)
@@ -202,7 +223,7 @@ panvk_per_arch(cmd_alloc_fb_desc)(struct panvk_cmd_buffer *cmdbuf)
                  pan_size(ZS_CRC_EXTENSION);
 
    fbd_size = ALIGN_POT(fbd_size, pan_alignment(RENDER_TARGET)) +
-              (MAX2(fbinfo->rt_count, 1) * pan_size(RENDER_TARGET));
+              (fb->rt_count * pan_size(RENDER_TARGET));
 
    batch->fb.bo_count = cmdbuf->state.gfx.render.fb.bo_count;
    memcpy(batch->fb.bos, cmdbuf->state.gfx.render.fb.bos,
@@ -212,9 +233,6 @@ panvk_per_arch(cmd_alloc_fb_desc)(struct panvk_cmd_buffer *cmdbuf)
       panvk_cmd_alloc_dev_mem(cmdbuf, desc, fbd_size * batch->fb.layer_count,
                               pan_alignment(FRAMEBUFFER));
    batch->fb.desc_stride = fbd_size;
-
-   memset(&cmdbuf->state.gfx.render.fb.info.bifrost.pre_post.dcds, 0,
-          sizeof(cmdbuf->state.gfx.render.fb.info.bifrost.pre_post.dcds));
 
    return batch->fb.desc.gpu ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
 }
@@ -250,7 +268,7 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
       goto out_set_layer_ctx;
    }
 
-   const struct pan_fb_info *fbinfo = &cmdbuf->state.gfx.render.fb.info;
+   const struct pan_fb_layout *fb = &cmdbuf->state.gfx.render.fb.layout;
    uint32_t layer_count = cmdbuf->state.gfx.render.layer_count;
    batch->tiler.heap_desc = panvk_cmd_alloc_desc(cmdbuf, TILER_HEAP);
    batch->tiler.ctx_descs =
@@ -271,10 +289,10 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    pan_pack(&batch->tiler.ctx_templ, TILER_CONTEXT, cfg) {
       cfg.hierarchy_mask = panvk_select_tiler_hierarchy_mask(
          phys_dev, &cmdbuf->state.gfx, pan_kmod_bo_size(dev->tiler_heap->bo));
-      cfg.fb_width = fbinfo->width;
-      cfg.fb_height = fbinfo->height;
+      cfg.fb_width = fb->width_px;
+      cfg.fb_height = fb->height_px;
       cfg.heap = batch->tiler.heap_desc.gpu;
-      cfg.sample_pattern = pan_sample_pattern(fbinfo->nr_samples);
+      cfg.sample_pattern = pan_sample_pattern(fb->sample_count);
    }
 
    memcpy(batch->tiler.heap_desc.cpu, &batch->tiler.heap_templ,
@@ -337,27 +355,9 @@ panvk_per_arch(CmdPipelineBarrier2)(VkCommandBuffer commandBuffer,
     * barrier flag set to true.
     */
    if (cmdbuf->cur_batch) {
-      bool preload_fb =
-         cmdbuf->cur_batch && cmdbuf->cur_batch->vtc_jc.first_tiler;
-
       panvk_per_arch(cmd_close_batch)(cmdbuf);
-
-      if (preload_fb)
-         panvk_per_arch(cmd_preload_fb_after_batch_split)(cmdbuf);
-
       panvk_per_arch(cmd_open_batch)(cmdbuf);
    }
-
-   for (uint32_t i = 0; i < pDependencyInfo->imageMemoryBarrierCount; i++) {
-      const VkImageMemoryBarrier2 *barrier = &pDependencyInfo->pImageMemoryBarriers[i];
-
-      panvk_per_arch(cmd_transition_image_layout)(commandBuffer, barrier);
-   }
-
-   /* If we had any layout transition dispatches, the batch will be closed at
-    * this point, therefore establishing the sync between itself and the
-    * commands that follow.
-    */
 }
 
 static void
@@ -400,6 +400,10 @@ panvk_destroy_cmdbuf(struct vk_command_buffer *vk_cmdbuf)
       vk_free(&cmdbuf->vk.pool->alloc, batch);
    }
 
+#if PAN_ARCH < 9
+   panvk_shader_link_cleanup(&cmdbuf->state.gfx.link);
+#endif
+
    panvk_pool_cleanup(&cmdbuf->desc_pool);
    panvk_pool_cleanup(&cmdbuf->tls_pool);
    panvk_pool_cleanup(&cmdbuf->varying_pool);
@@ -423,8 +427,14 @@ panvk_create_cmdbuf(struct vk_command_pool *vk_pool, VkCommandBufferLevel level,
    if (!cmdbuf)
       return panvk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   VkResult result = vk_command_buffer_init(
-      &pool->vk, &cmdbuf->vk, &panvk_per_arch(cmd_buffer_ops), level);
+   VkResult result = vk_command_buffer_init_with_params(
+      &cmdbuf->vk,
+      &(struct vk_command_buffer_init_params) {
+         .pool = &pool->vk,
+         .ops = &panvk_per_arch(cmd_buffer_ops),
+         .level = level,
+         .needs_cmd_queue = level == VK_COMMAND_BUFFER_LEVEL_SECONDARY,
+      });
    if (result != VK_SUCCESS) {
       vk_free(&device->vk.alloc, cmdbuf);
       return result;

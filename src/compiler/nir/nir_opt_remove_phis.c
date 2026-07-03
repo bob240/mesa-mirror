@@ -97,6 +97,7 @@ remove_phis_instr(nir_builder *b, nir_phi_instr *phi, void *unused)
    nir_block *block = phi->instr.block;
    nir_def *def = NULL;
    bool needs_remat = false;
+   nir_phi_instr *nested_phi = NULL;
 
    /* Skip unreachable phis, they should be removed by nir_opt_dead_cf. */
    if (nir_block_is_unreachable(block))
@@ -107,7 +108,7 @@ remove_phis_instr(nir_builder *b, nir_phi_instr *phi, void *unused)
        * sources from backedges that point back to the destination of the
        * same phi, i.e. something like:
        *
-       * a = phi(a, b, ...)
+       * b = phi(a, b)
        *
        * We can safely ignore these sources, since if all of the normal
        * sources point to the same definition, then that definition must
@@ -121,6 +122,15 @@ remove_phis_instr(nir_builder *b, nir_phi_instr *phi, void *unused)
       if (nir_src_is_undef(src->src))
          continue;
 
+      /* This src is from a loop back-edge and itself is another phi. */
+      if (src->pred->index > block->index && nir_src_is_phi(src->src)) {
+         if (nested_phi)
+            return false;
+
+         nested_phi = nir_src_as_phi(src->src);
+         continue;
+      }
+
       if (def == NULL) {
          def = src->src.ssa;
          if (!nir_block_dominates(nir_def_block(def), block->imm_dom)) {
@@ -130,6 +140,24 @@ remove_phis_instr(nir_builder *b, nir_phi_instr *phi, void *unused)
          }
       } else if (!phi_srcs_equal(src->src.ssa, def)) {
          return false;
+      }
+   }
+
+   if (nested_phi) {
+      if (!def)
+         return false;
+
+      /* For phi-sources from loop back-edges, if the source is another phi,
+       * check if the source-phi only uses this phi's definition or equal
+       * sources, i.e. something like:
+       *
+       * b = phi (a, c)
+       * ...
+       * c = phi (b, a)
+       */
+      nir_foreach_phi_src(src, nested_phi) {
+         if (src->src.ssa != &phi->def && !phi_srcs_equal(src->src.ssa, def))
+            return false;
       }
    }
 
@@ -161,7 +189,7 @@ nir_opt_remove_phis(nir_shader *shader)
 bool
 nir_remove_single_src_phis_block(nir_block *block)
 {
-   assert(block->predecessors.entries <= 1);
+   assert(nir_block_num_preds(block) <= 1);
    bool progress = false;
    nir_foreach_phi_safe(phi, block) {
       nir_def *def = NULL;
@@ -171,7 +199,7 @@ nir_remove_single_src_phis_block(nir_block *block)
       }
 
       if (!def) {
-         nir_builder b = nir_builder_create(nir_cf_node_get_function(&block->cf_node));
+         nir_builder b = nir_builder_create(block->impl);
          b.cursor = nir_after_phis(block);
          def = nir_undef(&b, phi->def.num_components, phi->def.bit_size);
       }

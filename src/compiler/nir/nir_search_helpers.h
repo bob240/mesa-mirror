@@ -30,6 +30,7 @@
 #include <math.h>
 #include "util/bitscan.h"
 #include "util/u_math.h"
+#include "util/half_float.h"
 #include "nir.h"
 #include "nir_range_analysis.h"
 #include "nir_search.h"
@@ -168,64 +169,6 @@ MULTIPLE(8)
 MULTIPLE(16)
 MULTIPLE(32)
 MULTIPLE(64)
-
-static inline bool
-is_zero_to_one(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
-               unsigned src, unsigned num_components,
-               const uint8_t *swizzle)
-{
-   /* only constant srcs: */
-   if (!nir_src_is_const(instr->src[src].src))
-      return false;
-
-   for (unsigned i = 0; i < num_components; i++) {
-      nir_alu_type type = nir_op_infos[instr->op].input_types[src];
-      switch (nir_alu_type_get_base_type(type)) {
-      case nir_type_float: {
-         double val = nir_src_comp_as_float(instr->src[src].src, swizzle[i]);
-         if (isnan(val) || val < 0.0f || val > 1.0f)
-            return false;
-         break;
-      }
-      default:
-         return false;
-      }
-   }
-
-   return true;
-}
-
-/**
- * Exclusive compare with (0, 1).
- *
- * This differs from \c is_zero_to_one because that function tests 0 <= src <=
- * 1 while this function tests 0 < src < 1.
- */
-static inline bool
-is_gt_0_and_lt_1(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
-                 unsigned src, unsigned num_components,
-                 const uint8_t *swizzle)
-{
-   /* only constant srcs: */
-   if (!nir_src_is_const(instr->src[src].src))
-      return false;
-
-   for (unsigned i = 0; i < num_components; i++) {
-      nir_alu_type type = nir_op_infos[instr->op].input_types[src];
-      switch (nir_alu_type_get_base_type(type)) {
-      case nir_type_float: {
-         double val = nir_src_comp_as_float(instr->src[src].src, swizzle[i]);
-         if (isnan(val) || val <= 0.0f || val >= 1.0f)
-            return false;
-         break;
-      }
-      default:
-         return false;
-      }
-   }
-
-   return true;
-}
 
 /**
  * x & 1 != 0
@@ -413,6 +356,25 @@ is_neg2x_16_bits(UNUSED const nir_search_state *state, const nir_alu_instr *inst
    return is_16_bits_with_scale(instr, src, num_components, swizzle, -2);
 }
 
+/** Is this a float constant that could fit in a half? */
+static inline bool
+is_representable_as_f16(UNUSED const nir_search_state *state,
+                        const nir_alu_instr *instr,
+                        unsigned src, unsigned num_components,
+                        const uint8_t *swizzle)
+{
+   /* only constant srcs: */
+   if (!nir_src_is_const(instr->src[src].src))
+      return false;
+
+   for (unsigned i = 0; i < num_components; i++) {
+      double value = nir_src_comp_as_float(instr->src[src].src, swizzle[i]);
+      if (!_mesa_float_is_half(value))
+         return false;
+   }
+   return true;
+}
+
 static inline bool
 is_not_const(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
              unsigned src, UNUSED unsigned num_components,
@@ -434,7 +396,7 @@ is_not_fmul(const nir_search_state *state, const nir_alu_instr *instr, unsigned 
    if (src_alu->op == nir_op_fneg)
       return is_not_fmul(state, src_alu, 0, 0, NULL);
 
-   return src_alu->op != nir_op_fmul && src_alu->op != nir_op_fmulz;
+   return src_alu->op != nir_op_fmul && src_alu->op != nir_op_fmulz && src_alu->op != nir_op_fmul_rtz;
 }
 
 static inline bool
@@ -450,7 +412,7 @@ is_fmul(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
    if (src_alu->op == nir_op_fneg)
       return is_fmul(state, src_alu, 0, 0, NULL);
 
-   return src_alu->op == nir_op_fmul || src_alu->op == nir_op_fmulz;
+   return src_alu->op == nir_op_fmul || src_alu->op == nir_op_fmulz || src_alu->op == nir_op_fmul_rtz;
 }
 
 static inline bool
@@ -515,7 +477,7 @@ static inline bool
 is_used_by_non_fsat(const nir_alu_instr *instr)
 {
    nir_foreach_use(src, &instr->def) {
-      const nir_instr *const user_instr = nir_src_parent_instr(src);
+      const nir_instr *const user_instr = nir_src_use_instr(src);
 
       if (user_instr->type != nir_instr_type_alu)
          return true;
@@ -534,7 +496,7 @@ static inline bool
 is_used_by_non_ldc_nv(const nir_alu_instr *instr)
 {
    nir_foreach_use(src, &instr->def) {
-      const nir_instr *const user_instr = nir_src_parent_instr(src);
+      const nir_instr *const user_instr = nir_src_use_instr(src);
 
       if (user_instr->type != nir_instr_type_intrinsic)
          return true;
@@ -549,10 +511,10 @@ is_used_by_non_ldc_nv(const nir_alu_instr *instr)
 }
 
 static inline bool
-is_only_used_as_float_impl(const nir_alu_instr *instr, unsigned depth)
+is_only_used_as_float_impl(const nir_alu_instr *instr, bool nsz, unsigned depth)
 {
    nir_foreach_use(src, &instr->def) {
-      const nir_instr *const user_instr = nir_src_parent_instr(src);
+      const nir_instr *const user_instr = nir_src_use_instr(src);
 
       if (user_instr->type != nir_instr_type_alu) {
          if (user_instr->type == nir_instr_type_intrinsic) {
@@ -563,6 +525,8 @@ is_only_used_as_float_impl(const nir_alu_instr *instr, unsigned depth)
             case nir_intrinsic_ddy_fine:
             case nir_intrinsic_ddx_coarse:
             case nir_intrinsic_ddy_coarse:
+               if (nsz)
+                  return false;
                continue;
             default:
                break;
@@ -577,6 +541,7 @@ is_only_used_as_float_impl(const nir_alu_instr *instr, unsigned depth)
                return false;
 
             unsigned idx = tex_src - tex->src;
+            /* Float tex sources don't care about signed zeros. */
             if (nir_tex_instr_src_type(tex, idx) == nir_type_float)
                continue;
          }
@@ -599,12 +564,14 @@ is_only_used_as_float_impl(const nir_alu_instr *instr, unsigned depth)
       bool is_mov = (user_alu->op == nir_op_bcsel && index != 0) ||
                     nir_op_is_vec_or_mov(user_alu->op);
       if (is_mov && depth < 8) {
-         if (is_only_used_as_float_impl(user_alu, depth + 1))
+         if (is_only_used_as_float_impl(user_alu, nsz, depth + 1))
             continue;
       }
 
       nir_alu_type type = nir_op_infos[user_alu->op].input_types[index];
       if (nir_alu_type_get_base_type(type) != nir_type_float)
+         return false;
+      if (nir_alu_instr_is_signed_zero_preserve(user_alu) && nsz)
          return false;
    }
 
@@ -614,14 +581,20 @@ is_only_used_as_float_impl(const nir_alu_instr *instr, unsigned depth)
 static inline bool
 is_only_used_as_float(const nir_alu_instr *instr)
 {
-   return is_only_used_as_float_impl(instr, 0);
+   return is_only_used_as_float_impl(instr, false, 0);
+}
+
+static inline bool
+is_only_used_as_float_nsz(const nir_alu_instr *instr)
+{
+   return is_only_used_as_float_impl(instr, true, 0);
 }
 
 static inline bool
 is_only_used_by_fadd(const nir_alu_instr *instr)
 {
    nir_foreach_use(src, &instr->def) {
-      const nir_instr *const user_instr = nir_src_parent_instr(src);
+      const nir_instr *const user_instr = nir_src_use_instr(src);
       if (user_instr->type != nir_instr_type_alu)
          return false;
 
@@ -640,10 +613,16 @@ is_only_used_by_fadd(const nir_alu_instr *instr)
 }
 
 static inline bool
+is_not_only_used_by_fadd(const nir_alu_instr *instr)
+{
+   return !is_only_used_by_fadd(instr);
+}
+
+static inline bool
 is_only_used_by_alu_op(const nir_alu_instr *instr, nir_op op)
 {
    nir_foreach_use(src, &instr->def) {
-      const nir_instr *const user_instr = nir_src_parent_instr(src);
+      const nir_instr *const user_instr = nir_src_use_instr(src);
       if (user_instr->type != nir_instr_type_alu)
          return false;
 
@@ -678,13 +657,21 @@ is_only_used_by_ior(const nir_alu_instr *instr)
 static inline bool
 only_lower_8_bits_used(const nir_alu_instr *instr)
 {
-   return (nir_def_bits_used(&instr->def) & ~0xffull) == 0;
+   if (instr->def.num_components > 1)
+      return false;
+
+   return (nir_def_bits_used(nir_get_scalar((nir_def*)&instr->def, 0)) &
+           ~0xffull) == 0;
 }
 
 static inline bool
 only_lower_16_bits_used(const nir_alu_instr *instr)
 {
-   return (nir_def_bits_used(&instr->def) & ~0xffffull) == 0;
+   if (instr->def.num_components > 1)
+      return false;
+
+   return (nir_def_bits_used(nir_get_scalar((nir_def*)&instr->def, 0)) &
+           ~0xffffull) == 0;
 }
 
 /**
@@ -862,6 +849,26 @@ is_not_uint_max(UNUSED const nir_search_state *state, const nir_alu_instr *instr
    return true;
 }
 
+/**
+ * Returns whether at least one bit is 1.
+ */
+static inline bool
+is_not_uint_zero(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
+                unsigned src, unsigned num_components,
+                const uint8_t *swizzle)
+{
+   if (nir_src_as_const_value(instr->src[src].src) == NULL)
+      return false;
+
+   for (unsigned i = 0; i < num_components; i++) {
+      const uint64_t c = nir_src_comp_as_uint(instr->src[src].src, swizzle[i]);
+      if (c == 0)
+         return false;
+   }
+
+   return true;
+}
+
 static inline bool
 no_signed_wrap(const nir_alu_instr *instr)
 {
@@ -880,125 +887,49 @@ xz_components_unused(const nir_alu_instr *instr)
    return (nir_def_components_read(&instr->def) & 0x5) == 0;
 }
 
-static inline bool
-is_integral(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
-            UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range r = nir_analyze_range(state->range_ht, instr, src);
-
-   return r.is_integral;
-}
-
-/**
- * Is the value finite?
- */
-static inline bool
-is_finite(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
-          unsigned src, UNUSED unsigned num_components,
-          UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-
-   return v.is_finite;
-}
-
-static inline bool
-is_finite_not_zero(UNUSED const nir_search_state *state, const nir_alu_instr *instr,
-                   unsigned src, UNUSED unsigned num_components,
-                   UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-
-   return v.is_finite &&
-          (v.range == lt_zero || v.range == gt_zero || v.range == ne_zero);
-}
-
-#define RELATION(r)                                                        \
-   static inline bool                                                      \
-      is_##r(const nir_search_state *state, const nir_alu_instr *instr,    \
-             unsigned src, UNUSED unsigned num_components,                 \
-             UNUSED const uint8_t *swizzle)                                \
-   {                                                                       \
-      const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src); \
-      return v.range == r;                                                 \
-   }                                                                       \
-                                                                           \
-   static inline bool                                                      \
-      is_a_number_##r(const nir_search_state *state, const nir_alu_instr *instr, \
-                      unsigned src, UNUSED unsigned num_components,        \
-                      UNUSED const uint8_t *swizzle)                       \
-   {                                                                       \
-      const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src); \
-      return v.is_a_number && v.range == r;                                \
+#define RELATION(r, _exclude)                                                                        \
+   static inline bool                                                                                \
+   is_##r(const nir_search_state *state, const nir_alu_instr *instr,                                 \
+          unsigned src, UNUSED unsigned num_components,                                              \
+          UNUSED const uint8_t *swizzle)                                                             \
+   {                                                                                                 \
+      fp_class_mask exclude = _exclude;                                                              \
+      if (exclude & (FP_CLASS_ANY_INF | FP_CLASS_NAN)) {                                             \
+         /* fp_math_ctrl lets us assume inputs are not NaN/Inf for float sources. */                 \
+         const nir_op_info *op_info = &nir_op_infos[(int)instr->op];                                 \
+         nir_alu_type base_type = nir_alu_type_get_base_type(op_info->input_types[src]);             \
+         if (base_type == nir_type_float) {                                                          \
+            if (!nir_alu_instr_is_inf_preserve(instr))                                               \
+               exclude &= ~FP_CLASS_ANY_INF;                                                         \
+            if (!nir_alu_instr_is_nan_preserve(instr))                                               \
+               exclude &= ~FP_CLASS_NAN;                                                             \
+            if (!exclude)                                                                            \
+               return true;                                                                          \
+         }                                                                                           \
+      }                                                                                              \
+      const fp_class_mask fp_class = nir_analyze_fp_class(state->range_ht, instr->src[src].src.ssa); \
+      return (fp_class & exclude) == 0;                                                              \
    }
 
-RELATION(lt_zero)
-RELATION(le_zero)
-RELATION(gt_zero)
-RELATION(ge_zero)
-RELATION(ne_zero)
+#define RELATION_AND_NUM(r, exclude) \
+   RELATION(r, exclude)              \
+   RELATION(a_number_##r, (exclude) | FP_CLASS_NAN)
 
-static inline bool
-is_not_negative(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
-                UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.range == ge_zero || v.range == gt_zero || v.range == eq_zero;
-}
-
-static inline bool
-is_a_number_not_negative(const nir_search_state *state, const nir_alu_instr *instr,
-                         unsigned src, UNUSED unsigned num_components,
-                         UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.is_a_number &&
-          (v.range == ge_zero || v.range == gt_zero || v.range == eq_zero);
-}
-
-static inline bool
-is_not_positive(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
-                UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.range == le_zero || v.range == lt_zero || v.range == eq_zero;
-}
-
-static inline bool
-is_a_number_not_positive(const nir_search_state *state, const nir_alu_instr *instr,
-                         unsigned src, UNUSED unsigned num_components,
-                         UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.is_a_number &&
-          (v.range == le_zero || v.range == lt_zero || v.range == eq_zero);
-}
-
-static inline bool
-is_not_zero(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
-            UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.range == lt_zero || v.range == gt_zero || v.range == ne_zero;
-}
-
-static inline bool
-is_a_number_not_zero(const nir_search_state *state, const nir_alu_instr *instr,
-                     unsigned src, UNUSED unsigned num_components,
-                     UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.is_a_number &&
-          (v.range == lt_zero || v.range == gt_zero || v.range == ne_zero);
-}
-
-static inline bool
-is_a_number(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
-            UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
-{
-   const struct ssa_result_range v = nir_analyze_range(state->range_ht, instr, src);
-   return v.is_a_number;
-}
+RELATION_AND_NUM(lt_zero, FP_CLASS_ANY_POS | FP_CLASS_ANY_ZERO)
+RELATION_AND_NUM(not_positive, FP_CLASS_ANY_POS)
+RELATION_AND_NUM(gt_zero, FP_CLASS_ANY_NEG | FP_CLASS_ANY_ZERO)
+RELATION_AND_NUM(not_negative, FP_CLASS_ANY_NEG)
+RELATION_AND_NUM(not_negative_or_negative_zero, FP_CLASS_ANY_NEG | FP_CLASS_NEG_ZERO)
+RELATION_AND_NUM(not_zero, FP_CLASS_ANY_ZERO)
+RELATION_AND_NUM(zero_to_one, FP_CLASS_ANY_NEG | FP_CLASS_GT_POS_ONE | FP_CLASS_POS_INF)
+RELATION_AND_NUM(le_pos_one, FP_CLASS_GT_POS_ONE | FP_CLASS_POS_INF)
+RELATION_AND_NUM(gt_0_and_lt_1, FP_CLASS_ANY_NEG | FP_CLASS_ANY_ZERO | FP_CLASS_POS_ONE | FP_CLASS_GT_POS_ONE | FP_CLASS_POS_INF)
+RELATION_AND_NUM(ge_pos_one, FP_CLASS_ANY_NEG | FP_CLASS_ANY_ZERO | FP_CLASS_GT_ZERO_LT_POS_ONE)
+RELATION(a_number, FP_CLASS_NAN)
+RELATION(finite, FP_CLASS_ANY_INF | FP_CLASS_NAN)
+RELATION(finite_not_zero, FP_CLASS_ANY_INF | FP_CLASS_NAN | FP_CLASS_ANY_ZERO)
+RELATION(integral, FP_CLASS_NON_INTEGRAL)
+RELATION(integral_not_negative, FP_CLASS_ANY_NEG | FP_CLASS_NON_INTEGRAL)
 
 static inline bool
 compare_component(const nir_alu_instr *instr, unsigned src, unsigned component,
@@ -1063,6 +994,27 @@ cannot_add_output_modifier(const nir_search_state *state,
                            const uint8_t *swizzle)
 {
    return !can_add_output_modifier(state, instr, src, num_components, swizzle);
+}
+
+
+static inline bool
+is_created_as_float(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
+                    UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
+{
+   nir_alu_instr *src_alu = nir_src_as_alu(instr->src[src].src);
+
+   if (src_alu == NULL)
+      return false;
+
+   nir_alu_type output_type = nir_op_infos[src_alu->op].output_type;
+   return nir_alu_type_get_base_type(output_type) == nir_type_float;
+}
+
+static inline bool
+is_undef(const nir_search_state *state, const nir_alu_instr *instr, unsigned src,
+         UNUSED unsigned num_components, UNUSED const uint8_t *swizzle)
+{
+   return nir_src_is_undef(instr->src[src].src);
 }
 
 #endif /* _NIR_SEARCH_ */

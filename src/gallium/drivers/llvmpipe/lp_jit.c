@@ -409,6 +409,8 @@ lp_jit_texture_from_pipe(struct lp_jit_texture *jit, const struct pipe_sampler_v
          jit->mip_offsets[0] = 0;
 
          if (llvmpipe_resource_is_texture(res)) {
+            float view_relative_min_lod = view->u.tex.min_lod_clamp - (float)first_level;
+            jit->view_min_lod = view_relative_min_lod > 0.0f ? view_relative_min_lod : 0.0f;
             if (res->nr_samples > 1) {
                jit->last_level = res->nr_samples;
                jit->mip_offsets[LP_JIT_TEXTURE_SAMPLE_STRIDE] = lp_tex->sample_stride;
@@ -460,6 +462,7 @@ lp_jit_texture_from_pipe(struct lp_jit_texture *jit, const struct pipe_sampler_v
             if (res->flags & PIPE_RESOURCE_FLAG_SPARSE)
                jit->residency = lp_tex->residency;
          } else {
+            jit->view_min_lod = 0.0f;
             /*
              * For tex2d_from_buf, adjust width and height with application
              * values. If is_tex2d_from_buf is false (1D images),
@@ -503,6 +506,7 @@ lp_jit_texture_from_pipe(struct lp_jit_texture *jit, const struct pipe_sampler_v
       jit->first_level = jit->last_level = 0;
       if (res->nr_samples > 1)
          jit->last_level = res->nr_samples;
+      jit->view_min_lod = 0.0f;
       assert(jit->base);
    }
 }
@@ -515,13 +519,19 @@ lp_jit_bindless_texture_from_pipe(struct lp_jit_bindless_texture *jit, const str
    assert(!lp_tex->dt);
 
    if (llvmpipe_resource_is_texture(res)) {
+      /* Convert the view's min_lod_clamp to view-relative space for the shader. */
+      float view_relative_min_lod =
+         view->u.tex.min_lod_clamp - (float)view->u.tex.first_level;
+      jit->view_min_lod = view_relative_min_lod > 0.0f ? view_relative_min_lod : 0.0f;
+
       jit->base = lp_tex->tex_data;
-
-      if (res->flags & PIPE_RESOURCE_FLAG_SPARSE)
-         jit->residency = lp_tex->residency;
    } else {
+      jit->view_min_lod = 0.0f;
       jit->base = lp_tex->data;
+   }
+   const void *base = jit->base;
 
+   if (!llvmpipe_resource_is_texture(res)) {
       /*
        * For tex2d_from_buf, adjust width and height with application
        * values. If is_tex2d_from_buf is false (1D images),
@@ -537,6 +547,11 @@ lp_jit_bindless_texture_from_pipe(struct lp_jit_bindless_texture *jit, const str
          jit->base = (uint8_t *)jit->base +
             view->u.tex2d_from_buf.offset * view_blocksize;
       }
+   }
+
+   if (res->flags & PIPE_RESOURCE_FLAG_SPARSE) {
+      jit->residency = lp_tex->residency;
+      jit->base_offset = (uint32_t)((uintptr_t)jit->base - (uintptr_t)base);
    }
 }
 
@@ -581,6 +596,7 @@ void
 lp_jit_bindless_texture_buffer_from_bda(struct lp_jit_bindless_texture *jit, void *mem)
 {
    jit->base = mem;
+   jit->view_min_lod = 0.0f;
 }
 
 void
@@ -605,6 +621,7 @@ lp_jit_image_from_pipe(struct lp_jit_image *jit, const struct pipe_image_view *v
       } else {
          jit->base = lp_res->data;
       }
+      const void *base = jit->base;
 
       jit->width = res->width0;
       jit->height = res->height0;
@@ -672,7 +689,7 @@ lp_jit_image_from_pipe(struct lp_jit_image *jit, const struct pipe_image_view *v
 
       if (res->flags & PIPE_RESOURCE_FLAG_SPARSE) {
          jit->residency = lp_res->residency;
-         jit->base_offset = (uint32_t)((uintptr_t)jit->base - (uintptr_t)lp_res->tex_data);
+         jit->base_offset = (uint32_t)((uintptr_t)jit->base - (uintptr_t)base);
       }
    }
 }

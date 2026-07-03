@@ -16,6 +16,19 @@ pvr_entrypoints = custom_target(
   depend_files : vk_entrypoints_gen_depend_files,
 )
 
+pvr_drirc = custom_target(
+  'pvr_drirc',
+  input  : [files('pvr_drirc_gen.py'), drirc_gen, '00-pvr-defaults.conf'],
+  output : ['pvr_drirc.c', 'pvr_drirc.h'],
+  command : [
+    prog_python, '@INPUT0@',
+    '--import-path', join_paths(dir_source_root, 'src/util'),
+    '--drirc-src', '@OUTPUT0@',
+    '--drirc-hdr', '@OUTPUT1@',
+    '--validate', '@INPUT2@',
+  ],
+)
+
 pvr_files = files(
   'winsys/powervr/pvr_drm.c',
   'winsys/powervr/pvr_drm_bo.c',
@@ -34,6 +47,7 @@ pvr_files = files(
   'pvr_formats.c',
   'pvr_image.c',
   'pvr_instance.c',
+  'pvr_nir_lower_ycbcr.c',
   'pvr_physical_device.c',
   'pvr_transfer_frag_store.c',
   'pvr_query.c',
@@ -67,6 +81,7 @@ pvr_flags = [
 
 common_per_arch_files = [
   pvr_entrypoints[0],
+  pvr_drirc[1],
   sha1_h,
 ]
 
@@ -94,8 +109,6 @@ common_per_arch_files += files(
   'pvr_arch_sampler.c',
   'pvr_arch_spm.c',
   'pvr_arch_tex_state.c',
-  'winsys/powervr/pvr_arch_drm_job_compute.c',
-  'winsys/powervr/pvr_arch_drm_job_render.c',
 )
 
 if with_imagination_srv
@@ -159,7 +172,7 @@ endforeach
 
 libvulkan_powervr_mesa = shared_library(
   'vulkan_powervr_mesa',
-  [pvr_files, pvr_entrypoints, u_format_pack_h],
+  [pvr_files, pvr_entrypoints, pvr_drirc, u_format_pack_h],
   include_directories : [
     pvr_includes,
     inc_imagination,

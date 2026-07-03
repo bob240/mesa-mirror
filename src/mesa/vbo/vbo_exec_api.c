@@ -685,6 +685,9 @@ vbo_exec_FlushVertices_internal(struct vbo_exec_context *exec, unsigned flags)
    struct gl_context *ctx = gl_context_from_vbo_exec(exec);
 
    if (flags & FLUSH_STORED_VERTICES) {
+      /* Update the flag before entering the flush to prevent re-entering. */
+      ctx->Driver.NeedFlush = 0;
+
       if (exec->vtx.vert_count) {
          vbo_exec_vtx_flush(exec);
       }
@@ -693,19 +696,15 @@ vbo_exec_FlushVertices_internal(struct vbo_exec_context *exec, unsigned flags)
          vbo_exec_copy_to_current(exec);
          vbo_reset_all_attr(ctx);
       }
-
-      /* All done. */
-      ctx->Driver.NeedFlush = 0;
    } else {
       assert(flags == FLUSH_UPDATE_CURRENT);
+      /* Only FLUSH_UPDATE_CURRENT is done. */
+      ctx->Driver.NeedFlush = ~FLUSH_UPDATE_CURRENT;
 
       /* Note that the vertex size is unchanged.
        * (vbo_reset_all_attr isn't called)
        */
       vbo_exec_copy_to_current(exec);
-
-      /* Only FLUSH_UPDATE_CURRENT is done. */
-      ctx->Driver.NeedFlush = ~FLUSH_UPDATE_CURRENT;
    }
 }
 
@@ -863,7 +862,7 @@ _mesa_Begin(GLenum mode)
          ctx->Dispatch.Current = ctx->Dispatch.Exec;
    } else if (ctx->GLApi == ctx->Dispatch.OutsideBeginEnd) {
       ctx->GLApi = ctx->Dispatch.Current = ctx->Dispatch.Exec;
-      _mesa_glapi_set_dispatch(ctx->GLApi);
+      _mesa_set_dispatch(ctx, ctx->GLApi);
    } else {
       assert(ctx->GLApi == ctx->Dispatch.Save);
    }
@@ -926,7 +925,7 @@ _mesa_End(void)
    } else if (ctx->GLApi == ctx->Dispatch.BeginEnd ||
               ctx->GLApi == ctx->Dispatch.HWSelectModeBeginEnd) {
       ctx->GLApi = ctx->Dispatch.Current = ctx->Dispatch.Exec;
-      _mesa_glapi_set_dispatch(ctx->GLApi);
+      _mesa_set_dispatch(ctx, ctx->GLApi);
    }
 
    if (exec->vtx.prim_count > 0) {

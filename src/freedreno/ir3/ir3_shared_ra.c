@@ -569,7 +569,7 @@ try_demote_instruction(struct ra_ctx *ctx, struct ir3_instruction *instr)
          struct ra_interval *src0_interval =
             (instr->srcs[0]->flags & IR3_REG_SSA) ? ra_interval_get(ctx, instr->srcs[0]->def) : NULL;
          struct ra_interval *src1_interval =
-            (instr->srcs[0]->flags & IR3_REG_SSA) ? ra_interval_get(ctx, instr->srcs[0]->def) : NULL;
+            (instr->srcs[1]->flags & IR3_REG_SSA) ? ra_interval_get(ctx, instr->srcs[1]->def) : NULL;
          if (!(src0_interval && src0_interval->spill_def) &&
              !(src1_interval && src1_interval->spill_def) &&
              !(instr->srcs[0]->flags & IR3_REG_IMMED) &&
@@ -826,7 +826,7 @@ reload_interval(struct ra_ctx *ctx, struct ir3_cursor cursor,
 }
 
 static void
-reload_src_finalize(struct ra_ctx *ctx, struct ir3_instruction *instr,
+reload_src_finalize(struct ra_ctx *ctx, struct ir3_cursor reload_cursor,
                     struct ir3_register *src)
 {
    struct ir3_register *reg = src->def;
@@ -835,7 +835,7 @@ reload_src_finalize(struct ra_ctx *ctx, struct ir3_instruction *instr,
    if (!interval->needs_reload)
       return;
 
-   reload_interval(ctx, ir3_before_instr(instr), interval);
+   reload_interval(ctx, reload_cursor, interval);
 
    interval->needs_reload = false;
 }
@@ -848,6 +848,19 @@ can_demote_src(struct ir3_instruction *instr)
    case OPC_META_COLLECT:
       return false;
    case OPC_MOV:
+      if (instr->block->shader->compiler->info->props.has_salu_int_narrowing_quirk) {
+         /* Avoid demoting something that would cause narrowin integer
+          * conversion from GPR to uGPR:
+          */
+         if ((instr->cat1.dst_type != instr->cat1.src_type) &&
+             (type_size(instr->cat1.dst_type) <
+              type_size(instr->cat1.src_type)) &&
+             !type_float(instr->cat1.dst_type) &&
+             (instr->dsts[0]->flags & IR3_REG_SHARED)) {
+            return false;
+         }
+      }
+
       /* non-shared -> shared floating-point conversions and
        * 8-bit sign extension don't work.
        */
@@ -932,7 +945,7 @@ assign_src(struct ra_ctx *ctx, struct ir3_register *src)
 
 static void
 handle_dst(struct ra_ctx *ctx, struct ir3_instruction *instr,
-           struct ir3_register *dst)
+           struct ir3_register *dst, struct ir3_cursor *reload_cursor)
 {
    if (!(dst->flags & IR3_REG_SHARED))
       return;
@@ -1002,18 +1015,23 @@ handle_dst(struct ra_ctx *ctx, struct ir3_instruction *instr,
       mov->cat1.src_type = mov->cat1.dst_type =
          (dst->flags & IR3_REG_HALF) ? TYPE_U16 : TYPE_U32;;
       dst->tied->num = dst->num;
+
+      /* If the tied src needs to be reloaded, this has to happen before the
+       * parallel copy we just inserted.
+       */
+      *reload_cursor = ir3_before_instr(mov);
    }
 }
 
 static void
-handle_src_late(struct ra_ctx *ctx, struct ir3_instruction *instr,
+handle_src_late(struct ra_ctx *ctx, struct ir3_cursor reload_cursor,
                 struct ir3_register *src)
 {
    if (!(src->flags & IR3_REG_SHARED))
       return;
 
    struct ra_interval *interval = ra_interval_get(ctx, src->def);
-   reload_src_finalize(ctx, instr, src);
+   reload_src_finalize(ctx, reload_cursor, src);
 
    /* Remove killed sources that have to be killed late due to being merged with
     * other defs.
@@ -1037,11 +1055,12 @@ handle_normal_instr(struct ra_ctx *ctx, struct ir3_instruction *instr)
    ra_foreach_src_rev (src, instr)
       assign_src(ctx, src);
 
+   struct ir3_cursor reload_cursor = ir3_before_instr(instr);
    ra_foreach_dst (dst, instr)
-      handle_dst(ctx, instr, dst);
+      handle_dst(ctx, instr, dst, &reload_cursor);
 
    ra_foreach_src (src, instr)
-      handle_src_late(ctx, instr, src);
+      handle_src_late(ctx, reload_cursor, src);
 }
 
 static void
@@ -1195,7 +1214,7 @@ handle_pcopy(struct ra_ctx *ctx, struct ir3_instruction *pcopy)
       assign_src(ctx, src);
 
    ra_foreach_src (src, pcopy)
-      handle_src_late(ctx, pcopy, src);
+      handle_src_late(ctx, ir3_before_instr(pcopy), src);
 }
 
 static void
@@ -1233,7 +1252,9 @@ reload_live_outs(struct ra_ctx *ctx, struct ir3_block *block)
       struct ir3_register *reg = ctx->live->definitions[name];
 
       struct ra_interval *interval = &ctx->intervals[name];
-      if (!interval->interval.inserted) {
+      if (!interval->interval.inserted ||
+          (interval->spill_def &&
+           interval->physreg_start != interval->physreg_start_orig)) {
          d("reloading %d at end of backedge", reg->name);
 
          /* When this interval was spilled inside the loop, we probably chose a

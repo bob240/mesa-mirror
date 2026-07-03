@@ -1,28 +1,6 @@
 /*
  * Copyright © 2010 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
- *
- * Authors:
- *    Eric Anholt <eric@anholt.net>
- *
+ * SPDX-License-Identifier: MIT
  */
 
 #include "brw_eu.h"
@@ -901,7 +879,7 @@ brw_reg_alloc::emit_unspill(const brw_builder &bld,
          unspill_inst->offset = spill_offset;
          unspill_inst->use_transpose = use_transpose;
          unspill_inst->size_written =
-            lsc_msg_dest_len(devinfo, LSC_DATA_SIZE_D32, bld.dispatch_width()) * REG_SIZE;
+            brw_lsc_msg_dest_len(devinfo, LSC_DATA_SIZE_D32, bld.dispatch_width()) * REG_SIZE;
          assert(unspill_inst->size_written == (reg_size * REG_SIZE));
 
          _mesa_set_add(spill_insts, unspill_inst);
@@ -909,7 +887,7 @@ brw_reg_alloc::emit_unspill(const brw_builder &bld,
       } else {
          brw_reg header = build_legacy_scratch_header(bld, spill_offset, ip);
 
-         const unsigned bti = GFX8_BTI_STATELESS_NON_COHERENT;
+         const unsigned bti = GEN_BTI_STATELESS_NON_COHERENT;
 
          brw_send_inst *unspill_inst = bld.SEND();
          unspill_inst->dst = dst;
@@ -924,7 +902,7 @@ brw_reg_alloc::emit_unspill(const brw_builder &bld,
          unspill_inst->size_written = reg_size * REG_SIZE;
          unspill_inst->has_side_effects = false;
          unspill_inst->is_volatile = true;
-         unspill_inst->sfid = BRW_SFID_HDC0;
+         unspill_inst->sfid = GEN_SFID_HDC0;
 
          unspill_inst->src[0] = brw_imm_ud(
             brw_dp_desc(devinfo, bti,
@@ -974,7 +952,7 @@ brw_reg_alloc::emit_spill(const brw_builder &bld,
       } else {
          brw_reg header = build_legacy_scratch_header(bld, spill_offset, ip);
 
-         const unsigned bti = GFX8_BTI_STATELESS_NON_COHERENT;
+         const unsigned bti = GEN_BTI_STATELESS_NON_COHERENT;
 
          brw_send_inst *spill_inst = bld.SEND();
          spill_inst->dst = bld.null_reg_f();
@@ -990,7 +968,7 @@ brw_reg_alloc::emit_spill(const brw_builder &bld,
          spill_inst->header_size = 1;
          spill_inst->has_side_effects = true;
          spill_inst->is_volatile = false;
-         spill_inst->sfid = BRW_SFID_HDC0;
+         spill_inst->sfid = GEN_SFID_HDC0;
 
          spill_inst->src[0] = brw_imm_ud(
             brw_dp_desc(devinfo, bti,

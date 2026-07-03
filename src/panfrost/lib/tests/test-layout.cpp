@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2022 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "pan_afbc.h"
@@ -265,6 +247,25 @@ layout_init(unsigned arch, const struct pan_image_props *props,
 
    *layout = plane.layout;
    return true;
+}
+
+TEST(Layout, LargeImage)
+{
+   struct pan_image_props p = {
+      .modifier = DRM_FORMAT_MOD_LINEAR,
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .extent_px = {
+         .width = 65536,
+         .height = 65536,
+         .depth = 1,
+      },
+      .nr_samples = 1,
+      .dim = MALI_TEXTURE_DIMENSION_2D,
+      .nr_slices = 1,
+   };
+   struct pan_image_layout l = {};
+
+   ASSERT_TRUE(layout_init(0, &p, 0, NULL, &l));
 }
 
 /* dEQP-GLES3.functional.texture.format.compressed.etc1_2d_pot */
@@ -591,6 +592,8 @@ format_can_do_mod(unsigned arch, enum pipe_format format, unsigned plane_idx,
       return pan_afbc_format(arch, format, plane_idx) != PAN_AFBC_MODE_INVALID;
    } else if (drm_is_afrc(modifier)) {
       return arch >= 10 && pan_afrc_supports_format(format);
+   } else if (modifier == DRM_FORMAT_MOD_ARM_INTERLEAVED_64K) {
+      return false;
    } else {
       assert(modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED ||
              modifier == DRM_FORMAT_MOD_LINEAR);
@@ -710,7 +713,7 @@ default_wsi_row_pitch(unsigned arch, const struct pan_image_props *iprops,
 
       unsigned row_pitch_B =
          (width_px / util_format_get_blockwidth(format)) * fmt_blksz_B;
-      struct pan_image_block_size tile_size_el = {1, 1};
+      ASSERTED struct pan_image_block_size tile_size_el = {1, 1};
 
       if (modifier == DRM_FORMAT_MOD_ARM_16X16_BLOCK_U_INTERLEAVED) {
          if (util_format_is_compressed(format)) {

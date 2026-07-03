@@ -62,9 +62,9 @@ nir_builder_create(nir_function_impl *impl)
 static inline nir_builder
 nir_builder_at(nir_cursor cursor)
 {
-   nir_cf_node *current_block = &nir_cursor_current_block(cursor)->cf_node;
+   nir_block *current_block = nir_cursor_current_block(cursor);
 
-   nir_builder b = nir_builder_create(nir_cf_node_get_function(current_block));
+   nir_builder b = nir_builder_create(current_block->impl);
    b.cursor = cursor;
    return b;
 }
@@ -718,15 +718,32 @@ nir_mov_alu(nir_builder *build, nir_alu_src src, unsigned num_components)
          return src.src.ssa;
    }
 
+   if (build->constant_fold_alu && nir_src_is_const(src.src)) {
+      nir_const_value dest[NIR_MAX_VEC_COMPONENTS];
+      nir_load_const_instr *load_const = nir_src_as_load_const(src.src);
+      for (unsigned i = 0; i < num_components; i++)
+         dest[i] = load_const->value[src.swizzle[i]];
+
+      return nir_build_imm(build, num_components,
+                           nir_src_bit_size(src.src),
+                           dest);
+   }
+
    nir_alu_instr *mov = nir_alu_instr_create(build->shader, nir_op_mov);
    nir_def_init(&mov->instr, &mov->def, num_components,
                 nir_src_bit_size(src.src));
-   mov->fp_math_ctrl = build->fp_math_ctrl;
+   assert(nir_op_infos[nir_op_mov].valid_fp_math_ctrl == 0);
    mov->src[0] = src;
    nir_builder_instr_insert(build, &mov->instr);
 
    return &mov->def;
 }
+
+/* Tries to avoid inserting a mov for the replacement,
+ * but if it has to insert one to handle non-alu, it's return instead of NULL.
+ */
+nir_def *
+nir_def_rewrite_uses_with_alu_src(nir_builder *build, nir_def *def, nir_alu_src src, unsigned num_components);
 
 /**
  * Construct a mov that reswizzles the source's components.
@@ -1344,33 +1361,33 @@ nir_uclamp(nir_builder *b,
 }
 
 static inline nir_def *
-nir_ffma_imm12(nir_builder *build, nir_def *src0, double src1, double src2)
+nir_ffma_weak_imm12(nir_builder *build, nir_def *src0, double src1, double src2)
 {
    if (build->shader->options &&
        build->shader->options->avoid_ternary_with_two_constants)
       return nir_fadd_imm(build, nir_fmul_imm(build, src0, src1), src2);
    else
-      return nir_ffma(build, src0, nir_imm_floatN_t(build, src1, src0->bit_size),
-                      nir_imm_floatN_t(build, src2, src0->bit_size));
+      return nir_ffma_weak(build, src0, nir_imm_floatN_t(build, src1, src0->bit_size),
+                                  nir_imm_floatN_t(build, src2, src0->bit_size));
 }
 
 static inline nir_def *
-nir_ffma_imm1(nir_builder *build, nir_def *src0, double src1, nir_def *src2)
+nir_ffma_weak_imm1(nir_builder *build, nir_def *src0, double src1, nir_def *src2)
 {
-   return nir_ffma(build, src0, nir_imm_floatN_t(build, src1, src0->bit_size), src2);
+   return nir_ffma_weak(build, src0, nir_imm_floatN_t(build, src1, src0->bit_size), src2);
 }
 
 static inline nir_def *
-nir_ffma_imm2(nir_builder *build, nir_def *src0, nir_def *src1, double src2)
+nir_ffma_weak_imm2(nir_builder *build, nir_def *src0, nir_def *src1, double src2)
 {
-   return nir_ffma(build, src0, src1, nir_imm_floatN_t(build, src2, src0->bit_size));
+   return nir_ffma_weak(build, src0, src1, nir_imm_floatN_t(build, src2, src0->bit_size));
 }
 
 static inline nir_def *
 nir_a_minus_bc(nir_builder *build, nir_def *src0, nir_def *src1,
                nir_def *src2)
 {
-   return nir_ffma(build, nir_fneg(build, src1), src2, src0);
+   return nir_ffma_weak(build, nir_fneg(build, src1), src2, src0);
 }
 
 static inline nir_def *
@@ -2157,17 +2174,18 @@ nir_tex_src_for_ssa(nir_tex_src_type src_type, nir_def *def)
 static inline nir_def *
 nir_build_deriv(nir_builder *b, nir_def *x, nir_intrinsic_op intrin)
 {
+   struct _nir_ddx_indices indices = { 0 };
    if (b->shader->options->scalarize_ddx && x->num_components > 1) {
       nir_def *res[NIR_MAX_VEC_COMPONENTS] = { NULL };
 
       for (unsigned i = 0; i < x->num_components; ++i) {
-         res[i] = _nir_build_ddx(b, x->bit_size, nir_channel(b, x, i));
+         res[i] = _nir_build_ddx(b, x->bit_size, nir_channel(b, x, i), indices);
          nir_def_as_intrinsic(res[i])->intrinsic = intrin;
       }
 
       return nir_vec(b, res, x->num_components);
    } else {
-      nir_def *res = _nir_build_ddx(b, x->bit_size, x);
+      nir_def *res = _nir_build_ddx(b, x->bit_size, x, indices);
       nir_def_as_intrinsic(res)->intrinsic = intrin;
       return res;
    }
@@ -2189,13 +2207,16 @@ DEF_DERIV(ddy_coarse)
 
 struct nir_tex_builder {
    nir_def *coord, *ms_index, *lod, *bias, *comparator;
+   nir_def *backend1, *backend2;
    unsigned texture_index, sampler_index;
    nir_def *texture_offset, *sampler_offset;
+   nir_def *texture_heap_offset, *sampler_heap_offset;
    nir_def *texture_handle, *sampler_handle;
    nir_deref_instr *texture_deref, *sampler_deref;
    enum glsl_sampler_dim dim;
    nir_alu_type dest_type;
    bool is_array;
+   bool is_sparse;
    bool can_speculate;
    uint32_t backend_flags;
 };
@@ -2337,6 +2358,9 @@ nir_inverse_ballot_imm(nir_builder *build, uint64_t imm, unsigned bit_size)
 {
    return nir_inverse_ballot(build, nir_imm_intN_t(build, imm, bit_size));
 }
+
+nir_def *
+nir_build_frag_coord(nir_builder *b, unsigned num_components);
 
 nir_def *
 nir_build_string(nir_builder *build, const char *value);

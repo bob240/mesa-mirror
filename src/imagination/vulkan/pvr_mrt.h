@@ -125,6 +125,7 @@ struct pvr_load_op {
    struct {
       uint16_t rt_clear_mask;
       uint16_t rt_load_mask;
+      uint16_t rt_2d_view_3d_mask;
 
       uint16_t unresolved_msaa_mask;
 
@@ -170,6 +171,14 @@ CHECK_MASK_SIZE(pvr_load_op,
 #undef CHECK_MASK_SIZE
 
 #ifdef PVR_PER_ARCH
+VkResult PVR_PER_ARCH(mrt_setup_partial_init)(
+   struct pvr_device *const device,
+   struct usc_mrt_setup *mrt_setup,
+   uint32_t num_renger_targets,
+   uint32_t num_output_regs,
+   uint32_t num_tile_buffers);
+
+#   define pvr_arch_mrt_setup_partial_init PVR_PER_ARCH(mrt_setup_partial_init)
 
 VkResult PVR_PER_ARCH(init_usc_mrt_setup)(
    struct pvr_device *device,

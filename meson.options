@@ -23,8 +23,7 @@ option(
   type : 'combo',
   value : 'auto',
   choices : [
-    'auto', 'x11', 'wayland', 'haiku', 'android', 'windows',
-    'surfaceless', 'drm',
+    'auto', 'x11', 'haiku', 'android', 'surfaceless',
   ],
   description : 'the window system EGL assumes for EGL_DEFAULT_DISPLAY',
 )
@@ -216,9 +215,9 @@ option(
                 'will be built'
 )
 
-# Note that currently turnip supports msm and kgsl, while the gallium driver
-# support msm and virtio.  This is a temporary situation with virtio support
-# for turnip and kgsl support for gallium planned/in-progress.
+# Note that the freedreno gallium driver doesn't support KGSL.
+# On those systems, zink with Turnip should be used instead.
+# WSL is only supported for the replay tool.
 option(
   'freedreno-kmds',
   type : 'array',
@@ -550,9 +549,9 @@ option(
   'tools',
   type : 'array',
   value : [],
-  choices : ['drm-shim', 'etnaviv', 'freedreno', 'glsl', 'intel', 'intel-ui',
-             'nir', 'nouveau', 'lima', 'panfrost', 'asahi', 'imagination',
-             'zink', 'all', 'dlclose-skip'],
+  choices : ['amd', 'asahi', 'dlclose-skip', 'drm-shim', 'etnaviv', 'freedreno',  
+             'glsl', 'imagination', 'intel', 'intel-ui', 'lima', 'nir', 'nouveau',
+             'panfrost', 'rti', 'zink', 'all'],
   description : 'List of tools to build. (Note: `intel-ui` selects `intel`)',
 )
 
@@ -719,7 +718,8 @@ option(
   type : 'array',
   value : ['all_free'],
   choices: [
-    'all', 'all_free', 'vc1dec', 'h264dec', 'h264enc', 'h265dec', 'h265enc', 'av1dec', 'av1enc', 'vp9dec'
+    'all', 'all_free', 'vc1dec', 'h264dec', 'h264enc', 'h265dec', 'h265enc',
+    'av1dec', 'av1enc', 'vp9dec', 'mpeg12dec', 'jpegdec'
   ],
   description : 'List of codecs to build support for. ' +
                 'Distros might want to consult their legal department before ' +
@@ -752,11 +752,25 @@ option(
 )
 
 option(
+  'radv-u_trace',
+  type : 'boolean',
+  value : false,
+  description : 'Enable u_trace profiling features.'
+)
+
+option(
   'radeonsi-build-id',
   type : 'string',
   value : '',
   description : 'Override build id for shader cache keys (hex string). ' +
                 'Can be extracted with readelf -x .note.gnu.build-id'
+)
+
+option(
+  'tu-build-id',
+  type : 'string',
+  value : '',
+  description : 'Override build id for shader cache keys (hex string). '
 )
 
 option(
@@ -863,4 +877,25 @@ option(
   'spirv-tools',
   type : 'feature',
   description : 'Use SPIRV-Tools for dumping SPIR-V for debugging purposes (required by CLC)'
+)
+
+option(
+  'allow-broken-lto',
+  type : 'boolean',
+  value : false,
+  description : 'Manual override switch to enable LTO, which is unsupported due to being broken. WARNING: This option may break your driver randomly!'
+)
+
+option(
+  'intel-virtio-experimental',
+  type : 'boolean',
+  value : false,
+  description : 'use experimental virtio backend for intel driver',
+)
+
+option(
+  'panfrost-rust',
+  type : 'boolean',
+  value : false,
+  description : 'Build panfrost Rust components.'
 )

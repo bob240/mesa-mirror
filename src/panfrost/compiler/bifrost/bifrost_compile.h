@@ -1,24 +1,6 @@
 /*
- * Copyright (C) 2018-2019 Alyssa Rosenzweig <alyssa@rosenzweig.io>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (C) 2018-2019 Alyssa Rosenzweig
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef __BIFROST_PUBLIC_H_
@@ -36,7 +18,6 @@ struct bifrost_precompiled_kernel_sysvals {
    } num_workgroups;
    uint64_t printf_buffer_address;
 } __attribute__((aligned(8)));
-;
 
 #define BIFROST_PRECOMPILED_KERNEL_SYSVALS_SIZE                                \
    sizeof(struct bifrost_precompiled_kernel_sysvals)
@@ -81,48 +62,23 @@ bifrost_precompiled_kernel_prepare_push_uniforms(
           user_data_size);
 }
 
-void bifrost_preprocess_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_optimize_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_postprocess_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_lower_texture_nir(nir_shader *nir, unsigned gpu_id);
-void bifrost_lower_texture_late_nir(nir_shader *nir, unsigned gpu_id);
-
-bool bifrost_will_dump_shaders(void);
+void bifrost_preprocess_nir(nir_shader *nir, uint64_t gpu_id);
+void bifrost_postprocess_nir(nir_shader *nir,
+                             const struct pan_compile_inputs *inputs,
+                             struct pan_shader_info *info);
 
 void bifrost_compile_shader_nir(nir_shader *nir,
                                 const struct pan_compile_inputs *inputs,
                                 struct util_dynarray *binary,
                                 struct pan_shader_info *info);
 
+bool valhall_can_merge_workgroups(nir_shader *nir);
+
 #define VALHAL_EX_FIFO_VARYING_BITS \
    (VARYING_BIT_PSIZ | VARYING_BIT_LAYER | VARYING_BIT_PRIMITIVE_ID)
 
-static inline bool
-valhal_writes_extended_fifo(uint64_t outputs_written,
-                            bool no_psiz, bool multiview)
-{
-   uint64_t ex_fifo_written = outputs_written & VALHAL_EX_FIFO_VARYING_BITS;
-   if (ex_fifo_written == 0)
-      return false;
-
-   /* Multiview shaders depend on the FIFO format for indexing per-view
-    * output writes. We don't currently patch these offsets in the no_psiz
-    * variant, so we need the extended format, regardless of point size.
-    */
-   if (multiview)
-      return true;
-
-   /* If we're not rendering in points mode, the no_psiz variant has point
-    * size write patched out for us.
-    */
-   if (no_psiz)
-      ex_fifo_written &= ~VARYING_BIT_PSIZ;
-
-   return ex_fifo_written != 0;
-}
-
-#define DEFINE_OPTIONS(arch)                                                   \
-   static const nir_shader_compiler_options bifrost_nir_options_v##arch = {    \
+#define DEFINE_OPTIONS(name, arch, merge_workgroups)                           \
+   static const nir_shader_compiler_options name = {                           \
       .lower_scmp = true,                                                      \
       .lower_flrp16 = true,                                                    \
       .lower_flrp32 = true,                                                    \
@@ -143,6 +99,7 @@ valhal_writes_extended_fifo(uint64_t outputs_written,
       .lower_bitfield_extract8 = true,                                         \
       .lower_bitfield_extract16 = true,                                        \
       .lower_insert_byte = true,                                               \
+      .has_bitfield_select = true,                                             \
                                                                                \
       .lower_pack_64_4x16 = true,                                              \
       .lower_pack_half_2x16 = true,                                            \
@@ -155,20 +112,25 @@ valhal_writes_extended_fifo(uint64_t outputs_written,
       .lower_unpack_snorm_2x16 = true,                                         \
       .lower_unpack_unorm_4x8 = true,                                          \
       .lower_unpack_snorm_4x8 = true,                                          \
+      .has_pack_32_4x8 = true,                                                 \
                                                                                \
       .lower_doubles_options =                                                 \
          nir_lower_dmod, /* TODO: Don't lower supported 64-bit operations */   \
-      .lower_int64_options = ~0, /* TODO: Use IMULD on v7 */                   \
+      .lower_int64_options = arch >= 9 ? ~(nir_lower_iadd64) : ~0,             \
       .lower_mul_high = true,                                                  \
       .lower_fisnormal = true,                                                 \
       .lower_uadd_carry = true,                                                \
       .lower_usub_borrow = true,                                               \
                                                                                \
+      .has_ldexp = true,                                                       \
       .has_isub = true,                                                        \
       .vectorize_vec2_16bit = true,                                            \
-      .fuse_ffma16 = true,                                                     \
-      .fuse_ffma32 = true,                                                     \
-      .fuse_ffma64 = true,                                                     \
+      .float_mul_add16 = nir_float_muladd_support_has_ffma |                   \
+          nir_float_muladd_support_fuse,                                       \
+      .float_mul_add32 = nir_float_muladd_support_has_ffma |                   \
+          nir_float_muladd_support_fuse,                                       \
+      .float_mul_add64 = nir_float_muladd_support_has_ffma |                   \
+          nir_float_muladd_support_fuse,                                       \
                                                                                \
       .lower_uniforms_to_ubo = true,                                           \
                                                                                \
@@ -190,10 +152,17 @@ valhal_writes_extended_fifo(uint64_t outputs_written,
       .has_udot_4x8_sat = arch >= 9,                                           \
       .has_sdot_4x8 = arch >= 9,                                               \
       .has_sdot_4x8_sat = arch >= 9,                                           \
+                                                                               \
+      .divergence_analysis_options = merge_workgroups ?                        \
+         (nir_divergence_across_subgroups |                                    \
+          nir_divergence_multiple_workgroup_per_compute_subgroup)              \
+         : 0,                                                                  \
    };
 
-DEFINE_OPTIONS(6);
-DEFINE_OPTIONS(9);
-DEFINE_OPTIONS(11);
+DEFINE_OPTIONS(bifrost_nir_options_v6, 6, false);
+DEFINE_OPTIONS(bifrost_nir_options_v9, 9, false);
+DEFINE_OPTIONS(bifrost_nir_options_v9_merge_wg, 9, true);
+DEFINE_OPTIONS(bifrost_nir_options_v11, 11, false);
+DEFINE_OPTIONS(bifrost_nir_options_v11_merge_wg, 11, true);
 
 #endif

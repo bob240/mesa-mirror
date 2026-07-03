@@ -127,6 +127,7 @@ enum vn_debug {
    VN_DEBUG_NO_SECOND_QUEUE = 1ull << 9,
    VN_DEBUG_NO_RAY_TRACING = 1ull << 10,
    VN_DEBUG_MEM_BUDGET = 1ull << 11,
+   VN_DEBUG_NO_DESC_HEAP = 1ull << 12,
 };
 
 enum vn_perf {
@@ -272,6 +273,7 @@ struct vn_relax_state {
    uint32_t iter;
    const struct vn_relax_profile profile;
    const char *reason_str;
+   bool warn;
 };
 
 /* TLS ring
@@ -428,6 +430,12 @@ vn_relax(struct vn_relax_state *state);
 
 void
 vn_relax_fini(struct vn_relax_state *state);
+
+static inline bool
+vn_relax_warn(struct vn_relax_state *state)
+{
+   return state->warn;
+}
 
 static_assert(sizeof(vn_object_id) >= sizeof(uintptr_t), "");
 
@@ -663,13 +671,13 @@ vn_tls_destroy_ring(struct vn_tls_ring *tls_ring);
 static inline uint32_t
 vn_cache_key_hash_function(const void *key)
 {
-   return _mesa_hash_data(key, SHA1_DIGEST_LENGTH);
+   return _mesa_hash_data(key, BLAKE3_KEY_LEN);
 }
 
 static inline bool
 vn_cache_key_equal_function(const void *key1, const void *key2)
 {
-   return memcmp(key1, key2, SHA1_DIGEST_LENGTH) == 0;
+   return memcmp(key1, key2, BLAKE3_KEY_LEN) == 0;
 }
 
 static inline void

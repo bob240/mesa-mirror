@@ -48,17 +48,16 @@ enum panvk_queue_family {
    PANVK_QUEUE_FAMILY_COUNT,
 };
 
-struct panvk_device_queue_family {
-   struct vk_queue **queues;
-   int queue_count;
-};
-
 struct panvk_device {
    struct vk_device vk;
 
    struct {
       simple_mtx_t lock;
       struct util_vma_heap heap;
+      struct util_vma_heap fixed_heap;
+      struct util_vma_heap *priv_heap;
+      bool split_heap;
+      bool extended_range;
    } as;
 
    struct {
@@ -94,8 +93,6 @@ struct panvk_device {
    uint32_t *dump_region_size;
 
    struct vk_device_dispatch_table cmd_dispatch;
-
-   struct panvk_device_queue_family queue_families[PANVK_QUEUE_FAMILY_COUNT];
 
    struct panvk_precomp_cache *precomp_cache;
 
@@ -143,6 +140,15 @@ to_panvk_device(struct vk_device *dev)
    return container_of(dev, struct panvk_device, vk);
 }
 
+static inline void
+panvk_address_binding_report(struct panvk_device *dev,
+                             struct vk_object_base *object, uint64_t base,
+                             uint64_t size, VkDeviceAddressBindingTypeEXT type)
+{
+   vk_address_binding_report(dev->vk.physical->instance,
+                             object ? object : &dev->vk.base, base, size, type);
+}
+
 static inline uint32_t
 panvk_device_adjust_bo_flags(const struct panvk_device *device,
                              uint32_t bo_flags)
@@ -181,21 +187,40 @@ panvk_get_gpu_page_size(const struct panvk_device *device)
 }
 
 static inline uint64_t
-panvk_as_alloc(struct panvk_device *device, uint64_t size, uint64_t alignment)
+panvk_as_alloc(struct panvk_device *device, struct util_vma_heap *heap,
+               uint64_t size, uint64_t alignment)
 {
    simple_mtx_lock(&device->as.lock);
-   uint64_t address = util_vma_heap_alloc(&device->as.heap, size, alignment);
+   uint64_t address = util_vma_heap_alloc(heap, size, alignment);
    simple_mtx_unlock(&device->as.lock);
    return address;
 }
 
-static inline void
-panvk_as_free(struct panvk_device *device, uint64_t address, uint64_t size)
+static inline uint64_t
+panvk_as_alloc_fixed_address(struct panvk_device *device,
+                             struct util_vma_heap *heap, uint64_t address,
+                             uint64_t size)
 {
    simple_mtx_lock(&device->as.lock);
-   util_vma_heap_free(&device->as.heap, address, size);
+   bool alloc_result = util_vma_heap_alloc_addr(heap, address, size);
+   simple_mtx_unlock(&device->as.lock);
+   return alloc_result ? address : 0;
+}
+
+static inline void
+panvk_as_free(struct panvk_device *device, struct util_vma_heap *heap,
+              uint64_t address, uint64_t size)
+{
+   simple_mtx_lock(&device->as.lock);
+   util_vma_heap_free(heap, address, size);
    simple_mtx_unlock(&device->as.lock);
 }
+
+struct nir_shader;
+
+bool panvk_nir_lower_tile_image(struct nir_shader *nir,
+                                uint32_t *color_read_out, bool *z_read_out,
+                                bool *s_read_out);
 
 #if PAN_ARCH
 VkResult

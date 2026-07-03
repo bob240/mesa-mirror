@@ -1,25 +1,7 @@
 /*
  * Copyright (C) 2018 Alyssa Rosenzweig
  * Copyright (C) 2019-2021 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef __PAN_BLEND_H__
@@ -78,7 +60,8 @@ struct pan_blend_shader_key {
 
 bool pan_blend_reads_dest(const struct pan_blend_equation eq);
 
-bool pan_blend_can_fixed_function(const struct pan_blend_equation equation,
+bool pan_blend_can_fixed_function(unsigned arch,
+                                  const struct pan_blend_equation equation,
                                   bool supports_2src);
 
 bool pan_blend_is_opaque(const struct pan_blend_equation eq);
@@ -132,6 +115,8 @@ enum mali_register_file_format pan_blend_type_from_nir(nir_alu_type nir_type);
 uint32_t pan_pack_blend(const struct pan_blend_equation equation);
 
 #ifdef PAN_ARCH
+
+enum pipe_format GENX(pan_blend_shader_fmt)(enum pipe_format format);
 
 nir_shader *GENX(pan_blend_create_shader)(const struct pan_blend_state *state,
                                           nir_alu_type src0_type,

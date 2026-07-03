@@ -16,6 +16,8 @@ nvk_files = files(
   'nvk_cmd_meta.c',
   'nvk_cmd_pool.c',
   'nvk_cmd_pool.h',
+  'nvk_cubin.c',
+  'nvk_cubin.h',
   'nvk_debug.h',
   'nvk_descriptor_set.h',
   'nvk_descriptor_set.c',
@@ -52,6 +54,7 @@ nvk_files = files(
   'nvk_mme.c',
   'nvk_mme.h',
   'nvk_nir_lower_descriptors.c',
+  'nvk_nir_lower_mesh_shader.c',
   'nvk_physical_device.c',
   'nvk_physical_device.h',
   'nvk_private.h',
@@ -67,6 +70,8 @@ nvk_files = files(
   'nvk_upload_queue.h',
   'nvk_wsi.c',
   'nvk_wsi.h',
+  'layers/nvk_app_workarounds.c',
+  'layers/nvk_app_workarounds.h',
   'nvkmd/nouveau/nvkmd_nouveau.h',
   'nvkmd/nouveau/nvkmd_nouveau_ctx.c',
   'nvkmd/nouveau/nvkmd_nouveau_dev.c',
@@ -79,6 +84,7 @@ nvk_files = files(
 
 nvkcl_files = files(
   'cl/nvk_query.cl',
+  'cl/nvk_copy_indirect.cl',
 )
 
 nvk_entrypoints = custom_target(
@@ -94,16 +100,19 @@ nvk_entrypoints = custom_target(
 )
 
 nvkcl_spv = custom_target(
-  input : nvkcl_files,
+  input : [nvkcl_files, libnvidia_headers],
   output : 'nvkcl.spv',
   command : [
     prog_mesa_clc, '-o', '@OUTPUT@', '--depfile', '@DEPFILE@', nvkcl_files, '--',
     '-I' + join_paths(meson.project_source_root(), 'src/compiler/libcl'),
     '-I' + join_paths(meson.current_source_dir(), '.'),
     '-I' + join_paths(meson.project_source_root(), 'src'),
+    '-I' + join_paths(meson.project_source_root(), 'src/nouveau/headers'),
+    '-I' + join_paths(meson.project_source_root(), 'src/nouveau/headers/nvidia/classes'),
+    '-I' + join_paths(meson.project_build_root(), 'src/nouveau/headers'),
     cl_args,
     ],
-  depfile : '@PLAINNAME@.d',
+  depfile : 'nvkcl.spv.d',
 )
 
 nvkcl = custom_target(
@@ -112,12 +121,27 @@ nvkcl = custom_target(
   command : [prog_vtn_bindgen2, '@INPUT@', '@OUTPUT@'],
 )
 
+nvk_drirc = custom_target(
+  'nvk_drirc',
+  input  : [files('nvk_drirc_gen.py'), drirc_gen, '00-nvk-defaults.conf'],
+  output : ['nvk_drirc.c', 'nvk_drirc.h'],
+  command : [
+    prog_python, '@INPUT0@',
+    '--import-path', join_paths(dir_source_root, 'src/util'),
+    '--drirc-src', '@OUTPUT0@',
+    '--drirc-hdr', '@OUTPUT1@',
+    '--validate', '@INPUT2@',
+  ],
+)
+
 nvk_deps = [
   dep_libdrm,
+  dep_elf,
   idep_nak,
   idep_nil,
   idep_nir,
   idep_mesautil,
+  idep_nouveau_cubin,
   idep_nouveau_mme,
   idep_nouveau_ws,
   idep_nvidia_headers,
@@ -137,6 +161,7 @@ libnvk = static_library(
   'nvk',
   [
     nvk_entrypoints,
+    nvk_drirc,
     cl_generated,
     nvk_files,
     nvkcl,
@@ -205,6 +230,7 @@ if with_tests and not with_platform_android
       files('test_nvk_mme.c'),
       dependencies : [nvk_deps],
       link_with : [libnvk],
-    )
+    ),
+    suite : ['nouveau'],
   )
 endif

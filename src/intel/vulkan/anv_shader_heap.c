@@ -105,7 +105,7 @@ anv_shader_heap_alloc(struct anv_shader_heap *heap,
                       uint64_t size,
                       uint64_t align,
                       bool capture_replay,
-                      uint64_t requested_addr)
+                      uint64_t requested_offset)
 {
    assert(align <= heap->base_chunk_size);
    assert(size <= heap->base_chunk_size);
@@ -117,10 +117,11 @@ anv_shader_heap_alloc(struct anv_shader_heap *heap,
       heap->vma.nospan_shift++;
 
    uint64_t addr = 0;
-   if (requested_addr) {
+   if (requested_offset) {
       if (util_vma_heap_alloc_addr(&heap->vma,
-                                   requested_addr, size)) {
-         addr = requested_addr;
+                                   heap->va_range.addr + requested_offset,
+                                   size)) {
+         addr = heap->va_range.addr + requested_offset;
       }
    } else {
       if (capture_replay) {
@@ -135,8 +136,28 @@ anv_shader_heap_alloc(struct anv_shader_heap *heap,
    struct anv_shader_alloc alloc = {};
 
    if (addr != 0) {
+      /* BSpec 56653:
+       *
+       *    "Due to prefetch of the instruction stream, the EUs may attempt to
+       *     access up to 56 cachelines (3584b) beyond the end of the kernel"
+       *
+       *    "Note that the General State Access Upper Bound field of the
+       *     STATE_BASE_ADDRESS command can be used to prevent memory accesses
+       *     past the end of the General State heap (where kernel programs
+       *     must reside)."
+       *
+       * To avoid page faults, we add the required padding to the upper address
+       * bound when allocating the buffers to back the shader allocation. If
+       * the resulting padded address range goes beyond the end of the heap, we
+       * can safely clamp it because we will program the instruction buffer
+       * size in STATE_BASE_ADDRESS to be equal to the shader heap VA range.
+       */
+      const unsigned overfetch_size = 3584;
+      uint64_t bound = addr + size + overfetch_size;
+      bound = MIN2(bound, heap->va_range.addr + heap->va_range.size);
+
       const uint32_t bo_begin_idx = shader_bo_index(heap, addr);
-      const uint32_t bo_end_idx = shader_bo_index(heap, addr + size - 1);
+      const uint32_t bo_end_idx = shader_bo_index(heap, bound - 1);
       for (uint32_t i = MIN2(bo_begin_idx, bo_end_idx);
            i <= MAX2(bo_begin_idx, bo_end_idx); i++) {
          if (heap->bos[i].bo != NULL)
@@ -187,12 +208,12 @@ anv_shader_heap_free(struct anv_shader_heap *heap, struct anv_shader_alloc alloc
 void
 anv_shader_heap_upload(struct anv_shader_heap *heap,
                        struct anv_shader_alloc alloc,
-                       const void *data, uint64_t data_size)
+                       const void *data, uint64_t size)
 {
    const uint32_t bo_begin_idx = shader_bo_index(
       heap, heap->va_range.addr + alloc.offset);
    const uint32_t bo_end_idx = shader_bo_index(
-      heap, heap->va_range.addr + alloc.offset + data_size - 1);
+      heap, heap->va_range.addr + alloc.offset + size - 1);
 
    const uint64_t upload_addr = heap->va_range.addr + alloc.offset;
    for (uint32_t i = MIN2(bo_begin_idx, bo_end_idx);
@@ -202,7 +223,7 @@ anv_shader_heap_upload(struct anv_shader_heap *heap,
       const uint32_t data_offset =
          upload_addr - (heap->bos[i].addr + bo_offset);
       const uint64_t copy_size =
-         MIN2(heap->bos[i].size - bo_offset, data_size - data_offset);
+         MIN2(heap->bos[i].size - bo_offset, size - data_offset);
 
       memcpy(heap->bos[i].bo->map + bo_offset, data, copy_size);
    }

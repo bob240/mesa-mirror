@@ -218,23 +218,13 @@ agx_create_blend_state(struct pipe_context *ctx,
 
       if (state->logicop_enable || !rt.blend_enable) {
          /* No blending, but we get the colour mask below */
-         key->rt[i] = (struct agx_blend_rt_key){
-            .rgb_func = PIPE_BLEND_ADD,
-            .rgb_src_factor = PIPE_BLENDFACTOR_ONE,
-            .rgb_dst_factor = PIPE_BLENDFACTOR_ZERO,
-
-            .alpha_func = PIPE_BLEND_ADD,
-            .alpha_src_factor = PIPE_BLENDFACTOR_ONE,
-            .alpha_dst_factor = PIPE_BLENDFACTOR_ZERO,
-         };
+         key->rt[i].mode = agx_pack_blend_standard(
+            PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO,
+            PIPE_BLEND_ADD, PIPE_BLENDFACTOR_ONE, PIPE_BLENDFACTOR_ZERO);
       } else {
-         key->rt[i].rgb_func = rt.rgb_func;
-         key->rt[i].rgb_src_factor = rt.rgb_src_factor;
-         key->rt[i].rgb_dst_factor = rt.rgb_dst_factor;
-
-         key->rt[i].alpha_func = rt.alpha_func;
-         key->rt[i].alpha_src_factor = rt.alpha_src_factor;
-         key->rt[i].alpha_dst_factor = rt.alpha_dst_factor;
+         key->rt[i].mode = agx_pack_blend_standard(
+            rt.rgb_func, rt.rgb_src_factor, rt.rgb_dst_factor, rt.alpha_func,
+            rt.alpha_src_factor, rt.alpha_dst_factor);
       }
 
       key->rt[i].colormask = rt.colormask;
@@ -1399,30 +1389,6 @@ asahi_cs_shader_key_equal(const void *a, const void *b)
    return true;
 }
 
-/* Dynamic lowered I/O version of nir_lower_clip_halfz */
-static bool
-agx_nir_lower_clip_m1_1(nir_builder *b, nir_intrinsic_instr *intr,
-                        UNUSED void *data)
-{
-   if (intr->intrinsic != nir_intrinsic_store_output)
-      return false;
-   if (nir_intrinsic_io_semantics(intr).location != VARYING_SLOT_POS)
-      return false;
-
-   assert(nir_intrinsic_component(intr) == 0 && "not yet scalarized");
-   b->cursor = nir_before_instr(&intr->instr);
-
-   nir_def *pos = intr->src[0].ssa;
-   nir_def *z = nir_channel(b, pos, 2);
-   nir_def *w = nir_channel(b, pos, 3);
-   nir_def *c = nir_load_clip_z_coeff_agx(b);
-
-   /* Lerp. If c = 0, reduces to z. If c = 1/2, reduces to (z + w)/2 */
-   nir_def *new_z = nir_ffma(b, nir_fneg(b, z), c, nir_ffma(b, w, c, z));
-   nir_src_rewrite(&intr->src[0], nir_vector_insert_imm(b, pos, new_z, 2));
-   return true;
-}
-
 /*
  * To implement point sprites, we'll replace TEX0...7 with point coordinate
  * reads as required. However, the .zw needs to read back 0.0/1.0. This pass
@@ -1570,8 +1536,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
 
       if (key->hw) {
          NIR_PASS(_, nir, agx_nir_lower_point_size, true);
-         NIR_PASS(_, nir, nir_shader_intrinsics_pass, agx_nir_lower_clip_m1_1,
-                  nir_metadata_control_flow, NULL);
+         NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
 
          NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
                   NULL);
@@ -1587,7 +1552,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
          outputs = nir->info.outputs_written;
       }
    } else if (nir->info.stage == MESA_SHADER_TESS_CTRL) {
-      NIR_PASS(_, nir, poly_nir_lower_tcs);
+      NIR_PASS(_, nir, poly_nir_lower_tcs, true);
    } else if (nir->info.stage == MESA_SHADER_GEOMETRY) {
       NIR_PASS(_, nir, poly_nir_lower_gs, &gs_count, &gs_copy, &pre_gs,
                &gs_info);
@@ -1671,8 +1636,7 @@ agx_compile_variant(struct agx_device *dev, struct pipe_context *pctx,
        */
       NIR_PASS(_, gs_copy, agx_nir_lower_point_size, false);
 
-      NIR_PASS(_, gs_copy, nir_shader_intrinsics_pass, agx_nir_lower_clip_m1_1,
-               nir_metadata_control_flow, NULL);
+      NIR_PASS(_, gs_copy, nir_lower_clip_halfz_dynamic);
 
       NIR_PASS(_, gs_copy, nir_lower_io_to_scalar, nir_var_shader_out, NULL,
                NULL);
@@ -1800,6 +1764,11 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
             nir_lower_io_lower_64bit_to_32 |
                nir_lower_io_use_interpolated_input_intrinsics);
 
+   /* Regather shader info after nir_lower_io. This recalculates interpolation
+    * qualifiers which got lost when mesa/st lowered I/O back to vars.
+    */
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
    if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       so->info.uses_fbfetch = nir->info.fs.uses_fbfetch_output;
       so->info.inputs_linear_shaded = nir->info.linear_varyings;
@@ -1872,8 +1841,8 @@ agx_shader_initialize(struct agx_device *dev, struct agx_uncompiled_shader *so,
 
    blob_init(&so->serialized_nir);
    nir_serialize(&so->serialized_nir, nir, true);
-   _mesa_sha1_compute(so->serialized_nir.data, so->serialized_nir.size,
-                      so->nir_sha1);
+   _mesa_blake3_compute(so->serialized_nir.data, so->serialized_nir.size,
+                        so->nir_blake3);
 
    so->has_xfb_info = (nir->xfb_info != NULL);
 
@@ -2357,12 +2326,17 @@ agx_update_fs(struct agx_batch *batch)
    /* Try to disable blending to get rid of some fsats */
    if (link_key.epilog.fs.link.loc0_w_1) {
       struct agx_blend_rt_key *k = &link_key.epilog.fs.blend.rt[0];
+      struct agx_blend_standard b = agx_unpack_blend_standard(k->mode);
 
-      k->rgb_src_factor = optimize_blend_factor_w_1(k->rgb_src_factor);
-      k->rgb_dst_factor = optimize_blend_factor_w_1(k->rgb_dst_factor);
+      b.rgb_src_factor = optimize_blend_factor_w_1(b.rgb_src_factor);
+      b.rgb_dst_factor = optimize_blend_factor_w_1(b.rgb_dst_factor);
 
-      k->alpha_src_factor = optimize_blend_factor_w_1(k->alpha_src_factor);
-      k->alpha_dst_factor = optimize_blend_factor_w_1(k->alpha_dst_factor);
+      b.alpha_src_factor = optimize_blend_factor_w_1(b.alpha_src_factor);
+      b.alpha_dst_factor = optimize_blend_factor_w_1(b.alpha_dst_factor);
+
+      k->mode = agx_pack_blend_standard(b.rgb_func, b.rgb_src_factor,
+                                        b.rgb_dst_factor, b.alpha_func,
+                                        b.alpha_src_factor, b.alpha_dst_factor);
    }
 
    link_key.epilog.fs.blend.alpha_to_coverage &= msaa;
@@ -3029,7 +3003,6 @@ agx_launch_internal(struct agx_batch *batch, struct agx_grid grid,
    struct agx_context *ctx = batch->ctx;
    struct agx_device *dev = agx_device(ctx->base.screen);
 
-   /* TODO: Ensure space if we allow multiple kernels in a batch */
    uint32_t *out = (uint32_t *)batch->cdm.current;
 
    out = agx_cdm_launch(out, dev->chip, grid, wg, launch, usc);
@@ -3038,6 +3011,19 @@ agx_launch_internal(struct agx_batch *batch, struct agx_grid grid,
    batch->cdm.current = (void *)out;
    assert(batch->cdm.current <= batch->cdm.end &&
           "Failed to reserve sufficient space in encoder");
+
+   /* If the next dispatch might overflow, flush now. TODO: If this is ever hit
+    * in practice, we can use CDM stream links.
+    */
+   size_t dispatch_upper_bound =
+      AGX_CDM_LAUNCH_WORD_0_LENGTH + AGX_CDM_LAUNCH_WORD_1_LENGTH +
+      AGX_CDM_UNK_G14X_LENGTH + AGX_CDM_INDIRECT_LENGTH +
+      AGX_CDM_GLOBAL_SIZE_LENGTH + AGX_CDM_LOCAL_SIZE_LENGTH +
+      AGX_CDM_BARRIER_LENGTH;
+
+   if (batch->cdm.current + dispatch_upper_bound >= batch->cdm.end)
+      agx_flush_batch_for_reason(ctx, batch, "CDM overfull");
+
 }
 
 void
@@ -5434,18 +5420,6 @@ agx_launch_grid(struct pipe_context *pipe, const struct pipe_grid_info *info)
    agx_dirty_all(ctx);
 
    batch->uniforms.tables[AGX_SYSVAL_TABLE_GRID] = 0;
-
-   /* If the next dispatch might overflow, flush now. TODO: If this is ever hit
-    * in practice, we can use CDM stream links.
-    */
-   size_t dispatch_upper_bound =
-      AGX_CDM_LAUNCH_WORD_0_LENGTH + AGX_CDM_LAUNCH_WORD_1_LENGTH +
-      AGX_CDM_UNK_G14X_LENGTH + AGX_CDM_INDIRECT_LENGTH +
-      AGX_CDM_GLOBAL_SIZE_LENGTH + AGX_CDM_LOCAL_SIZE_LENGTH +
-      AGX_CDM_BARRIER_LENGTH;
-
-   if (batch->cdm.current + dispatch_upper_bound >= batch->cdm.end)
-      agx_flush_batch_for_reason(ctx, batch, "CDM overfull");
 }
 
 static void

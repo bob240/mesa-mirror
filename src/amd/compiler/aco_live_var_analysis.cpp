@@ -67,7 +67,7 @@ RegisterDemand get_temp_reg_changes(Instruction* instr)
    }
 
    for (Operand op : instr->operands) {
-      if (op.isFirstKillBeforeDef() || op.isCopyKill())
+      if (op.isFirstKillBeforeDef() || (op.isCopyKill() && !op.isLateKill()))
          available_def_space -= op.getTemp();
       else if (op.isClobbered() && !op.isKill())
          available_def_space -= op.getTemp();
@@ -193,6 +193,8 @@ get_demand_for_reg(live_ctx& ctx, T op_or_def)
 void
 process_live_temps_per_block(live_ctx& ctx, Block* block)
 {
+   ctx.m.release_reallocate();
+
    RegisterDemand new_demand;
    unsigned num_linear_vgprs = 0;
    block->register_demand = RegisterDemand();
@@ -418,26 +420,11 @@ process_live_temps_per_block(live_ctx& ctx, Block* block)
       }
 
       if (insn->isCall()) {
-         /* For call instructions, definitions are live at the time s_setpc finishes,
-          * which continues execution in the callee. This means that all definitions are
-          * live concurrently with operands.
-          */
-         operand_demand += insn->definitions[0].getTemp();
-         if (insn->definitions[1].physReg() == vcc)
-            operand_demand += insn->definitions[1].getTemp();
-
          RegisterDemand limit = get_addr_regs_from_waves(ctx.program, ctx.program->min_waves);
-         insn->call().callee_preserved_limit = RegisterDemand();
+         insn->call().callee_preserved_limit = insn->call().abi.numPreserved(limit);
 
          BITSET_DECLARE(preserved_regs, 512);
          insn->call().abi.preservedRegisters(preserved_regs, limit);
-
-         RegisterDemand preserved_reg_demand;
-         preserved_reg_demand.sgpr =
-            __bitset_prefix_sum(preserved_regs, limit.sgpr, 256 / BITSET_WORDBITS);
-         preserved_reg_demand.vgpr = __bitset_prefix_sum(preserved_regs + 256 / BITSET_WORDBITS,
-                                                         limit.vgpr, 256 / BITSET_WORDBITS);
-         insn->call().callee_preserved_limit += preserved_reg_demand;
 
          /* Killed operands effectively make a preserved register unusable for temporaries which we
           * want to preserve (those included in caller_preserved_demand).
@@ -680,7 +667,7 @@ max_suitable_waves(Program* program, uint16_t waves)
 }
 
 void
-update_vgpr_sgpr_demand(Program* program, const RegisterDemand new_demand)
+update_vgpr_sgpr_demand(Program* program, RegisterDemand new_demand)
 {
    assert(program->min_waves >= 1);
    RegisterDemand limit = get_addr_regs_from_waves(program, program->min_waves);
@@ -690,6 +677,9 @@ update_vgpr_sgpr_demand(Program* program, const RegisterDemand new_demand)
       program->num_waves = 0;
       program->max_reg_demand = new_demand;
    } else {
+      RegisterDemand temp_demand = new_demand;
+      new_demand.update(program->fixed_reg_demand);
+
       program->num_waves = program->dev.physical_sgprs / get_sgpr_alloc(program, new_demand.sgpr);
       uint16_t vgpr_demand =
          get_vgpr_alloc(program, new_demand.vgpr) + program->config->num_shared_vgprs / 2;
@@ -697,8 +687,21 @@ update_vgpr_sgpr_demand(Program* program, const RegisterDemand new_demand)
          std::min<uint16_t>(program->num_waves, program->dev.physical_vgprs / vgpr_demand);
       program->num_waves = std::min(program->num_waves, program->dev.max_waves_per_simd);
 
-      /* Adjust for LDS and workgroup multiples and calculate max_reg_demand */
+      /* Adjust for LDS, workgroup multiples and callee ABI, and calculate max_reg_demand */
       program->num_waves = max_suitable_waves(program, program->num_waves);
+      if (program->is_callee) {
+         /* Decrease waves to reduce the chances of needing preserved VGPRs. */
+         std::pair<int, unsigned> best(INT_MIN, program->num_waves);
+         for (; program->num_waves > program->min_waves; program->num_waves--) {
+            program->max_reg_demand = get_addr_regs_from_waves(program, program->num_waves);
+            RegisterDemand clobbered = program->callee_abi.numClobbered(program->max_reg_demand);
+            std::pair<int, unsigned> val(MIN2(clobbered.vgpr - temp_demand.vgpr, 0),
+                                         program->num_waves);
+            if (val > best)
+               best = val;
+         }
+         program->num_waves = best.second;
+      }
       program->max_reg_demand = get_addr_regs_from_waves(program, program->num_waves);
    }
 }
@@ -724,8 +727,6 @@ live_var_analysis(Program* program)
    while (ctx.worklist >= 0) {
       process_live_temps_per_block(ctx, &program->blocks[ctx.worklist--]);
    }
-
-   program->max_reg_demand.update(program->fixed_reg_demand);
 
    /* calculate the program's register demand and number of waves */
    if (program->progress < CompilationProgress::after_ra)

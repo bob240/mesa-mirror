@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2019 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include <xf86drm.h>
@@ -102,8 +84,10 @@ panfrost_open_device(void *memctx, int fd, struct panfrost_device *dev)
       list_inithead(&dev->bo_cache.buckets[i]);
 
    /* Initialize pandecode before we start allocating */
-   if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC))
+   if (dev->debug & (PAN_DBG_TRACE | PAN_DBG_SYNC)) {
       dev->decode_ctx = pandecode_create_context(!(dev->debug & PAN_DBG_TRACE));
+      pandecode_set_disassemble(dev->decode_ctx, pan_disassemble);
+   }
 
    /* Tiler heap is internally required by the tiler, which can only be
     * active for a single job chain at once, so a single heap can be

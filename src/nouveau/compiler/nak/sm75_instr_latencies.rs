@@ -194,6 +194,7 @@ impl RegLatencySM75 {
             Op::SuAtom(_) => Decoupled,
             Op::PixLd(_) => Decoupled,
             Op::Isberd(_) => Decoupled,
+            Op::Isbewr(_) => Decoupled,
             Op::LdTram(_) => Decoupled,
             Op::Shfl(_) => Decoupled,
             Op::Ldsm(_) => Decoupled,
@@ -925,6 +926,13 @@ impl URegLatencySM75 {
 
             Op::IMad64(_) => vcoupled,
             Op::ISetP(_) => vcoupled,
+            Op::ALd(_)
+            | Op::ASt(_)
+            | Op::Ld(_)
+            | Op::Ldsm(_)
+            | Op::St(_)
+            | Op::Atom(_) => vdecoupled,
+            Op::SuLd(_) | Op::SuSt(_) | Op::SuAtom(_) => vdecoupled,
             Op::Ldc(_) => {
                 if uniform_op {
                     Uldc

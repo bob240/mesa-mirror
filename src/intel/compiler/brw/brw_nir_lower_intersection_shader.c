@@ -1,24 +1,6 @@
 /*
- * Copyright (c) 2020 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * Copyright © 2020 Intel Corporation
+ * SPDX-License-Identifier: MIT
  */
 
 #include "brw_nir_rt.h"
@@ -133,10 +115,11 @@ lower_any_hit_for_intersection(nir_shader *any_hit)
 }
 
 static void
-build_accept_ray(nir_builder *b)
+build_accept_ray(nir_builder *b,
+                 const struct intel_device_info *devinfo)
 {
    /* Set the "valid" bit in mem_hit */
-   nir_def *ray_addr = brw_nir_rt_mem_hit_addr(b, false /* committed */);
+   nir_def *ray_addr = brw_nir_rt_mem_hit_addr(b, false /* committed */, devinfo);
    nir_def *flags_dw_addr = nir_iadd_imm(b, ray_addr, 12);
    nir_store_global(b, nir_ior(b, nir_load_global(b, 1, 32, flags_dw_addr),
                                nir_imm_int(b, 1 << 16)),
@@ -166,18 +149,17 @@ brw_nir_lower_intersection_shader(nir_shader *intersection,
    nir_builder build = nir_builder_at(nir_before_impl(impl));
    nir_builder *b = &build;
 
-   nir_def *t_addr = brw_nir_rt_mem_hit_addr(b, false /* committed */);
+   nir_def *t_addr = brw_nir_rt_mem_hit_addr(b, false /* committed */, devinfo);
    nir_variable *commit =
       nir_local_variable_create(impl, glsl_bool_type(), "ray_commit");
    nir_store_var(b, commit, nir_imm_false(b), 0x1);
 
-   assert(impl->end_block->predecessors.entries == 1);
-   set_foreach(&impl->end_block->predecessors, block_entry) {
-      struct nir_block *block = (void *)block_entry->key;
+   assert(nir_block_num_preds(impl->end_block) == 1);
+   nir_foreach_pred(block, impl->end_block) {
       b->cursor = nir_after_block_before_jump(block);
       nir_push_if(b, nir_load_var(b, commit));
       {
-         build_accept_ray(b);
+         build_accept_ray(b, devinfo);
       }
       nir_push_else(b, NULL);
       {
@@ -239,7 +221,8 @@ brw_nir_lower_intersection_shader(nir_shader *intersection,
                      nir_store_var(b, commit, nir_imm_true(b), 0x1);
 
                      nir_def *ray_addr =
-                        brw_nir_rt_mem_ray_addr(b, brw_nir_rt_stack_addr(b), BRW_RT_BVH_LEVEL_WORLD);
+                        brw_nir_rt_mem_ray_addr(b, brw_nir_rt_stack_addr(b, devinfo),
+                                                BRW_RT_BVH_LEVEL_OBJECT);
 
                      nir_store_global(b, hit_t, nir_iadd_imm(b, ray_addr, 16 + 12));
                      if (devinfo->ver >= 30) {
@@ -280,7 +263,7 @@ brw_nir_lower_intersection_shader(nir_shader *intersection,
                                                         BRW_RT_RAY_FLAG_TERMINATE_ON_FIRST_HIT);
                      nir_push_if(b, terminate);
                      {
-                        build_accept_ray(b);
+                        build_accept_ray(b, devinfo);
                      }
                      nir_pop_if(b, NULL);
                   }

@@ -10,8 +10,6 @@
 #include "util/list.h"
 #include "util/mesa-blake3.h"
 
-#include "radv_constants.h"
-
 #include "vk_descriptor_set_layout.h"
 #include "vk_object.h"
 
@@ -28,7 +26,6 @@ struct radv_descriptor_set_binding_layout {
    uint32_t array_size;
 
    uint32_t offset;
-   uint32_t buffer_offset;
    uint16_t dynamic_offset_offset;
 
    uint16_t dynamic_offset_count;
@@ -64,9 +61,6 @@ struct radv_descriptor_set_layout {
    /* Shader stages affected by this descriptor set */
    uint16_t dynamic_shader_stages;
 
-   /* Number of buffers in this descriptor set */
-   uint32_t buffer_count;
-
    /* Number of dynamic offsets used by this descriptor set */
    uint16_t dynamic_offset_count;
 
@@ -92,7 +86,6 @@ struct radv_descriptor_set_header {
    struct radv_descriptor_set_layout *layout;
    uint32_t offset;
    uint32_t size;
-   uint32_t buffer_count;
 
    struct radeon_winsys_bo *bo;
    uint64_t va;
@@ -105,8 +98,6 @@ struct radv_descriptor_set {
 
    /* Link in radv_descriptor_pool::sets */
    struct list_head link;
-
-   struct radeon_winsys_bo *descriptors[];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(radv_descriptor_set, header.base, VkDescriptorSet, VK_OBJECT_TYPE_DESCRIPTOR_SET)

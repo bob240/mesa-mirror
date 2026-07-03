@@ -43,7 +43,9 @@
 #include "util/ralloc.h"
 #include "util/range_minimum_query.h"
 #include "util/set.h"
+#include "util/simple_mtx.h"
 #include "util/sparse_bitset.h"
+#include "util/u_dynarray.h"
 #include "util/u_math.h"
 #include "nir_defines.h"
 #include "nir_shader_compiler_options.h"
@@ -181,6 +183,40 @@ typedef struct nir_state_slot {
 } nir_state_slot;
 
 /**
+ * Resource types according to VkSpirvResourceTypeFlagsKHR.
+ */
+typedef enum {
+   nir_resource_type_sampler = 1u << 0,
+   nir_resource_type_sampled_image = 1u << 1,
+   nir_resource_type_read_only_image = 1u << 2,
+   nir_resource_type_read_write_image = 1u << 3,
+   nir_resource_type_combined_sampled_image = 1u << 4,
+   nir_resource_type_uniform_buffer = 1u << 5,
+   nir_resource_type_read_only_storage_buffer = 1u << 6,
+   nir_resource_type_read_write_storage_buffer = 1u << 7,
+   nir_resource_type_acceleration_structure = 1u << 8,
+} nir_resource_type;
+
+/**
+ * Descriptor types.
+ */
+typedef enum {
+   nir_descriptor_type_uniform_buffer = 0,
+   nir_descriptor_type_storage_buffer = 1,
+   nir_descriptor_type_acceleration_structure = 2,
+} nir_descriptor_type;
+
+/**
+ * NIR image intrinsics variants.
+ */
+typedef enum {
+   nir_image_intrinsic_type_default = 0,
+   nir_image_intrinsic_type_deref = 1,
+   nir_image_intrinsic_type_bindless = 2,
+   nir_image_intrinsic_type_heap = 3,
+} nir_image_intrinsic_type;
+
+/**
  * Rounding modes.
  */
 typedef enum {
@@ -225,6 +261,7 @@ typedef enum {
    nir_resource_intel_sampler = 1u << 2,
    nir_resource_intel_non_uniform = 1u << 3,
    nir_resource_intel_sampler_embedded = 1u << 4,
+   nir_resource_intel_internal = 1u << 5,
 } nir_resource_data_intel;
 
 /**
@@ -448,7 +485,12 @@ typedef struct nir_variable {
        *
        * :c:struct:`nir_variable_mode`
        */
-      unsigned mode : 24;
+      unsigned mode : 26;
+
+      /* A temporary for passes to store information. Used, for example, to
+       * replace an unordered set with an ordered util_dynarray.
+       */
+      bool pass_flags : 1;
 
       /**
        * Is the variable read-only?
@@ -710,10 +752,13 @@ typedef struct nir_variable {
        */
       unsigned access : 9;
 
+      /* NIR resource type bit index that this variable would have. */
+      nir_resource_type resource_type;
+
       /**
        * Descriptor set binding for sampler or UBO.
        */
-      unsigned descriptor_set : 5;
+      unsigned descriptor_set;
 
 #define NIR_VARIABLE_NO_INDEX ~0
 
@@ -1059,7 +1104,7 @@ nir_src_is_if(const nir_src *src)
 }
 
 static inline nir_instr *
-nir_src_parent_instr(const nir_src *src)
+nir_src_use_instr(const nir_src *src)
 {
    assert(!nir_src_is_if(src));
 
@@ -1068,7 +1113,7 @@ nir_src_parent_instr(const nir_src *src)
 }
 
 static inline nir_if *
-nir_src_parent_if(const nir_src *src)
+nir_src_use_if(const nir_src *src)
 {
    assert(nir_src_is_if(src));
 
@@ -1077,7 +1122,7 @@ nir_src_parent_if(const nir_src *src)
 }
 
 static inline void
-_nir_src_set_parent(nir_src *src, void *parent, bool is_if)
+_nir_src_set_use(nir_src *src, void *parent, bool is_if)
 {
     uintptr_t ptr = (uintptr_t) parent;
     assert((ptr & ~NIR_SRC_PARENT_MASK) == 0 && "pointer must be aligned");
@@ -1089,15 +1134,15 @@ _nir_src_set_parent(nir_src *src, void *parent, bool is_if)
 }
 
 static inline void
-nir_src_set_parent_instr(nir_src *src, nir_instr *parent_instr)
+nir_src_set_use_instr(nir_src *src, nir_instr *parent_instr)
 {
-   _nir_src_set_parent(src, parent_instr, false);
+   _nir_src_set_use(src, parent_instr, false);
 }
 
 static inline void
-nir_src_set_parent_if(nir_src *src, nir_if *parent_if)
+nir_src_set_use_if(nir_src *src, nir_if *parent_if)
 {
-   _nir_src_set_parent(src, parent_if, true);
+   _nir_src_set_use(src, parent_if, true);
 }
 
 static inline nir_src
@@ -1420,7 +1465,7 @@ typedef enum {
    /**
     * Operation is associative mathematically (as real numbers), but not
     * associative with floating-point math. This can be treated as associative
-    * iff the operation's exact bit is not set.
+    * iff the operation's nir_fp_no_reassoc bit is not set.
     */
    NIR_OP_IS_INEXACT_ASSOCIATIVE = (1 << 3),
 } nir_op_algebraic_property;
@@ -1480,6 +1525,8 @@ typedef struct nir_op_info {
 
    /** Whether this represents a numeric conversion opcode */
    bool is_conversion;
+
+   uint8_t valid_fp_math_ctrl;
 } nir_op_info;
 
 /** Metadata for each nir_op, indexed by opcode */
@@ -1490,14 +1537,13 @@ nir_op_is_selection(nir_op op)
 {
    return (nir_op_infos[op].algebraic_properties & NIR_OP_IS_SELECTION) != 0;
 }
+
+#define NIR_FP_MATH_CONTROL_BIT_COUNT 6
 /**
  * Floating point fast math control.
  *
  * All new bits must restrict optimizations when they are set, not when they
  * are missing. This means a bitwise OR always produces a no less restrictive set.
- *
- * See also nir_alu_instr::exact, which should (and hopefully will be) moved
- * to this enum in the future.
  */
 typedef enum {
    /**
@@ -1518,6 +1564,23 @@ typedef enum {
     */
    nir_fp_preserve_nan = BITFIELD_BIT(2),
 
+   /* If not set, allow all optimizations that result in a value closer
+    * to the infinitely precise result than the original pattern.
+    * One common example here is fma fusing.
+    */
+   nir_fp_no_contract = BITFIELD_BIT(3),
+
+   /* If not set, allow to treat opcodes with NIR_OP_IS_INEXACT_ASSOCIATIVE
+    * as associative.
+    */
+   nir_fp_no_reassoc = BITFIELD_BIT(4),
+
+   /* If not set, allow any optimization that would be valid for real numbers.
+    *
+    * Must be set if nir_fp_no_contract or nir_fp_no_reassoc are set.
+    */
+   nir_fp_no_transform = BITFIELD_BIT(5),
+
    /** Indicates that this ALU instruction generates an exact value
     *
     * This is kind of a mixture of GLSL "precise" and "invariant" and not
@@ -1527,18 +1590,19 @@ typedef enum {
     * original, with the exception of undefindness allowed by other
     * nir_fp_math_control bits and NaN patterns.
     *
-    * TODO This is currently also used to control NaN behavior of
-    * floating point comparisons and fmin/fmax/fsat.
-    * This should be changed to only depend on nir_fp_preserve_nan.
+    * The sub bits allow more fine grained control over the kind of inexact
+    * optimizations allowed.
     */
-   nir_fp_exact = BITFIELD_BIT(3),
+   nir_fp_exact = nir_fp_no_contract |
+                  nir_fp_no_reassoc |
+                  nir_fp_no_transform,
 
    nir_fp_preserve_sz_inf_nan = nir_fp_preserve_signed_zero |
                                 nir_fp_preserve_inf |
                                 nir_fp_preserve_nan,
 
    nir_fp_fast_math = 0,
-   nir_fp_no_fast_math = BITFIELD_MASK(4),
+   nir_fp_no_fast_math = BITFIELD_MASK(NIR_FP_MATH_CONTROL_BIT_COUNT),
 } nir_fp_math_control;
 
 /***/
@@ -1569,7 +1633,7 @@ typedef struct nir_alu_instr {
     * that have no float_controls2 equivalent (rounding mode and denorm handling)
     * remain in the execution mode only.
     */
-   uint32_t fp_math_ctrl : 4;
+   uint32_t fp_math_ctrl : NIR_FP_MATH_CONTROL_BIT_COUNT;
 
    /** Sources
     *
@@ -1579,33 +1643,57 @@ typedef struct nir_alu_instr {
 } nir_alu_instr;
 
 static inline bool
-nir_alu_instr_is_signed_zero_preserve(nir_alu_instr *alu)
+nir_alu_instr_is_signed_zero_preserve(const nir_alu_instr *alu)
 {
    return alu->fp_math_ctrl & nir_fp_preserve_signed_zero;
 }
 
 static inline bool
-nir_alu_instr_is_inf_preserve(nir_alu_instr *alu)
+nir_alu_instr_is_inf_preserve(const nir_alu_instr *alu)
 {
    return alu->fp_math_ctrl & nir_fp_preserve_inf;
 }
 
 static inline bool
-nir_alu_instr_is_nan_preserve(nir_alu_instr *alu)
+nir_alu_instr_is_nan_preserve(const nir_alu_instr *alu)
 {
    return alu->fp_math_ctrl & nir_fp_preserve_nan;
 }
 
 static inline bool
-nir_alu_instr_is_signed_zero_inf_nan_preserve(nir_alu_instr *alu)
+nir_alu_instr_is_signed_zero_inf_nan_preserve(const nir_alu_instr *alu)
 {
    return alu->fp_math_ctrl & nir_fp_preserve_sz_inf_nan;
 }
 
 static inline bool
-nir_alu_instr_is_exact(nir_alu_instr *alu)
+nir_alu_instr_is_exact(const nir_alu_instr *alu)
 {
    return alu->fp_math_ctrl & nir_fp_exact;
+}
+
+static inline bool
+nir_alu_instr_no_contract(const nir_alu_instr *alu)
+{
+   return alu->fp_math_ctrl & nir_fp_no_contract;
+}
+
+static inline bool
+nir_alu_instr_no_reassoc(const nir_alu_instr *alu)
+{
+   return alu->fp_math_ctrl & nir_fp_no_reassoc;
+}
+
+static inline bool
+nir_alu_instr_no_transform(const nir_alu_instr *alu)
+{
+   return alu->fp_math_ctrl & nir_fp_no_transform;
+}
+
+static inline unsigned
+nir_op_valid_fp_math_ctrl(nir_op op, unsigned fp_math_ctrl)
+{
+   return fp_math_ctrl & nir_op_infos[op].valid_fp_math_ctrl;
 }
 
 void nir_alu_src_copy(nir_alu_src *dest, const nir_alu_src *src);
@@ -1629,6 +1717,43 @@ nir_alu_instr_channel_used(const nir_alu_instr *instr, unsigned src,
 bool
 nir_alu_instr_is_comparison(const nir_alu_instr *instr);
 
+static inline bool
+nir_alu_instr_is_mul_add(const nir_alu_instr *instr)
+{
+   if (!instr)
+      return false;
+
+   switch (instr->op) {
+   case nir_op_ffma:
+   case nir_op_ffma_weak:
+   case nir_op_fmad:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+nir_alu_instr_is_mul_add_z(const nir_alu_instr *instr)
+{
+   if (!instr)
+      return false;
+
+   switch (instr->op) {
+   case nir_op_ffmaz:
+   case nir_op_fmadz:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+nir_alu_instr_is_any_mul_add(const nir_alu_instr *alu)
+{
+   return nir_alu_instr_is_mul_add(alu) || nir_alu_instr_is_mul_add_z(alu);
+}
+
 bool nir_const_value_negative_equal(nir_const_value c1, nir_const_value c2,
                                     nir_alu_type full_type);
 
@@ -1643,7 +1768,9 @@ bool nir_alu_srcs_negative_equal(const nir_alu_instr *alu1,
                                  const nir_alu_instr *alu2,
                                  unsigned src1, unsigned src2);
 
-bool nir_alu_src_is_trivial_ssa(const nir_alu_instr *alu, unsigned srcn);
+bool nir_alu_src_is_trivial_ssa(const nir_alu_src *src, unsigned num_components);
+
+bool nir_alu_has_trivial_src(const nir_alu_instr *alu, unsigned srcn);
 
 typedef enum {
    nir_deref_type_var,
@@ -1827,19 +1954,6 @@ nir_deref_instr_parent(const nir_deref_instr *instr)
       return nir_src_as_deref(instr->parent);
 }
 
-static inline nir_variable *
-nir_deref_instr_get_variable(const nir_deref_instr *instr)
-{
-   while (instr->deref_type != nir_deref_type_var) {
-      if (instr->deref_type == nir_deref_type_cast)
-         return NULL;
-
-      instr = nir_deref_instr_parent(instr);
-   }
-
-   return instr->var;
-}
-
 bool nir_deref_instr_has_indirect(nir_deref_instr *instr);
 bool nir_deref_instr_is_known_out_of_bounds(nir_deref_instr *instr);
 
@@ -1914,7 +2028,7 @@ static inline nir_cmat_reduce nir_cmat_call_reduce_flags(nir_cmat_call_instr *ca
 
 #include "nir_intrinsics.h"
 
-#define NIR_INTRINSIC_MAX_CONST_INDEX 8
+#define NIR_INTRINSIC_MAX_CONST_INDEX 9
 
 /** Represents an intrinsic
  *
@@ -1967,12 +2081,6 @@ typedef struct nir_intrinsic_instr {
    nir_src src[];
 } nir_intrinsic_instr;
 
-static inline nir_variable *
-nir_intrinsic_get_var(const nir_intrinsic_instr *intrin, unsigned i)
-{
-   return nir_deref_instr_get_variable(nir_src_as_deref(intrin->src[i]));
-}
-
 typedef enum {
    /* Memory ordering. */
    NIR_MEMORY_ACQUIRE = 1 << 0,
@@ -1982,6 +2090,17 @@ typedef enum {
    /* Memory visibility operations. */
    NIR_MEMORY_MAKE_AVAILABLE = 1 << 2,
    NIR_MEMORY_MAKE_VISIBLE = 1 << 3,
+
+   /* Control barrier operations. If both of these are set, or neither are set
+    * and the execution scope is not SCOPE_NONE, it's a combined arrive+wait
+    * barrier.
+    *
+    * Because a barrier can be a control one without either of these, the best
+    * way to see if it's a control one is to check the execution scope.
+    */
+   NIR_MEMORY_CONTROL_ARRIVE = 1 << 4,
+   NIR_MEMORY_CONTROL_WAIT = 1 << 5,
+   NIR_MEMORY_CONTROL_ARRIVE_WAIT = NIR_MEMORY_CONTROL_ARRIVE | NIR_MEMORY_CONTROL_WAIT,
 } nir_memory_semantics;
 
 /**
@@ -2049,12 +2168,14 @@ typedef struct nir_io_semantics {
    unsigned interp_explicit_strict : 1; /* preserve original vertex order */
    /* Skip nir_validate of the intrinsic. Any new code that sets it will ba NAK'd. */
    unsigned no_validate : 1;
+
+   /* Start of the second uint. */
+   unsigned no_signed_zero : 1; /* whether it matters if the input/output is -0.0 or +0.0. */
+   unsigned clamp : 1; /* whether the IO component should be clamped when GL_CLAMP_VERTEX_COLOR is enabled */
+   unsigned padding : 30;
 } nir_io_semantics;
 
-/* Transform feedback info for 2 outputs. nir_intrinsic_store_output contains
- * this structure twice to support up to 4 outputs. The structure is limited
- * to 32 bits because it's stored in nir_intrinsic_instr::const_index[].
- */
+/* Transform feedback info for 4 outputs. */
 typedef struct nir_io_xfb {
    struct {
       /* start_component is equal to the index of out[]; add 2 for io_xfb2 */
@@ -2064,7 +2185,7 @@ typedef struct nir_io_xfb {
       uint8_t buffer : 4;         /* buffer index, max 3 */
       uint8_t offset;             /* transform feedback buffer offset in dwords,
                                      max (1K - 4) bytes */
-   } out[2];
+   } out[4];
 } nir_io_xfb;
 
 unsigned
@@ -2110,6 +2231,9 @@ typedef struct nir_intrinsic_info {
 
    /** the number of constant indices used by the intrinsic */
    uint8_t num_indices;
+
+   /** the number of 32bit slots used for storing constant indices. */
+   uint8_t num_index_slots;
 
    /** list of indices */
    uint8_t indices[NIR_INTRINSIC_MAX_CONST_INDEX];
@@ -2193,9 +2317,9 @@ nir_intrinsic_has_align(const nir_intrinsic_instr *intrin)
 unsigned
 nir_image_intrinsic_coord_components(const nir_intrinsic_instr *instr);
 
-/* Converts a image_deref_* intrinsic into a image_* one */
+/* Converts an image intrinsic into a different type. */
 void nir_rewrite_image_intrinsic(nir_intrinsic_instr *instr,
-                                 nir_def *handle, bool bindless);
+                                 nir_def *handle, nir_image_intrinsic_type type);
 
 /* Determine if an intrinsic can be arbitrarily reordered and eliminated. */
 bool nir_intrinsic_can_reorder(nir_intrinsic_instr *instr);
@@ -2357,6 +2481,12 @@ typedef enum nir_tex_src_type {
     */
    nir_tex_src_sampler_handle,
 
+   /** Texture descriptor heap offset (in bytes) */
+   nir_tex_src_texture_heap_offset,
+
+   /** Sampler descriptor heap offset (in bytes) */
+   nir_tex_src_sampler_heap_offset,
+
    /** Tex src intrinsic
     *
     * This is an intrinsic used before function inlining i.e. before we know
@@ -2383,6 +2513,15 @@ typedef enum nir_tex_src_type {
 
    /** Second backend-specific vec4 tex src argument, see nir_tex_src_backend1. */
    nir_tex_src_backend2,
+
+   /** VK_QCOM_image_processing sources */
+   nir_tex_src_ref_coord,
+   nir_tex_src_texture_2_deref,
+   nir_tex_src_sampler_2_deref,
+   nir_tex_src_texture_2_handle,
+   nir_tex_src_sampler_2_handle,
+   nir_tex_src_block_size,
+   nir_tex_src_box_size,
 
    nir_num_tex_src_types
 } nir_tex_src_type;
@@ -2450,6 +2589,35 @@ typedef enum nir_texop {
    nir_texop_tex_type_nv,
    /** Maps to TXQ.SAMPLER_POS */
    nir_texop_sample_pos_nv,
+   /** Maps to TEX_GRADIENT */
+   nir_texop_gradient_pan,
+   /**
+    * Returns the weighted average of a region of texels in the texture, using
+    * the filter kernel sampled from ref_texture. (VK_QCOM_image_processing)
+   */
+   nir_texop_sample_weighted_qcom,
+   /**
+    * Returns the result of a weighted average of the texels in a box of size
+    * box_size centered at coord. (VK_QCOM_image_processing)
+   */
+   nir_texop_box_filter_qcom,
+   /**
+    * Returns the result of SAD/SSD block matching on 2D textures.
+    * (VK_QCOM_image_processing)
+    *
+    * The textures are always 2D dim, and the coord and ref_coord texture
+    * sources are ivec2s.  The size of the block is specified in the block_size
+    * texture source (uvec2 from SPIRV, packed u32 in the backend)
+   */
+   nir_texop_block_match_sad_qcom,
+   nir_texop_block_match_ssd_qcom,
+   /** txs in .xyz and query_levels in .w */
+   nir_texop_resinfo_intel,
+
+   /** Returns red data and a sparse residency code for sampling ops */
+   nir_texop_sparse_residency_intel,
+   /** Returns red data and a sparse residency code for texel fetches */
+   nir_texop_sparse_residency_txf_intel,
 } nir_texop;
 
 /** Represents a texture instruction */
@@ -2493,7 +2661,10 @@ typedef struct nir_tex_instr {
    /** Number of sources */
    unsigned num_srcs;
 
-   /** Number of components in the coordinate, if any */
+   /** Number of components in the coordinate, if any.
+    *
+    * This applies to the nir_tex_src_coord and nir_tex_src_ref_coord src types.
+    */
    unsigned coord_components;
 
    /** True if the texture instruction acts on an array texture */
@@ -2555,6 +2726,12 @@ typedef struct nir_tex_instr {
     * expression, or texture lookup will result in undefined values.").
     */
    bool sampler_non_uniform;
+
+   /** True if this texture instruction uses an embedded sampler.
+    *
+    * In this case, sampler_index is the index in embedded sampler table.
+    */
+   bool embedded_sampler;
 
    /** True if the offset is not dynamically uniform */
    bool offset_non_uniform;
@@ -2758,6 +2935,20 @@ typedef enum {
     * for instance, a discard or demote intrinsic is required.
     */
    nir_jump_halt,
+
+   /** Immediately exit the current shader due to a fatal error
+    *
+    * This has the same CFG semantics as nir_jump_halt — it jumps to the end
+    * block of the shader entrypoint — but carries the additional semantic
+    * that the invocation is terminating because a fatal error was detected
+    * (e.g. nir_intrinsic_abort wrote a message to the abort buffer).
+    *
+    * Backends that support hardware-level abort signalling (device fault,
+    * special sendmsg, etc.) may generate different code for nir_jump_abort
+    * vs nir_jump_halt.  Backends that do not distinguish the two can lower
+    * nir_jump_abort to nir_jump_halt before instruction selection.
+    */
+   nir_jump_abort,
 
    /** Break out of the inner-most loop
     *
@@ -3026,6 +3217,20 @@ NIR_DEFINE_SRC_AS_CONST(double, float)
 
 #undef NIR_DEFINE_SRC_AS_CONST
 
+static inline bool
+nir_src_is_zero(nir_src src)
+{
+   if (!nir_src_is_const(src))
+      return false;
+
+   for (unsigned i = 0; i < nir_src_num_components(src); i++) {
+      if (nir_src_comp_as_uint(src, i) != 0)
+         return false;
+   }
+
+   return true;
+}
+
 static inline nir_const_value
 nir_scalar_as_const_value(nir_scalar s)
 {
@@ -3048,6 +3253,12 @@ NIR_DEFINE_SCALAR_AS_CONST(bool, bool)
 NIR_DEFINE_SCALAR_AS_CONST(double, float)
 
 #undef NIR_DEFINE_SCALAR_AS_CONST
+
+static inline bool
+nir_scalar_is_zero(nir_scalar s)
+{
+   return nir_scalar_is_const(s) && nir_scalar_as_uint(s) == 0;
+}
 
 static inline nir_op
 nir_scalar_alu_op(nir_scalar s)
@@ -3121,12 +3332,33 @@ nir_alu_src_as_uint(nir_alu_src src)
    return nir_scalar_as_uint(scalar);
 }
 
+static inline uint64_t
+nir_alu_src_comp_as_uint(nir_alu_src src, unsigned comp)
+{
+   nir_scalar scalar = nir_scalar_resolved(src.src.ssa, src.swizzle[comp]);
+   return nir_scalar_as_uint(scalar);
+}
+
+static inline bool
+nir_alu_src_comp_get_uint(nir_alu_src src, unsigned comp, uint64_t *value)
+{
+   nir_scalar scalar = nir_scalar_resolved(src.src.ssa, src.swizzle[comp]);
+
+   if (nir_scalar_is_const(scalar)) {
+      *value = nir_scalar_as_uint(scalar);
+      return true;
+   }
+
+   return false;
+}
+
 typedef struct nir_binding {
    bool success;
 
    nir_variable *var;
    unsigned desc_set;
    unsigned binding;
+   unsigned resource_type;
    unsigned num_indices;
    nir_src indices[4];
    bool read_first_invocation;
@@ -3170,6 +3402,9 @@ typedef struct nir_block {
    /** list of nir_instr */
    struct exec_list instr_list;
 
+   /** pointer to the NIR function impl */
+   nir_function_impl *impl;
+
    /** generic block index; generated by nir_index_blocks */
    unsigned index;
 
@@ -3185,7 +3420,8 @@ typedef struct nir_block {
    nir_block *successors[2];
 
    /* Set of nir_block predecessors in the CFG */
-   struct set predecessors;
+   struct util_dynarray predecessors;
+   nir_block *_preds_storage[2];
 
    /*
     * this node's immediate dominator in the dominance tree - set to NULL for
@@ -3234,6 +3470,50 @@ typedef struct nir_block {
    struct u_sparse_bitset live_in;
    struct u_sparse_bitset live_out;
 } nir_block;
+
+static ALWAYS_INLINE nir_block **
+_nir_pred_iter_begin(const nir_block *block)
+{
+   return (nir_block **)util_dynarray_begin(&block->predecessors);
+}
+
+static ALWAYS_INLINE bool
+_nir_pred_iter_end(const nir_block *block, nir_block **iter, nir_block **pred)
+{
+   if (iter == (nir_block **)util_dynarray_end(&block->predecessors))
+      return false;
+   *pred = *iter;
+   return true;
+}
+
+#define nir_foreach_pred(pred, block)                                    \
+   for (nir_block * pred, **pred##_iter = _nir_pred_iter_begin((block)); \
+        _nir_pred_iter_end((block), pred##_iter, &pred);                 \
+        pred##_iter++)
+
+static inline size_t
+nir_block_num_preds(const nir_block *block)
+{
+   return util_dynarray_num_elements(&block->predecessors, nir_block *);
+}
+
+static inline bool
+nir_block_has_pred(const nir_block *block, const nir_block *pred)
+{
+   return pred->successors[0] == block || pred->successors[1] == block;
+}
+
+static inline void
+nir_block_add_pred(nir_block *block, nir_block *pred)
+{
+   util_dynarray_append(&block->predecessors, pred);
+}
+
+static inline void
+nir_block_remove_pred(nir_block *block, nir_block *pred)
+{
+   util_dynarray_delete_unordered(&block->predecessors, nir_block *, pred);
+}
 
 static inline bool
 nir_block_is_reachable(nir_block *b)
@@ -3387,6 +3667,9 @@ typedef struct nir_loop_terminator {
    /** Condition instruction that contains the induction variable */
    nir_instr *conditional_instr;
 
+   /** Init source of the induction variable used in conditional_instr. */
+   nir_src *init_src;
+
    /** Block within ::nif that has the break instruction. */
    nir_block *break_block;
 
@@ -3444,6 +3727,9 @@ typedef struct nir_loop_info {
    /* Unroll the loop regardless of its size */
    bool force_unroll;
 
+   /* Whether all control flow gets eliminated upon unrolling. */
+   bool flattens_all_control_flow;
+
    /* Does the loop contain complex loop terminators, continues or other
     * complex behaviours? If this is true we can't rely on
     * loop_terminator_list to be complete or accurate.
@@ -3477,6 +3763,7 @@ typedef struct nir_loop {
    nir_loop_info *info;
    nir_loop_control control;
    bool partially_unrolled;
+   bool do_while;
 
    /**
     * Whether some loop-active invocations might take a different control-flow path:
@@ -3784,17 +4071,7 @@ nir_loop_last_continue_block(nir_loop *loop)
    return nir_cf_node_as_block(exec_node_data(nir_cf_node, tail, node));
 }
 
-/**
- * Return the target block of a nir_jump_continue statement
- */
-static inline nir_block *
-nir_loop_continue_target(nir_loop *loop)
-{
-   if (nir_loop_has_continue_construct(loop))
-      return nir_loop_first_continue_block(loop);
-   else
-      return nir_loop_first_block(loop);
-}
+bool nir_loop_has_back_edge(nir_loop *loop);
 
 /**
  * Return true if this list of cf_nodes contains a single empty block.
@@ -3973,6 +4250,8 @@ typedef struct nir_shader {
    u_printf_info *printf_info;
 
    bool has_debug_info;
+   uint32_t nir_pass_depth;
+   bool nir_pass_recursed;
 } nir_shader;
 
 #define nir_foreach_function(func, shader) \
@@ -4068,6 +4347,26 @@ nir_shader_get_function_for_name(const nir_shader *shader, const char *name)
    }
 
    return NULL;
+}
+
+static inline nir_variable *
+nir_deref_instr_get_variable(const nir_deref_instr *instr)
+{
+   while (instr->deref_type != nir_deref_type_var) {
+      if (instr->deref_type == nir_deref_type_cast &&
+          !nir_def_is_deref(instr->parent.ssa))
+         return NULL;
+
+      instr = nir_deref_instr_parent(instr);
+   }
+
+   return instr->var;
+}
+
+static inline nir_variable *
+nir_intrinsic_get_var(const nir_intrinsic_instr *intrin, unsigned i)
+{
+   return nir_deref_instr_get_variable(nir_src_as_deref(intrin->src[i]));
 }
 
 /*
@@ -4169,9 +4468,9 @@ nir_function_impl *nir_function_impl_create(nir_function *func);
 /** creates a function_impl that isn't tied to any particular function */
 nir_function_impl *nir_function_impl_create_bare(nir_shader *shader);
 
-nir_block *nir_block_create(nir_shader *shader);
-nir_if *nir_if_create(nir_shader *shader);
-nir_loop *nir_loop_create(nir_shader *shader);
+nir_block *nir_block_create(nir_function_impl *impl);
+nir_if *nir_if_create(nir_function_impl *impl);
+nir_loop *nir_loop_create(nir_function_impl *impl);
 
 nir_function_impl *nir_cf_node_get_function(nir_cf_node *node);
 
@@ -4331,11 +4630,11 @@ nir_before_src(nir_src *src)
 {
    if (nir_src_is_if(src)) {
       nir_block *prev_block =
-         nir_cf_node_as_block(nir_cf_node_prev(&nir_src_parent_if(src)->cf_node));
+         nir_cf_node_as_block(nir_cf_node_prev(&nir_src_use_if(src)->cf_node));
       return nir_after_block(prev_block);
-   } else if (nir_src_parent_instr(src)->type == nir_instr_type_phi) {
+   } else if (nir_src_use_instr(src)->type == nir_instr_type_phi) {
 #ifndef NDEBUG
-      nir_phi_instr *cond_phi = nir_instr_as_phi(nir_src_parent_instr(src));
+      nir_phi_instr *cond_phi = nir_instr_as_phi(nir_src_use_instr(src));
       bool found = false;
       nir_foreach_phi_src(phi_src, cond_phi) {
          if (phi_src->src.ssa == src->ssa) {
@@ -4351,7 +4650,7 @@ nir_before_src(nir_src *src)
       nir_phi_src *phi_src = list_entry(src, nir_phi_src, src);
       return nir_after_block_before_jump(phi_src->pred);
    } else {
-      return nir_before_instr(nir_src_parent_instr(src));
+      return nir_before_instr(nir_src_use_instr(src));
    }
 }
 
@@ -4562,7 +4861,7 @@ static inline void
 nir_src_rewrite(nir_src *src, nir_def *new_ssa)
 {
    assert(src->ssa);
-   assert(nir_src_is_if(src) ? (nir_src_parent_if(src) != NULL) : (nir_src_parent_instr(src) != NULL));
+   assert(nir_src_is_if(src) ? (nir_src_use_if(src) != NULL) : (nir_src_use_instr(src) != NULL));
    list_del(&src->use_link);
    src->ssa = new_ssa;
    list_addtail(&src->use_link, &new_ssa->uses);
@@ -4631,7 +4930,7 @@ static inline void
 nir_def_replace(nir_def *def, nir_def *new_ssa)
 {
    nir_def_rewrite_uses(def, new_ssa);
-   nir_instr_remove(nir_def_instr(def));
+   nir_instr_remove_v(nir_def_instr(def));
 }
 
 nir_component_mask_t nir_src_components_read(const nir_src *src);
@@ -4758,6 +5057,18 @@ nir_block *nir_cf_node_cf_tree_prev(nir_cf_node *node);
                   *prev = nir_block_cf_tree_prev(block);       \
         block != nir_cf_node_cf_tree_prev(node);               \
         block = prev, prev = nir_block_cf_tree_prev(block))
+
+static inline nir_block *
+nir_loop_predecessor_block(nir_loop *loop)
+{
+   return nir_cf_node_cf_tree_prev(&loop->cf_node);
+}
+
+static inline nir_block *
+nir_loop_successor_block(nir_loop *loop)
+{
+   return nir_cf_node_cf_tree_next(&loop->cf_node);
+}
 
 /* If the following CF node is an if, this function returns that if.
  * Otherwise, it returns NULL.
@@ -4936,24 +5247,39 @@ should_print_nir(UNUSED nir_shader *shader)
 #define NIR_STRINGIZE_INNER(x) #x
 #define NIR_STRINGIZE(x)       NIR_STRINGIZE_INNER(x)
 
+extern simple_mtx_t nir_print_lock;
+
 #define NIR_PASS(progress, nir, pass, ...) _PASS(pass, nir, {                            \
    nir_metadata_set_validation_flag(nir);                                                \
-   if (should_print_nir(nir))                                                            \
+   if (should_print_nir(nir)) {                                                          \
+      if ((nir)->nir_pass_depth++ == 0) {                                                \
+         simple_mtx_lock(&nir_print_lock);                                               \
+      } else {                                                                           \
+         (nir)->nir_pass_recursed = true;                                                \
+      }                                                                                  \
       printf("%s\n", #pass);                                                             \
+   }                                                                                     \
    static const char *when = "after " #pass " in " __FILE__ ":" NIR_STRINGIZE(__LINE__); \
    struct blob blob_before = nir_validate_progress_setup(nir);                           \
    if (pass(nir, ##__VA_ARGS__)) {                                                       \
       nir_validate_shader(nir, when);                                                    \
       UNUSED bool _;                                                                     \
       progress = true;                                                                   \
-      if (should_print_nir(nir))                                                         \
+      if (should_print_nir(nir)) {                                                       \
+         if ((nir)->nir_pass_recursed)                                                   \
+            printf("%s (finished)\n", #pass);                                            \
          nir_print_shader(nir, stdout);                                                  \
+      }                                                                                  \
       nir_metadata_check_validation_flag(nir);                                           \
       nir_validate_progress_finish(nir, &blob_before, true, when);                       \
    } else {                                                                              \
       if (NIR_DEBUG(EXTENDED_VALIDATION))                                                \
          nir_validate_shader(nir, when);                                                 \
       nir_validate_progress_finish(nir, &blob_before, false, when);                      \
+   }                                                                                     \
+   if (should_print_nir(nir) && --(nir)->nir_pass_depth == 0) {                          \
+      simple_mtx_unlock(&nir_print_lock);                                                \
+      (nir)->nir_pass_recursed = false;                                                  \
    }                                                                                     \
 })
 
@@ -5160,12 +5486,6 @@ void nir_find_inlinable_uniforms(nir_shader *shader);
 bool nir_inline_uniforms(nir_shader *shader, unsigned num_uniforms,
                          const uint32_t *uniform_values,
                          const uint16_t *uniform_dw_offsets);
-bool nir_collect_src_uniforms(const nir_src *src, int component,
-                              uint32_t *uni_offsets, uint8_t *num_offsets,
-                              unsigned max_num_bo, unsigned max_offset);
-void nir_add_inlinable_uniforms(const nir_src *cond, nir_loop_info *info,
-                                uint32_t *uni_offsets, uint8_t *num_offsets,
-                                unsigned max_num_bo, unsigned max_offset);
 
 bool nir_inline_sysval(nir_shader *shader, nir_intrinsic_op op, uint64_t imm);
 
@@ -5216,7 +5536,7 @@ bool nir_lower_vars_to_scratch(nir_shader *shader,
                                glsl_type_size_align_func variable_size_align,
                                glsl_type_size_align_func scratch_layout_size_align);
 
-typedef void (*nir_lower_vars_to_scratch_cb)(struct set *, void *);
+typedef void (*nir_lower_vars_to_scratch_cb)(struct util_dynarray *, void *);
 
 bool nir_lower_vars_to_scratch_global(nir_shader *shader,
                                       glsl_type_size_align_func scratch_layout_size_align,
@@ -5225,6 +5545,7 @@ bool nir_lower_vars_to_scratch_global(nir_shader *shader,
 bool nir_lower_scratch_to_var(nir_shader *nir);
 
 bool nir_lower_clip_halfz(nir_shader *shader);
+bool nir_lower_clip_halfz_dynamic(nir_shader *shader);
 
 void nir_shader_gather_info(nir_shader *shader, nir_function_impl *entrypoint);
 void nir_gather_clip_cull_distance_sizes_from_vars(nir_shader *nir);
@@ -5240,7 +5561,6 @@ bool nir_remove_unused_io_vars(nir_shader *shader, nir_variable_mode mode,
                                uint64_t *used_by_other_stage_patches);
 void nir_compact_varyings(nir_shader *producer, nir_shader *consumer,
                           bool default_to_smooth_interp);
-void nir_link_xfb_varyings(nir_shader *producer, nir_shader *consumer);
 bool nir_link_opt_varyings(nir_shader *producer, nir_shader *consumer);
 void nir_link_varying_precision(nir_shader *producer, nir_shader *consumer);
 nir_variable *nir_clone_uniform_variable(nir_shader *nir,
@@ -5272,8 +5592,10 @@ nir_varying_var_mask(nir_shader *nir);
 void
 nir_opt_varyings_bulk(nir_shader **shaders, uint32_t num_shaders, bool spirv,
                       unsigned max_uniform_comps, unsigned max_ubos,
-                      void (*optimize)(nir_shader *));
+                      void (*optimize)(nir_shader *, void *),
+                      void *optimize_data);
 
+unsigned nir_slot_num_components(gl_varying_slot slot, mesa_shader_stage stage);
 bool nir_slot_is_sysval_output(gl_varying_slot slot,
                                mesa_shader_stage next_shader);
 bool nir_slot_is_varying(gl_varying_slot slot, mesa_shader_stage next_shader);
@@ -5499,10 +5821,13 @@ typedef bool (*nir_should_vectorize_mem_func)(unsigned align_mul,
 
 typedef struct nir_load_store_vectorize_options {
    nir_should_vectorize_mem_func callback;
+   unsigned (*round_up_components)(unsigned);
    nir_variable_mode modes;
    nir_variable_mode robust_modes;
+   nir_variable_mode bounds_checked_modes; /* modes with per-component bounds-checking */
    void *cb_data;
    bool has_shared2_amd;
+   bool round_up_store_components;
 } nir_load_store_vectorize_options;
 
 bool nir_opt_load_store_vectorize(nir_shader *shader, const nir_load_store_vectorize_options *options);
@@ -5551,13 +5876,47 @@ nir_lower_shader_calls(nir_shader *shader,
                        void *mem_ctx);
 
 int nir_get_io_offset_src_number(const nir_intrinsic_instr *instr);
+int nir_get_io_uniform_offset_src_number(const nir_intrinsic_instr *instr);
 int nir_get_io_index_src_number(const nir_intrinsic_instr *instr);
+int nir_get_io_data_src_number(const nir_intrinsic_instr *instr);
 int nir_get_io_arrayed_index_src_number(const nir_intrinsic_instr *instr);
 
 nir_src *nir_get_io_offset_src(nir_intrinsic_instr *instr);
+nir_src *nir_get_io_uniform_offset_src(nir_intrinsic_instr *instr);
 nir_src *nir_get_io_index_src(nir_intrinsic_instr *instr);
+nir_src *nir_get_io_data_src(nir_intrinsic_instr *instr);
 nir_src *nir_get_io_arrayed_index_src(nir_intrinsic_instr *instr);
 nir_src *nir_get_shader_call_payload_src(nir_intrinsic_instr *call);
+
+static inline unsigned
+nir_get_io_base_size_nv(const nir_intrinsic_instr *intr)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_global_atomic_swap_nv:
+   case nir_intrinsic_shared_atomic_nv:
+   case nir_intrinsic_shared_atomic_swap_nv:
+   case nir_intrinsic_load_global_nv:
+   case nir_intrinsic_load_scratch_nv:
+   case nir_intrinsic_load_shared_nv:
+   case nir_intrinsic_load_shared_lock_nv:
+   case nir_intrinsic_store_global_nv:
+   case nir_intrinsic_store_scratch_nv:
+   case nir_intrinsic_store_shared_nv:
+   case nir_intrinsic_store_shared_unlock_nv:
+      return 24;
+   case nir_intrinsic_global_atomic_nv:
+      /* TODO: SM100+ only has 23 bits for the UGPR + GPR form */
+      return 23;
+   case nir_intrinsic_ldc_nv:
+   case nir_intrinsic_ldcx_nv:
+      return 16;
+   case nir_intrinsic_vild_nv:
+      return 8;
+   default:
+      UNREACHABLE("unknown nvidia intrinsic");
+      return -1;
+   }
+}
 
 bool nir_is_shared_access(nir_intrinsic_instr *intr);
 bool nir_is_output_load(nir_intrinsic_instr *intr);
@@ -5621,8 +5980,21 @@ typedef enum {
    nir_move_to_entry_block_only = BITFIELD_BIT(0),
 
    /* Instruction options. */
-   nir_move_to_top_input_loads = BITFIELD_BIT(1),
-   nir_move_to_top_load_smem_amd = BITFIELD_BIT(2),
+
+   /* Simple input loads are non-interpolated loads and interpolated loads
+    * with pixel, centroid, and sample barycentrics. Other barycentrics are
+    * excluded.
+    */
+   nir_move_to_top_input_loads_simple = BITFIELD_BIT(1),
+
+   /* Interpolated loads with non-trivial barycentrics, such as at_offset and
+    * at_sample. (this option is not recommended for Control (game) because
+    * it moves at_sample with complex ALU perspective-correct interpolation
+    * out of conditional blocks)
+    */
+   nir_move_to_top_input_loads_complex_baryc = BITFIELD_BIT(2),
+
+   nir_move_to_top_load_smem_amd = BITFIELD_BIT(3),
 } nir_opt_move_to_top_options;
 
 bool nir_opt_move_to_top(nir_shader *nir, nir_opt_move_to_top_options options);
@@ -5633,7 +6005,6 @@ bool nir_lower_vec_to_regs(nir_shader *shader, nir_instr_writemask_filter_cb cb,
                            const void *_data);
 
 bool nir_lower_alpha_to_coverage(nir_shader *shader,
-                                 uint8_t nr_samples,
                                  bool has_intrinsic,
                                  nir_def *dyn_enable);
 
@@ -5649,7 +6020,6 @@ bool nir_scale_fdiv(nir_shader *shader);
 bool nir_lower_alu_to_scalar(nir_shader *shader, nir_instr_filter_cb cb, const void *data);
 bool nir_lower_alu_width(nir_shader *shader, nir_vectorize_cb cb, const void *data);
 bool nir_lower_alu_vec8_16_srcs(nir_shader *shader);
-bool nir_lower_bool_to_bitsize(nir_shader *shader);
 bool nir_lower_bool_to_float(nir_shader *shader, bool has_fcsel_ne);
 bool nir_lower_bool_to_int32(nir_shader *shader);
 bool nir_opt_simplify_convert_alu_types(nir_shader *shader);
@@ -5721,6 +6091,7 @@ typedef struct nir_lower_subgroups_options {
    uint8_t ballot_bit_size;
    uint8_t ballot_components;
    bool lower_to_scalar : 1;
+   bool lower_vote : 1;
    bool lower_vote_trivial : 1;
    bool lower_vote_feq : 1;
    bool lower_vote_ieq : 1;
@@ -5780,6 +6151,7 @@ typedef struct nir_lower_sysvals_to_varyings_options {
    bool point_coord : 1;
    bool layer_id : 1;
    bool view_index : 1;
+   bool primitive_id : 1;
 } nir_lower_sysvals_to_varyings_options;
 
 bool
@@ -6021,6 +6393,9 @@ typedef struct nir_lower_tex_options {
    /* Optimize txd(coord, ddxy_coarse(coord)) to tex(coord). */
    bool optimize_txd;
 
+   /* If true, lower tg4 shadow compare operations to 16bit. */
+   bool lower_tg4_shadow_to_16bit;
+
    /**
     * Payload data to be sent to callback / filter functions.
     */
@@ -6085,7 +6460,9 @@ enum nir_lower_non_uniform_access_type {
    nir_lower_non_uniform_image_access = (1 << 3),
    nir_lower_non_uniform_get_ssbo_size = (1 << 4),
    nir_lower_non_uniform_texture_offset_access = (1 << 5),
-   nir_lower_non_uniform_access_type_count = 6,
+   nir_lower_non_uniform_texture_query = (1 << 6),
+   nir_lower_non_uniform_image_query = (1 << 7),
+   nir_lower_non_uniform_access_type_count = 8,
 };
 
 typedef bool (*nir_lower_non_uniform_src_access_callback)(const nir_tex_instr *, unsigned, void *);
@@ -6266,8 +6643,7 @@ typedef struct nir_tex_src_type_constraint {
 bool nir_legalize_16bit_sampler_srcs(nir_shader *nir,
                                      nir_tex_src_type_constraints constraints);
 
-bool nir_lower_point_size(nir_shader *shader, float min, float max,
-                          nir_alu_type type);
+bool nir_lower_point_size(nir_shader *shader, float min, float max);
 
 bool nir_lower_default_point_size(nir_shader *nir);
 
@@ -6299,6 +6675,7 @@ bool nir_lower_discard_if(nir_shader *shader, nir_lower_discard_if_options optio
 bool nir_lower_terminate_to_demote(nir_shader *nir);
 
 bool nir_lower_memory_model(nir_shader *shader);
+bool nir_lower_disordered_control_barriers(nir_shader *shader);
 
 bool nir_lower_goto_ifs(nir_shader *shader);
 bool nir_lower_continue_constructs(nir_shader *shader);
@@ -6352,7 +6729,7 @@ void nir_convert_loop_to_lcssa(nir_loop *loop);
 bool nir_convert_to_lcssa(nir_shader *shader, bool skip_invariants, bool skip_bool_invariants);
 void nir_divergence_analysis_impl(nir_function_impl *impl, nir_divergence_options options);
 void nir_divergence_analysis(nir_shader *shader);
-void nir_vertex_divergence_analysis(nir_shader *shader);
+void nir_custom_divergence_analysis(nir_shader *shader, nir_divergence_options options);
 bool nir_has_divergent_loop(nir_shader *shader);
 
 void
@@ -6382,6 +6759,21 @@ bool nir_dedup_inline_samplers(nir_shader *shader);
 typedef struct nir_lower_ssbo_options {
    bool native_loads;
    bool native_offset;
+
+   /* If non-zero, use @get_ssbo_size to only use global memory accesses for
+    * SSBOs larger than this. Keep the existing SSBO accesses for smaller
+    * SSBOs. This is useful for HW hat has native SSBO access instructions
+    * that only support a limited size to only fall back to global memory for
+    * larger buffers.
+    */
+   uint32_t min_ssbo_size;
+
+   /* Add manual bounds checks for the generated global memory accesses. This
+    * is mostly useful in combination with `min_ssbo_size` when the native
+    * SSBO access instructions do the bounds check in HW so we don't want to
+    * add bounds checks for all SSBO accesses.
+    */
+   bool bounds_check;
 } nir_lower_ssbo_options;
 
 bool nir_lower_ssbo(nir_shader *shader, const nir_lower_ssbo_options *opts);
@@ -6395,6 +6787,14 @@ typedef struct nir_lower_printf_options {
 } nir_lower_printf_options;
 
 bool nir_lower_printf(nir_shader *nir, const nir_lower_printf_options *options);
+
+typedef struct nir_lower_abort_options {
+   uint64_t buffer_addr;
+   unsigned max_buffer_size;
+   unsigned ptr_bit_size;
+} nir_lower_abort_options;
+
+bool nir_lower_abort(nir_shader *nir, const nir_lower_abort_options *options);
 
 /* This is here for unit tests. */
 bool nir_opt_comparison_pre_impl(nir_function_impl *impl);
@@ -6413,7 +6813,10 @@ bool nir_opt_algebraic_late(nir_shader *shader);
 bool nir_opt_algebraic_distribute_src_mods(nir_shader *shader);
 bool nir_opt_algebraic_integer_promotion(nir_shader *shader);
 bool nir_opt_reassociate_matrix_mul(nir_shader *shader);
+bool nir_opt_reassociate_for_fma(nir_shader *shader);
 bool nir_opt_constant_folding(nir_shader *shader);
+
+bool nir_opt_fp_math_ctrl(nir_shader *shader);
 
 nir_def *nir_try_constant_fold_alu(nir_builder *b, nir_alu_instr *alu);
 
@@ -6441,6 +6844,7 @@ bool nir_opt_copy_prop_vars(nir_shader *shader);
 
 bool nir_opt_cse(nir_shader *shader);
 
+bool nir_opt_dce_impl(nir_function_impl *impl);
 bool nir_opt_dce(nir_shader *shader);
 
 bool nir_opt_dead_cf(nir_shader *shader);
@@ -6476,7 +6880,11 @@ bool nir_opt_large_constants(nir_shader *shader,
                              glsl_type_size_align_func size_align,
                              unsigned threshold);
 
-bool nir_opt_licm(nir_shader *shader);
+typedef bool (*nir_opt_licm_filter_cb)(nir_instr *instr, nir_loop *loop,
+                                       bool instr_block_dominates_exit);
+
+bool nir_opt_licm(nir_shader *shader,
+                  nir_opt_licm_filter_cb filter);
 bool nir_opt_loop(nir_shader *shader);
 
 bool nir_opt_loop_unroll(nir_shader *shader);
@@ -6534,6 +6942,9 @@ typedef struct nir_opt_offsets_options {
 
    /** nir_load/store_buffer_amd max base offset */
    uint32_t buffer_max;
+
+   /** nir_load/store_global_offset max base offset */
+   uint32_t global_max;
 
    /**
     * Callback to get the max base offset for instructions for which the
@@ -6600,7 +7011,9 @@ bool nir_opt_shrink_vectors(nir_shader *shader, bool shrink_start);
 
 bool nir_opt_undef(nir_shader *shader);
 
-bool nir_lower_undef_to_zero(nir_shader *shader);
+typedef bool (*nir_lower_undef_to_zero_filter)(nir_undef_instr *);
+bool nir_lower_undef_to_zero(nir_shader *shader,
+                             nir_lower_undef_to_zero_filter filter);
 
 bool nir_opt_uniform_atomics(nir_shader *shader, bool fs_atomics_predicated);
 
@@ -6643,6 +7056,7 @@ void nir_sweep(nir_shader *shader);
 
 nir_intrinsic_op nir_intrinsic_from_system_value(gl_system_value val);
 gl_system_value nir_system_value_from_intrinsic(nir_intrinsic_op intrin);
+gl_system_value nir_system_value_from_instr(nir_instr *instr);
 
 static inline bool
 nir_variable_is_in_ubo(const nir_variable *var)
@@ -6835,26 +7249,26 @@ nir_is_store_reg(nir_intrinsic_instr *intr)
 #define nir_foreach_reg_load(load, reg)              \
    assert(reg->intrinsic == nir_intrinsic_decl_reg); \
                                                      \
-   nir_foreach_use(load, &reg->def)             \
-      if (nir_is_load_reg(nir_instr_as_intrinsic(nir_src_parent_instr(load))))
+   nir_foreach_use(load, &reg->def)                  \
+      if (nir_is_load_reg(nir_instr_as_intrinsic(nir_src_use_instr(load))))
 
 #define nir_foreach_reg_load_safe(load, reg)         \
    assert(reg->intrinsic == nir_intrinsic_decl_reg); \
                                                      \
    nir_foreach_use_safe(load, &reg->def)             \
-      if (nir_is_load_reg(nir_instr_as_intrinsic(nir_src_parent_instr(load))))
+      if (nir_is_load_reg(nir_instr_as_intrinsic(nir_src_use_instr(load))))
 
 #define nir_foreach_reg_store(store, reg)            \
    assert(reg->intrinsic == nir_intrinsic_decl_reg); \
                                                      \
-   nir_foreach_use(store, &reg->def)            \
-      if (nir_is_store_reg(nir_instr_as_intrinsic(nir_src_parent_instr(store))))
+   nir_foreach_use(store, &reg->def)                 \
+      if (nir_is_store_reg(nir_instr_as_intrinsic(nir_src_use_instr(store))))
 
 #define nir_foreach_reg_store_safe(store, reg)       \
    assert(reg->intrinsic == nir_intrinsic_decl_reg); \
                                                      \
    nir_foreach_use_safe(store, &reg->def)            \
-      if (nir_is_store_reg(nir_instr_as_intrinsic(nir_src_parent_instr(store))))
+      if (nir_is_store_reg(nir_instr_as_intrinsic(nir_src_use_instr(store))))
 
 static inline nir_intrinsic_instr *
 nir_load_reg_for_def(const nir_def *def)
@@ -6882,7 +7296,7 @@ nir_store_reg_for_def(const nir_def *def)
    if (nir_src_is_if(src))
       return NULL;
 
-   nir_instr *parent = nir_src_parent_instr(src);
+   nir_instr *parent = nir_src_use_instr(src);
    if (parent->type != nir_instr_type_intrinsic)
       return NULL;
 
@@ -6964,7 +7378,54 @@ bool nir_unlower_io_to_vars(nir_shader *nir, bool keep_intrinsics);
 
 bool nir_opt_barycentric(nir_shader *shader, bool lower_sample_to_pos);
 
+bool nir_normalize_sin_cos(nir_shader *shader);
+
 #include "nir_inline_helpers.h"
+
+static inline bool
+nir_is_io_compact(nir_shader *nir, bool is_output, unsigned location)
+{
+   return nir->options->compact_arrays &&
+          (nir->info.stage != MESA_SHADER_VERTEX || is_output) &&
+          (nir->info.stage != MESA_SHADER_FRAGMENT || !is_output) &&
+          (location == VARYING_SLOT_CLIP_DIST0 ||
+           location == VARYING_SLOT_CLIP_DIST1 ||
+           location == VARYING_SLOT_CULL_DIST0 ||
+           location == VARYING_SLOT_CULL_DIST1 ||
+           (nir->info.stage != MESA_SHADER_MESH && location == VARYING_SLOT_TESS_LEVEL_OUTER) ||
+           (nir->info.stage != MESA_SHADER_MESH && location == VARYING_SLOT_TESS_LEVEL_INNER));
+}
+
+static inline nir_float_muladd_support
+nir_float_muladd_for_bitsize(const nir_shader *nir, unsigned bit_size)
+{
+   switch (bit_size) {
+   case 16:
+      return nir->options->float_mul_add16;
+   case 32:
+      return nir->options->float_mul_add32;
+   case 64:
+      return nir->options->float_mul_add64;
+   default:
+      UNREACHABLE("unsupported bit_size");
+      return (nir_float_muladd_support)0;
+   }
+}
+
+static inline bool
+nir_has_ffma(const nir_shader *nir, unsigned bit_size)
+{
+   nir_float_muladd_support muladd = nir_float_muladd_for_bitsize(nir, bit_size);
+   return (muladd & nir_float_muladd_support_has_ffma) != 0;
+}
+
+static inline bool
+nir_prefers_fmad(const nir_shader *nir, unsigned bit_size)
+{
+   nir_float_muladd_support muladd = nir_float_muladd_for_bitsize(nir, bit_size);
+   return  (muladd & nir_float_muladd_support_prefers_split) != 0 ||
+           (muladd & nir_float_muladd_support_has_ffma) == 0;
+}
 
 #ifdef __cplusplus
 } /* extern "C" */

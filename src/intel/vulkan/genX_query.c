@@ -336,6 +336,8 @@ VkResult genX(CreateQueryPool)(
 
    ANV_RMV(query_pool_create, device, pool, false);
 
+   ANV_ADDR_BINDING_REPORT_BO_BIND(device, &pool->vk.base, pool->bo);
+
    *pQueryPool = anv_query_pool_to_handle(pool);
 
    return VK_SUCCESS;
@@ -357,6 +359,7 @@ void genX(DestroyQueryPool)(
    if (!pool)
       return;
 
+   ANV_ADDR_BINDING_REPORT_BO_UNBIND(device, &pool->vk.base, pool->bo);
    ANV_RMV(resource_destroy, device, pool);
    ANV_DMR_BO_FREE(&pool->vk.base, pool->bo);
    anv_device_release_bo(device, pool->bo);
@@ -859,14 +862,15 @@ void genX(CmdResetQueryPool)(
 {
    ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
    ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
-   struct anv_physical_device *pdevice = cmd_buffer->device->physical;
+   const struct anv_physical_device *pdevice = cmd_buffer->device->physical;
+   const struct anv_instance *instance = pdevice->instance;
 
    /* Shader clearing is only possible on render/compute when not in protected
     * mode.
     */
    if (anv_cmd_buffer_is_render_or_compute_queue(cmd_buffer) &&
        (cmd_buffer->vk.pool->flags & VK_COMMAND_POOL_CREATE_PROTECTED_BIT) == 0 &&
-       queryCount >= pdevice->instance->query_clear_with_blorp_threshold) {
+       queryCount >= instance->drirc.perf.query_clear_with_blorp_threshold) {
       trace_intel_begin_query_clear_blorp(&cmd_buffer->trace);
 
       anv_cmd_buffer_fill_area(cmd_buffer,
@@ -1873,7 +1877,7 @@ copy_query_results_with_shader(struct anv_cmd_buffer *cmd_buffer,
       if (anv_cmd_buffer_is_render_queue(cmd_buffer))
          genX(flush_pipeline_select_3d)(cmd_buffer);
       else
-         genX(flush_pipeline_select_gpgpu)(cmd_buffer);
+         genX(flush_pipeline_select_gpgpu)(cmd_buffer, false);
    }
 
    if ((cmd_buffer->state.queries.buffer_write_bits |
@@ -2037,9 +2041,10 @@ void genX(CmdCopyQueryPoolResults)(
    ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
    ANV_FROM_HANDLE(anv_buffer, buffer, destBuffer);
    struct anv_device *device = cmd_buffer->device;
-   struct anv_physical_device *pdevice = device->physical;
+   const struct anv_physical_device *pdevice = device->physical;
+   const struct anv_instance *instance = pdevice->instance;
 
-   if (queryCount > pdevice->instance->query_copy_with_shader_threshold &&
+   if (queryCount > instance->drirc.perf.query_copy_with_shader_threshold &&
        anv_cmd_buffer_is_render_or_compute_queue(cmd_buffer)) {
       copy_query_results_with_shader(cmd_buffer, pool,
                                      anv_address_add(buffer->address,
@@ -2059,9 +2064,44 @@ void genX(CmdCopyQueryPoolResults)(
    }
 }
 
+void genX(CmdCopyQueryPoolResultsToMemoryKHR)(
+    VkCommandBuffer                             commandBuffer,
+    VkQueryPool                                 queryPool,
+    uint32_t                                    firstQuery,
+    uint32_t                                    queryCount,
+    const VkStridedDeviceAddressRangeKHR*       pDstRange,
+    VkAddressCommandFlagsKHR                    dstFlags,
+    VkQueryResultFlags                          queryResultFlags)
+{
+   ANV_FROM_HANDLE(anv_cmd_buffer, cmd_buffer, commandBuffer);
+   ANV_FROM_HANDLE(anv_query_pool, pool, queryPool);
+   struct anv_device *device = cmd_buffer->device;
+   const struct anv_physical_device *pdevice = device->physical;
+   const struct anv_instance *instance = pdevice->instance;
+
+   struct anv_address dst_addr =
+      anv_address_from_strided_range_flags(*pDstRange, dstFlags);
+
+   if (queryCount > instance->drirc.perf.query_copy_with_shader_threshold) {
+      copy_query_results_with_shader(cmd_buffer, pool,
+                                     dst_addr,
+                                     pDstRange->stride,
+                                     firstQuery,
+                                     queryCount,
+                                     queryResultFlags);
+   } else {
+      copy_query_results_with_cs(cmd_buffer, pool,
+                                 dst_addr,
+                                 pDstRange->stride,
+                                 firstQuery,
+                                 queryCount,
+                                 queryResultFlags);
+   }
+}
+
 #if GFX_VERx10 >= 125 && ANV_SUPPORT_RT
 
-#include "bvh/anv_bvh.h"
+#include "bvh/anv_bvh_defines.h"
 
 void
 genX(CmdWriteAccelerationStructuresPropertiesKHR)(

@@ -7,24 +7,7 @@
  * Also derived from anv_pipeline.c which is
  * Copyright © 2015 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "panvk_device.h"
@@ -34,6 +17,7 @@
 
 #include "nir.h"
 #include "nir_builder.h"
+#include "pan_nir.h"
 
 struct panvk_lower_input_attachment_load_ctx {
    uint32_t ro_color_mask;
@@ -161,16 +145,20 @@ lower_input_attachment_load(nir_builder *b, nir_intrinsic_instr *intr,
          iosem.location = FRAG_RESULT_DATA0;
          nir_push_if(b, is_read_only);
 	 {
-            load_ro_color = nir_load_readonly_output_pan(
-               b, intr->def.num_components, intr->def.bit_size, target,
-               intr->src[2].ssa, conversion, .dest_type = dest_type,
+            load_ro_color = nir_load_tile_res_pan(
+               b, intr->def.num_components, intr->def.bit_size,
+               pan_nir_tile_rt_sample(b, target, intr->src[2].ssa),
+               pan_nir_tile_default_coverage(b),
+               conversion, .dest_type = dest_type,
                .access = nir_intrinsic_access(intr), .io_semantics = iosem);
          }
          nir_push_else(b, NULL);
          {
-            load_rw_color = nir_load_converted_output_pan(
-               b, intr->def.num_components, intr->def.bit_size, target,
-               intr->src[2].ssa, conversion, .dest_type = dest_type,
+            load_rw_color = nir_load_tile_pan(
+               b, intr->def.num_components, intr->def.bit_size,
+               pan_nir_tile_rt_sample(b, target, intr->src[2].ssa),
+               pan_nir_tile_default_coverage(b),
+               conversion, .dest_type = dest_type,
                .access = nir_intrinsic_access(intr), .io_semantics = iosem);
          }
          nir_pop_if(b, NULL);
@@ -201,9 +189,11 @@ lower_input_attachment_load(nir_builder *b, nir_intrinsic_instr *intr,
          iosem.location = dest_type == nir_type_float32 ? FRAG_RESULT_DEPTH
                                                         : FRAG_RESULT_STENCIL;
          target = nir_imm_int(b, 0);
-         load_zs = nir_load_converted_output_pan(
-            b, intr->def.num_components, intr->def.bit_size, target,
-            intr->src[2].ssa, conversion, .dest_type = dest_type,
+         load_zs = nir_load_tile_pan(
+            b, intr->def.num_components, intr->def.bit_size,
+            pan_nir_tile_location_sample(b, iosem.location, intr->src[2].ssa),
+            pan_nir_tile_default_coverage(b),
+            conversion, .dest_type = dest_type,
             .access = nir_intrinsic_access(intr), .io_semantics = iosem);
 
          /* If we loaded the stencil value, the upper 24 bits might contain

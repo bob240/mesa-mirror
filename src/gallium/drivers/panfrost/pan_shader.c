@@ -4,38 +4,21 @@
  * Copyright (C) 2019-2022 Collabora, Ltd.
  * Copyright (C) 2019 Red Hat Inc.
  * Copyright (C) 2018 Alyssa Rosenzweig
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "pan_shader.h"
 #include "nir/tgsi_to_nir.h"
 #include "util/u_memory.h"
 #include "util/u_prim.h"
-#include "util/perf/cpu_trace.h"
 #include "nir_builder.h"
 #include "nir_serialize.h"
 #include "pan_bo.h"
 #include "pan_context.h"
 #include "pan_compiler.h"
 #include "pan_nir.h"
+#include "pan_trace.h"
+#include "compiler/bifrost/bifrost_compile.h"
 #include "shader_enums.h"
 
 static struct panfrost_uncompiled_shader *
@@ -57,7 +40,7 @@ panfrost_alloc_shader(const nir_shader *nir)
    struct blob blob;
    blob_init(&blob);
    nir_serialize(&blob, nir, true);
-   _mesa_sha1_compute(blob.data, blob.size, so->nir_sha1);
+   _mesa_blake3_compute(blob.data, blob.size, so->nir_blake3);
    blob_finish(&blob);
 
    return so;
@@ -101,28 +84,21 @@ lower_sample_mask_writes(nir_builder *b, nir_intrinsic_instr *intrin,
    b->cursor = nir_before_instr(&intrin->instr);
 
    nir_def *orig = nir_load_sample_mask(b);
-   nir_def *new = nir_b32csel(b, nir_load_multisampled_pan(b),
-                               intrin->src[0].ssa, orig);
+   nir_def *new =
+      nir_bcsel_pan(b, nir_load_multisampled_pan(b), intrin->src[0].ssa, orig);
    nir_src_rewrite(&intrin->src[0], new);
 
    return true;
 }
 
-static bool
-panfrost_use_ld_var_buf(const nir_shader *ir)
-{
-   const uint64_t allowed = VARYING_BIT_POS | VARYING_BIT_PSIZ |
-      BITFIELD64_MASK(16) << VARYING_SLOT_VAR0;
-   return (ir->info.inputs_read & ~allowed) == 0;
-}
-
 static void
 panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
                         struct util_debug_callback *dbg,
+                        const struct pan_varying_layout *varying_layout,
                         struct panfrost_shader_key *key, unsigned req_local_mem,
                         struct panfrost_shader_binary *out)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_SHADER);
 
    struct panfrost_device *dev = pan_device(&screen->base);
 
@@ -136,25 +112,17 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
     */
    if (mesa_shader_stage_is_compute(s->info.stage)) {
       pan_preprocess_nir(s, panfrost_device_gpu_id(dev));
-      pan_nir_lower_texture_early(s, panfrost_device_gpu_id(dev));
-      pan_postprocess_nir(s, panfrost_device_gpu_id(dev));
    }
 
    struct pan_compile_inputs inputs = {
       .gpu_id = panfrost_device_gpu_id(dev),
       .gpu_variant = dev->kmod.dev->props.gpu_variant,
-      .get_conv_desc = screen->vtbl.get_conv_desc,
    };
 
    /* Lower this early so the backends don't have to worry about it */
-   if (s->info.stage == MESA_SHADER_FRAGMENT) {
-      inputs.fixed_varying_mask =
-         pan_get_fixed_varying_mask(s->info.inputs_read);
-   } else if (s->info.stage == MESA_SHADER_VERTEX) {
+   if (s->info.stage == MESA_SHADER_VERTEX) {
       /* No IDVS for internal XFB shaders */
       inputs.no_idvs = s->info.has_transform_feedback_varyings;
-      inputs.fixed_varying_mask =
-         pan_get_fixed_varying_mask(s->info.outputs_written);
 
       if (s->info.has_transform_feedback_varyings) {
          NIR_PASS(_, s, nir_opt_constant_folding);
@@ -163,7 +131,10 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
       }
    }
 
-   out->binary = UTIL_DYNARRAY_INIT;
+   /* nir_opt_varyings is replacing all flat highp types with float32, we need
+    * to figure out the varying types ourselves */
+   inputs.trust_varying_flat_highp_types = false;
+   inputs.varying_layout = varying_layout;
 
    if (s->info.stage == MESA_SHADER_FRAGMENT) {
       if (key->fs.nr_cbufs_for_fragcolor) {
@@ -175,13 +146,13 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
          NIR_PASS(_, s, nir_lower_texcoord_replace_late,
                   key->fs.sprite_coord_enable,
                   true /* point coord is sysval */);
+         /* Lower load_point_coord if present */
+         NIR_PASS(_, s, pan_nir_lower_var_special_pan);
       }
 
       if (key->fs.clip_plane_enable) {
          NIR_PASS(_, s, nir_lower_clip_fs, key->fs.clip_plane_enable,
                   false, true);
-         inputs.fixed_varying_mask =
-            pan_get_fixed_varying_mask(s->info.inputs_read);
       }
 
       if (key->fs.line_smooth) {
@@ -194,6 +165,9 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
 
       NIR_PASS(_, s, nir_shader_intrinsics_pass,
                lower_sample_mask_writes, nir_metadata_control_flow, NULL);
+
+      if (s->info.fs.accesses_pixel_local_storage)
+         NIR_PASS(_, s, panfrost_nir_lower_pls, screen);
    }
 
    if (dev->arch <= 5 && s->info.stage == MESA_SHADER_FRAGMENT) {
@@ -202,10 +176,19 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
                panfrost_device_gpu_prod_id(dev) < 0x700);
    }
 
+   /* Lower resource indices */
+   NIR_PASS(_, s, panfrost_nir_lower_res_indices, inputs.gpu_id);
+
+   pan_postprocess_nir(s, &inputs, &out->info);
+
    if (s->info.stage == MESA_SHADER_VERTEX) {
       NIR_PASS(_, s, nir_inline_sysval,
                nir_intrinsic_load_noperspective_varyings_pan,
                key->vs.noperspective_varyings);
+   }
+
+   if (dev->arch >= 9 && mesa_shader_stage_is_compute(s->info.stage)) {
+      out->info.cs.allow_merging_workgroups = valhall_can_merge_workgroups(s);
    }
 
    NIR_PASS(_, s, panfrost_nir_lower_sysvals, dev->arch, &out->sysvals);
@@ -221,22 +204,19 @@ panfrost_shader_compile(struct panfrost_screen *screen, const nir_shader *ir,
       inputs.pushable_ubos |= BITFIELD_BIT(PAN_UBO_SYSVALS);
    }
 
-   /* Lower resource indices */
-   NIR_PASS(_, s, panfrost_nir_lower_res_indices, &inputs);
-   pan_nir_lower_texture_late(s, inputs.gpu_id);
-
    if (dev->arch >= 9) {
-      inputs.valhall.use_ld_var_buf = panfrost_use_ld_var_buf(s);
       /* Always enable this for GL, it avoids crashes when using unbound
        * resources. */
       inputs.robust_descriptors = true;
    }
 
+   out->binary = UTIL_DYNARRAY_INIT;
    screen->vtbl.compile_shader(s, &inputs, &out->binary, &out->info);
 
    /* Report stats only if we really got the shader compiled */
    if (out->binary.size > 0) {
-      if (s->info.stage == MESA_SHADER_VERTEX && out->info.vs.idvs) {
+      if (s->info.stage == MESA_SHADER_VERTEX &&
+          out->info.vs.secondary_offset) {
          pan_stats_util_debug(dbg, "MESA_SHADER_POSITION",
                               &out->info.stats);
          pan_stats_util_debug(dbg, "MESA_SHADER_VERTEX",
@@ -275,8 +255,12 @@ panfrost_shader_get(struct pipe_screen *pscreen,
     */
    if (!panfrost_disk_cache_retrieve(screen->disk_cache, uncompiled,
                                      &state->key, &res)) {
-      panfrost_shader_compile(screen, uncompiled->nir, dbg, &state->key,
-                              req_local_mem, &res);
+
+      const struct pan_varying_layout *varying_layout =
+         uncompiled->vs_varying_layout.known != 0
+            ? &uncompiled->vs_varying_layout : NULL;
+      panfrost_shader_compile(screen, uncompiled->nir, dbg, varying_layout,
+                              &state->key, req_local_mem, &res);
 
       panfrost_disk_cache_store(screen->disk_cache, uncompiled, &state->key,
                                 &res);
@@ -344,6 +328,8 @@ panfrost_build_fs_key(struct panfrost_context *ctx,
       if (u_reduced_prim(ctx->active_prim) == MESA_PRIM_LINES)
          key->line_smooth = rast->line_smooth;
    }
+
+   key->vs_varying_layout = uncompiled->vs_varying_layout;
 
    if (dev->arch <= 5) {
       u_foreach_bit(i, (nir->info.outputs_read >> FRAG_RESULT_DATA0)) {
@@ -483,11 +469,33 @@ glsl_type_size(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
+static struct panfrost_shader_key
+panfrost_default_shader_key(struct panfrost_uncompiled_shader *so)
+{
+   struct panfrost_shader_key key = {0};
+
+   if (so->nir->info.stage == MESA_SHADER_FRAGMENT) {
+      /* gl_FragColor lowering needs the number of colour buffers on desktop
+      * GL, where it acts as an implicit broadcast to all colour buffers.
+      *
+      * However, gl_FragColor is a legacy feature, so assume that if
+      * gl_FragColor is used, there is only a single render target. The
+      * implicit broadcast is neither especially useful nor required by GLES.
+      */
+      if (so->fragcolor_lowered)
+         key.fs.nr_cbufs_for_fragcolor = 1;
+
+      key.fs.vs_varying_layout = so->vs_varying_layout;
+   }
+
+   return key;
+}
+
 static void *
 panfrost_create_shader_state(struct pipe_context *pctx,
                              const struct pipe_shader_state *cso)
 {
-   MESA_TRACE_FUNC();
+   PAN_TRACE_FUNC(PAN_TRACE_GL_SHADER);
 
    nir_shader *nir = (cso->type == PIPE_SHADER_IR_TGSI)
                         ? tgsi_to_nir(cso->tokens, pctx->screen, false)
@@ -551,31 +559,30 @@ panfrost_create_shader_state(struct pipe_context *pctx,
    /* Then run the suite of lowering and optimization, including I/O lowering */
    struct panfrost_device *dev = pan_device(pctx->screen);
    pan_preprocess_nir(nir, panfrost_device_gpu_id(dev));
-   pan_nir_lower_texture_early(nir, panfrost_device_gpu_id(dev));
 
+   NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
+            nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             glsl_type_size, nir_lower_io_use_interpolated_input_intrinsics);
-
-   pan_postprocess_nir(nir, panfrost_device_gpu_id(dev));
+   /* nir_lower_io just computes offsets based on the original deref and
+    * lower_indirect_derefs ensures that the array derefs have a constant
+    * index.  Constant-fold to get us actual constants in in load/store
+    * instructions.
+    */
+   NIR_PASS(_, nir, nir_opt_constant_folding);
 
    if (nir->info.stage == MESA_SHADER_FRAGMENT)
       so->noperspective_varyings =
          pan_nir_collect_noperspective_varyings_fs(nir);
 
-   unsigned attrib_offset = 0;
-   if (nir->info.stage == MESA_SHADER_VERTEX && dev->arch <= 7) {
-      /* Vertex shaders get passed images through the vertex attribute
-       * descriptor array. We need to add an offset to all image intrinsics so
-       * they point to the right attribute.
-       */
-      attrib_offset += util_bitcount64(nir->info.inputs_read);
-      NIR_PASS(_, nir, pan_nir_lower_image_index, attrib_offset);
-   }
-   if (dev->arch >= 6 && dev->arch <= 7) {
-      /* Bifrost needs to use attributes to access texel buffers. We place these
-       * after images, which are also accessed using attributes. */
-      attrib_offset += BITSET_LAST_BIT(nir->info.images_used);
-      NIR_PASS(_, nir, pan_nir_lower_texel_buffer_fetch_index, attrib_offset);
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      struct pan_varying_layout *varying_layout = &so->vs_varying_layout;
+      pan_varying_collect_formats(varying_layout, nir,
+                                  panfrost_device_gpu_id(dev),
+                                  false, /* trust_varying_flat_highp_types */
+                                  false /* lower_mediump */);
+      pan_build_varying_layout_compact(varying_layout, nir,
+                                       panfrost_device_gpu_id(dev));
    }
 
    /* If this shader uses transform feedback, compile the transform
@@ -596,22 +603,20 @@ panfrost_create_shader_state(struct pipe_context *pctx,
       nir->info.has_transform_feedback_varyings = false;
    }
 
+   /* If we're not using separate shaders, the FS can use VS varying_layout to
+    * optimize loads (LD_VAR_BUF instead of LD_VAR).  Gallium won't provide us
+    * with the VS directly, so we need to delay the default variant compilation
+    * until link time
+    */
+   if (nir->info.stage == MESA_SHADER_FRAGMENT && !nir->info.separate_shader)
+      return so;
+
    /* Compile the program. We don't use vertex shader keys, so there will
     * be no further vertex shader variants. We do have fragment shader
     * keys, but we can still compile with a default key that will work most
     * of the time.
     */
-   struct panfrost_shader_key key = {0};
-
-   /* gl_FragColor lowering needs the number of colour buffers on desktop
-    * GL, where it acts as an implicit broadcast to all colour buffers.
-    *
-    * However, gl_FragColor is a legacy feature, so assume that if
-    * gl_FragColor is used, there is only a single render target. The
-    * implicit broadcast is neither especially useful nor required by GLES.
-    */
-   if (so->fragcolor_lowered)
-      key.fs.nr_cbufs_for_fragcolor = 1;
+   struct panfrost_shader_key key = panfrost_default_shader_key(so);
 
    /* Creating a CSO is single-threaded, so it's ok to use the
     * locked function without explicitly taking the lock. Creating a
@@ -644,6 +649,39 @@ panfrost_delete_shader_state(struct pipe_context *pctx, void *so)
    simple_mtx_destroy(&cso->lock);
 
    ralloc_free(so);
+}
+
+static void
+panfrost_link_shader(struct pipe_context *pctx, void** handles)
+{
+   struct panfrost_context *ctx = pan_context(pctx);
+   struct panfrost_uncompiled_shader *vs = handles[MESA_SHADER_VERTEX];
+   struct panfrost_uncompiled_shader *fs = handles[MESA_SHADER_FRAGMENT];
+
+   if (!fs || fs->nir->info.separate_shader)
+      return;
+
+   /* We only handle VS and FS for now, it's not clear how varying layout will
+    * fit when more shader types are supported.  So assert those are the only
+    * shaders present.
+    */
+   for (unsigned i = 0; i < MESA_SHADER_MESH_STAGES; i++) {
+      if (i != MESA_SHADER_VERTEX && i != MESA_SHADER_FRAGMENT)
+         assert(handles[i] == NULL);
+   }
+
+   /* Only copy the varying layout if we have a VS, sometimes we don't have one
+    * (e.g. fixed-function VS), in those cases we just compile a default FS.
+    */
+   if (vs)
+      fs->vs_varying_layout = vs->vs_varying_layout;
+
+   simple_mtx_lock(&fs->lock);
+
+   struct panfrost_shader_key key = panfrost_default_shader_key(fs);
+   panfrost_new_variant_locked(ctx, fs, &key);
+
+   simple_mtx_unlock(&fs->lock);
 }
 
 /*
@@ -711,6 +749,8 @@ panfrost_shader_context_init(struct pipe_context *pctx)
    pctx->create_fs_state = panfrost_create_shader_state;
    pctx->delete_fs_state = panfrost_delete_shader_state;
    pctx->bind_fs_state = panfrost_bind_fs_state;
+
+   pctx->link_shader = panfrost_link_shader;
 
    pctx->create_compute_state = panfrost_create_compute_state;
    pctx->bind_compute_state = panfrost_bind_compute_state;

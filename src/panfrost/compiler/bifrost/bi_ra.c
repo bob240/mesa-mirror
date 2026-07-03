@@ -1,16 +1,14 @@
 /*
  * Copyright (C) 2020,2025 Collabora Ltd.
  * SPDX-License-Identifier: MIT
- *
- * Authors (Collabora):
- *      Alyssa Rosenzweig <alyssa.rosenzweig@collabora.com>
- *      Eric R. Smith <eric.smith@collabora.com>
  */
 
 #include "util/u_memory.h"
+#include "bi_debug.h"
 #include "bi_builder.h"
 #include "compiler.h"
 #include "nodearray.h"
+#include "valhall.h"
 
 struct lcra_state {
    unsigned node_count;
@@ -324,8 +322,9 @@ bi_make_affinity(uint64_t clobber, unsigned count, bool split_file)
 static void
 bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
                      uint64_t preload_live, unsigned node_count, bool is_blend,
-                     bool split_file, bool aligned_sr)
+                     bool split_file, unsigned arch)
 {
+   bool aligned_sr = arch >= 9;
    bi_foreach_instr_in_block_rev(block, ins) {
       /* Mark all registers live after the instruction as
        * interfering with the destination */
@@ -382,12 +381,17 @@ bi_mark_interference(bi_block *block, struct lcra_state *l, uint8_t *live,
          bi_foreach_ssa_src(ins, s) {
             if (bi_count_read_registers(ins, s) >= 2)
                l->affinity[ins->src[s].value] &= EVEN_BITS_MASK;
+            else if (s < valhall_opcodes[ins->op].nr_srcs &&
+                     va_src_info(ins->op, s).size > VA_SIZE_32)
+               l->affinity[ins->src[s].value] &= EVEN_BITS_MASK;
          }
       }
 
       if (!is_blend && ins->op == BI_OPCODE_BLEND) {
-         /* Blend shaders might clobber r0-r15, r48. */
-         uint64_t clobber = BITFIELD64_MASK(16) | BITFIELD64_BIT(48);
+         /* Blend shaders might clobber r0-r15, blend link reg. */
+         uint64_t clobber =
+            BITFIELD64_MASK(16) |
+            BITFIELD64_BIT(bi_preload_reg(BI_PRELOAD_BLEND_LINK, arch));
 
          for (unsigned i = 0; i < node_count; ++i) {
             if (live[i])
@@ -413,7 +417,7 @@ bi_compute_interference(bi_context *ctx, struct lcra_state *l, bool full_regs)
       uint8_t *live = mem_dup(blk->live_out, ctx->ssa_alloc);
 
       bi_mark_interference(blk, l, live, blk->reg_live_out, ctx->ssa_alloc,
-                           ctx->inputs->is_blend, !full_regs, ctx->arch >= 9);
+                           ctx->inputs->is_blend, !full_regs, ctx->arch);
 
       free(live);
    }
@@ -441,36 +445,43 @@ bi_allocate_registers(bi_context *ctx, bool *success, bool full_regs)
       bi_foreach_dest(ins, d)
          l->affinity[ins->dest[d].value] = default_affinity;
 
-      /* Blend shaders expect the src colour to be in r0-r3 */
+      /* Blend shaders expect the src colour to be in blend_src0_c0
+       * through c3 */
       if (ins->op == BI_OPCODE_BLEND && !ctx->inputs->is_blend) {
          assert(bi_is_ssa(ins->src[0]));
-         l->solutions[ins->src[0].value] = 0;
+         l->solutions[ins->src[0].value] =
+            bi_preload_reg(BI_PRELOAD_BLEND_SRC0_C0, ctx->arch);
 
-         /* Dual source blend input in r4-r7 */
+         /* Dual source blend input in blend_src1_c0 through c3 */
          if (bi_is_ssa(ins->src[4]))
-            l->solutions[ins->src[4].value] = 4;
+            l->solutions[ins->src[4].value] =
+               bi_preload_reg(BI_PRELOAD_BLEND_SRC1_C0, ctx->arch);
 
-         /* Writes to R48 */
+         /* Writes to blend link */
          if (!bi_is_null(ins->dest[0]))
-            l->solutions[ins->dest[0].value] = 48;
+            l->solutions[ins->dest[0].value] =
+               bi_preload_reg(BI_PRELOAD_BLEND_LINK, ctx->arch);
       }
 
-      /* Coverage mask writes stay in R60 */
+      /* Coverage mask writes stay in the cumulative coverage reg */
       if ((ins->op == BI_OPCODE_ATEST || ins->op == BI_OPCODE_ZS_EMIT) &&
           !bi_is_null(ins->dest[0])) {
-         l->solutions[ins->dest[0].value] = 60;
+         l->solutions[ins->dest[0].value] =
+            bi_preload_reg(BI_PRELOAD_CUMULATIVE_COVERAGE, ctx->arch);
       }
 
       /* Experimentally, it seems coverage masks inputs to ATEST must
-       * be in R60. Otherwise coverage mask writes do not work with
-       * early-ZS with pixel-frequency-shading (this combination of
-       * settings is legal if depth/stencil writes are disabled).
-       * Allowing a FAU index also seems to work on Valhall, at least.
+       * be in the cumulative coverage reg. Otherwise coverage mask
+       * writes do not work with early-ZS with pixel-frequency-shading
+       * (this combination of settings is legal if depth/stencil
+       * writes are disabled). Allowing a FAU index also seems to
+       * work on Valhall, at least.
        */
       if (ins->op == BI_OPCODE_ATEST) {
          assert(bi_is_ssa(ins->src[0]) || ins->src[0].type == BI_INDEX_FAU);
          if (bi_is_ssa(ins->src[0]))
-            l->solutions[ins->src[0].value] = 60;
+            l->solutions[ins->src[0].value] =
+               bi_preload_reg(BI_PRELOAD_CUMULATIVE_COVERAGE, ctx->arch);
       }
    }
 
@@ -495,8 +506,10 @@ bi_allocate_registers(bi_context *ctx, bool *success, bool full_regs)
 
       if (ctx->inputs->is_blend) {
          /* We're allowed to coalesce the moves to these */
-         affinity |= BITFIELD64_BIT(48);
-         affinity |= BITFIELD64_BIT(60);
+         affinity |=
+            BITFIELD64_BIT(bi_preload_reg(BI_PRELOAD_BLEND_LINK, ctx->arch));
+         affinity |= BITFIELD64_BIT(
+            bi_preload_reg(BI_PRELOAD_CUMULATIVE_COVERAGE, ctx->arch));
       }
 
       /* Try to coalesce */
@@ -598,14 +611,15 @@ bi_choose_spill_node(bi_context *ctx, struct lcra_state *l)
    bi_foreach_instr_global(ctx, ins) {
       bi_foreach_dest(ins, d) {
          /* Don't allow spilling coverage mask writes because the
-          * register preload logic assumes it will stay in R60.
-          * This could be optimized.
+          * register preload logic assumes it will stay in the
+          * cumulative coverage reg. This could be optimized.
           */
          if (ins->no_spill || ins->op == BI_OPCODE_ATEST ||
              ins->op == BI_OPCODE_ZS_EMIT ||
              (ins->op == BI_OPCODE_MOV_I32 &&
               ins->src[0].type == BI_INDEX_REGISTER &&
-              ins->src[0].value == 60)) {
+              ins->src[0].value ==
+                 bi_preload_reg(BI_PRELOAD_CUMULATIVE_COVERAGE, ctx->arch))) {
             BITSET_SET(no_spill, ins->dest[d].value);
          }
       }
@@ -719,7 +733,7 @@ bi_compute_reg_alignment(bi_context *ctx)
    bi_foreach_instr_global(ctx, I) {
       bi_foreach_ssa_dest(I, d) {
          idx = I->dest[d].value;
-         count = bi_count_write_registers(I, d);
+         count = bi_count_write_registers(I, d) + I->dest[d].offset;
          if (count == 3) count = 4;
          assert(idx < ctx->ssa_alloc);
          ctx->reg_alignment[idx] = MAX2(count*4, ctx->reg_alignment[idx]);
@@ -741,18 +755,16 @@ bi_spill_register(bi_context *ctx, bi_index index, uint32_t offset,
                   bi_index spill_point)
 {
    bi_builder b = {.shader = ctx};
-   unsigned alignment = 4;
-   unsigned channels = 0;
+   if (!ctx->reg_alignment)
+      bi_compute_reg_alignment(ctx);
+   assert(index.value < ctx->ssa_alloc);
+   unsigned channels = ctx->reg_alignment[index.value] / 4;
+   assert(channels > 0);
+   unsigned alignment = (ctx->arch >= 9) ? ctx->reg_alignment[index.value] : 4;
 
    /* first figure out the alignment we will need, based on the
     * maximum count we see
     */
-   if (ctx->arch >= 9) {
-      if (!ctx->reg_alignment)
-         bi_compute_reg_alignment(ctx);
-      assert(index.value < ctx->ssa_alloc);
-      alignment = ctx->reg_alignment[index.value];
-   }
    offset = ALIGN_POT(offset, alignment);
 
    /* Spill after every store, fill before every load */
@@ -768,20 +780,18 @@ bi_spill_register(bi_context *ctx, bi_index index, uint32_t offset,
             if (!bi_is_equiv(I->dest[d], index))
                continue;
 
+            I->no_spill = true;
             unsigned count = bi_count_write_registers(I, d);
             unsigned extra = I->dest[d].offset;
+            bi_index src = index;
+            src.offset = extra;
 
-            channels = MAX2(channels, extra + count);
-            I->no_spill = true;
+            b.cursor = bi_after_instr(I);
+            bi_store_tl(&b, count * 32, src, offset + (extra * 4));
 
-            if (channels == extra + count) {
-               b.cursor = bi_after_instr(I);
-               bi_store_tl(&b, channels * 32, index, offset);
-
-               ctx->spills++;
-               /* Don't disable filling if spill_point is before index. */
-               fill = found_spill_point;
-            }
+            ctx->spills++;
+            /* Don't disable filling if spill_point is before index. */
+            fill = found_spill_point;
          }
 
          if (bi_has_arg(I, index) && fill) {
@@ -922,13 +932,12 @@ bi_coalesce_tied(bi_context *ctx)
       bi_builder b = bi_init_builder(ctx, bi_before_instr(I));
       unsigned n = bi_count_read_registers(I, 0);
 
+      bi_index dst = I->dest[0], src = I->src[0];
+      assert(dst.offset == 0);
       for (unsigned i = 0; i < n; ++i) {
-         bi_index dst = I->dest[0], src = I->src[0];
-
-         assert(dst.offset == 0 && src.offset == 0);
-         dst.offset = src.offset = i;
-
          bi_mov_i32_to(&b, dst, src);
+         dst.offset++;
+         src.offset++;
       }
 
       bi_replace_src(I, 0, I->dest[0]);
@@ -967,6 +976,20 @@ squeeze_index(bi_context *ctx)
    ralloc_free(map);
 }
 
+static void
+bi_mov_words_to(bi_builder *b, bi_index dst, bi_index src, unsigned words)
+{
+   assert(words >= 1 && words <= 4);
+
+   for (unsigned i = 0; i < words; ++i) {
+      bi_index word_dst = dst, word_src = src;
+      word_dst.offset += i;
+      word_src.offset += i;
+
+      bi_mov_i32_to(b, word_dst, word_src);
+   }
+}
+
 /*
  * Brainless out-of-SSA pass. The eventual goal is to go out-of-SSA after RA and
  * coalesce implicitly with biased colouring in a tree scan allocator. For now,
@@ -984,6 +1007,9 @@ bi_out_of_ssa(bi_context *ctx)
       bi_foreach_instr_in_block_safe(block, I) {
          if (I->op != BI_OPCODE_PHI)
             break;
+
+         unsigned words = I->table ? I->table : 1;
+         assert(words >= 1 && words <= 4);
 
          /* Assign a register for the phi */
          bi_index reg = bi_temp(ctx);
@@ -1003,12 +1029,17 @@ bi_out_of_ssa(bi_context *ctx)
 
             if (I->src[i].memory)
                /* spilled register, need to un-spill */
-               bi_load_tl(&b, 32, reg, I->src[i].value);
-            else if (ctx->arch >= 9 && I->src[i].type == BI_INDEX_CONSTANT)
+               bi_load_tl(&b, words * 32, reg, I->src[i].value);
+            else if (ctx->arch >= 9 && I->src[i].type == BI_INDEX_CONSTANT) {
                /* MOV of immediate needs lowering on Valhall */
-               bi_iadd_imm_i32_to(&b, reg, zero, I->src[i].value);
-            else
-               bi_mov_i32_to(&b, reg, I->src[i]);
+               for (unsigned w = 0; w < words; ++w) {
+                  bi_index word_reg = reg;
+                  word_reg.offset += w;
+                  bi_iadd_imm_i32_to(&b, word_reg, zero,
+                                     w == 0 ? I->src[i].value : 0);
+               }
+            } else
+               bi_mov_words_to(&b, reg, I->src[i], words);
          }
 
          /* Replace the phi with a move */
@@ -1016,13 +1047,13 @@ bi_out_of_ssa(bi_context *ctx)
          bi_builder b = bi_init_builder(ctx, bi_before_instr(I));
          if (I->dest[0].memory) {
             /* dest was spilled to memory */
-            bi_store_tl(&b, 32, reg, I->dest[0].value);
+            bi_store_tl(&b, words * 32, reg, I->dest[0].value);
             allow_propagate = false;
          } else if (ctx->arch >= 9 && reg.type == BI_INDEX_CONSTANT)
             /* MOV of immediate needs lowering on Valhall */
             bi_iadd_imm_i32_to(&b, I->dest[0], zero, reg.value);
          else
-            bi_mov_i32_to(&b, I->dest[0], reg);
+            bi_mov_words_to(&b, I->dest[0], reg, words);
          bi_remove_instruction(I);
 
          /* Propagate that move within the block. The destination
@@ -1210,7 +1241,7 @@ bi_register_allocate(bi_context *ctx)
 
       bi_compute_liveness_ssa(ctx);
       if (verbose) {
-         bi_print_shader(ctx, stdout);
+         bi_print_shader(ctx, stderr);
       }
       unsigned register_demand = bi_calc_register_demand(ctx);
       if (register_demand > regs_to_use) {
@@ -1218,7 +1249,9 @@ bi_register_allocate(bi_context *ctx)
          if (ctx->inputs->is_blend)
             UNREACHABLE("Blend shaders may not spill");
 
-         spill_count = bi_spill_ssa(ctx, regs_to_use, spill_count);
+         bi_spill_ssa(ctx, regs_to_use);
+         spill_count += bi_lower_spill(ctx, spill_count);
+
          /* By default, we use packed TLS addressing on Valhall.
           * We cannot cross 16 byte boundaries with packed TLS
           * addressing. Align to ensure this doesn't happen. This
@@ -1227,8 +1260,8 @@ bi_register_allocate(bi_context *ctx)
          if (ctx->arch >= 9)
             spill_count = ALIGN_POT(spill_count, 16);
          if (verbose) {
-            printf("\nspill_registers=%d\n", spill_count);
-            bi_print_shader(ctx, stdout);
+            fprintf(stderr, "\nspill_registers=%d\n", spill_count);
+            bi_print_shader(ctx, stderr);
          }
       }
    }

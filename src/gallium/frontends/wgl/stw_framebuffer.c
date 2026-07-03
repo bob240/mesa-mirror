@@ -475,7 +475,7 @@ stw_framebuffer_from_hdc_locked(HDC hdc)
 
    hwnd = WindowFromDC(hdc);
 
-   return stw_framebuffer_from_hwnd_hdc_locked(hwnd, hdc);
+   return stw_framebuffer_from_hwnd_hdc_locked(hwnd, hwnd ? NULL : hdc);
 }
 
 
@@ -762,7 +762,7 @@ stw_framebuffer_swap_locked(HDC hdc, struct stw_framebuffer *fb)
       wait_swap_interval(fb, interval);
    }
 
-   return stw_st_swap_framebuffer_locked(hdc, fb->drawable);
+   return stw_st_swap_framebuffer_locked(ctx ? ctx->st : NULL, hdc, fb->drawable);
 }
 
 BOOL APIENTRY

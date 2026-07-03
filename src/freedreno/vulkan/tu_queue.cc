@@ -9,14 +9,14 @@
 
 #include "tu_queue.h"
 
+#include "vk_util.h"
+
 #include "tu_buffer.h"
 #include "tu_cmd_buffer.h"
+#include "tu_device.h"
 #include "tu_dynamic_rendering.h"
 #include "tu_image.h"
 #include "tu_knl.h"
-#include "tu_device.h"
-
-#include "vk_util.h"
 
 static int
 tu_get_submitqueue_priority(const struct tu_physical_device *pdevice,
@@ -182,7 +182,7 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
     * streams and therefore should be avoided.
     */
    uint32_t min_vis_stream_count =
-      (TU_DEBUG(NO_CONCURRENT_BINNING) || dev->physical_device->info->chip < 7) ?
+      (!dev->instance->drirc.perf.allow_concurrent_binning || dev->physical_device->info->chip < 7) ?
       1 : MIN2(MAX2(rp_count, 1), TU_MAX_VIS_STREAMS);
    uint32_t vis_stream_count;
 
@@ -418,6 +418,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
    struct tu_device *device = queue->device;
    bool u_trace_enabled = u_trace_should_process(&queue->device->trace_context);
    struct util_dynarray dump_cmds;
+   struct tu_cs *autotune_cs = NULL;
 
    if (vk_submit->buffer_bind_count ||
        vk_submit->image_bind_count ||
@@ -495,9 +496,8 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       }
    }
 
-   if (tu_autotune_submit_requires_fence(cmd_buffers, cmdbuf_count)) {
-      struct tu_cs *autotune_cs = tu_autotune_on_submit(
-         device, &device->autotune, cmd_buffers, cmdbuf_count);
+   autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
+   if (autotune_cs) {
       submit_add_entries(device, submit, &dump_cmds, autotune_cs->entries,
                          autotune_cs->entry_count);
    }
@@ -548,7 +548,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
 #ifdef HAVE_PERFETTO
    if (u_trace_should_process(&device->trace_context)) {
       for (int i = 0; i < vk_submit->command_buffer_count; i++)
-         tu_perfetto_refresh_debug_utils_object_name(
+         tu_perfetto_refresh_debug_utils_object_name(device,
             &vk_submit->command_buffers[i]->base);
    }
 #endif
@@ -571,7 +571,9 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
       u_trace_submission_data->fence = queue->fence;
 
       for (uint32_t i = 0; i < u_trace_submission_data->cmd_buffer_count; i++) {
-         bool free_data = i == u_trace_submission_data->last_buffer_with_tracepoints;
+         bool free_data =
+            i == u_trace_submission_data->last_buffer_with_tracepoints &&
+            !u_trace_submission_data->timestamp_copy_data;
          if (u_trace_submission_data->trace_per_cmd_buffer[i])
             u_trace_flush(u_trace_submission_data->trace_per_cmd_buffer[i],
                           u_trace_submission_data, queue->device->vk.current_frame,
@@ -605,17 +607,11 @@ VkResult
 tu_queue_init(struct tu_device *device,
               struct tu_queue *queue,
               enum tu_queue_type type,
+              const VkQueueGlobalPriorityKHR global_priority,
               int idx,
-              const VkDeviceQueueCreateInfo *create_info)
+              const VkDeviceQueueCreateInfo *create_info,
+              struct tu_queue *shared_queue)
 {
-   const VkDeviceQueueGlobalPriorityCreateInfoKHR *priority_info =
-      vk_find_struct_const(create_info->pNext,
-            DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR);
-   const VkQueueGlobalPriorityKHR global_priority = priority_info ?
-      priority_info->globalPriority :
-      (TU_DEBUG(HIPRIO) ? VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR :
-       VK_QUEUE_GLOBAL_PRIORITY_MEDIUM_KHR);
-
    const int priority = tu_get_submitqueue_priority(
          device->physical_device, global_priority, type,
          device->vk.enabled_features.globalPriorityQuery);
@@ -629,17 +625,33 @@ tu_queue_init(struct tu_device *device,
       return result;
 
    queue->device = device;
+   queue->type = type;
+   queue->fence = -1;
+   queue->priority = -1;
+   queue->msm_queue_id = 0;
+
+   if (shared_queue) {
+      /* Emulated queue: submissions are redirected to the real queue by
+       * the common runtime, so no kernel submitqueue is needed. The real
+       * queue's priority is what actually takes effect on the hardware;
+       * the priority requested for the alias has already been validated
+       * above.
+       */
+      assert(shared_queue->type == type);
+      vk_queue_set_emulated(&queue->vk, &shared_queue->vk);
+      return VK_SUCCESS;
+   }
+
    queue->priority = priority;
    queue->vk.driver_submit =
       (type == TU_QUEUE_SPARSE) ? queue_submit_sparse : queue_submit;
-   queue->type = type;
 
    int ret = tu_drm_submitqueue_new(device, queue);
-   if (ret)
+   if (ret) {
+      vk_queue_finish(&queue->vk);
       return vk_startup_errorf(device->instance, VK_ERROR_INITIALIZATION_FAILED,
                                "submitqueue create failed");
-
-   queue->fence = -1;
+   }
 
    return VK_SUCCESS;
 }
@@ -647,7 +659,9 @@ tu_queue_init(struct tu_device *device,
 void
 tu_queue_finish(struct tu_queue *queue)
 {
+   bool emulated = vk_queue_is_emulated(&queue->vk);
    vk_queue_finish(&queue->vk);
-   tu_drm_submitqueue_close(queue->device, queue);
+   if (!emulated)
+      tu_drm_submitqueue_close(queue->device, queue);
 }
 

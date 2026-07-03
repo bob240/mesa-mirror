@@ -149,11 +149,23 @@ ir3_required_sync_flags(struct ir3_legalize_state *state,
             flags |= IR3_INSTR_SY;
          }
       } else if ((reg->flags & IR3_REG_CONST)) {
-         if (state->needs_ss_for_const) {
-            flags |= IR3_INSTR_SS;
-         }
-         if (state->needs_sy_for_const) {
-            flags |= IR3_INSTR_SY;
+         if (reg->flags & IR3_REG_RELATIV) {
+            /* Since we don't know which const reg is accessed, add sync flags
+             * if any const reg need them.
+             */
+            if (!BITSET_IS_EMPTY(state->needs_ss_for_const)) {
+               flags |= IR3_INSTR_SS;
+            }
+            if (!BITSET_IS_EMPTY(state->needs_sy_for_const)) {
+               flags |= IR3_INSTR_SY;
+            }
+         } else {
+            if (BITSET_TEST(state->needs_ss_for_const, reg->num)) {
+               flags |= IR3_INSTR_SS;
+            }
+            if (BITSET_TEST(state->needs_sy_for_const, reg->num)) {
+               flags |= IR3_INSTR_SY;
+            }
          }
       } else if (!(reg->flags & (IR3_REG_IMMED | IR3_REG_RT))) {
          if (regmask_get(&state->needs_ss, reg)) {
@@ -186,7 +198,7 @@ apply_ss(struct ir3_legalize_state *state, bool mergedregs)
    regmask_init(&state->needs_ss_or_sy_scalar_war, mergedregs);
    regmask_init(&state->needs_ss_scalar_full, mergedregs);
    regmask_init(&state->needs_ss_scalar_half, mergedregs);
-   state->needs_ss_for_const = false;
+   BITSET_ZERO(state->needs_ss_for_const);
    state->force_ss = false;
 }
 
@@ -197,7 +209,7 @@ apply_sy(struct ir3_legalize_state *state, bool mergedregs)
    regmask_init(&state->needs_sy_war, mergedregs);
    regmask_init(&state->needs_ss_or_sy_war, mergedregs);
    regmask_init(&state->needs_ss_or_sy_scalar_war, mergedregs);
-   state->needs_sy_for_const = false;
+   BITSET_ZERO(state->needs_sy_for_const);
    state->force_sy = false;
 }
 
@@ -242,7 +254,7 @@ sync_update(struct ir3_legalize_state *state, struct ir3_compiler *compiler,
 
    if (is_tex_or_prefetch(n) && !has_dummy_dst(n)) {
       regmask_set(&state->needs_sy, n->dsts[0]);
-   } else if (n->opc == OPC_RESINFO && !has_dummy_dst(n)) {
+   } else if ((n->opc == OPC_RESINFO || n->opc == OPC_RESBASE) && !has_dummy_dst(n)) {
       regmask_set(&state->needs_ss, n->dsts[0]);
    } else if (is_load(n)) {
       if (is_local_mem_load(n))
@@ -258,10 +270,18 @@ sync_update(struct ir3_legalize_state *state, struct ir3_compiler *compiler,
       } else {
          regmask_set(&state->needs_ss, n->dsts[0]);
       }
-   } else if (n->opc == OPC_PUSH_CONSTS_LOAD_MACRO || n->opc == OPC_STC) {
-      state->needs_ss_for_const = true;
+   } else if (n->opc == OPC_PUSH_CONSTS_LOAD_MACRO) {
+      unsigned const_dst = n->push_consts.dst_base;
+      unsigned const_size = n->push_consts.src_size * 2;
+      BITSET_SET_COUNT(state->needs_ss_for_const, const_dst, const_size);
+   } else if (n->opc == OPC_STC) {
+      unsigned const_dst = n->cat6.dst_offset;
+      unsigned const_size = n->cat6.iim_val;
+      BITSET_SET_COUNT(state->needs_ss_for_const, const_dst, const_size);
    } else if (n->opc == OPC_LDC_K) {
-      state->needs_sy_for_const = true;
+      unsigned const_dst = n->cat6.dst_offset;
+      unsigned const_size = n->cat6.iim_val * 4;
+      BITSET_SET_COUNT(state->needs_sy_for_const, const_dst, const_size);
    }
 
    /* both tex/sfu appear to not always immediately consume
@@ -370,8 +390,10 @@ ir3_merge_pred_legalize_states(struct ir3_legalize_state *state,
       regmask_or(&state->needs_ss_or_sy_war, &state->needs_ss_or_sy_war,
                  &pstate->needs_ss_or_sy_war);
       regmask_or(&state->needs_sy, &state->needs_sy, &pstate->needs_sy);
-      state->needs_ss_for_const |= pstate->needs_ss_for_const;
-      state->needs_sy_for_const |= pstate->needs_sy_for_const;
+      BITSET_OR(state->needs_ss_for_const, state->needs_ss_for_const,
+                pstate->needs_ss_for_const);
+      BITSET_OR(state->needs_sy_for_const, state->needs_sy_for_const,
+                pstate->needs_sy_for_const);
       state->force_ss |= pstate->force_ss;
       state->force_sy |= pstate->force_sy;
 
@@ -804,8 +826,8 @@ legalize_block(struct ir3_legalize_ctx *ctx, struct ir3_block *block)
       }
 
       if (ctx->compiler->samgq_workaround &&
-          ctx->type != MESA_SHADER_FRAGMENT &&
-          ctx->type != MESA_SHADER_COMPUTE && n->opc == OPC_SAMGQ) {
+          !is_compute_or_frag(ctx->type) &&
+          n->opc == OPC_SAMGQ) {
          struct ir3_instruction *samgp;
 
          list_delinit(&n->node);
@@ -963,7 +985,7 @@ apply_push_consts_load_macro(struct ir3_legalize_ctx *ctx,
          stsc->cat6.iim_val = n->push_consts.src_size;
          stsc->cat6.type = TYPE_U32;
 
-         if (ctx->compiler->stsc_duplication_quirk) {
+         if (ctx->compiler->info->props.stsc_duplication_quirk) {
             struct ir3_builder build = ir3_builder_at(ir3_after_instr(stsc));
             struct ir3_instruction *nop = ir3_NOP(&build);
             nop->flags |= IR3_INSTR_SS;
@@ -1224,7 +1246,7 @@ static void
 mark_xvergence_points(struct ir3 *ir)
 {
    foreach_block (block, &ir->block_list) {
-      if (block->reconvergence_point)
+      if (block->reconvergence_point || block->wave_reconvergence_point)
          mark_jp(block);
    }
 }
@@ -1353,11 +1375,11 @@ add_predication_workaround(struct ir3_compiler *compiler,
                            struct ir3_instruction *predtf,
                            struct ir3_instruction *prede)
 {
-   if (predtf && compiler->predtf_nop_quirk) {
+   if (predtf && compiler->info->props.predtf_nop_quirk) {
       add_nop_before_block(predtf->block->predecessors[0]->successors[1], 4);
    }
 
-   if (compiler->prede_nop_quirk) {
+   if (compiler->info->props.prede_nop_quirk) {
       add_nop_before_block(prede->block->successors[0], 6);
    }
 }
@@ -1456,6 +1478,11 @@ prede_sched(struct ir3 *ir)
       list_delinit(&succ0_terminator->node);
       struct ir3_builder build = ir3_builder_at(ir3_before_terminator(succ0));
       struct ir3_instruction *prede = ir3_PREDE(&build);
+
+      /* legalize_block might have set sync flags on the terminator that we just
+       * removed; set them on prede instead.
+       */
+      prede->flags |= succ0_terminator->flags;
       add_predication_workaround(ir->compiler, NULL, prede);
       remove_unused_block(succ1);
       block->successors[1] = succ0->successors[0];
@@ -2509,7 +2536,7 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
 
    so->early_preamble = has_preamble && !gpr_in_preamble &&
       !pred_in_preamble && !relative_in_preamble &&
-      ir->compiler->has_early_preamble &&
+      ir->compiler->info->props.has_early_preamble &&
       !(ir3_shader_debug & IR3_DBG_NOEARLYPREAMBLE);
 
    /* On a7xx, sync behavior for a1.x is different in the early preamble. RaW
@@ -2566,8 +2593,8 @@ ir3_legalize(struct ir3 *ir, struct ir3_shader_variant *so, int *max_bary)
    if (so->type == MESA_SHADER_FRAGMENT)
       kill_sched(ir, so);
 
-   if ((so->type == MESA_SHADER_FRAGMENT || so->type == MESA_SHADER_COMPUTE) &&
-       so->compiler->has_eolm_eogm) {
+   if ((so->type == MESA_SHADER_FRAGMENT || ir3_shader_compute(so)) &&
+       so->compiler->info->props.has_eolm_eogm) {
       feature_usage_sched(ctx, ir, so, needs_eolm, is_cheap_for_eolm_eogm,
                           IR3_INSTR_EOLM);
       feature_usage_sched(ctx, ir, so, needs_eogm, is_cheap_for_eolm_eogm,

@@ -1,25 +1,7 @@
 /* -*- c++ -*- */
 /*
  * Copyright © 2010-2016 Intel Corporation
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #pragma once
@@ -27,6 +9,7 @@
 #include <assert.h>
 #include "brw_reg.h"
 #include "compiler/brw_list.h"
+#include "compiler/gen/gen.h"
 #include "brw_sampler.h"
 
 #define MAX_SAMPLER_MESSAGE_SIZE 11
@@ -214,7 +197,7 @@ struct brw_inst : brw_exec_node {
       uint16_t bits;
    };
 
-   tgl_swsb sched; /**< Scheduling info. */
+   gen_swsb sched; /**< Scheduling info. */
 
    bblock_t *block;
 
@@ -456,9 +439,9 @@ regs_read(const struct intel_device_info *devinfo, const brw_inst *inst, unsigne
       return 1;
 
    const unsigned reg_size = inst->src[i].file == UNIFORM ? 4 : REG_SIZE;
+   const unsigned size_read = inst->size_read(devinfo, i);
    return DIV_ROUND_UP(reg_offset(inst->src[i]) % reg_size +
-                       inst->size_read(devinfo, i) -
-                       MIN2(inst->size_read(devinfo, i), reg_padding(inst->src[i])),
+                       size_read - MIN2(size_read, reg_padding(inst->src[i])),
                        reg_size);
 }
 
@@ -531,18 +514,31 @@ bool is_coalescing_payload(const struct brw_shader &s, const brw_inst *inst);
 
 bool has_bank_conflict(const struct brw_isa_info *isa, const brw_inst *inst);
 
+/* Helper from brw_lower_scoreboard.cpp. */
+gen_pipe
+inferred_exec_pipe(const struct intel_device_info *devinfo,
+                   const brw_inst *inst);
+
 /* Return the subset of flag registers that an instruction could
  * potentially read or write based on the execution controls and flag
  * subregister number of the instruction.
  */
 static inline unsigned
-brw_flag_mask(const brw_inst *inst, unsigned width)
+brw_flag_mask(unsigned flag_subreg, unsigned group, unsigned exec_size,
+              unsigned width)
 {
    assert(util_is_power_of_two_nonzero(width));
-   const unsigned start = (inst->flag_subreg * 16 + inst->group) &
+   const unsigned start = (flag_subreg * 16 + group) &
                           ~(width - 1);
-   const unsigned end = start + align(inst->exec_size, width);
+   const unsigned end = start + align(exec_size, width);
    return ((1 << DIV_ROUND_UP(end, 8)) - 1) & ~((1 << (start / 8)) - 1);
+}
+
+static inline unsigned
+brw_flag_mask(const brw_inst *inst, unsigned width)
+{
+   return brw_flag_mask(inst->flag_subreg, inst->group, inst->exec_size,
+                        width);
 }
 
 static inline unsigned
@@ -562,3 +558,7 @@ brw_flag_mask(const brw_reg &r, unsigned sz)
       return 0;
    }
 }
+
+unsigned brw_flags_written(enum opcode, enum brw_conditional_mod,
+                           unsigned flag_subreg, unsigned group,
+                           unsigned exec_size);

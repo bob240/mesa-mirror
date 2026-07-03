@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2021 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "bi_builder.h"
@@ -28,33 +10,9 @@
 #include "compiler.h"
 
 static bi_instr *
-lower_swz_v4i8(bi_builder *b, bi_instr *I)
-{
-   /* IADD.v4u8 is gone on v11 */
-   if (b->shader->arch >= 11) {
-      bi_index srcs[4] = {I->src[0], I->src[0], I->src[0], I->src[0]};
-      unsigned channels[4];
-      bool valid_swizzle =
-         bi_swizzle_to_byte_channels(I->src[0].swizzle, channels);
-      assert(valid_swizzle);
-      return bi_make_vec_to(b, I->dest[0], srcs, channels, 4, 8);
-   }
-
-   return bi_iadd_v4u8_to(b, I->dest[0], I->src[0], bi_zero(), false);
-}
-
-static bi_instr *
 lower(bi_builder *b, bi_instr *I)
 {
    switch (I->op) {
-
-   /* Integer addition has swizzles and addition with 0 is canonical swizzle */
-   case BI_OPCODE_SWZ_V2I16:
-      return bi_iadd_v2u16_to(b, I->dest[0], I->src[0], bi_zero(), false);
-
-   case BI_OPCODE_SWZ_V4I8:
-      return lower_swz_v4i8(b, I);
-
    case BI_OPCODE_ICMP_I32:
       return bi_icmp_or_u32_to(b, I->dest[0], I->src[0], I->src[1], bi_zero(),
                                I->cmpf, I->result_type);

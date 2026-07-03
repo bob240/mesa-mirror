@@ -6,7 +6,6 @@
 
 #include "aco_instruction_selection.h"
 #include "aco_interface.h"
-#include "aco_nir_call_attribs.h"
 
 #include "nir_builder.h"
 #include "nir_control_flow.h"
@@ -23,9 +22,9 @@ bool
 only_used_by_cross_lane_instrs(nir_def* ssa, bool follow_phis = true)
 {
    nir_foreach_use (src, ssa) {
-      switch (nir_src_parent_instr(src)->type) {
+      switch (nir_src_use_instr(src)->type) {
       case nir_instr_type_alu: {
-         nir_alu_instr* alu = nir_instr_as_alu(nir_src_parent_instr(src));
+         nir_alu_instr* alu = nir_instr_as_alu(nir_src_use_instr(src));
          if (alu->op != nir_op_unpack_64_2x32_split_x && alu->op != nir_op_unpack_64_2x32_split_y)
             return false;
          if (!only_used_by_cross_lane_instrs(&alu->def, follow_phis))
@@ -34,7 +33,7 @@ only_used_by_cross_lane_instrs(nir_def* ssa, bool follow_phis = true)
          continue;
       }
       case nir_instr_type_intrinsic: {
-         nir_intrinsic_instr* intrin = nir_instr_as_intrinsic(nir_src_parent_instr(src));
+         nir_intrinsic_instr* intrin = nir_instr_as_intrinsic(nir_src_use_instr(src));
          if (intrin->intrinsic != nir_intrinsic_read_invocation &&
              intrin->intrinsic != nir_intrinsic_read_first_invocation &&
              intrin->intrinsic != nir_intrinsic_lane_permute_16_amd)
@@ -47,7 +46,7 @@ only_used_by_cross_lane_instrs(nir_def* ssa, bool follow_phis = true)
          if (!follow_phis)
             return false;
 
-         nir_phi_instr* phi = nir_instr_as_phi(nir_src_parent_instr(src));
+         nir_phi_instr* phi = nir_instr_as_phi(nir_src_use_instr(src));
          if (!only_used_by_cross_lane_instrs(&phi->def, false))
             return false;
 
@@ -65,7 +64,8 @@ only_used_by_cross_lane_instrs(nir_def* ssa, bool follow_phis = true)
  * block instead. This is so that we can use any SGPR live-out of the side
  * without the branch without creating a linear phi in the invert or merge block.
  *
- * This also removes any unreachable merge blocks.
+ * This also removes any unreachable merge blocks and ensures that branches are
+ * in THEN side.
  */
 bool
 sanitize_if(nir_function_impl* impl, nir_if* nif)
@@ -77,11 +77,11 @@ sanitize_if(nir_function_impl* impl, nir_if* nif)
    if (!then_jump && !else_jump)
       return false;
 
-   /* If the continue from block is empty then return as there is nothing to
-    * move.
-    */
-   if (nir_cf_list_is_empty_block(then_jump ? &nif->else_list : &nif->then_list))
+   /* If the else block is empty then return as there is nothing to move. */
+   if (nir_cf_list_is_empty_block(&nif->else_list)) {
+      assert(then_jump);
       return false;
+   }
 
    /* Even though this if statement has a jump on one side, we may still have
     * phis afterwards.  Single-source phis can be produced by loop unrolling
@@ -90,19 +90,29 @@ sanitize_if(nir_function_impl* impl, nir_if* nif)
     */
    nir_remove_single_src_phis_block(nir_cf_node_as_block(nir_cf_node_next(&nif->cf_node)));
 
-   /* Finally, move the continue from branch after the if-statement. */
-   nir_block* last_continue_from_blk = then_jump ? else_block : then_block;
-   nir_block* first_continue_from_blk =
-      then_jump ? nir_if_first_else_block(nif) : nir_if_first_then_block(nif);
-
    /* We don't need to repair SSA. nir_remove_after_cf_node() replaces any uses with undef. */
    if (then_jump && else_jump)
       nir_remove_after_cf_node(&nif->cf_node);
 
-   nir_cf_list tmp;
-   nir_cf_extract(&tmp, nir_before_block(first_continue_from_blk),
-                  nir_after_block(last_continue_from_blk));
-   nir_cf_reinsert(&tmp, nir_after_cf_node(&nif->cf_node));
+   nir_cf_list else_list;
+   nir_cf_extract(&else_list, nir_before_cf_list(&nif->else_list), nir_after_block(else_block));
+
+   if (then_jump) {
+      /* Move the else block from branch after the if-statement. */
+      nir_cf_reinsert(&else_list, nir_after_cf_node(&nif->cf_node));
+   } else if (else_jump) {
+      /* If the jump is in the else block, move the then block after the if-statement. */
+      nir_cf_list then_list;
+      nir_cf_extract(&then_list, nir_before_cf_list(&nif->then_list), nir_after_block(then_block));
+      nir_cf_reinsert(&then_list, nir_after_cf_node(&nif->cf_node));
+
+      /* Move the previous then block to the else list and invert the condition. */
+      nir_cf_reinsert(&else_list, nir_before_cf_list(&nif->then_list));
+      nir_builder b = nir_builder_create(impl);
+      b.cursor = nir_before_src(&nif->condition);
+      nir_def* cond = nir_inot(&b, nif->condition.ssa);
+      nir_src_rewrite(&nif->condition, cond);
+   }
 
    return true;
 }
@@ -130,7 +140,7 @@ sanitize_cf_list(nir_function_impl* impl, struct exec_list* cf_list)
           * from the loop header are live. Handle this without complicating the ACO IR by creating a
           * dummy break.
           */
-         if (nir_cf_node_cf_tree_next(&loop->cf_node)->predecessors.entries == 0) {
+         if (nir_block_num_preds(nir_cf_node_cf_tree_next(&loop->cf_node)) == 0) {
             nir_builder b = nir_builder_create(impl);
             b.cursor = nir_after_block_before_jump(nir_loop_last_block(loop));
 
@@ -259,9 +269,9 @@ skip_uniformize_merge_phi(nir_def* ssa, unsigned depth)
       return false;
 
    nir_foreach_use (src, ssa) {
-      switch (nir_src_parent_instr(src)->type) {
+      switch (nir_src_use_instr(src)->type) {
       case nir_instr_type_alu: {
-         nir_alu_instr* alu = nir_instr_as_alu(nir_src_parent_instr(src));
+         nir_alu_instr* alu = nir_instr_as_alu(nir_src_use_instr(src));
          if (alu->def.divergent)
             break;
 
@@ -292,7 +302,7 @@ skip_uniformize_merge_phi(nir_def* ssa, unsigned depth)
          break;
       }
       case nir_instr_type_intrinsic: {
-         nir_intrinsic_instr* intrin = nir_instr_as_intrinsic(nir_src_parent_instr(src));
+         nir_intrinsic_instr* intrin = nir_instr_as_intrinsic(nir_src_use_instr(src));
          unsigned src_idx = src - intrin->src;
          /* nir_intrinsic_lane_permute_16_amd is only safe because we don't use divergence analysis
           * for it's instruction selection. We use that intrinsic for NGG culling. All others are
@@ -311,7 +321,7 @@ skip_uniformize_merge_phi(nir_def* ssa, unsigned depth)
          return false;
       }
       case nir_instr_type_phi: {
-         nir_phi_instr* phi = nir_instr_as_phi(nir_src_parent_instr(src));
+         nir_phi_instr* phi = nir_instr_as_phi(nir_src_use_instr(src));
          if (phi->def.divergent || skip_uniformize_merge_phi(&phi->def, depth + 1))
             break;
          return false;
@@ -338,6 +348,7 @@ intrinsic_try_skip_helpers(nir_intrinsic_instr* intr, UNUSED void* data)
    case nir_intrinsic_load_constant:
    case nir_intrinsic_load_scratch:
    case nir_intrinsic_load_global_amd:
+   case nir_intrinsic_load_buffer_amd:
    case nir_intrinsic_bindless_image_load:
    case nir_intrinsic_bindless_image_fragment_mask_load_amd:
    case nir_intrinsic_bindless_image_sparse_load:
@@ -369,6 +380,7 @@ init_context(isel_context* ctx, nir_shader* shader)
    /* Init NIR range analysis. */
    ctx->range_ht = _mesa_pointer_hash_table_create(NULL);
    ctx->numlsb_ht = _mesa_pointer_hash_table_create(NULL);
+   ctx->fp_class_ht = nir_create_fp_analysis_state(impl);
 
    uint32_t options =
       shader->options->divergence_analysis_options | nir_divergence_ignore_undef_if_phi_srcs;
@@ -462,7 +474,12 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_op_sdot_2x16_iadd:
                case nir_op_udot_2x16_uadd_sat:
                case nir_op_sdot_2x16_iadd_sat:
+               case nir_op_bfdot2_fadd:
                case nir_op_bfdot2_bfadd:
+               case nir_op_f16dot2_fadd:
+               case nir_op_e4m3fn_dot4_fadd:
+               case nir_op_e5m2_dot4_fadd:
+               case nir_op_e4m3fn_e5m2_dot4_fadd:
                case nir_op_byte_perm_amd:
                case nir_op_alignbyte_amd:
                case nir_op_f2f16_ru:
@@ -496,12 +513,10 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_op_fsqrt:
                case nir_op_fexp2:
                case nir_op_flog2:
-               case nir_op_fsin_amd:
-               case nir_op_fcos_amd:
+               case nir_op_fsin_normalized_2_pi:
+               case nir_op_fcos_normalized_2_pi:
                case nir_op_pack_half_2x16_rtz_split:
-               case nir_op_pack_half_2x16_split:
-               case nir_op_unpack_half_2x16_split_x:
-               case nir_op_unpack_half_2x16_split_y: {
+               case nir_op_pack_half_2x16_split: {
                   if (ctx->program->gfx_level < GFX11_5 ||
                       alu_instr->src[0].src.ssa->bit_size > 32) {
                      type = RegType::vgpr;
@@ -537,17 +552,12 @@ init_context(isel_context* ctx, nir_shader* shader)
                   break;
                if (intrinsic->intrinsic == nir_intrinsic_strict_wqm_coord_amd) {
                   regclasses[intrinsic->def.index] =
-                     RegClass::get(RegType::vgpr, intrinsic->def.num_components * 4 +
-                                                     nir_intrinsic_base(intrinsic))
-                        .as_linear();
+                     lv1.resize(intrinsic->def.num_components * 4 + nir_intrinsic_base(intrinsic));
                   break;
                }
                RegType type = RegType::sgpr;
                switch (intrinsic->intrinsic) {
                case nir_intrinsic_load_push_constant:
-               case nir_intrinsic_load_workgroup_id:
-               case nir_intrinsic_load_num_workgroups:
-               case nir_intrinsic_load_subgroup_id:
                case nir_intrinsic_load_num_subgroups:
                case nir_intrinsic_vote_all:
                case nir_intrinsic_vote_any:
@@ -581,8 +591,6 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_shared_atomic:
                case nir_intrinsic_shared_atomic_swap:
                case nir_intrinsic_load_scratch:
-               case nir_intrinsic_load_typed_buffer_amd:
-               case nir_intrinsic_load_buffer_amd:
                case nir_intrinsic_load_initial_edgeflags_amd:
                case nir_intrinsic_gds_atomic_add_amd:
                case nir_intrinsic_bvh64_intersect_ray_amd:
@@ -624,7 +632,8 @@ init_context(isel_context* ctx, nir_shader* shader)
                case nir_intrinsic_ddy_fine:
                case nir_intrinsic_ddx_coarse:
                case nir_intrinsic_ddy_coarse:
-               case nir_intrinsic_load_return_param_amd: {
+               case nir_intrinsic_load_return_param_amd:
+               case nir_intrinsic_load_global_tr_amd: {
                   type = RegType::vgpr;
                   break;
                }
@@ -733,6 +742,7 @@ cleanup_context(isel_context* ctx)
 {
    _mesa_hash_table_destroy(ctx->numlsb_ht, NULL);
    _mesa_hash_table_destroy(ctx->range_ht, NULL);
+   nir_free_fp_analysis_state(&ctx->fp_class_ht);
 }
 
 isel_context

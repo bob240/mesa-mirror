@@ -33,11 +33,12 @@ vtn_handle_cooperative_type(struct vtn_builder *b, struct vtn_value *val,
    struct vtn_type *component_type = vtn_get_type(b, w[2]);
 
    const mesa_scope scope = vtn_translate_scope(b, vtn_constant_uint(b, w[3]));
-   const uint32_t rows = vtn_constant_uint(b, w[4]);
-   const uint32_t cols = vtn_constant_uint(b, w[5]);
+   const uint64_t rows = vtn_constant_uint(b, w[4]);
+   const uint64_t cols = vtn_constant_uint(b, w[5]);
 
-   vtn_assert(rows < 256);
-   vtn_assert(cols < 256);
+   vtn_assert(rows <= UINT16_MAX);
+   vtn_assert(cols <= UINT16_MAX);
+   vtn_assert(cols == 0 || rows <= UINT32_MAX / cols);
 
    enum glsl_cmat_use use = vtn_cooperative_matrix_use_to_glsl(vtn_constant_uint(b, w[6]));
 
@@ -319,10 +320,10 @@ vtn_handle_cooperative_alu(struct vtn_builder *b, struct vtn_value *dest_val,
          struct vtn_type *dst_type = vtn_get_type(b, w[1]);
          nir_deref_instr *src = vtn_get_cmat_deref(b, w[3]);
 
-         bool ignored = false;
-         nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &ignored, &ignored,
-                                                     glsl_get_cmat_element(src->type),
-                                                     glsl_get_cmat_element(dst_type->type));
+         bool swap = false;
+         unsigned extra_fp_math_ctrl = nir_fp_fast_math;
+         nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &swap, &extra_fp_math_ctrl);
+         b->nb.fp_math_ctrl |= extra_fp_math_ctrl;
 
          nir_deref_instr *dst = vtn_create_cmat_temporary(b, dst_type->type, "cmat_unary");
          nir_cmat_unary_op(&b->nb, &dst->def, &src->def,
@@ -340,15 +341,15 @@ vtn_handle_cooperative_alu(struct vtn_builder *b, struct vtn_value *dest_val,
       case SpvOpIMul:
       case SpvOpSDiv:
       case SpvOpUDiv: {
-         bool ignored = false;
+         bool swap = false;
+         unsigned extra_fp_math_ctrl = nir_fp_fast_math;
 
          struct vtn_type *dst_type = vtn_get_type(b, w[1]);
          nir_deref_instr *mat_a = vtn_get_cmat_deref(b, w[3]);
          nir_deref_instr *mat_b = vtn_get_cmat_deref(b, w[4]);
 
-         nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &ignored, &ignored,
-                                                     glsl_get_cmat_element(mat_a->type),
-                                                     glsl_get_cmat_element(dst_type->type));
+         nir_op op = vtn_nir_alu_op_for_spirv_opcode(b, opcode, &swap, &extra_fp_math_ctrl);
+         b->nb.fp_math_ctrl |= extra_fp_math_ctrl;
 
          nir_deref_instr *dst = vtn_create_cmat_temporary(b, dst_type->type, "cmat_binary");
          nir_cmat_binary_op(&b->nb, &dst->def, &mat_a->def, &mat_b->def,

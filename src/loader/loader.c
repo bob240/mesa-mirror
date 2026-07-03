@@ -125,6 +125,16 @@ loader_get_kernel_driver_name(int fd)
 }
 
 bool
+amd_predicate(int fd, const char *driver)
+{
+   char *kernel_driver = loader_get_kernel_driver_name(fd);
+   bool ret = kernel_driver && (strcmp(kernel_driver, "amdgpu") == 0);
+
+   free(kernel_driver);
+   return ret;
+}
+
+bool
 iris_predicate(int fd, const char *driver)
 {
    char *kernel_driver = loader_get_kernel_driver_name(fd);
@@ -264,7 +274,9 @@ loader_open_render_node_platform_devices(const char * const drivers[],
          }
 
          for (j = 0; j < n_drivers; j++) {
-            if (strcmp(version->name, drivers[j]) == 0) {
+            /* Always try to open the render device with Zink if requested */
+            if (strcmp("zink", drivers[j]) == 0 ||
+                strcmp(version->name, drivers[j]) == 0) {
                found = true;
                break;
             }
@@ -341,8 +353,11 @@ static char *loader_get_dri_config_driver(int fd)
 
    driParseOptionInfo(&defaultInitOptions, __driConfigOptionsLoader,
                       ARRAY_SIZE(__driConfigOptionsLoader));
-   driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0,
-                       "loader", kernel_driver, NULL, NULL, 0, NULL, 0);
+   driParseConfigFiles(&userInitOptions, &defaultInitOptions,
+                       &(driConfigFileParseParams) {
+                          .driverName = "loader",
+                          .kernelDriverName = kernel_driver,
+                       });
    if (driCheckOption(&userInitOptions, "dri_driver", DRI_STRING)) {
       char *opt = driQueryOptionstr(&userInitOptions, "dri_driver");
       /* not an empty string */
@@ -364,8 +379,10 @@ static char *loader_get_dri_config_device_id(void)
 
    driParseOptionInfo(&defaultInitOptions, __driConfigOptionsLoader,
                       ARRAY_SIZE(__driConfigOptionsLoader));
-   driParseConfigFiles(&userInitOptions, &defaultInitOptions, 0,
-                       "loader", NULL, NULL, NULL, 0, NULL, 0);
+   driParseConfigFiles(&userInitOptions, &defaultInitOptions,
+                       &(driConfigFileParseParams) {
+                          .driverName = "loader",
+                       });
    if (driCheckOption(&userInitOptions, "device_id", DRI_STRING)) {
       char *opt = driQueryOptionstr(&userInitOptions, "device_id");
       if (*opt)

@@ -1055,7 +1055,7 @@ draw_set_sampler_views(struct draw_context *draw,
                        struct pipe_sampler_view **views,
                        unsigned num)
 {
-   assert(shader_stage < DRAW_MAX_SHADER_STAGE);
+   assert(shader_stage >= 0 && shader_stage < DRAW_MAX_SHADER_STAGE);
    assert(num <= PIPE_MAX_SHADER_SAMPLER_VIEWS);
 
    draw_do_flush(draw, DRAW_FLUSH_STATE_CHANGE);
@@ -1276,10 +1276,10 @@ draw_set_disk_cache_callbacks(struct draw_context *draw,
                               void *data_cookie,
                               void (*find_shader)(void *cookie,
                                                   struct lp_cached_code *cache,
-                                                  unsigned char ir_sha1_cache_key[SHA1_DIGEST_LENGTH]),
+                                                  unsigned char ir_blake3_cache_key[BLAKE3_KEY_LEN]),
                               void (*insert_shader)(void *cookie,
                                                     struct lp_cached_code *cache,
-                                                    unsigned char ir_sha1_cache_key[SHA1_DIGEST_LENGTH]))
+                                                    unsigned char ir_blake3_cache_key[BLAKE3_KEY_LEN]))
 {
    draw->disk_cache_find_shader = find_shader;
    draw->disk_cache_insert_shader = insert_shader;

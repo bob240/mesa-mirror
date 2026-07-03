@@ -1,23 +1,7 @@
-/* Copyright (c) 2018-2019 Alyssa Rosenzweig (alyssa@rosenzweig.io)
+/*
+ * Copyright (c) 2018-2019 Alyssa Rosenzweig
  * Copyright (C) 2019-2020 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "midgard.h"
@@ -264,16 +248,16 @@ struct mir_ldst_op_props load_store_opcode_props[256] = {
    [midgard_op_atomic_xchg_be]    = {"XCHG.32.be",    M32 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
    [midgard_op_atomic_cmpxchg_be] = {"CMPXCHG.32.be", M32 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
 
-   [midgard_op_atomic_add64]     = {"AADD.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_and64]     = {"AAND.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_or64]      = {"AOR.64.be",     M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_xor64]     = {"AXOR.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_imin64]    = {"AMIN.s64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_umin64]    = {"AMIN.u64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_imax64]    = {"AMAX.s64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_umax64]    = {"AMAX.u64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_xchg64]    = {"XCHG.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
-   [midgard_op_atomic_cmpxchg64] = {"CMPXCHG.64.be", M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_add64_be]     = {"AADD.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_and64_be]     = {"AAND.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_or64_be]      = {"AOR.64.be",     M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_xor64_be]     = {"AXOR.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_imin64_be]    = {"AMIN.s64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_umin64_be]    = {"AMIN.u64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_imax64_be]    = {"AMAX.s64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_umax64_be]    = {"AMAX.u64.be",   M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_xchg64_be]    = {"XCHG.64.be",    M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
+   [midgard_op_atomic_cmpxchg64_be] = {"CMPXCHG.64.be", M64 | LDST_SIDE_FX | LDST_ADDRESS | LDST_ATOMIC},
 
    [midgard_op_ld_u8]         = {"LD.u8",         M32 | LDST_ADDRESS},
    [midgard_op_ld_i8]         = {"LD.s8",         M32 | LDST_ADDRESS},

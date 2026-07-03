@@ -22,10 +22,10 @@
  */
 
 #include "util/u_printf.h"
+#include "util/stack_array.h"
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_control_flow.h"
-#include "nir_vla.h"
 
 /*
  * TODO: write a proper inliner for GPUs.
@@ -88,11 +88,11 @@ fixup_cast_deref_mode(nir_deref_instr *deref)
       deref->modes ^= nir_var_function_temp;
 
       nir_foreach_use(use, &deref->def) {
-         if (nir_src_parent_instr(use)->type != nir_instr_type_deref)
+         if (nir_src_use_instr(use)->type != nir_instr_type_deref)
             continue;
 
          /* Recurse into children */
-         fixup_cast_deref_mode(nir_instr_as_deref(nir_src_parent_instr(use)));
+         fixup_cast_deref_mode(nir_instr_as_deref(nir_src_use_instr(use)));
       }
    }
 }
@@ -240,12 +240,13 @@ inline_functions_pass(nir_builder *b,
     * to an SSA value first.
     */
    const unsigned num_params = call->num_params;
-   NIR_VLA(nir_def *, params, num_params);
+   STACK_ARRAY(nir_def *, params, num_params);
    for (unsigned i = 0; i < num_params; i++) {
       params[i] = call->params[i].ssa;
    }
 
    nir_inline_function_impl(b, call->callee->impl, params, NULL);
+   STACK_ARRAY_FINISH(params);
    return true;
 }
 

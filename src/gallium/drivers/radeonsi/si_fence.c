@@ -4,7 +4,9 @@
  * SPDX-License-Identifier: MIT
  */
 
-#include "si_build_pm4.h"
+#include "si_pipe.h"
+#include "gfx/si_gfx.h"
+#include "ac_cmdbuf_cp.h"
 #include "util/os_time.h"
 #include "util/u_memory.h"
 #include "util/u_queue.h"
@@ -124,16 +126,18 @@ void si_cp_wait_mem(struct si_context *ctx, struct radeon_cmdbuf *cs, uint64_t v
    ac_emit_cp_wait_mem(&cs->current, va, ref, mask, flags);
 }
 
-static void si_add_fence_dependency(struct si_context *sctx, struct pipe_fence_handle *fence)
+static void si_add_fence_dependency(struct si_context *sctx, struct pipe_fence_handle *fence,
+                                    uint64_t timeline_point)
 {
    struct radeon_winsys *ws = sctx->ws;
 
-   ws->cs_add_fence_dependency(&sctx->gfx_cs, fence);
+   ws->cs_add_fence_dependency(&sctx->gfx_cs, fence, timeline_point);
 }
 
-static void si_add_syncobj_signal(struct si_context *sctx, struct pipe_fence_handle *fence)
+static void si_add_syncobj_signal(struct si_context *sctx, struct pipe_fence_handle *fence,
+                                  uint64_t timeline_point)
 {
-   sctx->ws->cs_add_syncobj_signal(&sctx->gfx_cs, fence);
+   sctx->ws->cs_add_syncobj_signal(&sctx->gfx_cs, fence, timeline_point);
 }
 
 static void si_fence_reference(struct pipe_screen *screen, struct pipe_fence_handle **dst,
@@ -216,7 +220,7 @@ static void si_fine_fence_set(struct si_context *ctx, struct si_fine_fence *fine
    if (flags & PIPE_FLUSH_TOP_OF_PIPE) {
       uint32_t value = 0x80000000;
 
-      si_cp_write_data(ctx, fine->buf, fine->offset, 4, V_370_MEM, V_370_PFP, &value);
+      si_cp_write_data(ctx, fine->buf, fine->offset, 4, V_371_MEMORY, V_371_PREFETCH_PARSER, &value);
    } else if (flags & PIPE_FLUSH_BOTTOM_OF_PIPE) {
       uint64_t fence_va = fine->buf->gpu_address + fine->offset;
 
@@ -356,6 +360,13 @@ static void si_create_fence_fd(struct pipe_context *ctx, struct pipe_fence_handl
       sfence->gfx = ws->fence_import_syncobj(ws, fd);
       break;
 
+   case PIPE_FD_TYPE_TIMELINE_SEMAPHORE_VK:
+      if (!sscreen->info.has_timeline_syncobj)
+         goto finish;
+
+      sfence->gfx = ws->fence_import_syncobj(ws, fd);
+      break;
+
    default:
       UNREACHABLE("bad fence fd type when importing");
    }
@@ -428,10 +439,10 @@ static void si_flush_all_queues(struct pipe_context *ctx,
    }
 
    if (force_flush) {
-      sctx->initial_gfx_cs_size = 0;
+      rflags |= RADEON_FLUSH_FORCE;
    }
 
-   if (!radeon_emitted(&sctx->gfx_cs, sctx->initial_gfx_cs_size)) {
+   if (!force_flush && !radeon_emitted(&sctx->gfx_cs, sctx->initial_gfx_cs_size)) {
       if (fence)
          ws->fence_reference(ws, &gfx_fence, sctx->last_gfx_fence);
       if (!(flags & PIPE_FLUSH_DEFERRED))
@@ -509,19 +520,20 @@ finish:
 static void si_flush_from_st(struct pipe_context *ctx, struct pipe_fence_handle **fence,
                              unsigned flags)
 {
+#ifdef HAVE_GFX_COMPUTE
    return si_flush_all_queues(ctx, fence, flags, false);
+#endif
 }
 
 static void si_fence_server_signal(struct pipe_context *ctx, struct pipe_fence_handle *fence, uint64_t value)
 {
    struct si_context *sctx = (struct si_context *)ctx;
    struct si_fence *sfence = (struct si_fence *)fence;
-   assert(!value);
 
    assert(sfence->gfx);
 
    if (sfence->gfx)
-      si_add_syncobj_signal(sctx, sfence->gfx);
+      si_add_syncobj_signal(sctx, sfence->gfx, value);
 
    /**
     * The spec requires a flush here. We insert a flush
@@ -545,7 +557,6 @@ static void si_fence_server_sync(struct pipe_context *ctx, struct pipe_fence_han
 {
    struct si_context *sctx = (struct si_context *)ctx;
    struct si_fence *sfence = (struct si_fence *)fence;
-   assert(!value);
 
    util_queue_fence_wait(&sfence->ready);
 
@@ -564,15 +575,17 @@ static void si_fence_server_sync(struct pipe_context *ctx, struct pipe_fence_han
     * performance. Therefore, DO NOT FLUSH.
     */
    if (sfence->gfx)
-      si_add_fence_dependency(sctx, sfence->gfx);
+      si_add_fence_dependency(sctx, sfence->gfx, value);
 }
 
 void si_init_fence_functions(struct si_context *ctx)
 {
    ctx->b.flush = si_flush_from_st;
+#ifdef HAVE_GFX_COMPUTE
    ctx->b.create_fence_fd = si_create_fence_fd;
    ctx->b.fence_server_sync = si_fence_server_sync;
    ctx->b.fence_server_signal = si_fence_server_signal;
+#endif
 }
 
 void si_init_screen_fence_functions(struct si_screen *screen)

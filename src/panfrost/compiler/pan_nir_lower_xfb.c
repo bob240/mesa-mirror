@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2022 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "compiler/nir/nir_builder.h"
@@ -80,17 +62,14 @@ lower_xfb(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
 
    b->cursor = nir_before_instr(&intr->instr);
 
-   for (unsigned i = 0; i < 2; ++i) {
-      nir_io_xfb xfb =
-         i ? nir_intrinsic_io_xfb2(intr) : nir_intrinsic_io_xfb(intr);
-      for (unsigned j = 0; j < 2; ++j) {
-         if (!xfb.out[j].num_components)
-            continue;
+   nir_io_xfb xfb = nir_intrinsic_io_xfb(intr);
+   for (unsigned i = 0; i < 4; ++i) {
+      if (!xfb.out[i].num_components)
+         continue;
 
-         lower_xfb_output(b, intr, i * 2 + j, xfb.out[j].num_components,
-                          xfb.out[j].buffer, xfb.out[j].offset);
-         progress = true;
-      }
+      lower_xfb_output(b, intr, i, xfb.out[i].num_components,
+                        xfb.out[i].buffer, xfb.out[i].offset);
+      progress = true;
    }
 
    nir_instr_remove(&intr->instr);

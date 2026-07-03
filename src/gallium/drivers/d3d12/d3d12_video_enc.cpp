@@ -292,13 +292,17 @@ d3d12_video_encoder_destroy(struct pipe_video_codec *codec)
    struct d3d12_context* ctx = d3d12_context(pD3D12Enc->base.context);
    if (ctx->priority_manager)
    {
-      if (ctx->priority_manager->unregister_work_queue(ctx->priority_manager, pD3D12Enc->m_spEncodeCommandQueue.Get()) != 0)
+      // Command queues may be NULL when destroy is called from a failed creation path before initialization reached
+      // the point of registering the command queues, so check for nullptr before trying to unregister from priority manager
+      if (pD3D12Enc->m_spEncodeCommandQueue &&
+          ctx->priority_manager->unregister_work_queue(ctx->priority_manager, pD3D12Enc->m_spEncodeCommandQueue.Get()) != 0)
       {
          debug_printf("D3D12: Failed to unregister command queue with frontend priority manager\n");
          assert(false);
       }
 
-      if (ctx->priority_manager->unregister_work_queue(ctx->priority_manager, pD3D12Enc->m_spResolveCommandQueue.Get()) != 0)
+      if (pD3D12Enc->m_spResolveCommandQueue &&
+          ctx->priority_manager->unregister_work_queue(ctx->priority_manager, pD3D12Enc->m_spResolveCommandQueue.Get()) != 0)
       {
          debug_printf("D3D12: Failed to unregister command queue with frontend priority manager\n");
          assert(false);
@@ -1002,6 +1006,14 @@ d3d12_video_encoder_reconfigure_encoder_objects(struct d3d12_video_encoder *pD3D
          {
             heapFlags |= D3D12_VIDEO_ENCODER_HEAP_FLAG_ALLOW_SUBREGION_NOTIFICATION_ARRAY_OF_BUFFERS;
          }
+
+#if (USE_D3D12_PREVIEW_HEADERS && (D3D12_PREVIEW_SDK_VERSION >= 721))
+         if (((pD3D12Enc->m_currentEncodeCapabilities.m_SupportFlags &
+               D3D12_VIDEO_ENCODER_SUPPORT_FLAG_SUBREGION_NOTIFICATION_SEQUENTIAL_SIGNALING_AVAILABLE) != 0))
+         {
+            heapFlags |= D3D12_VIDEO_ENCODER_HEAP_FLAG_ENABLE_SUBREGION_NOTIFICATION_SEQUENTIAL_SIGNALING;
+         }
+#endif
 
          if (pD3D12Enc->m_currentEncodeConfig.m_TwoPassEncodeDesc.AppRequested)
          {
@@ -2435,7 +2447,6 @@ d3d12_video_encoder_create_command_objects(struct d3d12_video_encoder *pD3D12Enc
 
       // Initialize fence for the in flight resource pool slot
       inputResource.m_CompletionFence.reset(d3d12_create_fence_raw(pD3D12Enc->m_spFence.Get(), CompletionFenceValue));
-      inputResource.m_CompletionFence.reset(d3d12_create_fence_raw(pD3D12Enc->m_spLastSliceFence.Get(), CompletionFenceValue));
       CompletionFenceValue++;
    }
 
@@ -3025,7 +3036,7 @@ d3d12_video_encoder_calculate_max_slices_count_in_output(
       case D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_BYTES_PER_SUBREGION:
       case D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_AUTO:
       {
-         maxSlices = MaxSubregionsNumberFromCaps;
+         maxSlices = std::max(128u, MaxSubregionsNumberFromCaps);
       } break;
       case D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED:
       {
@@ -3319,6 +3330,9 @@ d3d12_video_encoder_encode_bitstream(struct pipe_video_codec * codec,
                                              &slice_fences,
                                              &last_slice_completion_fence,
                                              feedback);
+   // Release local fence references to prevent leaking pipe fences + event handles each frame
+   if (last_slice_completion_fence)
+      d3d12_fence_reference((struct d3d12_fence **)&last_slice_completion_fence, NULL);
 }
 
 void
@@ -4100,7 +4114,20 @@ d3d12_video_encoder_encode_bitstream_impl(struct pipe_video_codec *codec,
          pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionOffsets.resize(num_slice_objects, {});
          pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences.resize(num_slice_objects, NULL);
          pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pSubregionPipeFences.resize(num_slice_objects);
-         pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFenceValues.resize(num_slice_objects, pD3D12Enc->m_fenceValue);
+         pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFenceValues.resize(num_slice_objects);
+         // When sequential signaling is supported, use a single shared fence with incrementing per-slice values
+         // to avoid creating separate ID3D12Fence objects and reduce sync objects overhead
+#if (USE_D3D12_PREVIEW_HEADERS && (D3D12_PREVIEW_SDK_VERSION >= 721))
+         if (pD3D12Enc->m_spVideoEncoderHeap1->GetEncoderHeapFlags() & D3D12_VIDEO_ENCODER_HEAP_FLAG_ENABLE_SUBREGION_NOTIFICATION_SEQUENTIAL_SIGNALING)
+         {
+            for (uint32_t i = 0; i < num_slice_objects; i++)
+               pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFenceValues[i] = pD3D12Enc->m_SliceFenceValue++;
+         } else
+#endif
+         {
+            for (uint32_t i = 0; i < num_slice_objects; i++)
+               pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFenceValues[i] = pD3D12Enc->m_fenceValue;
+         }
 
          pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionSizes.resize(num_slice_objects, NULL);
          pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionOffsets.resize(num_slice_objects, NULL);
@@ -4142,9 +4169,60 @@ d3d12_video_encoder_encode_bitstream_impl(struct pipe_video_codec *codec,
 
             pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionSizes[i] = pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionSizes[i].Get();
 
-            if (pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i] == nullptr)
-               hr = pD3D12Enc->m_pD3D12Screen->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i]));
-            pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFences[i] = pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i].Get();
+#if (USE_D3D12_PREVIEW_HEADERS && (D3D12_PREVIEW_SDK_VERSION >= 721))
+            if (pD3D12Enc->m_spVideoEncoderHeap1->GetEncoderHeapFlags() & D3D12_VIDEO_ENCODER_HEAP_FLAG_ENABLE_SUBREGION_NOTIFICATION_SEQUENTIAL_SIGNALING) {
+               // Share a single ID3D12Fence object across all slices (with incrementing values per slice)
+               if (pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[0] == nullptr) {
+                  hr = pD3D12Enc->m_pD3D12Screen->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[0]));
+                  if (FAILED(hr)) {
+                     debug_printf("CreateFence failed with HR %x\n", (unsigned)hr);
+                     pD3D12Enc->m_inflightResourcesPool[d3d12_video_encoder_pool_current_index(pD3D12Enc)].encode_result = PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_FAILED;
+                     pD3D12Enc->m_spEncodedFrameMetadata[d3d12_video_encoder_metadata_current_index(pD3D12Enc)].encode_result = PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_FAILED;
+                     assert(false);
+                     return;
+                  }
+               }
+               pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i] = pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[0];
+               pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFences[i] = pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[0].Get();
+            } else
+#endif
+            {
+               if (pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i] == nullptr)
+               {
+                  hr = pD3D12Enc->m_pD3D12Screen->dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i]));
+                  if (FAILED(hr)) {
+                     debug_printf("CreateFence failed with HR %x\n", (unsigned)hr);
+                     pD3D12Enc->m_inflightResourcesPool[d3d12_video_encoder_pool_current_index(pD3D12Enc)].encode_result = PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_FAILED;
+                     pD3D12Enc->m_spEncodedFrameMetadata[d3d12_video_encoder_metadata_current_index(pD3D12Enc)].encode_result = PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_FAILED;
+                     assert(false);
+                     return;
+                  }
+               }
+               else if (pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFenceValues[i] > 0)
+               {
+                  // The ID3D12Fence objects in pspSubregionFences are reused across frames, but the
+                  // d3d12_fence wrappers (pSubregionPipeFences) are recreated each frame via
+                  // d3d12_create_fence_raw which calls SetEventOnCompletion. When a fence was never
+                  // GPU-signaled (e.g. AUTO slice mode in prev frame produced fewer slices than allocated),
+                  // the previous SetEventOnCompletion registration remains orphaned inside the ID3D12Fence.
+                  // CloseHandle on the event handle (in destroy_fence) does NOT unregister it.
+                  // CPU-signal to (new_value - 1) to flush any stale registration without
+                  // satisfying the upcoming new one.
+                  // At this point, the previous frame is guaranteed to be completed since when
+                  // reusing current_metadata_slot, we only pick slots for frames that are already
+                  // fully completed signaled (i.e. completed) as per the logic in d3d12_video_encoder_begin_frame.
+                  hr = pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i]->Signal(
+                     pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFenceValues[i] - 1);
+                  if (FAILED(hr)) {
+                     debug_printf("ID3D12Fence::Signal failed with HR %x\n", (unsigned)hr);
+                     pD3D12Enc->m_inflightResourcesPool[d3d12_video_encoder_pool_current_index(pD3D12Enc)].encode_result = PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_FAILED;
+                     pD3D12Enc->m_spEncodedFrameMetadata[d3d12_video_encoder_metadata_current_index(pD3D12Enc)].encode_result = PIPE_VIDEO_FEEDBACK_METADATA_ENCODE_FLAG_FAILED;
+                     assert(false);
+                     return;
+                  }
+               }
+               pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].ppSubregionFences[i] = pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i].Get();
+            }
 
             pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pSubregionPipeFences[i].reset(
                d3d12_create_fence_raw(pD3D12Enc->m_spEncodedFrameMetadata[current_metadata_slot].pspSubregionFences[i].Get(),
@@ -5111,7 +5189,7 @@ int d3d12_video_encoder_get_encode_headers([[maybe_unused]] struct pipe_video_co
                                            [[maybe_unused]] void* bitstream_buf,
                                            [[maybe_unused]] unsigned *bitstream_buf_size)
 {
-#if (VIDEO_CODEC_H264ENC || VIDEO_CODEC_H265ENC)
+#if (VIDEO_CODEC_H264ENC || VIDEO_CODEC_H265ENC || VIDEO_CODEC_AV1ENC)
    struct d3d12_video_encoder *pD3D12Enc = (struct d3d12_video_encoder *) codec;
    D3D12_VIDEO_SAMPLE srcTextureDesc = {};
    srcTextureDesc.Width = pD3D12Enc->base.width;
@@ -5128,6 +5206,10 @@ int d3d12_video_encoder_get_encode_headers([[maybe_unused]] struct pipe_video_co
 #if VIDEO_CODEC_H265ENC
       if (u_reduce_video_profile(pD3D12Enc->base.profile) == PIPE_VIDEO_FORMAT_HEVC)
          pD3D12Enc->m_upBitstreamBuilder = std::make_unique<d3d12_video_bitstream_builder_hevc>();
+#endif
+#if VIDEO_CODEC_AV1ENC
+      if (u_reduce_video_profile(pD3D12Enc->base.profile) == PIPE_VIDEO_FORMAT_AV1)
+         pD3D12Enc->m_upBitstreamBuilder = std::make_unique<d3d12_video_bitstream_builder_av1>();
 #endif
    }
    bool postEncodeHeadersNeeded = false;

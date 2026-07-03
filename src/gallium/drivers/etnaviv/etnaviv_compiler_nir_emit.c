@@ -50,7 +50,7 @@ static const struct etna_op_info etna_ops[] = {
 #define IOP(nir, op) IOPC(nir, op, TRUE)
 #define UOP(nir, op) UOPC(nir, op, TRUE)
    OP(mov, MOV), OP(fneg, MOV), OP(fabs, MOV), OP(fsat, MOV),
-   OP(fmul, MUL), OP(fadd, ADD), OP(ffma, MAD),
+   OP(fmul, MUL), OP(fadd, ADD), OP(fmad, MAD),
    OP(fdot2, DP2), OP(fdot3, DP3), OP(fdot4, DP4),
    OPC(fmin, SELECT, GT), OPC(fmax, SELECT, LT),
    OP(ffract, FRC), OP(frcp, RCP), OP(frsq, RSQ),
@@ -118,6 +118,11 @@ static const struct etna_op_info etna_ops[] = {
    IOP(ishr, RSHIFT),
    UOP(ushr, RSHIFT),
    UOP(uclz, LEADZERO),
+   UOP(bitfield_reverse, BIT_REV),
+   UOP(bit_count, POPCOUNT),
+   UOP(ubitfield_extract, BIT_EXTRACT),
+   IOP(ibitfield_extract, BIT_EXTRACT),
+   IOP(bitfield_insert_etna, BIT_INSERT),
 };
 
 void
@@ -263,7 +268,7 @@ etna_emit_discard(struct etna_compile *c, struct etna_inst_src condition)
    }
 
    struct etna_inst inst = {
-      .opcode = ISA_OPC_TEXKILL,
+      .opcode = ISA_OPC_TEXKILL_UNARY,
       .cond = ISA_COND_NZ,
       .type = (c->info->halti < 2) ? ISA_TYPE_F32 : ISA_TYPE_U32,
       .src[0] = condition,

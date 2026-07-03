@@ -243,6 +243,10 @@ impl PipeScreen {
         tmpl: &pipe_resource,
         mem: *mut c_void,
     ) -> Option<PipeResourceOwned> {
+        if !self.has_resource_from_user() {
+            return None;
+        }
+
         PipeResourceOwned::new(
             unsafe { self.screen().resource_from_user_memory?(self.pipe(), tmpl, mem) },
             true,
@@ -465,8 +469,9 @@ impl PipeScreen {
         &self,
         format: pipe_format,
         target: pipe_texture_target,
-        bindings: u32,
+        mut bindings: u32,
     ) -> bool {
+        bindings |= PIPE_BIND_OPENCL;
         unsafe {
             self.screen().is_format_supported.unwrap()(self.pipe(), format, target, 0, 0, bindings)
         }
@@ -559,6 +564,10 @@ impl PipeScreen {
 
     pub fn has_semaphore_create(&self) -> bool {
         self.screen().semaphore_create.is_some()
+    }
+
+    pub fn has_resource_from_user(&self) -> bool {
+        self.caps().resource_from_user_memory || self.caps().resource_from_user_memory_compute_only
     }
 }
 

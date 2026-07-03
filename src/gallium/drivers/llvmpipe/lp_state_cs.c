@@ -49,7 +49,7 @@
 #include "frontend/sw_winsys.h"
 #include "nir/nir_to_tgsi_info.h"
 #include "nir/tgsi_to_nir.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "nir_serialize.h"
 
 #include "draw/draw_context.h"
@@ -60,23 +60,6 @@
 static unsigned cs_no = 0;
 static unsigned task_no = 0;
 static unsigned mesh_no = 0;
-
-struct lp_cs_job_info {
-   unsigned grid_size[3];
-   unsigned iter_size[3];
-   unsigned grid_base[3];
-   unsigned block_size[3];
-   unsigned req_local_mem;
-   unsigned work_dim;
-   unsigned draw_id;
-   bool zero_initialize_shared_memory;
-   bool use_iters;
-   struct lp_cs_exec *current;
-   struct vertex_header *io;
-   size_t io_stride;
-   void *payload;
-   size_t payload_stride;
-};
 
 enum {
    CS_ARG_CONTEXT,
@@ -418,10 +401,16 @@ generate_compute(struct llvmpipe_context *lp,
    }
 
    if (variant->gallivm->cache->data_size) {
+#if GALLIVM_USE_ORCJIT
       gallivm_stub_func(gallivm, function);
       if (use_coro)
          gallivm_stub_func(gallivm, coro);
+      /* Otherwise continue to stub all other functions */
+      if (exec_list_length(&nir->functions) <= 1)
+         return;
+#else
       return;
+#endif
    }
 
    context_ptr  = LLVMGetParam(function, CS_ARG_CONTEXT);
@@ -487,14 +476,31 @@ generate_compute(struct llvmpipe_context *lp,
 
          LLVMTypeRef func_type = LLVMFunctionType(LLVMVoidTypeInContext(gallivm->context),
                                                   args, num_args, 0);
-         LLVMValueRef lfunc = LLVMAddFunction(gallivm->module, func->name, func_type);
+         const char *func_name = func->name ? func->name : "";
+         LLVMValueRef lfunc = LLVMAddFunction(gallivm->module, func_name, func_type);
          LLVMSetFunctionCallConv(lfunc, LLVMCCallConv);
+
+#if GALLIVM_USE_ORCJIT
+         if (gallivm->cache->data_size) {
+            gallivm_stub_func(gallivm, lfunc);
+            continue;
+         }
+#endif
 
          struct lp_build_fn *new_fn = ralloc(fns, struct lp_build_fn);
          new_fn->fn_type = func_type;
          new_fn->fn = lfunc;
          _mesa_hash_table_insert(fns, func, new_fn);
       }
+
+#if GALLIVM_USE_ORCJIT
+      if (gallivm->cache->data_size) {
+         lp_bld_llvm_sampler_soa_destroy(sampler);
+         lp_bld_llvm_image_soa_destroy(image);
+         _mesa_hash_table_destroy(fns, NULL);
+         return;
+      }
+#endif
 
       nir_foreach_function(func, nir) {
          if (func->is_entrypoint)
@@ -1251,7 +1257,7 @@ lp_debug_cs_variant(const struct lp_compute_shader_variant *variant)
 
 static void
 lp_cs_get_ir_cache_key(struct lp_compute_shader_variant *variant,
-                       unsigned char ir_sha1_cache_key[SHA1_DIGEST_LENGTH])
+                       unsigned char ir_blake3_cache_key[BLAKE3_KEY_LEN])
 {
    struct blob blob = { 0 };
    unsigned ir_size;
@@ -1262,11 +1268,11 @@ lp_cs_get_ir_cache_key(struct lp_compute_shader_variant *variant,
    ir_binary = blob.data;
    ir_size = blob.size;
 
-   struct mesa_sha1 ctx;
-   _mesa_sha1_init(&ctx);
-   _mesa_sha1_update(&ctx, &variant->key, variant->shader->variant_key_size);
-   _mesa_sha1_update(&ctx, ir_binary, ir_size);
-   _mesa_sha1_final(&ctx, ir_sha1_cache_key);
+   blake3_hasher ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, &variant->key, variant->shader->variant_key_size);
+   _mesa_blake3_update(&ctx, ir_binary, ir_size);
+   _mesa_blake3_final(&ctx, ir_blake3_cache_key);
 
    blob_finish(&blob);
 }
@@ -1296,13 +1302,13 @@ generate_variant(struct llvmpipe_context *lp,
    variant->shader = shader;
    memcpy(&variant->key, key, shader->variant_key_size);
 
-   unsigned char ir_sha1_cache_key[SHA1_DIGEST_LENGTH];
+   unsigned char ir_blake3_cache_key[BLAKE3_KEY_LEN];
    struct lp_cached_code cached = { 0 };
    bool needs_caching = false;
 
-   lp_cs_get_ir_cache_key(variant, ir_sha1_cache_key);
+   lp_cs_get_ir_cache_key(variant, ir_blake3_cache_key);
 
-   lp_disk_cache_find_shader(screen, &cached, ir_sha1_cache_key);
+   lp_disk_cache_find_shader(screen, &cached, ir_blake3_cache_key);
    if (!cached.data_size)
       needs_caching = true;
 
@@ -1322,8 +1328,10 @@ generate_variant(struct llvmpipe_context *lp,
 
    lp_jit_init_cs_types(variant);
 
+   struct nir_shader *nir = shader->base.ir.nir;
+   variant->stage = nir->info.stage;
+
    if (sh_type == MESA_SHADER_MESH) {
-      struct nir_shader *nir = shader->base.ir.nir;
       int per_prim_count = util_bitcount64(nir->info.per_primitive_outputs);
       int out_count = util_bitcount64(nir->info.outputs_written);
       int per_vert_count = out_count - per_prim_count;
@@ -1349,7 +1357,7 @@ generate_variant(struct llvmpipe_context *lp,
       gallivm_jit_function(variant->gallivm, variant->function, variant->function_name);
 
    if (needs_caching) {
-      lp_disk_cache_insert_shader(screen, &cached, ir_sha1_cache_key);
+      lp_disk_cache_insert_shader(screen, &cached, ir_blake3_cache_key);
    }
    gallivm_free_ir(variant->gallivm);
    return variant;
@@ -2150,6 +2158,8 @@ llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
    }
 
    struct nir_shader *mhs_shader = lp->mhs->base.ir.nir;
+   struct nir_shader *tsk_shader = lp->tss ? lp->tss->base.ir.nir : NULL;
+   uint16_t *workgroup_size = tsk_shader ? tsk_shader->info.workgroup_size : mhs_shader->info.workgroup_size;
    int prim_out_idx = -1;
    int first_per_prim_idx = -1;
    int cull_prim_idx = -1;
@@ -2182,19 +2192,15 @@ llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
    for (unsigned dr = 0; dr < draw_count; dr++) {
       fill_grid_size(pipe, dr, info, job_info.grid_size);
 
-      job_info.grid_base[0] = info->grid_base[0];
-      job_info.grid_base[1] = info->grid_base[1];
-      job_info.grid_base[2] = info->grid_base[2];
-      job_info.block_size[0] = info->block[0];
-      job_info.block_size[1] = info->block[1];
-      job_info.block_size[2] = info->block[2];
+      job_info.block_size[0] = workgroup_size[0];
+      job_info.block_size[1] = workgroup_size[1];
+      job_info.block_size[2] = workgroup_size[2];
 
       void *payload = NULL;
       size_t payload_stride = 0;
       int num_tasks = job_info.grid_size[2] * job_info.grid_size[1] * job_info.grid_size[0];
       int num_mesh_invocs = 1;
       if (lp->tss) {
-         struct nir_shader *tsk_shader = lp->tss->base.ir.nir;
          payload_stride = tsk_shader->info.task_payload_size + 3 * sizeof(uint32_t);
 
          payload = calloc(num_tasks, payload_stride);
@@ -2217,15 +2223,14 @@ llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
             lp_cs_tpool_wait_for_task(screen->cs_tpool, &task);
          }
          if (!lp->queries_disabled)
-            lp->pipeline_statistics.ts_invocations += num_tasks * info->block[0] * info->block[1] * info->block[2];
+            lp->pipeline_statistics.ts_invocations += num_tasks * job_info.block_size[0] * job_info.block_size[1] * job_info.block_size[2];
          num_mesh_invocs = num_tasks;
       }
 
       for (unsigned i = 0; i < num_mesh_invocs; i++) {
-         if (payload) {
+         if (lp->tss) {
             void *this_payload = (char *)payload + (payload_stride * i);
             uint32_t *payload_grid = (uint32_t *)this_payload;
-            assert(lp->tss);
             job_info.grid_size[0] = payload_grid[0];
             job_info.grid_size[1] = payload_grid[1];
             job_info.grid_size[2] = payload_grid[2];
@@ -2233,6 +2238,8 @@ llvmpipe_draw_mesh_tasks(struct pipe_context *pipe,
             job_info.block_size[0] = mhs_shader->info.workgroup_size[0];
             job_info.block_size[1] = mhs_shader->info.workgroup_size[1];
             job_info.block_size[2] = mhs_shader->info.workgroup_size[2];
+         } else {
+            job_info.payload = screen->empty_mesh_payload;
          }
 
          job_info.req_local_mem = lp->mhs->req_local_mem + info->variable_shared_mem;

@@ -28,6 +28,7 @@
 #ifndef AC_VCN_ENC_H
 #define AC_VCN_ENC_H
 
+#include <stdint.h>
 #include "amd_family.h"
 
 #define RENCODE_IB_OP_INITIALIZE                                                    0x01000001
@@ -66,9 +67,11 @@
 
 #define RENCODE_H264_SLICE_CONTROL_MODE_FIXED_MBS                                   0x00000000
 #define RENCODE_H264_SLICE_CONTROL_MODE_FIXED_BITS                                  0x00000001
+#define RENCODE_H264_SLICE_CONTROL_MODE_VARIABLE_MBS                                0x00000002
 
 #define RENCODE_HEVC_SLICE_CONTROL_MODE_FIXED_CTBS                                  0x00000000
 #define RENCODE_HEVC_SLICE_CONTROL_MODE_FIXED_BITS                                  0x00000001
+#define RENCODE_HEVC_SLICE_CONTROL_MODE_VARIABLE_CTBS                               0x00000002
 
 #define RENCODE_RATE_CONTROL_METHOD_NONE                                            0x00000000
 #define RENCODE_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR                         0x00000001
@@ -198,7 +201,7 @@
 #define RENCODE_REC_SWIZZLE_MODE_256B_D                                             2
 #define RENCODE_REC_SWIZZLE_MODE_8x8_1D_THIN_12_24BPP                               0x10000001
 #define RENCODE_REC_SWIZZLE_MODE_8x8_1D_THIN_12_24BPP_VCN4                          0x10000000
-#define RENCODE_REC_SWIZZLE_MODE_256B_D_VCN5                                        1
+#define RENCODE_REC_SWIZZLE_MODE_256B_D_GFX12                                       1
 
 #define RENCODE_VIDEO_BITSTREAM_BUFFER_MODE_LINEAR                                  0
 #define RENCODE_VIDEO_BITSTREAM_BUFFER_MODE_CIRCULAR                                1
@@ -684,6 +687,8 @@ typedef struct rvcn_enc_cmd_s {
    uint32_t metadata;
    uint32_t ctx_override;
    uint32_t enc_latency;
+   uint32_t slice_info_hevc;
+   uint32_t slice_info_h264;
 } rvcn_enc_cmd_t;
 
 typedef struct rvcn_enc_quality_modes_s
@@ -753,6 +758,28 @@ typedef struct rvcn_enc_latency_s
    uint32_t encode_latency;
 } rvcn_enc_latency_t;
 
+#define RENCODE_MAX_NUM_SLICES 32
+
+typedef struct rvcn_enc_h264_slice_info_var_s
+{
+   uint32_t num_slices;
+   struct slice_info
+   {
+      uint32_t num_mbs_per_slice;
+   } slice_info[RENCODE_MAX_NUM_SLICES];
+} rvcn_enc_h264_slice_info_var_t;
+
+typedef struct rvcn_enc_hevc_slice_info_var_s
+{
+   uint32_t num_slice_segments;
+   struct slice_segment_info
+   {
+      uint32_t num_ctbs_per_segment;
+      uint32_t is_independent;
+   } slice_segment_info[RENCODE_MAX_NUM_SLICES];
+} rvcn_enc_hevc_slice_info_var_t;
+
 void ac_vcn_enc_init_cmds(rvcn_enc_cmd_t *cmd, enum vcn_version version);
+bool ac_vcn_enc_variable_slice_mode_supported(const struct radeon_info *info, bool preencode);
 
 #endif

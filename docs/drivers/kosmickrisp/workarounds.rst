@@ -49,6 +49,161 @@ info on what was updated.
 Workarounds
 ===========
 
+KK_WORKAROUND_13
+----------------
+| macOS version: 26.5, 27.0 beta 1
+| Metal ticket: FB23291220
+| Metal ticket status: Waiting resolution
+| CTS test failure: N/A
+| Comments:
+
+Metal 4 guarantees about index buffer out-of-bounds access are not true for
+index buffers that are not 32-bit aligned, for example with 16-bit indices.
+We need to handle them manually by unrolling.
+
+KK_WORKAROUND_12
+----------------
+| macOS version: 26.x
+| Metal ticket: N/A
+| Metal ticket status: Resolved in macOS 27
+| CTS test failure: ``dEQP-VK.robustness.bind_index_buffer2.*.oo_size``
+| Comments:
+
+macOS 26.x is missing some math when configuring the register for the index
+buffer length in the Metal 4 draw paths. To avoid any unpredictable behavior,
+just handle robustness ourselves.
+
+KK_WORKAROUND_11
+----------------
+| macOS version: 26.5
+| Metal ticket: FB22683138
+| Metal ticket status: Waiting resolution
+| CTS test failure: ``dEQP-VK.api.object_management.multithreaded_per_thread_device.merged_pipeline_cache``
+| Comments:
+
+If multiple MTL4Compiler instances are created and used concurrently, they may
+corrupt the heap and crash the application. This has been verified
+independently of KosmicKrisp and reported to Apple using a small demo
+application which directly uses Metal.
+
+The CTS test in question here creates an instance, physical device, and device
+for each of multiple threads, and intentionally creates several pipelines in
+each thread at the same time.
+
+To work around this, maintain a table of devices to compilers, and use it to
+ensure that each device only has one compiler instance to share. `MTLDevice`
+instances are unique within the process, so no matter how many Vulkan devices
+we create, the same GPU uses the same `MTLDevice`. Each `MTL4Compiler` instance
+is still capable of performing concurrent compilation.
+
+KK_WORKAROUND_10
+----------------
+| macOS version: 26.4.1
+| Metal ticket: Not reported
+| Metal ticket status:
+| CTS test failure: ``dEQP-VK.subgroups.arithmetic.compute.subgroupinclusive*_vec4``
+| Comments:
+
+See comment
+https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/41186#note_3470793
+
+In short, certain ``ior`` operations can be and will be turned into ``bcsel``
+before reaching NIR to MSL. However, the MSL compiler seems to incorrectly
+handle ``bcsel`` and the compiled shader misbehaves while the ``ior`` version
+does not. This is worked around by adding a known true value to the conditional
+of the ``bcsel``.
+
+| Log:
+| 2026-05-14: Workaround implemented
+
+KK_WORKAROUND_9
+---------------
+| macOS version: 26.4.1
+| Metal ticket: Not reported
+| Metal ticket status:
+| CTS test failure: ``dEQP-VK.reconvergence.maximal.compute.nesting*``
+| Comments:
+
+Metal seems to re-order the sole break case of a loop such that execution
+reconverges earlier than expected.
+
+From the above mentioned CTS test, consider the following, which is the
+only code path that breaks within a loop:
+
+.. code-block:: c
+
+   if (subgroupElect()) {
+      outputC.loc[gl_LocalInvocationIndex]++;
+      outputB.b[(outLoc++)*invocationStride + gl_LocalInvocationIndex] =
+         subgroupBallot(true);
+      break;
+   }
+
+The test expects the ``subgroupBallot`` to yield just one bit set for the
+thread picked by ``subgroupElect``; however, Metal returns the full 0xFFFFFFFF,
+presumably because it re-ordered the operations to after the loop.
+
+To work around this, we add a trivial, always-true runtime condition to the
+break to ensure that the prior logic is not re-ordered.
+
+KK_WORKAROUND_8
+---------------
+| macOS version: 26.4.1
+| Metal ticket: FB22579201 (@squidbus)
+| Metal ticket status: Waiting resolution
+| CTS test failure: N/A
+| Comments:
+
+Metal GPU capture uses ``currentAllocatedSize`` to create an internal buffer
+over ``MTLHeap`` for the purpose of capturing its contents.
+
+Suppose we have a heap whose size is under the memory page size. Under native
+ARM execution, both the heap ``size`` and ``currentAllocatedSize`` will be
+aligned up to 16K. However, it has been observed that under Rosetta 2, ``size``
+will be aligned up to 4K but ``currentAllocatedSize`` will still be aligned up
+to 16K.
+
+These two in combination mean that, when GPU capture attempts to create buffers
+for these small heaps, it will fail, as ``currentAllocatedSize`` is larger than
+the heap ``size``. This will cause Metal validation layer errors if they are
+enabled, and attempting to take a GPU capture will crash the application.
+
+This workaround ensures that under Rosetta 2, heap sizes will be aligned to a
+minimum of 16K, prevening this scenario from occurring.
+
+| Log:
+| 2026-04-27: Workaround implemented
+
+KK_WORKAROUND_7
+---------------
+| macOS version: 26.0.1
+| Metal ticket: Not reported
+| Metal ticket status:
+| CTS test failure: ``dEQP-VK.renderpasses.renderpass2.depth_stencil_resolve.image_2d_*testing_stencil_samplemask``
+| Comments:
+
+Metal seems to ignore sample_mask out for cases for the stencil attachment
+where we have no color attachments, a multisample depth_stencil attachment
+with at least 2 samples and a fragment shader that only writes the depth and
+a static sample_mask out.
+
+My conclusion is that they may try to prematurely optimize by doing early
+fragment testing disregarding completely the sample_mask out and applying
+the value to all stencil samples.
+
+The failing tests do something along the lines of, start render pass with
+depth_stencil cleared to 0.0f and 0 respectively, if depth test passes set
+stencil to 1. Sample mask out is 1 (first sample). Draw framebuffer size square
+with 0.5f depth. End render pass storing values. Start render pass loading the
+previous output but if depth passes stencil will be set to 255. Sample mask out
+is 2 (second sample). Draw framebuffer size square with 0.5f depth.
+
+In a similar fashion to 2 workarounds below this one, we do a conditional
+discard at the end discarding fragments not covered by the coverage_mask.
+
+| Log:
+| 2026-02-05: Workaround implemented
+
 KK_WORKAROUND_6
 ---------------
 | macOS version: 26.0.1
@@ -79,6 +234,7 @@ Hopefully this does not affect performance much.
 
 | Log:
 | 2025-12-08: Workaround implemented and reported to Apple
+| 2026-06-22: Fixed in macOS 27 Beta (Build 26A5353q)
 
 KK_WORKAROUND_5
 ---------------
@@ -97,6 +253,7 @@ a premature discard.
 
 | Log:
 | 2025-12-01: Workaround implemented
+| 2026-06-22: Fixed in macOS 27 Beta (Build 26A5353q)
 
 KK_WORKAROUND_4
 ---------------
@@ -113,17 +270,27 @@ fragment is discarded. This issue is present in M1 and M2 chips.
 
 | Log:
 | 2025-11-22: Workaround implemented and reported to Apple
+| 2026-06-22: Fixed in macOS 27 Beta (Build 26A5353q)
 
 KK_WORKAROUND_3
 ---------------
 | macOS version: 15.4.x
 | Metal ticket: FB20113490 (@aitor)
 | Metal ticket status: Waiting resolution
-| CTS test failure: ``dEQP-VK.subgroups.ballot_other.*.subgroupballotfindlsb``
+| CTS test failure: ``dEQP-VK.subgroups.ballot_other.*.subgroupballotfindlsb``, ``dEQP-VK.subgroups.arithmetic.graphics.*``, ``dEQP-VK.subgroups.shader_quad_control.divergent_condition``
 | Comments:
 
-``simd_is_first`` does not seem to behave as documented in the MSL
-specification. The following code snippet misbehaves:
+``simd_ballot`` within a conditional block does not seem to behave as
+documented in the MSL specification. For example, the following code blocks
+misbehave:
+
+.. code-block:: c
+
+   bool execute = (gl_SubGroupInvocation & 1u) != 0u;
+   if (execute)
+      temp = simd_ballot(true); /* <- This may return all active threads... */
+   else
+      temp = 2u;
 
 .. code-block:: c
 
@@ -132,17 +299,34 @@ specification. The following code snippet misbehaves:
    else
       temp = simd_ballot(true); /* <- This will return all active threads... */
 
-The way to fix this is by changing the conditional to:
+This appears to also apply to ``quad_any`` and ``quad_all``, and likely the
+``simd`` equivalents as well.
+
+The way to fix this is to use ``simd_or`` instead:
 
 .. code-block:: c
 
-   if (simd_is_first() && (ulong)simd_ballot(true))
-      temp = 3u;
+   bool execute = (gl_SubGroupInvocation & 1u) != 0u;
+   if (execute)
+      temp = simd_or(1 << gl_SubGroupInvocation);
    else
-      temp = (ulong)simd_ballot(true);
+      temp = 2u;
+
+Alternatively, the conditional can be changed to include ``simd_ballot(true)``:
+
+.. code-block:: c
+
+   bool execute = (gl_SubGroupInvocation & 1u) != 0u;
+   if (execute && (ulong)simd_ballot(true))
+      temp = simd_ballot(true);
+   else
+      temp = 2u;
+
 
 | Log:
 | 2025-09-09: Workaround implemented and reported to Apple
+| 2026-04-28: Workaround updated to expand to all ballot/vote ops.
+| 2026-06-22: Fixed in macOS 27 Beta (Build 26A5353q)
 
 KK_WORKAROUND_2
 ---------------
@@ -180,6 +364,7 @@ tricks the MSL compiler into believing we are not doing an infinite loop
 
 | Log:
 | 2025-09-08: Workaround implemented
+| 2026-06-22: Fixed in macOS 27 Beta (Build 26A5353q)
 
 KK_WORKAROUND_1
 ---------------

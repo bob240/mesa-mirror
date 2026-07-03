@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2021 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef __VALHALL_H
@@ -28,6 +10,7 @@
 #include "util/macros.h"
 #include "bi_opcodes.h"
 #include "valhall_enums.h"
+#include "shader_enums.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -195,14 +178,36 @@ va_op_dest_modifier_does_convert(enum bi_opcode op)
 
 enum va_shader_output {
    /* Output position data */
-   VA_SHADER_OUTPUT_POSITION = BITFIELD_BIT(0),
+   VA_SHADER_OUTPUT_POSITION,
 
    /* Output position FIFO attributes */
-   VA_SHADER_OUTPUT_ATTRIB = BITFIELD_BIT(1),
+   VA_SHADER_OUTPUT_ATTRIB,
 
    /* Output varying */
-   VA_SHADER_OUTPUT_VARY = BITFIELD_BIT(2),
+   VA_SHADER_OUTPUT_VARY,
+
+   /* Number of variants, keep last */
+   VA_SHADER_OUTPUT_COUNT
 };
+
+#define VA_SHADER_OUTPUT_POSITION_BIT BITFIELD_BIT(VA_SHADER_OUTPUT_POSITION)
+#define VA_SHADER_OUTPUT_ATTRIB_BIT BITFIELD_BIT(VA_SHADER_OUTPUT_ATTRIB)
+#define VA_SHADER_OUTPUT_VARY_BIT BITFIELD_BIT(VA_SHADER_OUTPUT_VARY)
+
+static inline enum va_shader_output
+va_shader_output_from_loc(gl_varying_slot location)
+{
+   switch (location) {
+   case VARYING_SLOT_POS:
+      return VA_SHADER_OUTPUT_POSITION;
+   case VARYING_SLOT_PSIZ:
+   case VARYING_SLOT_LAYER:
+   case VARYING_SLOT_PRIMITIVE_ID:
+      return VA_SHADER_OUTPUT_ATTRIB;
+   default:
+      return VA_SHADER_OUTPUT_VARY;
+   }
+}
 
 #ifdef __cplusplus
 } /* extern C */

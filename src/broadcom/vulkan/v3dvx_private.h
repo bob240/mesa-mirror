@@ -22,11 +22,11 @@
  */
 
 /* This file generates the per-v3d-version function prototypes.  It must only
- * be included from v3dv_private.h.
+ * be included from v3dv_version_dispatch.h.
  */
 
-#ifndef V3DV_PRIVATE_H
-#error This file is included by means other than v3dv_private.h
+#ifndef V3DV_VERSION_DISPATCH_H
+#error This file is included by means other than v3dv_version_dispatch.h
 #endif
 
 /* Used at v3dv_cmd_buffer */
@@ -280,12 +280,6 @@ v3dX(meta_framebuffer_init)(struct v3dv_meta_framebuffer *fb,
 /* Used at v3dv_pipeline */
 void
 v3dX(pipeline_pack_state)(struct v3dv_pipeline *pipeline,
-                          const VkPipelineColorBlendStateCreateInfo *cb_info,
-                          const VkPipelineDepthStencilStateCreateInfo *ds_info,
-                          const VkPipelineRasterizationStateCreateInfo *rs_info,
-                          const VkPipelineRasterizationProvokingVertexStateCreateInfoEXT *pv_info,
-                          const VkPipelineRasterizationLineStateCreateInfoEXT *ls_info,
-                          const VkPipelineMultisampleStateCreateInfo *ms_info,
                           const struct vk_graphics_pipeline_state *state);
 void
 v3dX(pipeline_pack_compile_state)(struct v3dv_pipeline *pipeline,
@@ -299,10 +293,6 @@ struct v3dv_bo *
 v3dX(create_default_attribute_values)(struct v3dv_device *device,
                                       struct v3dv_pipeline *pipeline);
 
-/* Used at v3dv_queue */
-void
-v3dX(job_emit_noop)(struct v3dv_job *job);
-
 /* Used at v3dv_descriptor_set, and other descriptor set utils */
 uint32_t v3dX(descriptor_bo_size)(VkDescriptorType type);
 
@@ -312,10 +302,11 @@ uint32_t v3dX(combined_image_sampler_texture_state_offset)(uint8_t plane);
 
 uint32_t v3dX(combined_image_sampler_sampler_state_offset)(uint8_t plane);
 
+void v3dX(pack_null_texture_state)(struct v3dv_device *device, void *map);
+
 /* General utils */
 
 void
 v3dX(viewport_compute_xform)(const VkViewport *viewport,
                              float scale[3],
                              float translate[3]);
-

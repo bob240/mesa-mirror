@@ -43,6 +43,7 @@
 #include "hwdef/pvr_hw_utils.h"
 #include "hwdef/rogue_hw_utils.h"
 #include "pvr_bo.h"
+#include "vk_debug_utils.h"
 #include "pvr_buffer.h"
 #include "pvr_entrypoints.h"
 #include "pvr_framebuffer.h"
@@ -61,7 +62,7 @@
 #include "pvr_wsi.h"
 #include "util/log.h"
 #include "util/macros.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/os_misc.h"
 #include "util/u_math.h"
 #include "vk_device_memory.h"
@@ -72,11 +73,6 @@
 #include "vk_physical_device_properties.h"
 #include "vk_sampler.h"
 #include "vk_util.h"
-
-/* Amount of padding required for VkBuffers to ensure we don't read beyond
- * a page boundary.
- */
-#define PVR_BUFFER_MEMORY_PADDING_SIZE 4
 
 /** Gets the amount of memory to allocate per-core for a tile buffer. */
 static uint32_t
@@ -182,13 +178,60 @@ void pvr_rstate_entry_remove(struct pvr_device *device,
       if (entry != rstate)
          continue;
 
-      pvr_render_state_cleanup(device, rstate);
+      pvr_render_state_cleanup(device, &device->vk.alloc, rstate);
       list_del(&entry->link);
 
       vk_free(&device->vk.alloc, entry);
    }
 
    simple_mtx_unlock(&device->rs_mtx);
+}
+
+static void pvr_memory_emit_report(struct pvr_device *device,
+                                   struct pvr_device_memory *mem,
+                                   bool is_alloc,
+                                   VkResult result)
+{
+   struct vk_device *dev_vk = &device->vk;
+
+   if (likely(!dev_vk->memory_reports))
+      return;
+
+   assert(mem);
+
+   const struct vk_device_memory *mem_vk = &mem->vk;
+   VkDeviceMemoryReportEventTypeEXT type;
+
+   if (result != VK_SUCCESS) {
+      type = VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATION_FAILED_EXT;
+   } else if (is_alloc) {
+      type = mem_vk->import_handle_type
+                ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_IMPORT_EXT
+                : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATE_EXT;
+   } else {
+      type = mem_vk->import_handle_type
+                ? VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_UNIMPORT_EXT
+                : VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_FREE_EXT;
+   }
+
+   const uint64_t mem_obj_id = mem->bo ? (uintptr_t)mem->bo : 0;
+   const uint64_t obj_handle =
+      (type == VK_DEVICE_MEMORY_REPORT_EVENT_TYPE_ALLOCATION_FAILED_EXT)
+         ? 0
+         : (uintptr_t)mem;
+
+   assert(mem_vk->memory_type_index < device->pdevice->memory.memoryTypeCount);
+
+   const VkMemoryType *mem_type =
+      &device->pdevice->memory.memoryTypes[mem_vk->memory_type_index];
+
+   vk_emit_device_memory_report(dev_vk,
+                                type,
+                                mem_obj_id,
+                                mem_vk->size,
+                                VK_OBJECT_TYPE_DEVICE_MEMORY,
+                                obj_handle,
+                                mem_type->heapIndex);
 }
 
 VkResult pvr_AllocateMemory(VkDevice _device,
@@ -314,9 +357,13 @@ VkResult pvr_AllocateMemory(VkDevice _device,
 
    *pMem = pvr_device_memory_to_handle(mem);
 
+   pvr_memory_emit_report(device, mem, true, VK_SUCCESS);
+
    return VK_SUCCESS;
 
 err_vk_device_memory_destroy:
+   pvr_memory_emit_report(device, mem, true, result);
+
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 
    return result;
@@ -372,6 +419,8 @@ void pvr_FreeMemory(VkDevice _device,
 
    if (!mem)
       return;
+
+   pvr_memory_emit_report(device, mem, false, VK_SUCCESS);
 
    /* From the Vulkan spec (§11.2.13. Freeing Device Memory):
     *   If a memory object is mapped at the time it is freed, it is implicitly
@@ -701,7 +750,7 @@ VkResult pvr_CreateBuffer(VkDevice _device,
                           VkBuffer *pBuffer)
 {
    VK_FROM_HANDLE(pvr_device, device, _device);
-   const uint32_t alignment = 4096;
+   const uint32_t alignment = device->pdevice->ws->page_size;
    struct pvr_buffer *buffer;
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
@@ -931,6 +980,7 @@ void pvr_render_targets_fini(struct pvr_render_target *render_targets,
 }
 
 void pvr_render_state_cleanup(struct pvr_device *device,
+                              const VkAllocationCallbacks *pAllocator,
                               const struct pvr_render_state *rstate)
 {
    if (!rstate)
@@ -947,7 +997,7 @@ void pvr_render_state_cleanup(struct pvr_device *device,
    pvr_render_targets_fini(rstate->render_targets,
                            rstate->render_targets_count);
    pvr_bo_suballoc_free(rstate->ppp_state_bo);
-   vk_free(&device->vk.alloc, rstate->render_targets);
+   vk_free2(&device->vk.alloc, pAllocator, rstate->render_targets);
 }
 
 void pvr_GetBufferMemoryRequirements2(
@@ -985,8 +1035,9 @@ void pvr_GetBufferMemoryRequirements2(
       size += PVR_BUFFER_MEMORY_PADDING_SIZE;
    }
 
+   /* Use align64 to prevent overflow for large buffers (> 4GB). */
    pMemoryRequirements->memoryRequirements.size =
-      ALIGN_POT(size, buffer->alignment);
+      align64(size, buffer->alignment);
 
    vk_foreach_struct (ext, pMemoryRequirements->pNext) {
       switch (ext->sType) {
@@ -1003,6 +1054,61 @@ void pvr_GetBufferMemoryRequirements2(
          break;
       }
    }
+}
+
+void pvr_GetDeviceBufferMemoryRequirements(
+   VkDevice _device,
+   const VkDeviceBufferMemoryRequirements *pInfo,
+   VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(pvr_device, device, _device);
+   struct pvr_buffer buffer = { 0 };
+
+   /* Initialize a minimal buffer structure */
+   vk_buffer_init(&device->vk, &buffer.vk, pInfo->pCreateInfo);
+   buffer.alignment = device->pdevice->ws->page_size;
+
+   VkBufferMemoryRequirementsInfo2 buffer_info = {
+      .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2,
+      .buffer = pvr_buffer_to_handle(&buffer),
+   };
+
+   pvr_GetBufferMemoryRequirements2(_device, &buffer_info, pMemoryRequirements);
+
+   /* Clean up the temporary buffer */
+   vk_buffer_finish(&buffer.vk);
+}
+
+void pvr_GetDeviceImageMemoryRequirements(
+   VkDevice _device,
+   const VkDeviceImageMemoryRequirements *pInfo,
+   VkMemoryRequirements2 *pMemoryRequirements)
+{
+   VK_FROM_HANDLE(pvr_device, device, _device);
+   struct pvr_image image = { 0 };
+
+   vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
+   pvr_image_init(device, pInfo->pCreateInfo, &image);
+
+   VkImageMemoryRequirementsInfo2 image_info = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2,
+      .image = pvr_image_to_handle(&image),
+   };
+
+   pvr_GetImageMemoryRequirements2(_device, &image_info, pMemoryRequirements);
+
+   pvr_image_fini(device, &image);
+   vk_image_finish(&image.vk);
+}
+
+void pvr_GetDeviceImageSparseMemoryRequirements(
+   VkDevice device,
+   const VkDeviceImageMemoryRequirements *pInfo,
+   uint32_t *pSparseMemoryRequirementCount,
+   VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+   /* Sparse images are not yet supported */
+   *pSparseMemoryRequirementCount = 0;
 }
 
 void pvr_GetImageMemoryRequirements2(VkDevice _device,
@@ -1037,7 +1143,7 @@ void pvr_GetImageMemoryRequirements2(VkDevice _device,
     */
    pMemoryRequirements->memoryRequirements.alignment = image->alignment;
    pMemoryRequirements->memoryRequirements.size =
-      align64(image->size, image->alignment);
+      align64(image->total_size, image->alignment);
    pMemoryRequirements->memoryRequirements.memoryTypeBits = memory_types;
 
    vk_foreach_struct (ext, pMemoryRequirements->pNext) {

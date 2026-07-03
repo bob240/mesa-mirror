@@ -11,8 +11,8 @@
 #define TU_IMAGE_H
 
 #include "tu_common.h"
-#include "fdl/freedreno_lrz_layout.h"
 
+#include "fdl/freedreno_lrz_layout.h"
 #include "tu_knl.h"
 
 #define TU_MAX_PLANE_COUNT 3
@@ -34,6 +34,7 @@ struct tu_image
    struct vk_image vk;
 
    struct fdl_layout layout[3];
+   uint64_t subsampled_metadata_offset;
    uint64_t total_size;
 
    /* Set when bound */
@@ -54,23 +55,14 @@ struct tu_image
    /* Maximum width/height of tiles for use with this image, or ~0 if no constraints. */
    uint32_t max_tile_w_constraint_fdm;
    uint32_t max_tile_h_constraint_fdm;
-
-   bool ubwc_enabled;
-   bool force_linear_tile;
-   bool is_mutable;
-   /* Force to either use tiled layout or linear for all mip layers. */
-   bool force_disable_linear_fallback;
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)
 
-VkResult
-tu_image_init(struct tu_device *device, struct tu_image *image,
-              const VkImageCreateInfo *pCreateInfo);
-
 template <chip CHIP>
 VkResult
-tu_image_update_layout(struct tu_device *device, struct tu_image *image,
-                       uint64_t modifier, const VkSubresourceLayout *plane_layouts);
+tu_image_init(struct tu_device *device, struct tu_image *image,
+              const VkImageCreateInfo *pCreateInfo, uint64_t modifier,
+              const VkSubresourceLayout *plane_layouts);
 
 struct tu_image_view
 {
@@ -163,10 +155,6 @@ tu_fragment_density_map_sample(const struct tu_image_view *fdm,
                                int32_t x, int32_t y,
                                uint32_t width, uint32_t height,
                                uint32_t layer, struct tu_frag_area *area);
-
-VkResult
-tu_image_update_layout(struct tu_device *device, struct tu_image *image,
-                       uint64_t modifier, const VkSubresourceLayout *plane_layouts);
 
 void
 tu_bind_sparse_image(struct tu_device *device, void *submit,

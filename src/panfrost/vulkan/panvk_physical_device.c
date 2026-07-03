@@ -1,5 +1,7 @@
 /*
  * Copyright © 2021 Collabora Ltd.
+ * Copyright © 2026 Google LLC
+ * Copyright © 2026 Arm Ltd.
  *
  * Derived from tu_device.c which is:
  * Copyright © 2016 Red Hat.
@@ -10,17 +12,19 @@
  */
 
 #include <sys/stat.h>
-#include <sys/sysinfo.h>
 
 #include "util/disk_cache.h"
 #include "util/os_misc.h"
+#include "util/u_atomic.h"
 #include "git_sha1.h"
 
 #include "vk_android.h"
 #include "vk_device.h"
 #include "vk_drm_syncobj.h"
+#include "vk_enum_defines.h"
 #include "vk_format.h"
 #include "vk_log.h"
+#include "vk_physical_device.h"
 #include "vk_util.h"
 
 #include "panvk_device.h"
@@ -38,6 +42,7 @@
 #define PER_ARCH_FUNCS(_ver)                                                   \
    void panvk_v##_ver##_get_physical_device_extensions(                        \
       const struct panvk_physical_device *device,                              \
+      const struct panvk_instance *instance,                                   \
       struct vk_device_extension_table *ext);                                  \
                                                                                \
    void panvk_v##_ver##_get_physical_device_features(                          \
@@ -63,6 +68,7 @@ PER_ARCH_FUNCS(7);
 PER_ARCH_FUNCS(10);
 PER_ARCH_FUNCS(12);
 PER_ARCH_FUNCS(13);
+PER_ARCH_FUNCS(14);
 
 static VkResult
 create_kmod_dev(struct panvk_physical_device *device,
@@ -143,29 +149,30 @@ static void
 init_shader_caches(struct panvk_physical_device *device,
                    const struct panvk_instance *instance)
 {
-   struct mesa_sha1 sha_ctx;
-   _mesa_sha1_init(&sha_ctx);
+   blake3_hasher blake3_ctx;
+   _mesa_blake3_init(&blake3_ctx);
 
-   _mesa_sha1_update(&sha_ctx, instance->driver_build_sha,
+   _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                      sizeof(instance->driver_build_sha));
 
-   _mesa_sha1_update(&sha_ctx, &device->kmod.dev->props.gpu_id,
+   _mesa_blake3_update(&blake3_ctx, &device->kmod.dev->props.gpu_id,
                      sizeof(device->kmod.dev->props.gpu_id));
 
-   unsigned char sha[SHA1_DIGEST_LENGTH];
-   _mesa_sha1_final(&sha_ctx, sha);
+   unsigned char blake3[BLAKE3_KEY_LEN];
+   _mesa_blake3_final(&blake3_ctx, blake3);
 
-   STATIC_ASSERT(VK_UUID_SIZE <= SHA1_DIGEST_LENGTH);
-   memcpy(device->cache_uuid, sha, VK_UUID_SIZE);
+   STATIC_ASSERT(VK_UUID_SIZE <= BLAKE3_KEY_LEN);
+   memcpy(device->cache_uuid, blake3, VK_UUID_SIZE);
 
 #ifdef ENABLE_SHADER_CACHE
-   char renderer[17];
-   ASSERTED int len = snprintf(renderer, sizeof(renderer), "panvk_0x%08x",
-                               device->kmod.dev->props.gpu_id);
+   char renderer[25];
+   ASSERTED int len =
+      snprintf(renderer, sizeof(renderer), "panvk_0x%016" PRIx64,
+               device->kmod.dev->props.gpu_id);
    assert(len == sizeof(renderer) - 1);
 
-   char timestamp[SHA1_DIGEST_STRING_LENGTH];
-   _mesa_sha1_format(timestamp, instance->driver_build_sha);
+   char timestamp[BLAKE3_HEX_LEN];
+   _mesa_blake3_format(timestamp, instance->driver_build_sha);
 
    const uint64_t driver_flags = 0;
    device->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
@@ -188,10 +195,10 @@ free_disk_cache(struct panvk_physical_device *device)
 static VkResult
 get_core_mask(struct panvk_physical_device *device,
               const struct panvk_instance *instance, const char *option_name,
-              uint64_t *mask)
+              uint64_t opt_mask, uint64_t *mask)
 {
    uint64_t present = device->kmod.dev->props.shader_present;
-   *mask = driQueryOptionu64(&instance->dri_options, option_name) & present;
+   *mask = opt_mask & present;
 
    if (!*mask)
       return panvk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
@@ -209,45 +216,31 @@ get_core_masks(struct panvk_physical_device *device,
    VkResult result;
 
    result = get_core_mask(device, instance, "pan_compute_core_mask",
+                          instance->drirc.misc.compute_core_mask,
                           &device->compute_core_mask);
    if (result != VK_SUCCESS)
       return result;
    result = get_core_mask(device, instance, "pan_fragment_core_mask",
+                          instance->drirc.misc.fragment_core_mask,
                           &device->fragment_core_mask);
 
    return result;
 }
 
-static uint64_t
-get_system_heap_size()
-{
-   struct sysinfo info;
-   sysinfo(&info);
-
-   uint64_t total_ram = (uint64_t)info.totalram * info.mem_unit;
-
-   /* We don't want to burn too much ram with the GPU.  If the user has 4GiB
-    * or less, we use at most half.  If they have more than 4GiB, we use 3/4.
-    */
-   uint64_t available_ram;
-   if (total_ram <= 4ull * 1024 * 1024 * 1024)
-      available_ram = total_ram / 2;
-   else
-      available_ram = total_ram * 3 / 4;
-
-   return available_ram;
-}
-
 static VkResult
 get_device_heaps(struct panvk_physical_device *device,
-                 const struct panvk_instance *instance)
+                 struct panvk_instance *instance)
 {
    int host_coherent_not_cached_idx = -1;
    int host_cached_not_coherent_idx = -1;
 
+   const uint64_t heap_size =
+      os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
+                           &instance->drirc.misc.heap_memory_percent);
+
    device->memory.heap_count = 1;
-   device->memory.heaps[0] = (VkMemoryHeap) {
-      .size = get_system_heap_size(),
+   device->memory.heaps[0] = (VkMemoryHeap){
+      .size = heap_size,
       .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
    };
 
@@ -315,6 +308,11 @@ get_device_heaps(struct panvk_physical_device *device,
       device->memory.types[host_coherent_not_cached_idx] =
          host_cached_not_coherent_type;
    }
+
+   const uint64_t request_va =
+      PANVK_DEBUG(NO_EXTENDED_VA_RANGE) ? 1ull << 32 : 1ull << 48;
+   device->memory.max_supported_va =
+      pan_clamp_to_usable_va_range(device->kmod.dev, request_va);
 
    return VK_SUCCESS;
 }
@@ -395,7 +393,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
 
    if (!device->model) {
       result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
-                            "Unknown gpu_id (%#x) or variant (%#x)",
+                            "Unknown gpu_id (%#" PRIx64 ") or variant (%#x)",
                             device->kmod.dev->props.gpu_id,
                             device->kmod.dev->props.gpu_variant);
       goto fail;
@@ -404,6 +402,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
    switch (arch) {
    case 6:
    case 7:
+   case 14:
       if (!os_get_option("PAN_I_WANT_A_BROKEN_VULKAN_DRIVER")) {
          result = panvk_errorf(instance, VK_ERROR_INCOMPATIBLE_DRIVER,
                                "WARNING: panvk is not well-tested on v%d, "
@@ -461,7 +460,7 @@ panvk_physical_device_init(struct panvk_physical_device *device,
       vk_warn_non_conformant_implementation("panvk");
 
    struct vk_device_extension_table supported_extensions;
-   panvk_arch_dispatch(arch, get_physical_device_extensions, device,
+   panvk_arch_dispatch(arch, get_physical_device_extensions, device, instance,
                        &supported_extensions);
 
    struct vk_features supported_features;
@@ -615,6 +614,47 @@ panvk_GetPhysicalDeviceMemoryProperties2(
       pMemoryProperties->memoryProperties.memoryTypes[i] =
           physical_device->memory.types[i];
    }
+
+   vk_foreach_struct(ext, pMemoryProperties->pNext) {
+      switch (ext->sType) {
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
+         VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = (void *)ext;
+
+         uint64_t used = p_atomic_read(&physical_device->memory.heap_used);
+         uint64_t heap_size = physical_device->memory.heaps[0].size;
+
+         /* From the Vulkan 1.3.278 spec:
+          *
+          *    "heapUsage is an array of VK_MAX_MEMORY_HEAPS VkDeviceSize
+          *    values in which memory usages are returned, with one element
+          *    for each memory heap. A heap’s usage is an estimate of how
+          *    much memory the process is currently using in that heap."
+          */
+         p->heapUsage[0] = used;
+
+         /* Set the budget at 90% of available to avoid thrashing */
+         p->heapBudget[0] = vk_physical_device_heap_budget_from_system(
+            &physical_device->vk, 0.9f, heap_size, used);
+
+         /* From the Vulkan 1.3.278 spec:
+          *
+          *    "The heapBudget and heapUsage values must be zero for array
+          *    elements greater than or equal to
+          *    VkPhysicalDeviceMemoryProperties::memoryHeapCount. The
+          *    heapBudget value must be non-zero for array elements less than
+          *    VkPhysicalDeviceMemoryProperties::memoryHeapCount."
+          */
+         for (unsigned i = 1; i < VK_MAX_MEMORY_HEAPS; i++) {
+            p->heapBudget[i] = 0;
+            p->heapUsage[i] = 0;
+         }
+         break;
+      }
+      default:
+         vk_debug_ignored_stype(ext->sType);
+         break;
+      }
+   }
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -727,7 +767,8 @@ get_image_plane_format_features(struct panvk_physical_device *physical_device,
       features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_READ_WITHOUT_FORMAT_BIT |
                   VK_FORMAT_FEATURE_2_STORAGE_WRITE_WITHOUT_FORMAT_BIT;
-      if (pfmt == PIPE_FORMAT_R32_UINT || pfmt == PIPE_FORMAT_R32_SINT)
+      if (pfmt == PIPE_FORMAT_R32_UINT || pfmt == PIPE_FORMAT_R32_SINT ||
+          pfmt == PIPE_FORMAT_R32_FLOAT)
          features |= VK_FORMAT_FEATURE_2_STORAGE_IMAGE_ATOMIC_BIT;
    }
 
@@ -798,8 +839,14 @@ get_image_format_features(struct panvk_physical_device *physical_device,
        * each have their own, separate filters, so these two bits make sense
        * for multi-planar formats only.
        */
-      features |= VK_FORMAT_FEATURE_2_DISJOINT_BIT |
-                  VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT;
+      features |= VK_FORMAT_FEATURE_2_DISJOINT_BIT;
+
+      /* YUV texturing only support unified filtering across planes. */
+      unsigned arch = pan_arch(physical_device->kmod.dev->props.gpu_id);
+      if (!panvk_image_use_yuv_tex(arch, format)) {
+         features |=
+            VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT;
+      }
    }
 
    return features;
@@ -828,6 +875,34 @@ panvk_get_sample_counts(unsigned arch, unsigned max_tib_size,
       sample_counts |= VK_SAMPLE_COUNT_16_BIT;
 
    return sample_counts;
+}
+
+/* Plane descriptors have limits to how large resources they can encode, both
+ * for the buffer size and for the slice-strides.
+ *
+ * The only mandates we have from the Vulkan spec to limit resource sizes,
+ * is to use the maxImageDimension* limits, or through maxResourceSize.
+ * Limiting using maxImageDimension* has application compatibility problems,
+ * so let's use maxResourceSize.
+ *
+ * Unfortunately, this means we have to limit the *entire* resource to the
+ * limit, rather than just a single image plane.
+ */
+
+VkDeviceSize
+panvk_get_max_resource_size(const struct panvk_physical_device *device)
+{
+   const unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+   unsigned max_desc_size = u_uintN_max(arch < 11 ? 32 : 48);
+   return MIN2(max_desc_size, device->memory.max_supported_va);
+}
+
+VkDeviceSize
+panvk_get_max_buffer_size(const struct panvk_physical_device *device)
+{
+   const unsigned arch = pan_arch(device->kmod.dev->props.gpu_id);
+   unsigned max_desc_size = u_uintN_max(arch < 11 ? 32 : 48);
+   return MIN2(max_desc_size, device->memory.max_supported_va);
 }
 
 static VkFormatFeatureFlags2
@@ -890,10 +965,14 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
    VkFormatFeatureFlags2 buffer =
       get_buffer_format_features(physical_device, format);
 
+   VkFormatFeatureFlags tex_legacy = vk_format_features2_to_features(tex);
+   VkFormatFeatureFlags buffer_legacy =
+      vk_format_features2_to_features(buffer);
+
    pFormatProperties->formatProperties = (VkFormatProperties){
-      .linearTilingFeatures = tex,
-      .optimalTilingFeatures = tex,
-      .bufferFeatures = buffer,
+      .linearTilingFeatures = tex_legacy,
+      .optimalTilingFeatures = tex_legacy,
+      .bufferFeatures = buffer_legacy,
    };
 
    VkFormatProperties3 *formatProperties3 =
@@ -904,39 +983,88 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
       formatProperties3->bufferFeatures = buffer;
    }
 
+   const uint32_t plane_count = vk_format_get_plane_count(format);
+
+   PAN_SUPPORTED_MODIFIERS(supported);
+   uint64_t afbc_modifiers[ARRAY_SIZE(supported)];
+   uint32_t afbc_modifier_count = 0;
+   if (PANVK_DEBUG(WSI_AFBC) &&
+         pan_afbc_supports_format(arch, vk_format_to_pipe_format(format))) {
+      for (uint32_t mi = 0; mi < ARRAY_SIZE(supported); mi++) {
+         if (drm_is_afbc(supported[mi]))
+            afbc_modifiers[afbc_modifier_count++] = supported[mi];
+      }
+   }
    VkDrmFormatModifierPropertiesListEXT *list = vk_find_struct(
       pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT);
    if (list) {
+      VkFormatFeatureFlags optimal_features =
+         pFormatProperties->formatProperties.optimalTilingFeatures;
+      VkFormatFeatureFlags linear_features =
+         pFormatProperties->formatProperties.linearTilingFeatures;
+
       VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierPropertiesEXT, out,
-                             list->pDrmFormatModifierProperties,
-                             &list->drmFormatModifierCount);
-      if (pFormatProperties->formatProperties.optimalTilingFeatures &&
-          PANVK_DEBUG(WSI_AFBC))
-      {
-         PAN_SUPPORTED_MODIFIERS(supported);
-         for (int mi = 0; mi < ARRAY_SIZE(supported); mi++) {
-            if (drm_is_afbc(supported[mi]) &&
-                pan_afbc_supports_format(arch, vk_format_to_pipe_format(format)))
+                              list->pDrmFormatModifierProperties,
+                              &list->drmFormatModifierCount);
+
+      if (optimal_features) {
+         /* Multi-planar AFBC is not supported. */
+         assert(!afbc_modifier_count || plane_count == 1);
+
+         for (uint32_t i = 0; i < afbc_modifier_count; i++) {
+            vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
+                                       mod_props)
             {
-               vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out, mod_props)
-               {
-                  mod_props->drmFormatModifier = supported[mi];
-                  mod_props->drmFormatModifierPlaneCount = 1;
-                  mod_props->drmFormatModifierTilingFeatures =
-                     pFormatProperties->formatProperties.optimalTilingFeatures;
-               }
+               mod_props->drmFormatModifier = afbc_modifiers[i];
+               mod_props->drmFormatModifierPlaneCount = plane_count;
+               mod_props->drmFormatModifierTilingFeatures = optimal_features;
             }
          }
       }
 
-      if (pFormatProperties->formatProperties.linearTilingFeatures) {
+      if (linear_features) {
          vk_outarray_append_typed(VkDrmFormatModifierPropertiesEXT, &out,
-                                  mod_props)
+                                    mod_props)
          {
             mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
-            mod_props->drmFormatModifierPlaneCount = 1;
-            mod_props->drmFormatModifierTilingFeatures =
-               pFormatProperties->formatProperties.linearTilingFeatures;
+            mod_props->drmFormatModifierPlaneCount = plane_count;
+            mod_props->drmFormatModifierTilingFeatures = linear_features;
+         }
+      }
+   }
+   VkDrmFormatModifierPropertiesList2EXT *list2 = vk_find_struct(
+      pFormatProperties->pNext, DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT);
+   if (list2) {
+      VkFormatFeatureFlags2 optimal_features2 = tex;
+      VkFormatFeatureFlags2 linear_features2 = tex;
+
+      VK_OUTARRAY_MAKE_TYPED(VkDrmFormatModifierProperties2EXT, out,
+                              list2->pDrmFormatModifierProperties,
+                              &list2->drmFormatModifierCount);
+
+      if (optimal_features2) {
+         /* Multi-planar AFBC is not supported. */
+         assert(!afbc_modifier_count || plane_count == 1);
+
+         for (uint32_t i = 0; i < afbc_modifier_count; i++) {
+            vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
+                                       mod_props)
+            {
+               mod_props->drmFormatModifier = afbc_modifiers[i];
+               mod_props->drmFormatModifierPlaneCount = plane_count;
+               mod_props->drmFormatModifierTilingFeatures =
+                  optimal_features2;
+            }
+         }
+      }
+
+      if (linear_features2) {
+         vk_outarray_append_typed(VkDrmFormatModifierProperties2EXT, &out,
+                                    mod_props)
+         {
+            mod_props->drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
+            mod_props->drmFormatModifierPlaneCount = plane_count;
+            mod_props->drmFormatModifierTilingFeatures = linear_features2;
          }
       }
    }
@@ -947,56 +1075,6 @@ panvk_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
       /* We always resolve in a separate command instead of in HW atm. */
       subpass_resolve_perf->optimal = VK_FALSE;
    }
-}
-
-#define MAX_IMAGE_SIZE_PX (1 << 16)
-
-static VkExtent3D
-get_max_2d_image_size(struct panvk_physical_device *phys_dev, VkFormat format)
-{
-   const unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
-   const uint64_t max_img_size_B =
-      arch <= 10 ? u_uintN_max(32) : u_uintN_max(48);
-   const enum pipe_format pfmt = vk_format_to_pipe_format(format);
-   const uint32_t fmt_blksize = util_format_get_blocksize(pfmt);
-   /* Evenly split blocks across all axis. */
-   const uint32_t max_size_el = floor(sqrt(max_img_size_B / fmt_blksize));
-   const VkExtent3D ret = {
-      .width = MIN2(max_size_el * util_format_get_blockwidth(pfmt),
-                    MAX_IMAGE_SIZE_PX),
-      .height = MIN2(max_size_el * util_format_get_blockheight(pfmt),
-                     MAX_IMAGE_SIZE_PX),
-      .depth = 1,
-   };
-
-   assert(ret.width >= phys_dev->vk.properties.maxImageDimension2D);
-   assert(ret.height >= phys_dev->vk.properties.maxImageDimension2D);
-   return ret;
-}
-
-static VkExtent3D
-get_max_3d_image_size(struct panvk_physical_device *phys_dev, VkFormat format)
-{
-   const unsigned arch = pan_arch(phys_dev->kmod.dev->props.gpu_id);
-   const uint64_t max_img_size_B =
-      arch <= 10 ? u_uintN_max(32) : u_uintN_max(48);
-   enum pipe_format pfmt = vk_format_to_pipe_format(format);
-   uint32_t fmt_blksize = util_format_get_blocksize(pfmt);
-   /* Evenly split blocks across each axis. */
-   const uint32_t max_size_el = floor(cbrt(max_img_size_B / fmt_blksize));
-   const VkExtent3D ret = {
-      .width = MIN2(max_size_el * util_format_get_blockwidth(pfmt),
-                    MAX_IMAGE_SIZE_PX),
-      .height = MIN2(max_size_el * util_format_get_blockheight(pfmt),
-                     MAX_IMAGE_SIZE_PX),
-      .depth = MIN2(max_size_el * util_format_get_blockdepth(pfmt),
-                    MAX_IMAGE_SIZE_PX),
-   };
-
-   assert(ret.width >= phys_dev->vk.properties.maxImageDimension3D);
-   assert(ret.height >= phys_dev->vk.properties.maxImageDimension3D);
-   assert(ret.depth >= phys_dev->vk.properties.maxImageDimension3D);
-   return ret;
 }
 
 static VkResult
@@ -1141,13 +1219,17 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
       maxArraySize = 1 << 16;
       break;
    case VK_IMAGE_TYPE_2D:
-      maxExtent = get_max_2d_image_size(physical_device, info->format);
-      maxMipLevels = util_logbase2(maxExtent.width) + 1;
+      maxExtent.width = 1 << 16;
+      maxExtent.height = 1 << 16;
+      maxExtent.depth = 1;
+      maxMipLevels = 17; /* log2(maxWidth) + 1 */
       maxArraySize = 1 << 16;
       break;
    case VK_IMAGE_TYPE_3D:
-      maxExtent = get_max_3d_image_size(physical_device, info->format);
-      maxMipLevels = util_logbase2(maxExtent.width) + 1;
+      maxExtent.width = 1 << 16;
+      maxExtent.height = 1 << 16;
+      maxExtent.depth = 1 << 16;
+      maxMipLevels = 17; /* log2(maxWidth) + 1 */
       maxArraySize = 1;
       break;
    default:
@@ -1218,14 +1300,7 @@ get_image_format_properties(struct panvk_physical_device *physical_device,
       .maxMipLevels = maxMipLevels,
       .maxArrayLayers = maxArraySize,
       .sampleCounts = sampleCounts,
-
-      /* We need to limit images to 32-bit range, because the maximum
-       * slice-stride is 32-bit wide, meaning that if we allocate an image
-       * with the maximum width and height, we end up overflowing it.
-       *
-       * We get around this by simply limiting the maximum resource size.
-       */
-      .maxResourceSize = UINT32_MAX,
+      .maxResourceSize = panvk_get_max_resource_size(physical_device),
    };
 
    if (p_feature_flags)
@@ -1422,7 +1497,16 @@ panvk_GetPhysicalDeviceImageFormatProperties2(
          physical_device, base_info->format, usage, base_info->type,
          base_info->tiling, base_info->flags);
       hic_props->optimalDeviceAccess = !can_use_afbc;
-      hic_props->identicalMemoryLayout = !can_use_afbc;
+
+      /* FIXME: we only support host transfer with certain modifiers and for now
+       * there's no easy way to know whether the presence of HOST_TRANSFER will
+       * be the thing that causes the modifier to be filtered out, and thus
+       * causing a difference in memory layout.
+       *
+       * See https://gitlab.freedesktop.org/panfrost/mesa/-/issues/281 for
+       * details.
+       */
+      hic_props->identicalMemoryLayout = false;
    }
 
    const struct vk_format_ycbcr_info *ycbcr_info =

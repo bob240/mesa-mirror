@@ -6,8 +6,6 @@
 #ifndef KK_MTL_TO_VK_MAP_H
 #define KK_MTL_TO_VK_MAP_H 1
 
-enum pipe_format;
-
 struct mtl_origin;
 struct mtl_size;
 enum mtl_primitive_type;
@@ -22,6 +20,7 @@ enum mtl_compare_function;
 enum mtl_winding;
 enum mtl_cull_mode;
 enum mtl_index_type;
+enum mtl_command_queue_error;
 
 struct VkOffset3D;
 struct VkExtent3D;
@@ -77,5 +76,10 @@ enum mtl_winding vk_front_face_to_mtl_winding(enum VkFrontFace face);
 enum mtl_cull_mode vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode);
 
 enum mtl_index_type index_size_in_bytes_to_mtl_index_type(unsigned bytes);
+
+unsigned mtl_index_type_to_size_B(enum mtl_index_type type);
+
+const char *
+mtl_command_queue_error_to_string(enum mtl_command_queue_error error);
 
 #endif /* KK_MTL_TO_VK_MAP_H */

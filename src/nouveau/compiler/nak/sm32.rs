@@ -230,7 +230,7 @@ impl SM32Encoder<'_> {
     }
 
     fn set_reg_src(&mut self, range: Range<usize>, src: &Src) {
-        assert!(src.src_swizzle.is_none());
+        assert!(src.src_swizzle.is_none() || src.src_swizzle == SrcSwizzle::Yy);
         self.set_reg_src_ref(range, &src.src_ref);
     }
 
@@ -319,7 +319,7 @@ enum AluSrc {
 
 impl AluSrc {
     fn from_src(src: &Src) -> AluSrc {
-        assert!(src.src_swizzle.is_none());
+        assert!(src.src_swizzle.is_none() || src.src_swizzle == SrcSwizzle::Yy);
         // do not assert src_mod, can be encoded by opcode.
 
         match &src.src_ref {
@@ -1557,10 +1557,12 @@ impl SM32Op for OpF2F {
 
         e.set_dst(&self.dst);
 
-        match &self.src.src_ref {
+        // The swizzle is handled by the .high bit below.
+        let src = self.src.clone().without_swizzle();
+        match &src.src_ref {
             SrcRef::Zero | SrcRef::Reg(_) => {
                 e.set_opcode(0xe54, 2);
-                e.set_reg_src(23..31, &self.src);
+                e.set_reg_src(23..31, &src);
             }
             SrcRef::CBuf(cb) => {
                 e.set_opcode(0x654, 2);
@@ -1578,12 +1580,12 @@ impl SM32Op for OpF2F {
         e.set_field(12..14, (self.src_type.bits() / 8).ilog2());
 
         e.set_rnd_mode(42..44, self.rnd_mode);
-        e.set_bit(44, self.high);
+        e.set_bit(44, self.src.src_swizzle == SrcSwizzle::Yy);
         e.set_bit(45, self.integer_rnd);
         e.set_bit(47, self.ftz);
-        e.set_bit(48, self.src.src_mod.has_fneg());
+        e.set_bit(48, src.src_mod.has_fneg());
         e.set_bit(50, false); // dst.CC
-        e.set_bit(52, self.src.src_mod.has_fabs());
+        e.set_bit(52, src.src_mod.has_fabs());
         e.set_bit(53, false); // saturate
     }
 }
@@ -1621,7 +1623,7 @@ impl SM32Op for OpF2I {
         e.set_bit(14, self.dst_type.is_signed());
 
         e.set_rnd_mode(42..44, self.rnd_mode);
-        // 44: .h1
+        e.set_bit(44, self.src.src_swizzle == SrcSwizzle::Yy);
         e.set_bit(47, self.ftz);
         e.set_bit(48, self.src.src_mod.has_fneg());
         e.set_bit(50, false); // dst.CC
@@ -2501,7 +2503,7 @@ fn legalize_ext_instr(op: &mut impl SrcsAsSlice, _b: &mut LegalizeBuilder) {
                 panic!("ALU srcs must be legalized explicitly");
             }
             SrcType::Pred => {
-                panic!("Predicates must be legalized explicitly");
+                assert!(src_is_reg(src, RegFile::Pred));
             }
             SrcType::Carry => {
                 panic!("Carry values must be legalized explicitly");
@@ -2547,6 +2549,8 @@ impl SM32Op for OpLd {
     }
 
     fn encode(&self, e: &mut SM32Encoder<'_>) {
+        assert_eq!(self.stride, OffsetStride::X1);
+        assert!(self.pred.is_true());
         // Missing:
         // 0x7c8 for indirect const load
         match self.access.space {
@@ -2631,6 +2635,7 @@ impl SM32Op for OpSt {
     }
 
     fn encode(&self, e: &mut SM32Encoder<'_>) {
+        assert_eq!(self.stride, OffsetStride::X1);
         match self.access.space {
             MemSpace::Global(_) => {
                 e.set_opcode(0xe00, 0);
@@ -2737,6 +2742,7 @@ impl SM32Op for OpAtom {
     }
 
     fn encode(&self, e: &mut SM32Encoder<'_>) {
+        assert_eq!(self.addr_stride, OffsetStride::X1);
         match self.mem_space {
             MemSpace::Global(addr_type) => {
                 if let AtomOp::CmpExch(cmp_src) = self.atom_op {

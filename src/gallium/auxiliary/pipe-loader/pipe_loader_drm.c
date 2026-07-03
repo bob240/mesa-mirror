@@ -89,6 +89,7 @@ static const struct drm_driver_descriptor *driver_descriptors[] = {
    &tegra_driver_descriptor,
    &lima_driver_descriptor,
    &zink_driver_descriptor,
+   &kmsro_driver_descriptor,
 };
 
 static const struct drm_driver_descriptor *
@@ -98,7 +99,7 @@ get_driver_descriptor(const char *driver_name)
       if (strcmp(driver_descriptors[i]->driver_name, driver_name) == 0)
          return driver_descriptors[i];
    }
-   return &kmsro_driver_descriptor;
+   return NULL;
 }
 
 static int
@@ -147,6 +148,12 @@ pipe_loader_drm_probe_fd_nodup(struct pipe_loader_device **dev, int fd, bool zin
    if (strcmp(ddev->base.driver_name, "amdgpu") == 0) {
       FREE(ddev->base.driver_name);
       ddev->base.driver_name = strdup("radeonsi");
+   }
+
+   /* powervr has no Gallium driver and relies on Zink */
+   if (strcmp(ddev->base.driver_name, "powervr") == 0) {
+      FREE(ddev->base.driver_name);
+      ddev->base.driver_name = strdup("zink");
    }
 
    if (strcmp(ddev->base.driver_name, "virtio_gpu") == 0) {
@@ -388,6 +395,9 @@ pipe_loader_get_compatible_render_capable_device_fds(int kms_only_fd, unsigned i
 #endif
 #if defined GALLIUM_VC4
       "vc4",
+#endif
+#if defined GALLIUM_ZINK
+      "zink",
 #endif
    };
 

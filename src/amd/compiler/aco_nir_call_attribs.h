@@ -22,7 +22,13 @@ enum aco_nir_function_attribs {
 };
 
 enum aco_nir_parameter_attribs {
-   /* Parameter value is not used by any callee and does not need to be preserved */
+   /* This parameter's value may not be preserved across a callee. Unlike return parameters, the
+    * parameter's value is undefined on return. Callers must back up values of discardable
+    * parameters separately.
+    * Mostly used for tail calls, where parameters to the tail callee have different values than
+    * for the caller. In that case, on function return, the parameters will have been overwritten
+    * with the tail callee parameter values.
+    */
    ACO_NIR_PARAM_ATTRIB_DISCARDABLE = 0x1,
 };
 
@@ -37,6 +43,8 @@ enum aco_nir_rt_function_arg {
    RT_ARG_LAUNCH_SIZE,
    RT_ARG_DESCRIPTORS,
    RT_ARG_DYNAMIC_DESCRIPTORS,
+   RT_ARG_HEAP_RESOURCE = RT_ARG_DESCRIPTORS,
+   RT_ARG_HEAP_SAMPLER = RT_ARG_DYNAMIC_DESCRIPTORS,
    RT_ARG_PUSH_CONSTANTS,
    RT_ARG_SBT_DESCRIPTORS,
    RT_ARG_COUNT,
@@ -66,6 +74,26 @@ enum aco_nir_traversal_function_arg {
    TRAVERSAL_ARG_GEOMETRY_ID_AND_FLAGS,
    TRAVERSAL_ARG_HIT_KIND,
    TRAVERSAL_ARG_PAYLOAD_BASE,
+};
+
+enum aco_nir_ahit_isec_function_arg {
+   AHIT_ISEC_ARG_SHADER_RECORD_PTR = RT_ARG_COUNT,
+   AHIT_ISEC_ARG_CULL_MASK_AND_FLAGS,
+   AHIT_ISEC_ARG_SBT_INDEX,
+   AHIT_ISEC_ARG_RAY_ORIGIN,
+   AHIT_ISEC_ARG_RAY_TMIN,
+   AHIT_ISEC_ARG_RAY_DIRECTION,
+   AHIT_ISEC_ARG_CANDIDATE_RAY_TMAX,
+   AHIT_ISEC_ARG_PRIMITIVE_ADDR,
+   AHIT_ISEC_ARG_PRIMITIVE_ID,
+   AHIT_ISEC_ARG_INSTANCE_ADDR,
+   AHIT_ISEC_ARG_GEOMETRY_ID_AND_FLAGS,
+   AHIT_ISEC_ARG_OPAQUE,
+   AHIT_ISEC_ARG_HIT_KIND,
+   AHIT_ISEC_ARG_ACCEPT,
+   AHIT_ISEC_ARG_TERMINATE,
+   AHIT_ISEC_ARG_COMMITTED_RAY_TMAX,
+   AHIT_ISEC_ARG_HIT_ATTRIB_PAYLOAD_BASE,
 };
 
 enum aco_nir_chit_miss_function_arg {

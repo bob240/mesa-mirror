@@ -176,8 +176,8 @@ void create_shader(test_state *state, nir_shader_compiler_options *options)
    if (st->gfx_level != GFX11) {
       if (st->gfx_level >= GFX12)
          _mesa_string_buffer_printf(state->result, "gfx%u,", st->gfx_level - GFX12 + 12);
-      else if (st->gfx_level == GFX11_5)
-         _mesa_string_buffer_append(state->result, "gfx11.5,");
+      else if (st->gfx_level >= GFX11_5)
+         _mesa_string_buffer_printf(state->result, "gfx11.%u,", (st->gfx_level > GFX11_5 ? 7u : 5u));
       else if (st->gfx_level >= GFX11)
          _mesa_string_buffer_printf(state->result, "gfx%u,", st->gfx_level - GFX11 + 11);
       else if (st->gfx_level == GFX10_3)
@@ -221,11 +221,12 @@ static void run_subtest(subtest *st, bool print = false)
 
    struct radeon_info info = {};
    info.gfx_level = st->gfx_level;
-   info.cu_info.has_packed_math_16bit = true;
-   info.cu_info.has_accelerated_dot_product = true;
+   info.compiler_info.gfx_level = info.gfx_level;
+   info.compiler_info.has_packed_math_16bit = true;
+   info.compiler_info.has_accelerated_dot_product = true;
 
    nir_shader_compiler_options options = {};
-   ac_nir_set_options(&info, st->use_llvm, &options);
+   ac_nir_set_options(&info.compiler_info, st->use_llvm, &options);
 
    create_shader(&state, &options);
 

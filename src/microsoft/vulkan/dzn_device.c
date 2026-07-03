@@ -36,10 +36,10 @@
 #include "util/u_debug.h"
 #include "util/disk_cache.h"
 #include "util/macros.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
 #include "util/u_dl.h"
 
-#include "util/driconf.h"
+#include "dzn_drirc.h"
 
 #include "glsl_types.h"
 
@@ -145,6 +145,7 @@ dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
       .KHR_timeline_semaphore                = true,
       .KHR_uniform_buffer_standard_layout    = true,
       .EXT_buffer_device_address             = pdev->shader_model >= D3D_SHADER_MODEL_6_6,
+      .EXT_debug_marker                      = true,
       .EXT_descriptor_indexing               = pdev->shader_model >= D3D_SHADER_MODEL_6_6,
 #if defined(_WIN32)
       .EXT_external_memory_host              = pdev->dev13,
@@ -156,6 +157,7 @@ dzn_physical_device_get_extensions(struct dzn_physical_device *pdev)
       .EXT_shader_subgroup_vote              = true,
       .EXT_subgroup_size_control             = true,
       .EXT_vertex_attribute_divisor          = true,
+      .EXT_memory_budget                     = true,
       .MSFT_layered_driver                   = true,
    };
 }
@@ -192,10 +194,10 @@ static const struct debug_control dzn_debug_options[] = {
 };
 
 static void
-dzn_physical_device_destroy(struct vk_physical_device *physical)
+dzn_physical_device_release(struct dzn_physical_device *pdev)
 {
-   struct dzn_physical_device *pdev = container_of(physical, struct dzn_physical_device, vk);
-   struct dzn_instance *instance = container_of(pdev->vk.instance, struct dzn_instance, vk);
+   if (!pdev)
+      return;
 
    if (pdev->dev)
       ID3D12Device1_Release(pdev->dev);
@@ -214,7 +216,15 @@ dzn_physical_device_destroy(struct vk_physical_device *physical)
 
    if (pdev->adapter)
       IUnknown_Release(pdev->adapter);
+}
 
+static void
+dzn_physical_device_destroy(struct vk_physical_device *physical)
+{
+   struct dzn_physical_device *pdev = container_of(physical, struct dzn_physical_device, vk);
+   struct dzn_instance *instance = container_of(pdev->vk.instance, struct dzn_instance, vk);
+
+   dzn_physical_device_release(pdev);
    dzn_wsi_finish(pdev);
    vk_physical_device_finish(&pdev->vk);
    vk_free(&instance->vk.alloc, pdev);
@@ -238,8 +248,8 @@ dzn_instance_destroy(struct dzn_instance *instance, const VkAllocationCallbacks 
    if (instance->d3d12_mod)
       util_dl_close(instance->d3d12_mod);
 
-   driDestroyOptionCache(&instance->dri_options);
-   driDestroyOptionInfo(&instance->available_dri_options);
+   driDestroyOptionCache(&instance->drirc.options);
+   driDestroyOptionInfo(&instance->drirc.available_options);
 
    vk_free2(vk_default_allocator(), alloc, instance);
 }
@@ -342,40 +352,40 @@ dzn_physical_device_init_uuids(struct dzn_physical_device *pdev)
 {
    const char *mesa_version = "Mesa " PACKAGE_VERSION MESA_GIT_SHA1;
 
-   struct mesa_sha1 sha1_ctx;
-   uint8_t sha1[SHA1_DIGEST_LENGTH];
-   STATIC_ASSERT(VK_UUID_SIZE <= sizeof(sha1));
+   blake3_hasher blake3_ctx;
+   uint8_t blake3[BLAKE3_KEY_LEN];
+   STATIC_ASSERT(VK_UUID_SIZE <= sizeof(blake3));
 
    /* The pipeline cache UUID is used for determining when a pipeline cache is
     * invalid. Our cache is device-agnostic, but it does depend on the features
     * provided by the D3D12 driver, so let's hash the build ID plus some
     * caps that might impact our NIR lowering passes.
     */
-   _mesa_sha1_init(&sha1_ctx);
-   _mesa_sha1_update(&sha1_ctx,  mesa_version, strlen(mesa_version));
-   disk_cache_get_function_identifier(dzn_physical_device_init_uuids, &sha1_ctx);
-   _mesa_sha1_update(&sha1_ctx, &pdev->options,
+   _mesa_blake3_init(&blake3_ctx);
+   _mesa_blake3_update(&blake3_ctx,  mesa_version, strlen(mesa_version));
+   disk_cache_get_function_identifier(dzn_physical_device_init_uuids, &blake3_ctx);
+   _mesa_blake3_update(&blake3_ctx, &pdev->options,
       offsetof(struct dzn_physical_device, options21) + sizeof(pdev->options21) -
                      offsetof(struct dzn_physical_device, options));
-   _mesa_sha1_final(&sha1_ctx, sha1);
-   memcpy(pdev->pipeline_cache_uuid, sha1, VK_UUID_SIZE);
+   _mesa_blake3_final(&blake3_ctx, blake3);
+   memcpy(pdev->pipeline_cache_uuid, blake3, VK_UUID_SIZE);
 
    /* The driver UUID is used for determining sharability of images and memory
     * between two Vulkan instances in separate processes.  People who want to
     * share memory need to also check the device UUID (below) so all this
     * needs to be is the build-id.
     */
-   _mesa_sha1_compute(mesa_version, strlen(mesa_version), sha1);
-   memcpy(pdev->driver_uuid, sha1, VK_UUID_SIZE);
+   _mesa_blake3_compute(mesa_version, strlen(mesa_version), blake3);
+   memcpy(pdev->driver_uuid, blake3, VK_UUID_SIZE);
 
    /* The device UUID uniquely identifies the given device within the machine. */
-   _mesa_sha1_init(&sha1_ctx);
-   _mesa_sha1_update(&sha1_ctx, &pdev->desc.vendor_id, sizeof(pdev->desc.vendor_id));
-   _mesa_sha1_update(&sha1_ctx, &pdev->desc.device_id, sizeof(pdev->desc.device_id));
-   _mesa_sha1_update(&sha1_ctx, &pdev->desc.subsys_id, sizeof(pdev->desc.subsys_id));
-   _mesa_sha1_update(&sha1_ctx, &pdev->desc.revision, sizeof(pdev->desc.revision));
-   _mesa_sha1_final(&sha1_ctx, sha1);
-   memcpy(pdev->device_uuid, sha1, VK_UUID_SIZE);
+   _mesa_blake3_init(&blake3_ctx);
+   _mesa_blake3_update(&blake3_ctx, &pdev->desc.vendor_id, sizeof(pdev->desc.vendor_id));
+   _mesa_blake3_update(&blake3_ctx, &pdev->desc.device_id, sizeof(pdev->desc.device_id));
+   _mesa_blake3_update(&blake3_ctx, &pdev->desc.subsys_id, sizeof(pdev->desc.subsys_id));
+   _mesa_blake3_update(&blake3_ctx, &pdev->desc.revision, sizeof(pdev->desc.revision));
+   _mesa_blake3_final(&blake3_ctx, blake3);
+   memcpy(pdev->device_uuid, blake3, VK_UUID_SIZE);
 }
 
 const struct vk_pipeline_cache_object_ops *const dzn_pipeline_cache_import_ops[] = {
@@ -657,7 +667,7 @@ dzn_physical_device_get_features(const struct dzn_physical_device *pdev,
 
    bool support_descriptor_indexing = pdev->shader_model >= D3D_SHADER_MODEL_6_6 &&
       !(instance->debug_flags & DZN_DEBUG_NO_BINDLESS);
-   bool support_8bit = driQueryOptionb(&instance->dri_options, "dzn_enable_8bit_loads_stores") &&
+   bool support_8bit = instance->drirc.debug.enable_8bit_loads_stores &&
       pdev->options4.Native16BitShaderOpsSupported;
 
    *features = (struct vk_features) {
@@ -676,7 +686,7 @@ dzn_physical_device_get_features(const struct dzn_physical_device *pdev,
       .depthBiasClamp = true,
       .fillModeNonSolid = true,
       .depthBounds = pdev->options2.DepthBoundsTestSupported,
-      .wideLines = driQueryOptionb(&instance->dri_options, "dzn_claim_wide_lines"),
+      .wideLines = instance->drirc.debug.claim_wide_lines,
       .largePoints = false,
       .alphaToOne = false,
       .multiViewport = false,
@@ -1155,7 +1165,7 @@ dzn_physical_device_create(struct vk_instance *instance,
       pdev->options3.ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
 
    dzn_physical_device_get_extensions(pdev);
-   if (driQueryOptionb(&dzn_instance->dri_options, "dzn_enable_8bit_loads_stores") &&
+   if (dzn_instance->drirc.debug.enable_8bit_loads_stores &&
        pdev->options4.Native16BitShaderOpsSupported)
       pdev->vk.supported_extensions.KHR_8bit_storage = true;
    if (dzn_instance->debug_flags & DZN_DEBUG_NO_BINDLESS)
@@ -1166,7 +1176,9 @@ dzn_physical_device_create(struct vk_instance *instance,
    result = dzn_wsi_init(pdev);
    if (result != VK_SUCCESS || !pdev->dev) {
       list_del(&pdev->vk.link);
-      dzn_physical_device_destroy(&pdev->vk);
+      dzn_physical_device_release(pdev);
+      vk_physical_device_finish(&pdev->vk);
+      vk_free(&instance->alloc, pdev);
       return result;
    }
 
@@ -1751,23 +1763,17 @@ dzn_enumerate_physical_devices(struct vk_instance *instance)
    return result;
 }
 
-static const driOptionDescription dzn_dri_options[] = {
-   DRI_CONF_SECTION_DEBUG
-      DRI_CONF_DZN_CLAIM_WIDE_LINES(false)
-      DRI_CONF_DZN_ENABLE_8BIT_LOADS_STORES(false)
-      DRI_CONF_DZN_DISABLE(false)
-      DRI_CONF_VK_WSI_FORCE_SWAPCHAIN_TO_CURRENT_EXTENT(false)
-   DRI_CONF_SECTION_END
-};
-
 static void
 dzn_init_dri_config(struct dzn_instance *instance)
 {
-   driParseOptionInfo(&instance->available_dri_options, dzn_dri_options,
-                      ARRAY_SIZE(dzn_dri_options));
-   driParseConfigFiles(&instance->dri_options, &instance->available_dri_options, 0, "dzn", NULL, NULL,
-                       instance->vk.app_info.app_name, instance->vk.app_info.app_version,
-                       instance->vk.app_info.engine_name, instance->vk.app_info.engine_version);
+   dzn_parse_dri_options(&instance->drirc,
+                         &(driConfigFileParseParams) {
+                            .driverName = "dzn",
+                            .applicationName = instance->vk.app_info.app_name,
+                            .applicationVersion = instance->vk.app_info.app_version,
+                            .engineName = instance->vk.app_info.engine_name,
+                            .engineVersion = instance->vk.app_info.engine_version,
+                         });
 }
 
 static VkResult
@@ -1857,7 +1863,7 @@ dzn_instance_create(const VkInstanceCreateInfo *pCreateInfo,
    instance->sync_binary_type = vk_sync_binary_get_type(&dzn_sync_type);
    dzn_init_dri_config(instance);
 
-   if (driQueryOptionb(&instance->dri_options, "dzn_disable")) {
+   if (instance->drirc.debug.disable) {
       dzn_instance_destroy(instance, pAllocator);
       return vk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED, "dzn_disable set, failing instance creation");
    }
@@ -1936,7 +1942,31 @@ dzn_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
                                          &pMemoryProperties->memoryProperties);
 
    vk_foreach_struct(ext, pMemoryProperties->pNext) {
-      vk_debug_ignored_stype(ext->sType);
+      if(ext->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT){
+
+         VkPhysicalDeviceMemoryBudgetPropertiesEXT* vk_physical_memory_budget_properties = (VkPhysicalDeviceMemoryBudgetPropertiesEXT*)ext;
+         VK_FROM_HANDLE(dzn_physical_device, pdev, physicalDevice);
+
+         struct d3d12_memory_info memory_info;
+
+         dzn_query_memory_info(pdev->adapter, &memory_info);
+
+         memset(vk_physical_memory_budget_properties->heapBudget, 0, sizeof(VkDeviceSize) * VK_MAX_MEMORY_HEAPS);
+         memset(vk_physical_memory_budget_properties->heapUsage,  0, sizeof(VkDeviceSize) * VK_MAX_MEMORY_HEAPS);
+
+         for(int i = 0; i < pMemoryProperties->memoryProperties.memoryHeapCount; i++){
+            if(pMemoryProperties->memoryProperties.memoryHeaps[i].flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT){
+               vk_physical_memory_budget_properties->heapBudget[i] = memory_info.budget_local;
+               vk_physical_memory_budget_properties->heapUsage[i]  = memory_info.usage_local;
+            } else {
+               vk_physical_memory_budget_properties->heapBudget[i] = memory_info.budget_nonlocal;
+               vk_physical_memory_budget_properties->heapUsage[i]  = memory_info.usage_nonlocal;
+            }
+         }
+      }
+      else {
+         vk_debug_ignored_stype(ext->sType);
+      }
    }
 }
 

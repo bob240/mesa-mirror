@@ -22,12 +22,15 @@
 #include "wsi_common.h"
 
 #include "util/build_id.h"
+#include "util/os_misc.h"
+#include "pvr_drirc.h"
 
 #include "pvr_debug.h"
 #include "pvr_device.h"
 #include "pvr_entrypoints.h"
 #include "pvr_macros.h"
 #include "pvr_physical_device.h"
+#include "pvr_winsys.h"
 #include "pvr_wsi.h"
 
 #if defined(VK_USE_PLATFORM_DISPLAY_KHR)
@@ -35,26 +38,6 @@
 #else
 #   define PVR_USE_WSI_PLATFORM_DISPLAY false
 #endif
-
-struct pvr_drm_device_config {
-   struct pvr_drm_device_info {
-      const char *name;
-      size_t len;
-   } render;
-};
-
-#define DEF_CONFIG(render_)                                      \
-   {                                                             \
-      .render = { .name = render_, .len = sizeof(render_) - 1 }, \
-   }
-
-/* This is the list of supported DRM render driver configs. */
-static const struct pvr_drm_device_config pvr_drm_configs[] = {
-   DEF_CONFIG("mediatek,mt8173-gpu"),
-   DEF_CONFIG("ti,am62-gpu"),
-   DEF_CONFIG("ti,j721s2-gpu"),
-};
-#undef DEF_CONFIG
 
 static const struct vk_instance_extension_table pvr_instance_extensions = {
    .KHR_device_group_creation = true,
@@ -103,28 +86,39 @@ static VkResult pvr_get_drm_devices(void *const obj,
 }
 
 static bool
-pvr_drm_device_compatible(const struct pvr_drm_device_info *const info,
-                          drmDevice *const drm_dev)
+pvr_drm_device_is_compatible(drmDevicePtr drm_dev)
 {
-   char **const compatible = drm_dev->deviceinfo.platform->compatible;
+   drmVersionPtr version;
+   bool is_pvr;
+   int32_t fd;
 
-   for (char **compat = compatible; *compat; compat++) {
-      if (strncmp(*compat, info->name, info->len) == 0)
-         return true;
+   fd = open(drm_dev->nodes[DRM_NODE_RENDER], O_RDWR | O_CLOEXEC);
+   if (fd < 0) {
+      mesa_logd("Failed to open render node: %s\n",
+                drm_dev->nodes[DRM_NODE_RENDER]);
+
+      return false;
    }
 
-   return false;
-}
+   version = drmGetVersion(fd);
+   if (!version) {
+      mesa_logd("Failed to get version information for render node: %s\n",
+                drm_dev->nodes[DRM_NODE_RENDER]);
 
-static const struct pvr_drm_device_config *
-pvr_drm_device_get_config(drmDevice *const drm_dev)
-{
-   for (size_t i = 0U; i < ARRAY_SIZE(pvr_drm_configs); i++) {
-      if (pvr_drm_device_compatible(&pvr_drm_configs[i].render, drm_dev))
-         return &pvr_drm_configs[i];
+      close(fd);
+      return false;
    }
 
-   return NULL;
+   is_pvr = !strcmp(version->name, PVR_DRM_DRIVER_NAME);
+
+#if defined(PVR_SUPPORT_SERVICES_DRIVER)
+   is_pvr |= !strcmp(version->name, PVR_SRV_DRIVER_NAME);
+#endif /* defined(PVR_SUPPORT_SERVICES_DRIVER) */
+
+   drmFreeVersion(version);
+   close(fd);
+
+   return is_pvr;
 }
 
 static bool pvr_drm_device_is_compatible_display(drmDevicePtr drm_dev)
@@ -183,8 +177,6 @@ pvr_physical_device_enumerate(struct vk_instance *const vk_instance)
    struct pvr_instance *const instance =
       container_of(vk_instance, struct pvr_instance, vk);
 
-   const struct pvr_drm_device_config *config = NULL;
-
    drmDevicePtr drm_display_device = NULL;
    drmDevicePtr drm_render_device = NULL;
    struct pvr_physical_device *pdevice;
@@ -224,14 +216,15 @@ pvr_physical_device_enumerate(struct vk_instance *const vk_instance)
       if (!(drm_dev->available_nodes & BITFIELD_BIT(DRM_NODE_RENDER)))
          continue;
 
-      config = pvr_drm_device_get_config(drm_dev);
-      if (config) {
-         drm_render_device = drm_dev;
-         break;
-      }
+
+      if (!pvr_drm_device_is_compatible(drm_dev))
+         continue;
+
+      drm_render_device = drm_dev;
+      break;
    }
 
-   if (!config) {
+   if (!drm_render_device) {
       result = VK_SUCCESS;
       goto out_free_drm_devices;
    }
@@ -306,7 +299,7 @@ out:
 }
 
 static bool
-pvr_get_driver_build_sha(uint8_t sha_out[const static BUILD_ID_EXPECTED_HASH_LENGTH])
+pvr_get_driver_build_sha(struct pvr_instance *instance)
 {
    const struct build_id_note *note;
    unsigned build_id_len;
@@ -323,9 +316,22 @@ pvr_get_driver_build_sha(uint8_t sha_out[const static BUILD_ID_EXPECTED_HASH_LEN
       return false;
    }
 
-   memcpy(sha_out, build_id_data(note), BUILD_ID_EXPECTED_HASH_LENGTH);
+   STATIC_ASSERT(sizeof(instance->driver_build_sha) == BLAKE3_KEY_LEN);
+   copy_build_id_to_sha1(instance->driver_build_sha, note);
 
    return true;
+}
+
+static void pvr_init_dri_options(struct pvr_instance *instance)
+{
+   pvr_parse_dri_options(&instance->drirc,
+                         &(driConfigFileParseParams) {
+                            .driverName = "pvr",
+                            .applicationName = instance->vk.app_info.app_name,
+                            .applicationVersion = instance->vk.app_info.app_version,
+                            .engineName = instance->vk.app_info.engine_name,
+                            .engineVersion = instance->vk.app_info.engine_version,
+                         });
 }
 
 VkResult pvr_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
@@ -365,6 +371,7 @@ VkResult pvr_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
       goto err_free_instance;
 
    pvr_process_debug_variable();
+   pvr_init_dri_options(instance);
 
    instance->active_device_count = 0;
 
@@ -373,7 +380,7 @@ VkResult pvr_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
 
    VG(VALGRIND_CREATE_MEMPOOL(instance, 0, false));
 
-   if (!pvr_get_driver_build_sha(instance->driver_build_sha)) {
+   if (!pvr_get_driver_build_sha(instance)) {
       result = vk_errorf(NULL,
                          VK_ERROR_INITIALIZATION_FAILED,
                          "Failed to get driver build sha.");
@@ -385,6 +392,8 @@ VkResult pvr_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    return VK_SUCCESS;
 
 err_free_instance:
+   driDestroyOptionCache(&instance->drirc.options);
+   driDestroyOptionInfo(&instance->drirc.available_options);
    vk_free(pAllocator, instance);
    return result;
 }
@@ -398,6 +407,9 @@ void pvr_DestroyInstance(VkInstance _instance,
       return;
 
    VG(VALGRIND_DESTROY_MEMPOOL(instance));
+
+   driDestroyOptionCache(&instance->drirc.options);
+   driDestroyOptionInfo(&instance->drirc.available_options);
 
    vk_instance_finish(&instance->vk);
    vk_free(&instance->vk.alloc, instance);

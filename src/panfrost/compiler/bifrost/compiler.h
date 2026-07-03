@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2020 Collabora Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #ifndef __BIFROST_COMPILER_H
@@ -53,6 +35,9 @@ enum bi_swizzle {
    BI_SWIZZLE_H10 = 2,
    BI_SWIZZLE_H11 = 3,
 
+   /* Identity swizzle */
+   BI_SWIZZLE_NONE = BI_SWIZZLE_H01,
+
    /* 8-bit swizzle equivalents */
    BI_SWIZZLE_B0101 = BI_SWIZZLE_H00,
    BI_SWIZZLE_B0123 = BI_SWIZZLE_H01,
@@ -82,7 +67,6 @@ enum bi_swizzle {
    BI_SWIZZLE_B3322 = 19,
    BI_SWIZZLE_B0033 = 20,
    BI_SWIZZLE_B1133 = 21,
-   BI_SWIZZLE_B1123 = 22,
 
    /* 16-bit single-lane, values ordered sequentially */
    BI_SWIZZLE_H0 = BI_SWIZZLE_H00,
@@ -116,7 +100,10 @@ enum bi_swizzle {
    BI_SWIZZLE_B33 = BI_SWIZZLE_B3333,
 };
 
-static inline bool
+bool bi_op_supports_swizzle(enum bi_opcode op, unsigned src,
+                            enum bi_swizzle swizzle, unsigned arch);
+
+static inline void
 bi_swizzle_to_byte_channels(enum bi_swizzle swizzle, unsigned *channels)
 {
 #define B(b0, b1, b2, b3)                                                      \
@@ -125,7 +112,7 @@ bi_swizzle_to_byte_channels(enum bi_swizzle swizzle, unsigned *channels)
       channels[1] = b1;                                                        \
       channels[2] = b2;                                                        \
       channels[3] = b3;                                                        \
-      return true;                                                             \
+      return;                                                                  \
    }
    switch (swizzle) {
       B(0, 1, 0, 1);
@@ -150,11 +137,75 @@ bi_swizzle_to_byte_channels(enum bi_swizzle swizzle, unsigned *channels)
       B(3, 3, 2, 2);
       B(0, 0, 3, 3);
       B(1, 1, 3, 3);
-      B(1, 1, 2, 3);
+   }
+#undef B
+
+   UNREACHABLE("Invalid bi_swizzle");
+}
+
+static inline bool
+bi_swizzle_from_byte_channels(const unsigned byte_channels[4],
+                              enum bi_swizzle *out_swizzle)
+{
+   unsigned index = 0;
+   for (unsigned i = 0; i < 4; i++) {
+      assert(byte_channels[i] < 4);
+      index = (index << 2) | byte_channels[i];
+   }
+
+   switch (index) {
+#define B(b0, b1, b2, b3)                                                      \
+   case ((b0) << 6) | ((b1) << 4) | ((b2) << 2) | (b3):                        \
+      *out_swizzle = BI_SWIZZLE_B##b0##b1##b2##b3;                             \
+      return true;
+      B(0, 1, 0, 1);
+      B(0, 1, 2, 3);
+      B(2, 3, 0, 1);
+      B(2, 3, 2, 3);
+      B(0, 0, 0, 0);
+      B(1, 1, 1, 1);
+      B(2, 2, 2, 2);
+      B(3, 3, 3, 3);
+      B(0, 0, 1, 1);
+      B(2, 2, 3, 3);
+      B(1, 0, 3, 2);
+      B(3, 2, 1, 0);
+      B(0, 0, 2, 2);
+      B(1, 1, 0, 0);
+      B(2, 2, 0, 0);
+      B(3, 3, 0, 0);
+      B(2, 2, 1, 1);
+      B(3, 3, 1, 1);
+      B(1, 1, 2, 2);
+      B(3, 3, 2, 2);
+      B(0, 0, 3, 3);
+      B(1, 1, 3, 3);
+#undef B
    default:
       return false;
    }
-#undef B
+}
+
+static inline bool
+bi_try_compose_swizzles(enum bi_swizzle *ab_out,
+                        enum bi_swizzle a, enum bi_swizzle b)
+{
+   unsigned a_bytes[4], b_bytes[4];
+   bi_swizzle_to_byte_channels(a, a_bytes);
+   bi_swizzle_to_byte_channels(b, b_bytes);
+
+   unsigned ab_bytes[4];
+   for (unsigned i = 0; i < 4; i++) {
+      ab_bytes[i] = b_bytes[a_bytes[i]];
+   }
+
+   return bi_swizzle_from_byte_channels(ab_bytes, ab_out);
+}
+
+static inline enum bi_swizzle
+bi_swizzle_from_half(bool x, bool y)
+{
+   return (enum bi_swizzle)(BI_SWIZZLE_H00 | (x << 1) | y);
 }
 
 /* Given a packed i16vec2/i8vec4 constant, apply a swizzle. Useful for constant
@@ -193,7 +244,6 @@ bi_apply_swizzle(uint32_t value, enum bi_swizzle swz)
       B(3, 3, 2, 2);
       B(0, 0, 3, 3);
       B(1, 1, 3, 3);
-      B(1, 1, 2, 3);
    }
 
 #undef H
@@ -353,8 +403,17 @@ bi_passthrough(enum bifrost_packed_src value)
 static inline bi_index
 bi_swz_16(bi_index idx, bool x, bool y)
 {
-   assert(idx.swizzle == BI_SWIZZLE_H01);
-   idx.swizzle = (enum bi_swizzle)(BI_SWIZZLE_H00 | (x << 1) | y);
+   bool halves[2];
+   switch (idx.swizzle) {
+   case BI_SWIZZLE_H00: halves[0] = 0; halves[1] = 0; break;
+   case BI_SWIZZLE_H01: halves[0] = 0; halves[1] = 1; break;
+   case BI_SWIZZLE_H10: halves[0] = 1; halves[1] = 0; break;
+   case BI_SWIZZLE_H11: halves[0] = 1; halves[1] = 1; break;
+   default: UNREACHABLE("Not a half swizzle");
+   }
+   assert(idx.swizzle == bi_swizzle_from_half(halves[0], halves[1]));
+
+   idx.swizzle = bi_swizzle_from_half(halves[x], halves[y]);
    return idx;
 }
 
@@ -364,22 +423,14 @@ bi_half(bi_index idx, bool upper)
    return bi_swz_16(idx, upper, upper);
 }
 
-static inline bool
-bi_valid_lane_for_byte_swizzle(enum bi_swizzle swizzle, unsigned lane)
-{
-   unsigned channels[4];
-   if (bi_swizzle_to_byte_channels(swizzle, channels)) {
-      return lane == channels[0] || lane == channels[1] ||
-             lane == channels[2] || lane == channels[3];
-   }
-   return false;
-}
-
 static inline bi_index
 bi_byte(bi_index idx, unsigned lane)
 {
-   assert(bi_valid_lane_for_byte_swizzle(idx.swizzle, lane));
-   idx.swizzle = (enum bi_swizzle)(BI_SWIZZLE_B0 + lane);
+   unsigned bytes[4];
+   bi_swizzle_to_byte_channels(idx.swizzle, bytes);
+
+   assert(lane < 4);
+   idx.swizzle = (enum bi_swizzle)(BI_SWIZZLE_B0 + bytes[lane]);
    return idx;
 }
 
@@ -522,7 +573,7 @@ bi_is_value_equiv(bi_index left, bi_index right)
    }
 }
 
-#define BI_MAX_VEC   8
+#define BI_MAX_VEC   16
 #define BI_MAX_DESTS 4
 #define BI_MAX_SRCS  8
 
@@ -562,6 +613,10 @@ typedef struct {
    /* Can we spill the value written here? Used to prevent
     * useless double fills */
    bool no_spill;
+
+   /* Tags the gl_PointSize memory write, this is used if we want to
+    * create a variant without psiz writes */
+   bool is_psiz_write;
 
    /* On Bifrost: A value of bi_table to override the table, inducing a
     * DTSEL_IMM pair if nonzero.
@@ -651,6 +706,7 @@ typedef struct {
 
       struct {
          enum bi_seg seg;       /* LOAD, STORE, SEG_ADD, SEG_SUB */
+         enum va_memory_access mem_access; /* LOAD, STORE, LD_CVT, ST_CVT */
          bool preserve_null;    /* SEG_ADD, SEG_SUB */
          enum bi_extend extend; /* LOAD, IMUL */
       };
@@ -715,6 +771,8 @@ typedef struct {
          bool divzero;                /* FRSQ_APPROX, FRSQ */
       };
    };
+
+   const nir_instr_debug_info *debug_info;
 } bi_instr;
 
 /*
@@ -1057,6 +1115,137 @@ enum bi_idvs_mode {
 
 #define BI_MAX_REGS 64
 
+enum bi_preload {
+   /* Compute */
+   BI_PRELOAD_LOCAL_ID_0,
+   BI_PRELOAD_LOCAL_ID_1,
+   BI_PRELOAD_LOCAL_ID_2,
+   BI_PRELOAD_WORKGROUP_ID_0,
+   BI_PRELOAD_WORKGROUP_ID_1,
+   BI_PRELOAD_WORKGROUP_ID_2,
+   BI_PRELOAD_GLOBAL_ID_0,
+   BI_PRELOAD_GLOBAL_ID_1,
+   BI_PRELOAD_GLOBAL_ID_2,
+   /* Vertex */
+   BI_PRELOAD_POS_RESULT_PTR_LO,
+   BI_PRELOAD_POS_RESULT_PTR_HI,
+   BI_PRELOAD_INTERNAL_ID,
+   BI_PRELOAD_VERTEX_ID,
+   BI_PRELOAD_INSTANCE_ID,
+   BI_PRELOAD_DRAW_ID,
+   BI_PRELOAD_VIEW_ID,
+   /* Fragment */
+   BI_PRELOAD_PRIMITIVE_ID,
+   BI_PRELOAD_PRIMITIVE_FLAGS,
+   BI_PRELOAD_POSITION_XY,
+   BI_PRELOAD_CUMULATIVE_COVERAGE,
+   BI_PRELOAD_RASTERIZER_COVERAGE,
+   BI_PRELOAD_SAMPLE_ID,
+   BI_PRELOAD_CENTROID_ID,
+   BI_PRELOAD_FRAME_ARG,
+   /* Blend */
+   BI_PRELOAD_BLEND_SRC0_C0,
+   BI_PRELOAD_BLEND_SRC0_C1,
+   BI_PRELOAD_BLEND_SRC0_C2,
+   BI_PRELOAD_BLEND_SRC0_C3,
+   BI_PRELOAD_BLEND_SRC1_C0,
+   BI_PRELOAD_BLEND_SRC1_C1,
+   BI_PRELOAD_BLEND_SRC1_C2,
+   BI_PRELOAD_BLEND_SRC1_C3,
+   BI_PRELOAD_BLEND_LINK,
+};
+
+static inline unsigned
+bi_preload_reg(enum bi_preload val, unsigned arch)
+{
+   switch (val) {
+   /* Compute */
+   case BI_PRELOAD_LOCAL_ID_0:
+      /* Bits [15;0] */
+      return 55;
+   case BI_PRELOAD_LOCAL_ID_1:
+      /* Bits [31;16] */
+      return 55;
+   case BI_PRELOAD_LOCAL_ID_2:
+      /* Bits [15;0] */
+      return 56;
+   case BI_PRELOAD_WORKGROUP_ID_0:
+      return 57;
+   case BI_PRELOAD_WORKGROUP_ID_1:
+      return 58;
+   case BI_PRELOAD_WORKGROUP_ID_2:
+      return 59;
+   case BI_PRELOAD_GLOBAL_ID_0:
+      return 60;
+   case BI_PRELOAD_GLOBAL_ID_1:
+      return 61;
+   case BI_PRELOAD_GLOBAL_ID_2:
+      return 62;
+   /* Vertex */
+   case BI_PRELOAD_POS_RESULT_PTR_LO:
+      assert(arch < 9);
+      return 58;
+   case BI_PRELOAD_POS_RESULT_PTR_HI:
+      assert(arch < 9);
+      return 59;
+   case BI_PRELOAD_INTERNAL_ID:
+      assert(arch >= 9);
+      return 59;
+   case BI_PRELOAD_VERTEX_ID:
+      return (arch >= 9) ? 60 : 61;
+   case BI_PRELOAD_INSTANCE_ID:
+      return (arch >= 9) ? 61 : 62;
+   case BI_PRELOAD_DRAW_ID:
+      assert(arch >= 9);
+      return 62;
+   case BI_PRELOAD_VIEW_ID:
+      assert(arch >= 9);
+      return 63;
+   /* Fragment */
+   case BI_PRELOAD_PRIMITIVE_ID:
+      return 57;
+   case BI_PRELOAD_PRIMITIVE_FLAGS:
+      return 58;
+   case BI_PRELOAD_POSITION_XY:
+      return 59;
+   case BI_PRELOAD_CUMULATIVE_COVERAGE:
+      /* Bits [15;0] */
+      return 60;
+   case BI_PRELOAD_RASTERIZER_COVERAGE:
+      /* Bits [15;0] */
+      return 61;
+   case BI_PRELOAD_SAMPLE_ID:
+      /* Bits [23;16] */
+      return 61;
+   case BI_PRELOAD_CENTROID_ID:
+      /* Bits [31;24] */
+      return 61;
+   case BI_PRELOAD_FRAME_ARG:
+      /* Double reg */
+      return 62;
+   /* Blend */
+   case BI_PRELOAD_BLEND_SRC0_C0:
+      return 0;
+   case BI_PRELOAD_BLEND_SRC0_C1:
+      return 1;
+   case BI_PRELOAD_BLEND_SRC0_C2:
+      return 2;
+   case BI_PRELOAD_BLEND_SRC0_C3:
+      return 3;
+   case BI_PRELOAD_BLEND_SRC1_C0:
+      return 4;
+   case BI_PRELOAD_BLEND_SRC1_C1:
+      return 5;
+   case BI_PRELOAD_BLEND_SRC1_C2:
+      return 6;
+   case BI_PRELOAD_BLEND_SRC1_C3:
+      return 7;
+   case BI_PRELOAD_BLEND_LINK:
+      return 48;
+   }
+   UNREACHABLE("Non-handled BI_PRELOAD");
+}
+
 typedef struct {
    const struct pan_compile_inputs *inputs;
    nir_shader *nir;
@@ -1211,6 +1400,21 @@ static inline bi_index
 bi_temp(bi_context *ctx)
 {
    return bi_get_index(ctx->ssa_alloc++);
+}
+
+static inline bi_index
+bi_temp_like(bi_context *ctx, bi_index idx)
+{
+   idx.value = ctx->ssa_alloc++;
+   /* Reset the fields which don't make sense on a destination.
+    * When the temp replaces a source, bi_replace_index copies these from the
+    * old index.
+    */
+   idx.abs = false;
+   idx.neg = false;
+   idx.swizzle = BI_SWIZZLE_H01;
+   idx.discard = false;
+   return idx;
 }
 
 static inline bi_index
@@ -1416,10 +1620,8 @@ void bi_calc_dominance(bi_context *ctx);
 bool bi_block_dominates(bi_block *parent, bi_block *child);
 
 void bi_print_instr(const bi_instr *I, FILE *fp);
+void bi_print_instr_impl(const bi_instr *I, FILE *fp);
 void bi_print_slots(bi_registers *regs, FILE *fp);
-void bi_print_tuple(bi_tuple *tuple, FILE *fp);
-void bi_print_clause(bi_clause *clause, FILE *fp);
-void bi_print_block(bi_block *block, FILE *fp);
 void bi_print_shader(bi_context *ctx, FILE *fp);
 
 /* BIR passes */
@@ -1451,6 +1653,7 @@ void va_optimize(bi_context *ctx);
 void va_lower_split_64bit(bi_context *ctx);
 
 void bi_lower_opt_instructions(bi_context *ctx);
+void bi_lower_mkvec_swz(bi_context *ctx);
 
 void bi_iterator_schedule(bi_context *ctx);
 void bi_pressure_schedule(bi_context *ctx);
@@ -1491,8 +1694,19 @@ unsigned bi_calc_register_demand(bi_context *ctx);
 void bi_postra_liveness(bi_context *ctx);
 uint64_t MUST_CHECK bi_postra_liveness_ins(uint64_t live, bi_instr *ins);
 
-/* SSA spilling; returns number of spilled registers */
-unsigned bi_spill_ssa(bi_context *ctx, unsigned num_registers, unsigned tls_size);
+/* Record sizes of SSA values into the provided array. */
+void bi_record_sizes(bi_context *ctx, uint32_t *sizes);
+
+/* SSA spilling */
+void bi_spill_ssa(bi_context *ctx, unsigned num_registers);
+
+void bi_repair_ssa(bi_context *ctx);
+
+/* Reindex SSA to reduce memory usage */
+void bi_reindex_ssa(bi_context *ctx);
+
+/* Lower memory operands created during spilling. */
+unsigned bi_lower_spill(bi_context* ctx, uint32_t tls_base);
 
 /* Layout */
 
@@ -1515,6 +1729,11 @@ bi_is_terminal_block(bi_block *block)
 /* Returns the size of the final clause */
 unsigned bi_pack(bi_context *ctx, struct util_dynarray *emission);
 void bi_pack_valhall(bi_context *ctx, struct util_dynarray *emission);
+
+void bi_compile_variant(nir_shader *nir,
+                   const struct pan_compile_inputs *inputs,
+                   struct util_dynarray *binary, struct pan_shader_info *info,
+                   enum bi_idvs_mode idvs);
 
 struct bi_packed_tuple {
    uint64_t lo;
@@ -1697,6 +1916,7 @@ bi_before_function(bi_context *ctx)
 typedef struct {
    bi_context *shader;
    bi_cursor cursor;
+   const nir_instr_debug_info *debug_info;
 } bi_builder;
 
 static inline bi_builder

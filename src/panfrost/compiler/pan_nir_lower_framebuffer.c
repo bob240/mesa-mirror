@@ -1,24 +1,6 @@
 /*
  * Copyright (C) 2020 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
- * IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 /**
@@ -471,12 +453,14 @@ static nir_def *pan_pack(nir_builder *b,
    case PIPE_FORMAT_B5G6R5_UNORM:
       return pan_pack_unorm(b, unpacked, 5, 6, 5, 0);
    case PIPE_FORMAT_R10G10B10A2_UNORM:
+   case PIPE_FORMAT_R10G10B10X2_UNORM:
    case PIPE_FORMAT_B10G10R10A2_UNORM:
       return pan_pack_unorm_1010102(b, unpacked);
    case PIPE_FORMAT_R10G10B10A2_UINT:
    case PIPE_FORMAT_B10G10R10A2_UINT:
       return pan_pack_int_1010102(b, unpacked, false);
    case PIPE_FORMAT_R10G10B10A2_SINT:
+   case PIPE_FORMAT_R10G10B10X2_SINT:
    case PIPE_FORMAT_B10G10R10A2_SINT:
       return pan_pack_int_1010102(b, unpacked, true);
    case PIPE_FORMAT_R11G11B10_FLOAT:

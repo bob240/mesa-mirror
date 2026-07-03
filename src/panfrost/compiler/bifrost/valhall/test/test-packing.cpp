@@ -1,24 +1,7 @@
 /*
  * Copyright (C) 2021 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * Copyright (C) 2026 Arm Ltd.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "bi_builder.h"
@@ -27,9 +10,9 @@
 
 #include <gtest/gtest.h>
 
-#define CASE(instr, expected)                                                  \
+#define CASE_ARCH(instr, arch, expected)                                       \
    do {                                                                        \
-      uint64_t _value = va_pack_instr(instr, 10);                              \
+      uint64_t _value = va_pack_instr(instr, arch);                            \
       if (_value != expected) {                                                \
          fprintf(stderr, "Got %" PRIx64 ", expected %" PRIx64 "\n", _value,    \
                  (uint64_t)expected);                                          \
@@ -38,6 +21,8 @@
          ADD_FAILURE();                                                        \
       }                                                                        \
    } while (0)
+
+#define CASE(instr, expected) CASE_ARCH(instr, 10, expected)
 
 class ValhallPacking : public testing::Test {
  protected:
@@ -296,11 +281,41 @@ TEST_F(ValhallPacking, LdVarBufImmF16)
                                  BI_VECSIZE_V4, 0),
         0x005d80843300003d);
 
-   CASE(bi_ld_var_buf_imm_f16_to(b, bi_register(0), bi_register(61),
-                                 BI_REGISTER_FORMAT_F16, BI_SAMPLE_CENTROID,
-                                 BI_SOURCE_FORMAT_F16, BI_UPDATE_STORE,
-                                 BI_VECSIZE_V4, 8),
-        0x005d80443308003d);
+   CASE_ARCH(bi_ld_var_buf_imm_f16_to(b, bi_register(0), bi_register(61),
+                                      BI_REGISTER_FORMAT_F16,
+                                      BI_SAMPLE_CENTROID, BI_SOURCE_FORMAT_F16,
+                                      BI_UPDATE_STORE, BI_VECSIZE_V4, 8),
+             10, 0x005d80443308003d);
+
+   CASE_ARCH(bi_ld_var_buf_imm_f16_to(b, bi_register(0), bi_register(61),
+                                      BI_REGISTER_FORMAT_F16,
+                                      BI_SAMPLE_CENTROID, BI_SOURCE_FORMAT_F16,
+                                      BI_UPDATE_STORE, BI_VECSIZE_V4, 8),
+             11, 0x005d80443300083d);
+}
+
+TEST_F(ValhallPacking, LdVarBufFlatImmFormat)
+{
+   CASE_ARCH(bi_ld_var_buf_flat_imm_to(b, bi_register(0),
+                                       BI_REGISTER_FORMAT_F32,
+                                       BI_VECSIZE_V4, 0x12),
+             14, 0x0040800832001200);
+
+   CASE_ARCH(bi_ld_var_buf_flat_imm_to(b, bi_register(0),
+                                       BI_REGISTER_FORMAT_F16,
+                                       BI_VECSIZE_V4, 0x12),
+             14, 0x0040800433001200);
+}
+
+TEST_F(ValhallPacking, LdVarBufFlat)
+{
+   CASE_ARCH(bi_ld_var_buf_flat_to(b, bi_register(0), bi_register(61),
+                                   BI_REGISTER_FORMAT_F32, BI_VECSIZE_V4),
+             14, 0x005f80083200003d);
+
+   CASE_ARCH(bi_ld_var_buf_flat_to(b, bi_register(0), bi_register(61),
+                                   BI_REGISTER_FORMAT_F16, BI_VECSIZE_V4),
+             14, 0x005f80043300003d);
 }
 
 TEST_F(ValhallPacking, LeaBufImm)
@@ -309,37 +324,38 @@ TEST_F(ValhallPacking, LeaBufImm)
         0x005e84040000007b);
 }
 
-TEST_F(ValhallPacking, StoreSegment)
+TEST_F(ValhallPacking, StoreMemoryAccess)
 {
-   CASE(bi_store_i96(b, bi_register(0), bi_discard(bi_register(4)),
-                     bi_discard(bi_register(5)), BI_SEG_VARY, 0),
-        0x0061400632000044);
+   bi_instr *I = bi_store_i96(b, bi_register(0), bi_discard(bi_register(4)),
+                              bi_discard(bi_register(5)), BI_SEG_NONE, 0);
+   I->mem_access = VA_MEMORY_ACCESS_ESTREAM;
+   CASE(I, 0x0061400632000044);
 }
 
 TEST_F(ValhallPacking, Convert16To32)
 {
    CASE(bi_u16_to_u32_to(b, bi_register(2),
-                         bi_discard(bi_swz_16(bi_register(55), false, false))),
+                         bi_discard(bi_half(bi_register(55), false))),
         0x0090c20000140077);
 
    CASE(bi_u16_to_u32_to(b, bi_register(2),
-                         bi_discard(bi_swz_16(bi_register(55), true, false))),
+                         bi_discard(bi_half(bi_register(55), true))),
         0x0090c20010140077);
 
    CASE(bi_u16_to_f32_to(b, bi_register(2),
-                         bi_discard(bi_swz_16(bi_register(55), false, false))),
+                         bi_discard(bi_half(bi_register(55), false))),
         0x0090c20000150077);
 
    CASE(bi_u16_to_f32_to(b, bi_register(2),
-                         bi_discard(bi_swz_16(bi_register(55), true, false))),
+                         bi_discard(bi_half(bi_register(55), true))),
         0x0090c20010150077);
 
    CASE(bi_s16_to_s32_to(b, bi_register(2),
-                         bi_discard(bi_swz_16(bi_register(55), false, false))),
+                         bi_discard(bi_half(bi_register(55), false))),
         0x0090c20000040077);
 
    CASE(bi_s16_to_s32_to(b, bi_register(2),
-                         bi_discard(bi_swz_16(bi_register(55), true, false))),
+                         bi_discard(bi_half(bi_register(55), true))),
         0x0090c20010040077);
 }
 

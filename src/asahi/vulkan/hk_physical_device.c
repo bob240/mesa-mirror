@@ -10,7 +10,8 @@
 #include "asahi/lib/agx_device.h"
 #include "asahi/lib/agx_nir_lower_vbo.h"
 #include "util/disk_cache.h"
-#include "util/mesa-sha1.h"
+#include "util/mesa-blake3.h"
+#include "util/os_misc.h"
 #include "git_sha1.h"
 #include "hk_buffer.h"
 #include "hk_entrypoints.h"
@@ -24,6 +25,7 @@
 #include "vulkan/vulkan_core.h"
 #include "vulkan/wsi/wsi_common.h"
 #include "vk_drm_syncobj.h"
+#include "vk_physical_device.h"
 #include "vk_shader_module.h"
 
 #include <fcntl.h>
@@ -140,12 +142,14 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .KHR_zero_initialize_workgroup_memory = true,
       .EXT_4444_formats = true,
       .EXT_attachment_feedback_loop_layout = true,
+      .EXT_blend_operation_advanced = true,
       .EXT_border_color_swizzle = true,
       .EXT_buffer_device_address = true,
       .EXT_calibrated_timestamps = true,
       .EXT_conditional_rendering = false,
       .EXT_color_write_enable = true,
       .EXT_custom_border_color = true,
+      .EXT_debug_marker = true,
       .EXT_depth_bias_control = true,
       .EXT_depth_clip_control = false,
       .EXT_depth_clip_enable = true,
@@ -168,7 +172,7 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_image_drm_format_modifier = true,
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = false,
-      .EXT_image_view_min_lod = instance->image_view_min_lod,
+      .EXT_image_view_min_lod = instance->drirc.misc.image_view_min_lod,
       .EXT_index_type_uint8 = true,
       .EXT_inline_uniform_block = true,
       .EXT_line_rasterization = true,
@@ -183,6 +187,9 @@ hk_get_device_extensions(const struct hk_instance *instance,
       .EXT_pipeline_protected_access = true,
       .EXT_pipeline_robustness = true,
       .EXT_physical_device_drm = true,
+#ifdef HK_USE_WSI_PLATFORM
+      .EXT_present_timing = true,
+#endif
       .EXT_primitive_topology_list_restart = true,
       .EXT_private_data = true,
       .EXT_primitives_generated_query = false,
@@ -254,7 +261,7 @@ hk_get_device_features(
       .textureCompressionASTC_LDR = true,
       .occlusionQueryPrecise = true,
       .pipelineStatisticsQuery = true,
-      .vertexPipelineStoresAndAtomics = instance->vertex_stores,
+      .vertexPipelineStoresAndAtomics = instance->drirc.misc.enable_vertex_pipeline_stores_atomics,
       .fragmentStoresAndAtomics = true,
       .shaderTessellationAndGeometryPointSize = true,
       .shaderImageGatherExtended = true,
@@ -335,7 +342,7 @@ hk_get_device_features(
       .descriptorBindingPartiallyBound = true,
       .descriptorBindingVariableDescriptorCount = true,
       .runtimeDescriptorArray = true,
-      .samplerFilterMinmax = instance->fake_minmax,
+      .samplerFilterMinmax = instance->drirc.misc.fake_minmax,
       .scalarBlockLayout = true,
       .imagelessFramebuffer = true,
       .uniformBufferStandardLayout = true,
@@ -555,7 +562,7 @@ hk_get_device_features(
 #endif
 
       /* VK_EXT_image_view_min_lod */
-      .minLod = instance->image_view_min_lod,
+      .minLod = instance->drirc.misc.image_view_min_lod,
 
       /* VK_EXT_map_memory_placed */
       .memoryMapPlaced = true,
@@ -632,6 +639,16 @@ hk_get_device_features(
 
       /* VK_KHR_shader_relaxed_extended_instruction */
       .shaderRelaxedExtendedInstruction = true,
+
+      /* VK_EXT_blend_operation_advanced */
+      .advancedBlendCoherentOperations = true,
+
+#ifdef HK_USE_WSI_PLATFORM
+      /* VK_EXT_present_timing */
+      .presentTiming = true,
+      .presentAtRelativeTime = true,
+      .presentAtAbsoluteTime = true,
+#endif
    };
 }
 
@@ -658,7 +675,7 @@ hk_get_device_properties(const struct agx_device *dev,
    *properties = (struct vk_properties){
       .apiVersion = hk_get_vk_version(),
       .driverVersion = vk_get_driver_version(),
-      .vendorID = instance->force_vk_vendor ?: VK_VENDOR_ID_MESA,
+      .vendorID = instance->drirc.debug.force_vk_vendor ?: VK_VENDOR_ID_MESA,
       .deviceID = 0,
       .deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
 
@@ -725,7 +742,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxFragmentInputComponents = max_vgt_output_components,
       .maxFragmentOutputAttachments = HK_MAX_RTS,
       .maxFragmentDualSrcAttachments = 1,
-      .maxFragmentCombinedOutputResources = 16,
+      .maxFragmentCombinedOutputResources = HK_MAX_RTS + HK_MAX_DESCRIPTORS,
       .maxComputeSharedMemorySize = HK_MAX_SHARED_SIZE,
       .maxComputeWorkGroupCount = {0x7fffffff, 65535, 65535},
       .maxComputeWorkGroupInvocations = 1024,
@@ -872,7 +889,7 @@ hk_get_device_properties(const struct agx_device *dev,
       .maxDescriptorSetUpdateAfterBindSampledImages = HK_MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindStorageImages = HK_MAX_DESCRIPTORS,
       .maxDescriptorSetUpdateAfterBindInputAttachments = HK_MAX_DESCRIPTORS,
-      .filterMinmaxSingleComponentFormats = instance->fake_minmax,
+      .filterMinmaxSingleComponentFormats = instance->drirc.misc.fake_minmax,
       .filterMinmaxImageComponentMapping = false,
       .maxTimelineSemaphoreValueDifference = UINT64_MAX,
       .framebufferIntegerColorSampleCounts = sample_counts,
@@ -1012,6 +1029,14 @@ hk_get_device_properties(const struct agx_device *dev,
 
       /* VK_KHR_fragment_shader_barycentric */
       .triStripVertexOrderIndependentOfProvokingVertex = false,
+
+      /* VK_EXT_blend_operation_advanced */
+      .advancedBlendMaxColorAttachments = HK_MAX_RTS,
+      .advancedBlendIndependentBlend = true,
+      .advancedBlendNonPremultipliedSrcColor = true,
+      .advancedBlendNonPremultipliedDstColor = true,
+      .advancedBlendCorrelatedOverlap = true,
+      .advancedBlendAllOperations = true,
    };
 
    strncpy(properties->deviceName, dev->name, sizeof(properties->deviceName));
@@ -1067,16 +1092,16 @@ hk_get_device_properties(const struct agx_device *dev,
    properties->identicalMemoryTypeRequirements = true;
 
    {
-      struct mesa_sha1 sha1_ctx;
-      uint8_t sha1[SHA1_DIGEST_LENGTH];
+      blake3_hasher blake3_ctx;
+      uint8_t blake3[BLAKE3_KEY_LEN];
 
-      _mesa_sha1_init(&sha1_ctx);
+      _mesa_blake3_init(&blake3_ctx);
       /* Make sure we don't match with other vendors */
       const char *driver = "honeykrisp-v1";
-      _mesa_sha1_update(&sha1_ctx, driver, strlen(driver));
-      _mesa_sha1_final(&sha1_ctx, sha1);
+      _mesa_blake3_update(&blake3_ctx, driver, strlen(driver));
+      _mesa_blake3_final(&blake3_ctx, blake3);
 
-      memcpy(properties->optimalTilingLayoutUUID, sha1, VK_UUID_SIZE);
+      memcpy(properties->optimalTilingLayoutUUID, blake3, VK_UUID_SIZE);
    }
 }
 
@@ -1085,21 +1110,21 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 {
    struct hk_instance *instance = hk_physical_device_instance(pdev);
 
-   struct mesa_sha1 sha_ctx;
-   _mesa_sha1_init(&sha_ctx);
+   blake3_hasher blake3_ctx;
+   _mesa_blake3_init(&blake3_ctx);
 
-   _mesa_sha1_update(&sha_ctx, instance->driver_build_sha,
+   _mesa_blake3_update(&blake3_ctx, instance->driver_build_sha,
                      sizeof(instance->driver_build_sha));
 
    const uint64_t compiler_flags = hk_physical_device_compiler_flags(pdev);
-   _mesa_sha1_update(&sha_ctx, &compiler_flags, sizeof(compiler_flags));
+   _mesa_blake3_update(&blake3_ctx, &compiler_flags, sizeof(compiler_flags));
 
-   unsigned char sha[SHA1_DIGEST_LENGTH];
-   _mesa_sha1_final(&sha_ctx, sha);
+   unsigned char blake3[BLAKE3_KEY_LEN];
+   _mesa_blake3_final(&blake3_ctx, blake3);
 
-   static_assert(SHA1_DIGEST_LENGTH >= VK_UUID_SIZE);
-   memcpy(pdev->vk.properties.pipelineCacheUUID, sha, VK_UUID_SIZE);
-   memcpy(pdev->vk.properties.shaderBinaryUUID, sha, VK_UUID_SIZE);
+   static_assert(BLAKE3_KEY_LEN >= VK_UUID_SIZE);
+   memcpy(pdev->vk.properties.pipelineCacheUUID, blake3, VK_UUID_SIZE);
+   memcpy(pdev->vk.properties.shaderBinaryUUID, blake3, VK_UUID_SIZE);
 
 #ifdef ENABLE_SHADER_CACHE
    char renderer[10];
@@ -1109,8 +1134,8 @@ hk_physical_device_init_pipeline_cache(struct hk_physical_device *pdev)
 
    assert(len == sizeof(renderer) - 2);
 
-   char timestamp[SHA1_DIGEST_STRING_LENGTH];
-   _mesa_sha1_format(timestamp, instance->driver_build_sha);
+   char timestamp[BLAKE3_HEX_LEN];
+   _mesa_blake3_format(timestamp, instance->driver_build_sha);
 
    const uint64_t driver_flags = hk_physical_device_compiler_flags(pdev);
    pdev->vk.disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
@@ -1136,42 +1161,30 @@ hk_physical_device_free_disk_cache(struct hk_physical_device *pdev)
 #endif
 }
 
-/* Use 1/2 of total size to avoid swapping */
-#define SYSMEM_HEAP_FRACTION(x) (x * 1 / 2)
-
 static uint64_t
 hk_get_sysmem_heap_size(struct hk_physical_device *pdev)
 {
    if (pdev->sysmem)
       return pdev->sysmem;
 
-   uint64_t sysmem_size_B = 0;
-   if (!os_get_total_physical_memory(&sysmem_size_B))
-      return 0;
-
-   return ROUND_DOWN_TO(SYSMEM_HEAP_FRACTION(sysmem_size_B), 1 << 20);
+   struct hk_instance *instance = hk_physical_device_instance(pdev);
+   return os_get_gpu_heap_size(instance->drirc.misc.heap_memory_percent,
+                               &instance->drirc.misc.heap_memory_percent);
 }
 
 static uint64_t
 hk_get_sysmem_heap_available(struct hk_physical_device *pdev)
 {
-   if (pdev->sysmem) {
-      uint64_t total_used = 0;
-      for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
-         const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
-         uint64_t used = p_atomic_read(&heap->used);
-         total_used += used;
-      }
-      return pdev->sysmem - total_used;
+   assert(pdev->sysmem);
+
+   uint64_t total_used = 0;
+   for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
+      const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
+      uint64_t used = p_atomic_read(&heap->used);
+      total_used += used;
    }
 
-   uint64_t sysmem_size_B = 0;
-   if (!os_get_available_system_memory(&sysmem_size_B)) {
-      vk_loge(VK_LOG_OBJS(pdev), "Failed to query available system memory");
-      return 0;
-   }
-
-   return ROUND_DOWN_TO(SYSMEM_HEAP_FRACTION(sysmem_size_B), 1 << 20);
+   return pdev->sysmem - total_used;
 }
 
 VkResult
@@ -1287,7 +1300,6 @@ hk_create_drm_physical_device(struct vk_instance *_instance,
    pdev->mem_heaps[sysmem_heap_idx] = (struct hk_memory_heap){
       .size = sysmem_size_B,
       .flags = VK_MEMORY_HEAP_DEVICE_LOCAL_BIT,
-      .available = hk_get_sysmem_heap_available,
    };
 
    pdev->mem_types[pdev->mem_type_count++] = (VkMemoryType){
@@ -1371,6 +1383,7 @@ hk_GetPhysicalDeviceMemoryProperties2(
    VkPhysicalDeviceMemoryProperties2 *pMemoryProperties)
 {
    VK_FROM_HANDLE(hk_physical_device, pdev, physicalDevice);
+   struct hk_instance *instance = hk_physical_device_instance(pdev);
 
    pMemoryProperties->memoryProperties.memoryHeapCount = pdev->mem_heap_count;
    for (int i = 0; i < pdev->mem_heap_count; i++) {
@@ -1390,6 +1403,9 @@ hk_GetPhysicalDeviceMemoryProperties2(
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT: {
          VkPhysicalDeviceMemoryBudgetPropertiesEXT *p = (void *)ext;
 
+         uint64_t sysmem_budget =
+            pdev->sysmem ? hk_get_sysmem_heap_available(pdev) : 0;
+
          for (unsigned i = 0; i < pdev->mem_heap_count; i++) {
             const struct hk_memory_heap *heap = &pdev->mem_heaps[i];
             uint64_t used = p_atomic_read(&heap->used);
@@ -1405,33 +1421,22 @@ hk_GetPhysicalDeviceMemoryProperties2(
              */
             p->heapUsage[i] = used;
 
-            uint64_t available = heap->size;
-            if (heap->available)
-               available = heap->available(pdev);
+            /* Set the budget at 90% to avoid thrashing. */
+            float percent = 0.9f;
 
-            /* From the Vulkan 1.3.278 spec:
-             *
-             *    "heapBudget is an array of VK_MAX_MEMORY_HEAPS VkDeviceSize
-             *    values in which memory budgets are returned, with one
-             *    element for each memory heap. A heap’s budget is a rough
-             *    estimate of how much memory the process can allocate from
-             *    that heap before allocations may fail or cause performance
-             *    degradation. The budget includes any currently allocated
-             *    device memory."
-             *
-             * and
-             *
-             *    "The heapBudget value must be less than or equal to
-             *    VkMemoryHeap::size for each heap."
-             *
-             * available (queried above) is the total amount free memory
-             * system-wide and does not include our allocations so we need
-             * to add that in.
-             */
-            uint64_t budget = MIN2(available + used, heap->size);
+            uint64_t budget;
+            if (sysmem_budget) {
+               budget = MIN2(sysmem_budget + used, heap->size);
+               budget = ROUND_DOWN_TO((uint64_t)(budget * percent), 1 << 20);
+            } else {
+               /* Scale the budget the same way the heap was scaled. */
+               percent *= instance->drirc.misc.heap_memory_percent;
 
-            /* Set the budget at 90% of available to avoid thrashing */
-            p->heapBudget[i] = ROUND_DOWN_TO(budget * 9 / 10, 1 << 20);
+               budget = vk_physical_device_heap_budget_from_system(
+                  &pdev->vk, percent, heap->size, used);
+            }
+
+            p->heapBudget[i] = budget;
          }
 
          /* From the Vulkan 1.3.278 spec:

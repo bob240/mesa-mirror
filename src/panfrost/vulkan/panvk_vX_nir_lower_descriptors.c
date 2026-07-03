@@ -1,42 +1,27 @@
 /*
  * Copyright © 2021 Collabora Ltd.
- *
- * Derived from tu_shader.c which is:
- * Copyright © 2019 Google LLC
+ * Copyright © 2019-2026 Google LLC
  *
  * Also derived from anv_pipeline.c which is
  * Copyright © 2015 Intel Corporation
  *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
- * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
- * DEALINGS IN THE SOFTWARE.
+ * SPDX-License-Identifier: MIT
  */
 
 #include "panvk_device.h"
+#include "panvk_image.h"
+#include "panvk_sampler.h"
 #include "panvk_shader.h"
 
+#include "vk_format.h"
 #include "vk_graphics_state.h"
+#include "vk_nir_convert_ycbcr.h"
 #include "vk_pipeline.h"
 #include "vk_pipeline_layout.h"
+#include "vk_ycbcr_conversion.h"
 
 #include "util/bitset.h"
-#include "nir.h"
-#include "nir_builder.h"
+#include "pan_nir.h"
 
 #if PAN_ARCH >= 9
 #define VALHALL_RESOURCE_TABLE_IDX 62
@@ -67,6 +52,7 @@ struct lower_desc_info {
 };
 
 struct lower_desc_ctx {
+   mesa_shader_stage stage;
    const struct panvk_descriptor_set_layout *set_layouts[MAX_SETS];
    struct lower_desc_info desc_info;
    struct hash_table_u64 *ht;
@@ -77,16 +63,14 @@ struct lower_desc_ctx {
 };
 
 static nir_address_format
-addr_format_for_desc_type(VkDescriptorType desc_type,
+addr_format_for_desc_type(nir_descriptor_type desc_type,
                           const struct lower_desc_ctx *ctx)
 {
    switch (desc_type) {
-   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+   case nir_descriptor_type_uniform_buffer:
       return ctx->ubo_addr_format;
 
-   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
-   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+   case nir_descriptor_type_storage_buffer:
       return ctx->ssbo_addr_format;
 
    default:
@@ -181,14 +165,22 @@ shader_desc_idx(uint32_t set, uint32_t binding,
    const struct lower_desc_map *map;
 
 #if PAN_ARCH < 9
+   uint32_t table = PANVK_BIFROST_DESC_TABLE_INVALID;
    if (bind_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
       map = &ctx->desc_info.dyn_ubos;
    } else if (bind_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) {
       map = &ctx->desc_info.dyn_ssbos;
    } else {
-      uint32_t table = desc_type_to_table_type(bind_layout, src.sampler_subdesc);
-
+      table = desc_type_to_table_type(bind_layout, src.sampler_subdesc);
       assert(table < PANVK_BIFROST_DESC_TABLE_COUNT);
+
+      /* For some reason, GCC thinks the initialization above will lead to an
+       * OOB array access on ctx->desc_info.others[table] even though it
+       * clearly gets overwritten above. This gets rid of the warning.
+       */
+      if (table >= PANVK_BIFROST_DESC_TABLE_COUNT)
+         return 0;
+
       map = &ctx->desc_info.others[table];
    }
 #else
@@ -200,11 +192,17 @@ shader_desc_idx(uint32_t set, uint32_t binding,
    uint32_t idx = entry - map->map;
 
 #if PAN_ARCH < 9
-   /* Adjust the destination index for all dynamic UBOs, which are laid out
-    * just after the regular UBOs in the UBO table. */
    if (bind_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {
+      /* Adjust the destination index for all dynamic UBOs, which are laid out
+       * just after the regular UBOs in the UBO table.
+       */
       idx += ctx->desc_info.others[PANVK_BIFROST_DESC_TABLE_UBO].count;
-   } else if (subdesc.type == VK_DESCRIPTOR_TYPE_SAMPLER) {
+   } else if (table == PANVK_BIFROST_DESC_TABLE_IMG) {
+      /* Images go after attributes in the attribute table. */
+      idx += ctx->stage == MESA_SHADER_VERTEX ? MAX_VS_ATTRIBS : 0;
+   }
+
+   if (subdesc.type == VK_DESCRIPTOR_TYPE_SAMPLER) {
       /* the Cb/Cr planes share the same sampler, so in a 3 plane arrangement
        * the number of planes can exceed the number of samplers */
       idx += MIN2(subdesc.plane, bind_layout->samplers_per_desc - 1);
@@ -452,7 +450,7 @@ lower_res_intrinsic(nir_builder *b, nir_intrinsic_instr *intrin,
 {
    b->cursor = nir_before_instr(&intrin->instr);
 
-   const VkDescriptorType desc_type = nir_intrinsic_desc_type(intrin);
+   const nir_descriptor_type desc_type = nir_intrinsic_desc_type(intrin);
    nir_address_format addr_format = addr_format_for_desc_type(desc_type, ctx);
 
    nir_def *res;
@@ -567,42 +565,24 @@ load_resource_deref_desc(nir_builder *b, nir_deref_instr *deref,
    /* note that user sets start from index 1 */
    return nir_load_ubo(
       b, num_components, bit_size,
-      nir_imm_int(b, pan_res_handle(VALHALL_RESOURCE_TABLE_IDX, set + 1)),
+      pan_nir_res_handle(b, VALHALL_RESOURCE_TABLE_IDX, set + 1, NULL),
       set_offset, .range = ~0u, .align_mul = PANVK_DESCRIPTOR_SIZE,
       .align_offset = desc_offset);
 #endif
 }
 
-static nir_def *
-is_nulldesc(nir_builder *b, nir_deref_instr *deref,
-            enum VkDescriptorType desc_type, const struct lower_desc_ctx *ctx)
-{
-   nir_def *desc_header =
-      load_resource_deref_desc(b, deref, desc_type, 0, 1, 16, ctx);
-   /* If the first 16 bits are all zero (specifically the descriptor type),
-    * this is a nulldescriptor, in which case we need to avoid the "add 1"
-    * when loading the size from the descriptor. */
-   return nir_ieq_imm(b, desc_header, 0);
-}
-
+#if PAN_ARCH < 9
 static nir_def *
 load_tex_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
               bool is_array, const struct lower_desc_ctx *ctx)
 {
    nir_def *loaded_size;
    if (dim == GLSL_SAMPLER_DIM_BUF) {
-#if PAN_ARCH >= 9
-      nir_def *size = load_resource_deref_desc(
-         b, deref, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 4, 1, 32, ctx);
-      nir_def *stride = load_resource_deref_desc(
-         b, deref, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 16, 1, 32, ctx);
-      loaded_size = nir_idiv(b, size, stride);
-#else
+      assert(PAN_ARCH < 9);
       nir_def *stride_size = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 8, 2, 32, ctx);
       loaded_size = nir_idiv(b, nir_channel(b, stride_size, 1),
                              nir_channel(b, stride_size, 0));
-#endif
    } else {
       nir_def *tex_w_h = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4, 2, 16, ctx);
@@ -624,12 +604,8 @@ load_tex_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
       loaded_size = nir_iadd_imm(b, nir_u2u32(b, tex_sz), 1);
    }
 
-   if (PAN_ARCH >= 9 && ctx->null_descriptor_support) {
-      nir_def *nulldesc =
-         is_nulldesc(b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx);
-      return nir_bcsel(b, nulldesc, nir_u2u32(b, nir_imm_int(b, 0)),
-                       loaded_size);
-   }
+   /* TODO/Bifrost: Null descriptors */
+   assert(PAN_ARCH < 9 && !ctx->null_descriptor_support);
 
    return loaded_size;
 }
@@ -638,9 +614,6 @@ static nir_def *
 load_img_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
               bool is_array, const struct lower_desc_ctx *ctx)
 {
-   if (PAN_ARCH >= 9)
-      return load_tex_size(b, deref, dim, is_array, ctx);
-
    if (dim == GLSL_SAMPLER_DIM_BUF) {
       nir_def *stride_size = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 8, 2, 32, ctx);
@@ -650,14 +623,12 @@ load_img_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
       nir_def *tex_sz = load_resource_deref_desc(
          b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 18, 3, 16, ctx);
 
-#if PAN_ARCH < 9
       if (is_array && dim == GLSL_SAMPLER_DIM_CUBE)
          tex_sz =
             nir_vector_insert_imm(b, tex_sz,
                                      nir_udiv_imm(b, nir_channel(b, tex_sz, 2),
                                                      6),
                                      2);
-#endif
 
       if (is_array && dim == GLSL_SAMPLER_DIM_1D)
          tex_sz =
@@ -668,7 +639,26 @@ load_img_size(nir_builder *b, nir_deref_instr *deref, enum glsl_sampler_dim dim,
       /* The sizes are provided as 16-bit values with 1 subtracted so
        * convert to 32-bit and add 1.
        */
-      return nir_iadd_imm(b, nir_u2u32(b, tex_sz), 1);
+      tex_sz = nir_iadd_imm(b, nir_u2u32(b, tex_sz), 1);
+
+      if (is_array && dim == GLSL_SAMPLER_DIM_MS) {
+         /* log2(sample_count) is placed into bits 7..9 of the pixel
+          * stride (see prepare_attr_buf_descs) which is stored at
+          * offset 8 in the attribute descriptor buffer
+          */
+         nir_def *sample_count = load_resource_deref_desc(
+            b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8, 1, 32, ctx);
+         sample_count = nir_iand_imm(b, nir_ushr_imm(b, sample_count, 7),
+                                     BITFIELD_MASK(3));
+         /* the Z value was lowered by the number of samples so that
+          * we could make the multisampled array look like a 3D texture
+          * Undo that here so we get the correct size
+          */
+         nir_def *z_val = nir_channel(b, tex_sz, 2);
+         z_val = nir_ushr(b, z_val, sample_count);
+         tex_sz = nir_vector_insert_imm(b, tex_sz, z_val, 2);
+      }
+      return tex_sz;
    }
 }
 
@@ -684,11 +674,8 @@ load_tex_levels(nir_builder *b, nir_deref_instr *deref,
    nir_def *lod_count = nir_iand_imm(b, nir_ushr_imm(b, tex_word2, 16), 0x1f);
    nir_def *loaded_levels = nir_iadd_imm(b, lod_count, 1);
 
-   if (PAN_ARCH >= 9 && ctx->null_descriptor_support) {
-      nir_def *nulldesc =
-         is_nulldesc(b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx);
-      return nir_bcsel(b, nulldesc, nir_imm_int(b, 0), loaded_levels);
-   }
+   /* TODO/Bifrost: Null descriptors */
+   assert(PAN_ARCH < 9 && !ctx->null_descriptor_support);
 
    return loaded_levels;
 }
@@ -705,11 +692,8 @@ load_tex_samples(nir_builder *b, nir_deref_instr *deref,
    nir_def *sample_count = nir_iand_imm(b, nir_ushr_imm(b, tex_word3, 13), 0x7);
    nir_def *loaded_samples = nir_ishl(b, nir_imm_int(b, 1), sample_count);
 
-   if (PAN_ARCH >= 9 && ctx->null_descriptor_support) {
-      nir_def *nulldesc =
-         is_nulldesc(b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, ctx);
-      return nir_bcsel(b, nulldesc, nir_imm_int(b, 0), loaded_samples);
-   }
+   /* TODO/Bifrost: Null descriptors */
+   assert(PAN_ARCH < 9 && !ctx->null_descriptor_support);
 
    return loaded_samples;
 }
@@ -718,18 +702,23 @@ static nir_def *
 load_img_samples(nir_builder *b, nir_deref_instr *deref,
                  enum glsl_sampler_dim dim, const struct lower_desc_ctx *ctx)
 {
-   if (PAN_ARCH >= 9)
-      return load_tex_samples(b, deref, dim, ctx);
+   assert(PAN_ARCH < 9);
 
    assert(dim != GLSL_SAMPLER_DIM_BUF);
 
-   /* Sample count is stored in the image depth field.
-    * FIXME: This won't work for 2DMSArray images, but those are already
-    * broken. */
+   /* log2(sample_count) is placed into bits 7..9 of the pixel
+    * stride (see prepare_attr_buf_descs) which is stored at
+    * offset 8 in the attribute descriptor buffer
+    */
+   nir_def *one = nir_imm_int(b, 1);
    nir_def *sample_count = load_resource_deref_desc(
-      b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 22, 1, 16, ctx);
-   return nir_iadd_imm(b, nir_u2u32(b, sample_count), 1);
+      b, deref, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8, 1, 32, ctx);
+
+   sample_count = nir_iand_imm(b, nir_ushr_imm(b, sample_count, 7),
+                               BITFIELD_MASK(3));
+   return nir_ishl(b, one, sample_count);
 }
+#endif /* PAN_ARCH < 9 */
 
 static uint32_t
 get_desc_array_stride(const struct panvk_descriptor_set_binding_layout *layout,
@@ -755,6 +744,81 @@ get_desc_array_stride(const struct panvk_descriptor_set_binding_layout *layout,
    }
 }
 
+static void
+lower_tex_ycbcr(nir_builder *b, nir_tex_instr *tex,
+                const struct vk_ycbcr_conversion_state *conversion)
+{
+   b->cursor = nir_after_instr(&tex->instr);
+
+   nir_def *raw = &tex->def;
+
+   VkFormat y_format = vk_format_get_plane_format(conversion->format, 0);
+   uint8_t bits = vk_format_get_bpc(y_format);
+   uint32_t bpcs[3] = {bits, bits, bits};
+
+#if PAN_ARCH < 14
+   if (bits == 10) {
+      /* Upon normalization, the 10-bit component is divided by 1020 (0xFF<<2)
+       * instead of 1023. So here we have to scale down accordingly.
+       */
+      const float factor = 1020.0f / 1023.0f;
+      nir_def *scale = nir_imm_vec4(b, factor, factor, factor, 1.0f);
+      raw = nir_fmul(b, raw, scale);
+   }
+#endif
+
+   nir_def *result = raw;
+   if (conversion->ycbcr_model !=
+       VK_SAMPLER_YCBCR_MODEL_CONVERSION_RGB_IDENTITY) {
+      result = nir_convert_ycbcr_to_rgb(b, conversion->ycbcr_model,
+                                        conversion->ycbcr_range, raw, bpcs);
+   }
+
+   nir_def_rewrite_uses_after(&tex->def, result);
+
+   b->cursor = nir_before_instr(&tex->instr);
+}
+
+static void
+lower_tex_immutable(nir_builder *b, nir_tex_instr *tex,
+                    const struct lower_desc_ctx *ctx)
+{
+   /* clang-format off */
+   if (tex->op == nir_texop_txs ||
+       tex->op == nir_texop_query_levels ||
+       tex->op == nir_texop_texture_samples ||
+       tex->op == nir_texop_lod)
+      return;
+   /* clang-format on */
+
+   int sampler_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+   if (sampler_src_idx < 0)
+      return;
+
+   nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
+   uint32_t set, binding, index_imm, max_idx;
+   nir_def *index_ssa;
+   get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa,
+                              &max_idx);
+
+   const struct panvk_descriptor_set_layout *set_layout = ctx->set_layouts[set];
+   const struct panvk_descriptor_set_binding_layout *bind_layout =
+      &set_layout->bindings[binding];
+
+   if (!bind_layout->immutable_samplers)
+      return;
+
+   const struct panvk_sampler *sampler =
+      bind_layout->immutable_samplers[index_imm];
+   if (sampler && sampler->vk.ycbcr_conversion) {
+      const struct vk_ycbcr_conversion_state *conversion =
+         &sampler->vk.ycbcr_conversion->state;
+      if (panvk_image_use_yuv_tex(PAN_ARCH, conversion->format))
+         lower_tex_ycbcr(b, tex, conversion);
+   }
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 {
@@ -762,6 +826,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
 
    b->cursor = nir_before_instr(&tex->instr);
 
+   lower_tex_immutable(b, tex, ctx);
+
+#if PAN_ARCH < 9
    if (tex->op == nir_texop_txs || tex->op == nir_texop_query_levels ||
        tex->op == nir_texop_texture_samples) {
       int tex_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
@@ -791,6 +858,7 @@ lower_tex(nir_builder *b, nir_tex_instr *tex, const struct lower_desc_ctx *ctx)
       nir_def_replace(&tex->def, res);
       return true;
    }
+#endif
 
    uint32_t plane = 0;
    int sampler_src_idx =
@@ -871,7 +939,7 @@ get_img_index(nir_builder *b, nir_deref_instr *deref,
    get_resource_deref_binding(deref, &set, &binding, &index_imm, &index_ssa,
                               &max_idx);
 
-   const struct panvk_descriptor_set_binding_layout *bind_layout =
+   ASSERTED const struct panvk_descriptor_set_binding_layout *bind_layout =
       get_binding_layout(set, binding, ctx);
    assert(bind_layout->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ||
           bind_layout->type == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER ||
@@ -895,6 +963,7 @@ lower_img_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
    b->cursor = nir_before_instr(&intr->instr);
    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
 
+#if PAN_ARCH < 9
    if (intr->intrinsic == nir_intrinsic_image_deref_size ||
        intr->intrinsic == nir_intrinsic_image_deref_samples) {
       const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
@@ -914,9 +983,12 @@ lower_img_intrinsic(nir_builder *b, nir_intrinsic_instr *intr,
       }
 
       nir_def_replace(&intr->def, res);
-   } else {
-      nir_rewrite_image_intrinsic(intr, get_img_index(b, deref, ctx), false);
+      return true;
    }
+#endif
+
+   nir_rewrite_image_intrinsic(intr, get_img_index(b, deref, ctx),
+                               nir_image_intrinsic_type_default);
 
    return true;
 }
@@ -964,9 +1036,9 @@ record_binding(struct lower_desc_ctx *ctx, unsigned set, unsigned binding,
    const struct panvk_descriptor_set_layout *set_layout = ctx->set_layouts[set];
    const struct panvk_descriptor_set_binding_layout *binding_layout =
       &set_layout->bindings[binding];
-   uint32_t subdesc_idx = get_subdesc_idx(binding_layout, subdesc);
-   uint32_t desc_stride = panvk_get_desc_stride(binding_layout);
-   uint32_t max_desc_stride = MAX2(
+   ASSERTED uint32_t subdesc_idx = get_subdesc_idx(binding_layout, subdesc);
+   ASSERTED uint32_t desc_stride = panvk_get_desc_stride(binding_layout);
+   ASSERTED uint32_t max_desc_stride = MAX2(
       binding_layout->samplers_per_desc + binding_layout->textures_per_desc, 1);
 
    assert(desc_stride >= 1 && desc_stride <= max_desc_stride);
@@ -1307,6 +1379,7 @@ panvk_per_arch(nir_lower_descriptors)(
    struct panvk_shader_desc_info *desc_info)
 {
    struct lower_desc_ctx ctx = {
+      .stage = nir->info.stage,
       .add_bounds_checks =
          rs->storage_buffers !=
             VK_PIPELINE_ROBUSTNESS_BUFFER_BEHAVIOR_DISABLED_EXT ||

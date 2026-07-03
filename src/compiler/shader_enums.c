@@ -125,6 +125,7 @@ _mesa_shader_stage_to_file_ext(unsigned stage)
    case MESA_SHADER_FRAGMENT:     return "frag";
    case MESA_SHADER_GEOMETRY:     return "geom";
    case MESA_SHADER_COMPUTE:      return "comp";
+   case MESA_SHADER_KERNEL:       return "kernel";
    case MESA_SHADER_TESS_CTRL:    return "tesc";
    case MESA_SHADER_TESS_EVAL:    return "tese";
    case MESA_SHADER_TASK:         return "task";
@@ -202,6 +203,34 @@ gl_varying_slot_name_for_stage(gl_varying_slot slot, mesa_shader_stage stage)
    case MESA_SHADER_TASK:
       switch (slot) {
       case VARYING_SLOT_TASK_COUNT: return "VARYING_SLOT_TASK_COUNT";
+      default:
+         /* Not an overlapping value. */
+         break;
+      }
+      break;
+
+   case MESA_SHADER_VERTEX:
+      switch (slot) {
+      case VARYING_SLOT_GS_HEADER_IR3: return "VARYING_SLOT_GS_HEADER_IR3";
+      default:
+         /* Not an overlapping value. */
+         break;
+      }
+      break;
+
+   case MESA_SHADER_TESS_EVAL:
+      switch (slot) {
+      case VARYING_SLOT_GS_HEADER_IR3: return "VARYING_SLOT_GS_HEADER_IR3";
+      default:
+         /* Not an overlapping value. */
+         break;
+      }
+      break;
+
+   case MESA_SHADER_GEOMETRY:
+      switch (slot) {
+      case VARYING_SLOT_GS_HEADER_IR3: return "VARYING_SLOT_GS_HEADER_IR3";
+      case VARYING_SLOT_GS_VERTEX_FLAGS_IR3: return "VARYING_SLOT_GS_VERTEX_FLAGS_IR3";
       default:
          /* Not an overlapping value. */
          break;
@@ -355,8 +384,10 @@ gl_system_value_name(gl_system_value sysval)
      ENUM(SYSTEM_VALUE_INVOCATION_ID),
      ENUM(SYSTEM_VALUE_FRAG_COORD),
      ENUM(SYSTEM_VALUE_PIXEL_COORD),
+     ENUM(SYSTEM_VALUE_FRAG_COORD_XY),
      ENUM(SYSTEM_VALUE_FRAG_COORD_Z),
      ENUM(SYSTEM_VALUE_FRAG_COORD_W),
+     ENUM(SYSTEM_VALUE_FRAG_COORD_W_RCP),
      ENUM(SYSTEM_VALUE_POINT_COORD),
      ENUM(SYSTEM_VALUE_LINE_COORD),
      ENUM(SYSTEM_VALUE_FRONT_FACE),
@@ -431,6 +462,8 @@ gl_system_value_name(gl_system_value sysval)
      ENUM(SYSTEM_VALUE_CORE_MAX_ID_ARM),
      ENUM(SYSTEM_VALUE_WARP_ID_ARM),
      ENUM(SYSTEM_VALUE_WARP_MAX_ID_ARM),
+     ENUM(SYSTEM_VALUE_COLOR0_AMD),
+     ENUM(SYSTEM_VALUE_COLOR1_AMD),
    };
    STATIC_ASSERT(ARRAY_SIZE(names) == SYSTEM_VALUE_MAX);
    return NAME(sysval);

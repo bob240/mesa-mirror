@@ -1,25 +1,6 @@
 /*
  * Copyright (C) 2026 Collabora, Ltd.
- *
- * Permission is hereby granted, free of charge, to any person obtaining a
- * copy of this software and associated documentation files (the "Software"),
- * to deal in the Software without restriction, including without limitation
- * the rights to use, copy, modify, merge, publish, distribute, sublicense,
- * and/or sell copies of the Software, and to permit persons to whom the
- * Software is furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice (including the next
- * paragraph) shall be included in all copies or substantial portions of the
- * Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
+ * SPDX-License-Identifier: MIT
  */
 
 #include "pan_nir.h"
@@ -156,7 +137,7 @@ pan_nir_lower_fs_outputs(nir_shader *shader, bool skip_atest)
     */
    nir_def *alpha;
    if (color0 && glsl_type_is_float_16_32(color0->type))
-      alpha = nir_f2f32(b, nir_channel(b, nir_load_var(b, color0), 3));
+      alpha = nir_channel(b, nir_load_var(b, color0), 3);
    else
       alpha = nir_imm_float(b, 1.0f);
 
@@ -166,7 +147,7 @@ pan_nir_lower_fs_outputs(nir_shader *shader, bool skip_atest)
     * skipped for pure integer framebuffers, so the issue is moot.
     */
    if (!skip_atest)
-      coverage = nir_atest_pan(b, coverage, nir_f2f32(b, alpha));
+      coverage = nir_atest_pan(b, coverage, alpha);
 
    /* We discard depth/stencil writes if early fragment tests is forced. */
    if ((out.depth || out.stencil) && !shader->info.fs.early_fragment_tests) {

@@ -10,7 +10,7 @@
 #include "ac_binary.h"
 #include "amd_family.h"
 #include "compiler/shader_enums.h"
-#include "util/format/u_format.h"
+#include "util/format/u_formats.h"
 #include "util/u_math.h"
 
 #include <stdbool.h>
@@ -45,8 +45,8 @@ enum ac_access_type {
    ac_access_type_atomic,
 };
 
-/* GFX6-11. The meaning of these enums is different between chips. They match LLVM definitions,
- * but they can also be used by ACO. Use ac_get_hw_cache_flags to get these.
+/* GFX6-11. The meaning of these enums is different between chips.
+ * Use ac_get_hw_cache_flags to get these.
  */
 enum ac_cache_flags
 {
@@ -149,12 +149,10 @@ enum gfx12_speculative_data_read
 union ac_hw_cache_flags
 {
    struct {
-      /* This matches LLVM, but it can also be used by ACO for translation of ac_memop_flags. */
       uint8_t temporal_hint:3;   /* gfx12_{load,store,atomic}_temporal_hint */
       uint8_t scope:2;           /* gfx12_scope */
-      uint8_t _reserved:1;
       uint8_t swizzled:1;        /* for swizzled buffer access (attribute ring) */
-      uint8_t _pad:1;
+      uint8_t _already_reserved_for_future:2;
    } gfx12;
 
    uint8_t value; /* ac_cache_flags (GFX6-11) or the gfx12 structure */
@@ -237,6 +235,8 @@ enum ac_descriptor_type
    AC_DESC_PLANE_2,
 };
 
+struct ac_compiler_info;
+
 unsigned ac_get_spi_shader_z_format(bool writes_z, bool writes_stencil, bool writes_samplemask,
                                     bool writes_mrt0_alpha);
 
@@ -284,7 +284,7 @@ unsigned ac_compute_lshs_workgroup_size(enum amd_gfx_level gfx_level, mesa_shade
 unsigned ac_compute_ngg_workgroup_size(unsigned es_verts, unsigned gs_inst_prims,
                                        unsigned max_vtx_out, unsigned prim_amp_factor);
 
-uint32_t ac_compute_num_tess_patches(const struct radeon_info *info, uint32_t num_tcs_input_cp,
+uint32_t ac_compute_num_tess_patches(const struct ac_compiler_info *info, uint32_t num_tcs_input_cp,
                                      uint32_t num_tcs_output_cp, uint32_t num_mem_tcs_outputs,
                                      uint32_t num_mem_tcs_patch_outputs, uint32_t lds_per_patch,
                                      uint32_t wave_size, bool tess_uses_primid);
@@ -342,6 +342,12 @@ ac_ngg_compute_subgroup_info(enum amd_gfx_level gfx_level, mesa_shader_stage es_
                              unsigned esgs_vertex_stride, unsigned ngg_lds_vertex_size,
                              unsigned ngg_lds_scratch_size, bool tess_turns_off_ngg,
                              unsigned max_esgs_lds_padding, ac_ngg_subgroup_info *out);
+
+void
+ac_print_spi_ps_input_vgpr_list(uint32_t spi_ps_input_ena, uint32_t spi_ps_input_addr, FILE *f);
+
+void ac_print_spi_ps_shader_col_format(uint32_t spi_shader_col_format, FILE *f);
+void ac_print_spi_ps_shader_z_format(uint32_t spi_shader_z_format, FILE *f);
 
 static unsigned inline
 ac_shader_get_lds_alloc_granularity(enum amd_gfx_level gfx_level)

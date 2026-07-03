@@ -1,25 +1,7 @@
 #encoding=utf-8
 
 # Copyright (C) 2021 Collabora, Ltd.
-#
-# Permission is hereby granted, free of charge, to any person obtaining a
-# copy of this software and associated documentation files (the "Software"),
-# to deal in the Software without restriction, including without limitation
-# the rights to use, copy, modify, merge, publish, distribute, sublicense,
-# and/or sell copies of the Software, and to permit persons to whom the
-# Software is furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice (including the next
-# paragraph) shall be included in all copies or substantial portions of the
-# Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
-# THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
-# FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
-# IN THE SOFTWARE.
+# SPDX-License-Identifier: MIT
 
 import argparse
 import os
@@ -94,15 +76,31 @@ def parse_int(s, minimum, maximum):
     return number
 
 def encode_source(op, fau):
-    if op[0] == '^':
-        die_if(op[1] != 'r', f"Expected register after discard {op}")
-        return parse_int(op[2:], 0, 63) | 0x40
+    # Reg tuple
+    if op[0] == '[' and op[-1:] == ']':
+        # Remove brackets and split on ":"
+        unpacked = op[1:-1].split(":")
+        die_if(len(unpacked) != 2, 'Invalid tuple')
+        die_if(unpacked[0][0] != 'r', 'Invalid tuple')
+        die_if(unpacked[1][0] != 'r', 'Invalid tuple')
+        if (unpacked[0][-1:] == '^'):
+            val0 = parse_int(unpacked[0][1:-1], 0, 63)
+            val1 = parse_int(unpacked[1][1:-1], 0, 63)
+            die_if(val1 != val0 + 1, 'Invalid tuple value')
+            return val0 | 0x40
+        else:
+            val0 = parse_int(unpacked[0][1:], 0, 63)
+            val1 = parse_int(unpacked[1][1:], 0, 63)
+            die_if(val1 != val0 + 1, 'Invalid tuple value')
+            return val0
     elif op[0] == 'r':
+        if (op[-1:] == '^'):
+            return parse_int(op[1:-1], 0, 63) | 0x40
         return parse_int(op[1:], 0, 63)
     elif op[0] == 'u':
         val = parse_int(op[1:], 0, 127)
-        fau.set_page(val >> 6)
-        return (val & 0x3F) | 0x80
+        fau.set_page(val >> 5)
+        return ((val & 0x1F) << 1) | 0x80
     elif op[0] == 'i':
         return int(op[3:]) | 0xC0
     elif op.startswith('0x'):
@@ -124,10 +122,27 @@ def encode_source(op, fau):
 
 
 def encode_dest(op):
-    die_if(op[0] != 'r', f"Expected register destination {op}")
+    # Reg tuple
+    if op[0] == '[' and op[-1:] == ']':
+        # Remove brackets and split on ":"
+        unpacked = op[1:-1].split(":")
+        die_if(len(unpacked) != 2, 'Invalid tuple')
+        die_if(unpacked[0][0] != 'r', 'Invalid tuple')
+        die_if(unpacked[1][0] != 'r', 'Invalid tuple')
 
-    parts = op.split(".")
-    reg = parts[0]
+        parts = unpacked[0].split(".")
+        reg = parts[0]
+        value = parse_int(reg[1:], 0, 63)
+
+        parts1 = unpacked[1].split(".")
+        reg1 = parts1[0]
+        val1 = parse_int(reg1[1:], 0, 63)
+        die_if(val1 != value + 1, 'Invalid tuple value')
+    else:
+        die_if(op[0] != 'r', f"Expected register destination {op}")
+        parts = op.split(".")
+        reg = parts[0]
+        value = parse_int(reg[1:], 0, 63)
 
     # Default to writing in full
     wrmask = 0x3
@@ -139,7 +154,7 @@ def encode_dest(op):
         die_if(mask not in WMASKS, "Expected a write mask")
         wrmask = 1 << WMASKS.index(mask)
 
-    return parse_int(reg[1:], 0, 63) | (wrmask << 6)
+    return value | (wrmask << 6)
 
 def parse_asm(line):
     global LINE
@@ -226,14 +241,16 @@ def parse_asm(line):
         encoded_src = encode_source(parts[0], fau)
 
         # Require a word selection for special FAU values
-        needs_word_select = ((encoded_src >> 5) == 0b111)
+        may_have_word_select = ((encoded_src >> 5) == 0b111)
+        # or for regular FAU values
+        may_have_word_select |= ((encoded_src >> 6) == 0b10)
 
         # Has a swizzle been applied yet?
         swizzled = False
 
         for mod in parts[1:]:
             # Encode the modifier
-            if mod in src.offset and src.bits[mod] == 1:
+            if mod in src.offset and src.mask[mod] == 0x1:
                 encoded |= (1 << src.offset[mod])
             elif src.halfswizzle and mod in enums[f'half_swizzles_{src.size}_bit'].bare_values:
                 die_if(swizzled, "Multiple swizzles specified")
@@ -280,13 +297,13 @@ def parse_asm(line):
                 val = enums['lanes_8_bit'].bare_values.index(mod)
                 encoded |= (val << src.offset['widen'])
             elif mod in ['w0', 'w1']:
-                # Chck for special
-                die_if(not needs_word_select, 'Unexpected word select')
+                # Check whether we may have word select
+                die_if(not may_have_word_select, 'Unexpected word select')
 
                 if mod == 'w1':
                     encoded_src |= 0x1
 
-                needs_word_select = False
+                may_have_word_select = False
             else:
                 die(f"Unknown modifier {mod}")
 
@@ -333,12 +350,12 @@ def parse_asm(line):
     operands = operands[len(ins.immediates):]
 
     # Encode the operation itself
-    encoded |= (ins.opcode << 48)
-    encoded |= (ins.opcode2 << ins.secondary_shift)
+    for subcode in ins.opcode:
+        encoded |= (subcode.value << subcode.start)
 
     # Encode FAU page
     if fau.page:
-        encoded |= (fau.page << 57)
+        encoded |= (fau.page << ins.offset['fau_page'])
 
     # Encode modifiers
     has_flow = False
@@ -349,7 +366,7 @@ def parse_asm(line):
         if mod in enums['flow'].bare_values:
             die_if(has_flow, "Multiple flow control modifiers specified")
             has_flow = True
-            encoded |= (enums['flow'].bare_values.index(mod) << 59)
+            encoded |= (enums['flow'].bare_values.index(mod) << ins.offset['flow'])
         else:
             candidates = [c for c in ins.modifiers if mod in c.bare_values]
 
